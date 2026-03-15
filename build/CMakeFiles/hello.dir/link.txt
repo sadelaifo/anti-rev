@@ -1,1 +1,0 @@
-/usr/bin/cc CMakeFiles/hello.dir/tests/hello/main.c.o -o hello 
