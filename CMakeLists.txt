@@ -37,8 +37,8 @@ function(make_blob_header OUTPUT INPUT VARNAME DEP)
 endfunction()
 
 # ── Helper: build a stub binary with a given compiler ─────────────────
-# Usage: build_stub(<output> <compiler> <blob_header_dep>)
-function(build_stub OUTPUT COMPILER STRIPPER BLOB_DEP)
+# Usage: build_stub(<output> <compiler> <stripper> <dlopen_blob_dep> <audit_blob_dep>)
+function(build_stub OUTPUT COMPILER STRIPPER DLOPEN_BLOB_DEP AUDIT_BLOB_DEP)
     # Extra flags: pass -static for cross-compiled (non-native) stubs so they run
     # on QEMU user-mode (no ARM64 dynamic linker on the host) and on embedded targets.
     # Native x86-64 stub stays dynamically linked (faster startup, smaller binary).
@@ -60,7 +60,8 @@ function(build_stub OUTPUT COMPILER STRIPPER BLOB_DEP)
             "${CMAKE_SOURCE_DIR}/stub/stub.c"
             "${CMAKE_SOURCE_DIR}/stub/crypto.c"
             "${CMAKE_SOURCE_DIR}/stub/crypto.h"
-            "${BLOB_DEP}"
+            "${DLOPEN_BLOB_DEP}"
+            "${AUDIT_BLOB_DEP}"
         COMMENT "Building and stripping stub: ${OUTPUT}"
     )
 endfunction()
@@ -79,7 +80,16 @@ add_custom_target(dlopen_shim_x86 DEPENDS "${SHIM_X86}")
 make_blob_header("${SHIM_BLOB_X86_H}" "${SHIM_X86}" "dlopen_shim_blob" "${SHIM_X86}")
 add_custom_target(dlopen_shim_blob_h DEPENDS "${SHIM_BLOB_X86_H}")
 
-build_stub("${STUB_X86}" gcc strip "${SHIM_BLOB_X86_H}")
+set(AUDIT_X86        "${CMAKE_BINARY_DIR}/audit_shim_x86_64.so")
+set(AUDIT_BLOB_X86_H "${CMAKE_BINARY_DIR}/audit_shim_blob.h")
+
+compile_shim("${AUDIT_X86}" gcc "${CMAKE_SOURCE_DIR}/stub/audit_shim.c")
+add_custom_target(audit_shim_x86 DEPENDS "${AUDIT_X86}")
+
+make_blob_header("${AUDIT_BLOB_X86_H}" "${AUDIT_X86}" "audit_shim_blob" "${AUDIT_X86}")
+add_custom_target(audit_shim_blob_h DEPENDS "${AUDIT_BLOB_X86_H}")
+
+build_stub("${STUB_X86}" gcc strip "${SHIM_BLOB_X86_H}" "${AUDIT_BLOB_X86_H}")
 add_custom_target(stub ALL DEPENDS "${STUB_X86}")
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -97,7 +107,16 @@ if(AARCH64_GCC)
     make_blob_header("${SHIM_BLOB_ARM64_H}" "${SHIM_ARM64}" "dlopen_shim_blob" "${SHIM_ARM64}")
     add_custom_target(dlopen_shim_blob_aarch64_h DEPENDS "${SHIM_BLOB_ARM64_H}")
 
-    build_stub("${STUB_ARM64}" "${AARCH64_GCC}" aarch64-linux-gnu-strip "${SHIM_BLOB_ARM64_H}")
+    set(AUDIT_ARM64        "${CMAKE_BINARY_DIR}/audit_shim_aarch64.so")
+    set(AUDIT_BLOB_ARM64_H "${CMAKE_BINARY_DIR}/audit_shim_blob_aarch64.h")
+
+    compile_shim("${AUDIT_ARM64}" "${AARCH64_GCC}" "${CMAKE_SOURCE_DIR}/stub/audit_shim.c")
+    add_custom_target(audit_shim_aarch64 DEPENDS "${AUDIT_ARM64}")
+
+    make_blob_header("${AUDIT_BLOB_ARM64_H}" "${AUDIT_ARM64}" "audit_shim_blob" "${AUDIT_ARM64}")
+    add_custom_target(audit_shim_blob_aarch64_h DEPENDS "${AUDIT_BLOB_ARM64_H}")
+
+    build_stub("${STUB_ARM64}" "${AARCH64_GCC}" aarch64-linux-gnu-strip "${SHIM_BLOB_ARM64_H}" "${AUDIT_BLOB_ARM64_H}")
     add_custom_target(stub_aarch64 ALL DEPENDS "${STUB_ARM64}")
 endif()
 
@@ -246,6 +265,44 @@ add_custom_target(test_multi_so
     DEPENDS stub multi_libs multi_main
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
     COMMENT "multi_so test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_linked — DT_NEEDED library loaded via LD_AUDIT audit shim
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_lib("${CMAKE_BINARY_DIR}/liblinkedmath.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/linked/liblinkedmath.c")
+add_custom_target(liblinkedmath DEPENDS "${CMAKE_BINARY_DIR}/liblinkedmath.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/linked_main"
+    COMMAND gcc -O2
+            -I "${CMAKE_SOURCE_DIR}/tests"
+            -o "${CMAKE_BINARY_DIR}/linked_main"
+            "${CMAKE_SOURCE_DIR}/tests/linked/main.c"
+            -L "${CMAKE_BINARY_DIR}" -llinkedmath
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/linked/main.c"
+            "${CMAKE_BINARY_DIR}/liblinkedmath.so"
+    COMMENT "Building test binary: linked_main"
+)
+add_custom_target(linked_main DEPENDS "${CMAKE_BINARY_DIR}/linked_main")
+
+add_custom_target(test_linked
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_linked ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py"
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/linked_main"
+            --lib    "${CMAKE_BINARY_DIR}/liblinkedmath.so"
+            --key    "${CMAKE_BINARY_DIR}/linked.key"
+            --output "${CMAKE_BINARY_DIR}/linked_main.protected"
+    COMMAND ${CMAKE_COMMAND}
+            "-DBINARY=${CMAKE_BINARY_DIR}/linked_main.protected"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
+    DEPENDS stub liblinkedmath linked_main
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "DT_NEEDED LD_AUDIT test"
     USES_TERMINAL
 )
 
