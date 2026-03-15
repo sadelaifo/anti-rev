@@ -199,47 +199,84 @@ static void ghash_update(uint8_t state[16], const uint8_t H[16],
 }
 
 /* ------------------------------------------------------------------ */
-/*  Public API                                                         */
+/*  Public streaming API                                               */
 /* ------------------------------------------------------------------ */
 
-int aes256gcm_decrypt(
-    const uint8_t  key[32],
-    const uint8_t  iv[12],
-    const uint8_t  tag[16],
-    const uint8_t *ct, size_t ct_len,
-    uint8_t       *pt)
+void aes256gcm_init(aes256gcm_ctx *ctx,
+                    const uint8_t key[32], const uint8_t iv[12])
 {
-    uint8_t rk[240];
-    key_expand(key, rk);
+    key_expand(key, ctx->rk);
 
     /* H = AES_K(0^128) */
-    uint8_t H[16] = {0};
-    aes256_enc(rk, H);
+    memset(ctx->H, 0, 16);
+    aes256_enc(ctx->rk, ctx->H);
 
-    /* J0 = IV || 0x00000001  (for 96-bit IV per NIST SP 800-38D §7.1) */
-    uint8_t J0[16] = {0};
-    memcpy(J0, iv, 12);
-    J0[15] = 0x01;
+    /* J0 = IV || 0x00000001 */
+    memset(ctx->J0, 0, 16);
+    memcpy(ctx->J0, iv, 12);
+    ctx->J0[15] = 0x01;
 
-    /* --- GHASH over ciphertext (no AAD) --- */
-    uint8_t ghash[16] = {0};
+    /* GHASH state */
+    memset(ctx->ghash,     0, 16);
+    memset(ctx->ghash_buf, 0, 16);
+    ctx->ghash_bytes   = 0;
+    ctx->ghash_buf_len = 0;
 
-    size_t full_blocks = ct_len / 16;
-    size_t remainder   = ct_len % 16;
+    /* CTR starts at inc32(J0) = IV || 0x00000002 */
+    memcpy(ctx->ctr, ctx->J0, 16);
+    inc32(ctx->ctr);
+    ctx->ks_used = 16; /* no buffered keystream yet */
+}
 
-    for (size_t i = 0; i < full_blocks; i++)
-        ghash_update(ghash, H, ct + i * 16);
+void aes256gcm_ghash_update(aes256gcm_ctx *ctx,
+                             const uint8_t *ct, size_t len)
+{
+    size_t pos = 0;
 
-    if (remainder > 0) {
-        uint8_t padded[16] = {0};
-        memcpy(padded, ct + full_blocks * 16, remainder);
-        ghash_update(ghash, H, padded);
+    /* Fill any existing partial block */
+    if (ctx->ghash_buf_len > 0) {
+        size_t need = 16 - ctx->ghash_buf_len;
+        size_t take = (len < need) ? len : need;
+        memcpy(ctx->ghash_buf + ctx->ghash_buf_len, ct, take);
+        ctx->ghash_buf_len += take;
+        pos += take;
+        if (ctx->ghash_buf_len == 16) {
+            ghash_update(ctx->ghash, ctx->H, ctx->ghash_buf);
+            ctx->ghash_buf_len = 0;
+        }
     }
 
-    /* Final GHASH block: len(A)||len(C) as two 64-bit big-endian values.
-     * A is empty so len(A) = 0; len(C) = ct_len * 8 bits. */
+    /* Process full 16-byte blocks directly */
+    while (pos + 16 <= len) {
+        ghash_update(ctx->ghash, ctx->H, ct + pos);
+        pos += 16;
+    }
+
+    /* Buffer trailing partial block */
+    size_t rem = len - pos;
+    if (rem > 0) {
+        memcpy(ctx->ghash_buf, ct + pos, rem);
+        ctx->ghash_buf_len = rem;
+    }
+
+    ctx->ghash_bytes += len;
+}
+
+int aes256gcm_ghash_verify(const aes256gcm_ctx *ctx, const uint8_t tag[16])
+{
+    uint8_t ghash[16];
+    memcpy(ghash, ctx->ghash, 16);
+
+    /* Flush any remaining partial block */
+    if (ctx->ghash_buf_len > 0) {
+        uint8_t padded[16] = {0};
+        memcpy(padded, ctx->ghash_buf, ctx->ghash_buf_len);
+        ghash_update(ghash, ctx->H, padded);
+    }
+
+    /* Final GHASH block: len(A=0) || len(C) as big-endian 64-bit values */
     uint8_t len_block[16] = {0};
-    uint64_t ct_bits = (uint64_t)ct_len * 8;
+    uint64_t ct_bits = (uint64_t)ctx->ghash_bytes * 8;
     len_block[ 8] = (uint8_t)(ct_bits >> 56);
     len_block[ 9] = (uint8_t)(ct_bits >> 48);
     len_block[10] = (uint8_t)(ct_bits >> 40);
@@ -248,39 +285,51 @@ int aes256gcm_decrypt(
     len_block[13] = (uint8_t)(ct_bits >> 16);
     len_block[14] = (uint8_t)(ct_bits >>  8);
     len_block[15] = (uint8_t) ct_bits;
-    ghash_update(ghash, H, len_block);
+    ghash_update(ghash, ctx->H, len_block);
 
-    /* Expected tag: T = AES_K(J0) XOR ghash */
+    /* T = AES_K(J0) XOR ghash */
     uint8_t T[16];
-    memcpy(T, J0, 16);
-    aes256_enc(rk, T);
+    memcpy(T, ctx->J0, 16);
+    aes256_enc(ctx->rk, T);
     for (int i = 0; i < 16; i++) T[i] ^= ghash[i];
 
-    /* Constant-time tag comparison */
+    /* Constant-time compare */
     uint8_t diff = 0;
     for (int i = 0; i < 16; i++) diff |= T[i] ^ tag[i];
-    if (diff != 0) return -1;
+    return (diff == 0) ? 0 : -1;
+}
 
-    /* --- Decrypt: GCTR_K(inc32(J0), C) --- */
-    uint8_t cb[16];
-    memcpy(cb, J0, 16);
-    inc32(cb);   /* CB_1 = IV || 0x00000002 */
+void aes256gcm_ctr_decrypt(aes256gcm_ctx *ctx,
+                            const uint8_t *ct, uint8_t *pt, size_t len)
+{
+    size_t done = 0;
 
-    for (size_t i = 0; i < full_blocks; i++) {
-        uint8_t ks[16];
-        memcpy(ks, cb, 16);
-        aes256_enc(rk, ks);
+    /* Consume any buffered partial keystream block first */
+    while (done < len && ctx->ks_used < 16) {
+        pt[done] = ct[done] ^ ctx->ks[ctx->ks_used++];
+        done++;
+    }
+
+    /* Process full 16-byte blocks */
+    while (done + 16 <= len) {
+        memcpy(ctx->ks, ctx->ctr, 16);
+        aes256_enc(ctx->rk, ctx->ks);
+        inc32(ctx->ctr);
         for (int j = 0; j < 16; j++)
-            pt[i * 16 + j] = ct[i * 16 + j] ^ ks[j];
-        inc32(cb);
-    }
-    if (remainder > 0) {
-        uint8_t ks[16];
-        memcpy(ks, cb, 16);
-        aes256_enc(rk, ks);
-        for (size_t j = 0; j < remainder; j++)
-            pt[full_blocks * 16 + j] = ct[full_blocks * 16 + j] ^ ks[j];
+            pt[done + j] = ct[done + j] ^ ctx->ks[j];
+        ctx->ks_used = 16;
+        done += 16;
     }
 
-    return 0;
+    /* Handle final partial block */
+    if (done < len) {
+        memcpy(ctx->ks, ctx->ctr, 16);
+        aes256_enc(ctx->rk, ctx->ks);
+        inc32(ctx->ctr);
+        ctx->ks_used = 0;
+        while (done < len) {
+            pt[done] = ct[done] ^ ctx->ks[ctx->ks_used++];
+            done++;
+        }
+    }
 }

@@ -1,0 +1,13 @@
+# Build output
+build/
+
+# Key files (contain secrets)
+*.key
+
+# Benchmark generated project (large binaries + 100MB data file)
+bench/project/
+
+# Compiled artifacts
+*.o
+*.so
+*.protected

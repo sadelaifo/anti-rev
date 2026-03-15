@@ -10,20 +10,21 @@
  *     [ct_size  : 8 B LE]
  *     [ciphertext : ct_size bytes]
  *   [bundle_start_offset : 8 B LE]   <- offset from file start
+ *   [key  : 32 B]                    <- AES-256 key embedded in binary
  *   [magic : 8 B "ANTREV01"]
  *
- * Runtime flow (no fork, no disk):
- *   1. Decrypt main ELF   → memfd (in RAM only)
- *   2. Decrypt each .so   → memfd (in RAM only)
- *   3. Write embedded shim.so blob → memfd
- *   4. Set LD_PRELOAD=/proc/self/fd/<shim_fd>
- *      Set ANTIREV_FD_MAP=libfoo.so=<fd>,libbar.so=<fd>,...
- *   5. fexecve(main_fd) — replaces this process image (same PID, no fork)
+ * Trailer is always 48 bytes at end of file.
  *
- * Trailer format (last 48 bytes of the protected binary):
- *   [bundle_start_offset : 8B LE]
- *   [key                 : 32B]
- *   [magic               : 8B "ANTREV01"]
+ * Runtime flow (no fork, no disk, O(chunk) peak memory):
+ *   Phase 1 — scan bundle headers (tiny reads, skip ciphertext via offset)
+ *   Phase 2 — per file, two streaming passes over ciphertext:
+ *               Pass A: GHASH  → verify GCM tag (abort on failure)
+ *               Pass B: CTR    → decrypt chunk by chunk → write to memfd
+ *   Phase 3 — load embedded shim.so into memfd (if any .so files present)
+ *   Phase 4 — fexecve(main_fd) — replaces this process image (same PID)
+ *
+ * Peak stub heap: one CHUNK_SIZE buffer (~4 MB) + header table (~37 KB max).
+ * All plaintext lives only in kernel memfds, never fully in user-space heap.
  */
 
 #define _GNU_SOURCE
@@ -42,13 +43,26 @@
 
 /* ------------------------------------------------------------------ */
 
-#define MAGIC       "ANTREV01"
-#define MAGIC_LEN   8
-#define KEY_SIZE    32   /* AES-256 */
-#define IV_SIZE     12   /* GCM nonce */
-#define TAG_SIZE    16   /* GCM auth tag */
-#define MAX_NAME    255
-#define MAX_FILES   128
+#define MAGIC        "ANTREV01"
+#define MAGIC_LEN    8
+#define KEY_SIZE     32   /* AES-256 */
+#define IV_SIZE      12   /* GCM nonce */
+#define TAG_SIZE     16   /* GCM auth tag */
+#define MAX_NAME     255
+#define MAX_FILES    128
+#define CHUNK_SIZE   (4 * 1024 * 1024)  /* 4 MB I/O + crypto buffer */
+
+/* ------------------------------------------------------------------ */
+/*  Per-file metadata collected during header scan (Phase 1)          */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    char     name[MAX_NAME + 1];
+    int      is_main;
+    uint8_t  iv[IV_SIZE];
+    uint8_t  tag[TAG_SIZE];
+    uint64_t ct_size;
+    uint64_t ct_offset;   /* byte offset in /proc/self/exe */
+} file_entry_t;
 
 /* ------------------------------------------------------------------ */
 /*  Little-endian readers                                              */
@@ -69,40 +83,23 @@ static inline uint64_t u64le(const uint8_t *p)
 }
 
 /* ------------------------------------------------------------------ */
-/*  AES-256-GCM decrypt                                                */
-/*  Returns malloc'd plaintext; sets *pt_len. NULL on error.          */
-/* ------------------------------------------------------------------ */
-static uint8_t *decrypt_file(
-    const uint8_t  key[KEY_SIZE],
-    const uint8_t  iv[IV_SIZE],
-    const uint8_t  tag[TAG_SIZE],
-    const uint8_t *ct, size_t ct_len,
-    size_t *pt_len)
-{
-    uint8_t *pt = malloc(ct_len + 1);
-    if (!pt) { perror("malloc"); return NULL; }
-    if (aes256gcm_decrypt(key, iv, tag, ct, ct_len, pt) != 0) {
-        free(pt);
-        return NULL;
-    }
-    *pt_len = ct_len;
-    return pt;
-}
-
-/* ------------------------------------------------------------------ */
 /*  Write bytes to a new memfd (no O_CLOEXEC — must survive fexecve)  */
 /* ------------------------------------------------------------------ */
-static int write_memfd(const char *name, const uint8_t *data, size_t len)
+static int make_memfd(const char *name)
 {
     int fd = memfd_create(name, 0 /* no MFD_CLOEXEC */);
     if (fd < 0) { perror("memfd_create"); return -1; }
+    return fd;
+}
+
+static int write_chunk(int fd, const uint8_t *data, size_t len)
+{
     for (size_t w = 0; w < len; ) {
         ssize_t n = write(fd, data + w, len - w);
-        if (n < 0) { perror("write memfd"); close(fd); return -1; }
+        if (n < 0) { perror("write memfd"); return -1; }
         w += (size_t)n;
     }
-    if (lseek(fd, 0, SEEK_SET) < 0) { perror("lseek memfd"); close(fd); return -1; }
-    return fd;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -110,7 +107,7 @@ static int write_memfd(const char *name, const uint8_t *data, size_t len)
 /* ------------------------------------------------------------------ */
 int main(int argc __attribute__((unused)), char *argv[], char *envp[])
 {
-    /* 1. Open /proc/self/exe and locate the appended bundle */
+    /* 1. Open /proc/self/exe and read the 48-byte trailer */
     int self = open("/proc/self/exe", O_RDONLY);
     if (self < 0) { perror("open /proc/self/exe"); return 1; }
 
@@ -131,68 +128,121 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     }
 
     uint64_t bundle_off = u64le(trailer);
-    uint64_t bundle_sz  = (uint64_t)(fsize - 48) - bundle_off;
 
-    /* 2. Read entire bundle into memory */
-    uint8_t *bundle = malloc(bundle_sz);
-    if (!bundle) { perror("malloc bundle"); return 1; }
-    if ((uint64_t)pread(self, bundle, bundle_sz, (off_t)bundle_off) != bundle_sz) {
-        perror("pread bundle"); return 1;
-    }
-    close(self);
-
-    /* 3. Extract decryption key from trailer (bytes 8–39) */
+    /* 2. Extract key from trailer */
     uint8_t key[KEY_SIZE];
     memcpy(key, trailer + 8, KEY_SIZE);
 
-    /* 4. Parse bundle and decrypt each file into memfds */
-    if (bundle_sz < 4) { fprintf(stderr, "[antirev] bundle truncated\n"); return 1; }
-    uint32_t nfiles = u32le(bundle);
-    size_t   pos    = 4;
+    /* ----------------------------------------------------------------
+     * Phase 1: scan bundle headers — collect metadata for every file.
+     * We only read the tiny per-file headers; ciphertext is skipped via
+     * offset arithmetic and never loaded into user-space memory here.
+     * ---------------------------------------------------------------- */
+    uint8_t tmp[2 + MAX_NAME + 1 + IV_SIZE + TAG_SIZE + 8]; /* max header */
 
-    int  main_fd  = -1;
-    int  lib_fds[MAX_FILES];
-    char lib_names[MAX_FILES][MAX_NAME + 1];
-    int  nlibs = 0;
+    /* Read num_files (4 bytes) */
+    if (pread(self, tmp, 4, (off_t)bundle_off) != 4) {
+        perror("pread num_files"); return 1;
+    }
+    uint32_t nfiles = u32le(tmp);
+    if (nfiles > MAX_FILES) {
+        fprintf(stderr, "[antirev] too many files in bundle (%u)\n", nfiles);
+        return 1;
+    }
+
+    file_entry_t entries[MAX_FILES];
+    off_t scan = (off_t)bundle_off + 4;
 
     for (uint32_t i = 0; i < nfiles; i++) {
-        /* name */
-        if (pos + 2 > bundle_sz) goto truncated;
-        uint16_t nlen = u16le(bundle + pos); pos += 2;
-        if (nlen > MAX_NAME || pos + nlen > bundle_sz) goto truncated;
-        char name[MAX_NAME + 1];
-        memcpy(name, bundle + pos, nlen);
-        name[nlen] = '\0';
-        pos += nlen;
+        file_entry_t *e = &entries[i];
 
-        /* flags */
-        if (pos + 1 > bundle_sz) goto truncated;
-        int is_main = bundle[pos++] & 1;
+        /* name_len (2 bytes) */
+        if (pread(self, tmp, 2, scan) != 2) { perror("pread name_len"); return 1; }
+        uint16_t nlen = u16le(tmp);
+        if (nlen > MAX_NAME) {
+            fprintf(stderr, "[antirev] name too long in bundle\n");
+            return 1;
+        }
+        scan += 2;
 
-        /* iv, tag, ciphertext */
-        if (pos + IV_SIZE + TAG_SIZE + 8 > bundle_sz) goto truncated;
-        uint8_t iv[IV_SIZE], tag[TAG_SIZE];
-        memcpy(iv,  bundle + pos, IV_SIZE);  pos += IV_SIZE;
-        memcpy(tag, bundle + pos, TAG_SIZE); pos += TAG_SIZE;
+        /* name + flags + iv + tag + ct_size */
+        ssize_t hdr_rest = nlen + 1 + IV_SIZE + TAG_SIZE + 8;
+        if (pread(self, tmp, (size_t)hdr_rest, scan) != hdr_rest) {
+            perror("pread file header"); return 1;
+        }
+        memcpy(e->name, tmp, nlen);
+        e->name[nlen]  = '\0';
+        e->is_main     = tmp[nlen] & 1;
+        memcpy(e->iv,  tmp + nlen + 1,                     IV_SIZE);
+        memcpy(e->tag, tmp + nlen + 1 + IV_SIZE,           TAG_SIZE);
+        e->ct_size     = u64le(tmp + nlen + 1 + IV_SIZE + TAG_SIZE);
+        scan          += hdr_rest;
 
-        uint64_t ct_sz = u64le(bundle + pos); pos += 8;
-        if (pos + ct_sz > bundle_sz) goto truncated;
-        const uint8_t *ct = bundle + pos;
-        pos += ct_sz;
+        e->ct_offset   = (uint64_t)scan;
+        scan          += (off_t)e->ct_size;
 
-        /* decrypt */
-        size_t   pt_sz = 0;
-        uint8_t *pt    = decrypt_file(key, iv, tag, ct, (size_t)ct_sz, &pt_sz);
-        if (!pt) {
-            fprintf(stderr, "[antirev] decryption failed for '%s'\n", name);
+        /* Sanity: ciphertext must not overlap the trailer */
+        if (e->ct_offset + e->ct_size > (uint64_t)(fsize - 48)) {
+            fprintf(stderr, "[antirev] bundle extends past trailer\n");
+            return 1;
+        }
+    }
+
+    /* ----------------------------------------------------------------
+     * Phase 2: for each file, stream two passes over the ciphertext.
+     *   Pass A — GHASH accumulation → tag verification
+     *   Pass B — CTR decryption chunk by chunk → write to memfd
+     *
+     * Peak user-space heap: one CHUNK_SIZE buffer.
+     * ---------------------------------------------------------------- */
+    uint8_t *chunk = malloc(CHUNK_SIZE);
+    if (!chunk) { perror("malloc chunk"); return 1; }
+
+    int  main_fd              = -1;
+    int  lib_fds[MAX_FILES];
+    char lib_names[MAX_FILES][MAX_NAME + 1];
+    int  nlibs                = 0;
+
+    for (uint32_t i = 0; i < nfiles; i++) {
+        file_entry_t *e = &entries[i];
+        aes256gcm_ctx ctx;
+
+        /* --- Pass A: GHASH --- */
+        aes256gcm_init(&ctx, key, e->iv);
+        uint64_t remaining = e->ct_size;
+        off_t    pos       = (off_t)e->ct_offset;
+        while (remaining > 0) {
+            size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
+            ssize_t got     = pread(self, chunk, to_read, pos);
+            if (got != (ssize_t)to_read) { perror("pread ciphertext"); return 1; }
+            aes256gcm_ghash_update(&ctx, chunk, to_read);
+            pos       += (off_t)to_read;
+            remaining -= to_read;
+        }
+        if (aes256gcm_ghash_verify(&ctx, e->tag) != 0) {
+            fprintf(stderr, "[antirev] decryption failed for '%s'\n", e->name);
             return 1;
         }
 
-        int fd = write_memfd(name, pt, pt_sz);
-        free(pt);
+        /* --- Pass B: CTR decrypt + write to memfd --- */
+        int fd = make_memfd(e->name);
         if (fd < 0) return 1;
 
-        if (is_main) {
+        aes256gcm_init(&ctx, key, e->iv);  /* reset counter for decryption pass */
+        remaining = e->ct_size;
+        pos       = (off_t)e->ct_offset;
+        while (remaining > 0) {
+            size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
+            ssize_t got     = pread(self, chunk, to_read, pos);
+            if (got != (ssize_t)to_read) { perror("pread ciphertext"); return 1; }
+            aes256gcm_ctr_decrypt(&ctx, chunk, chunk, to_read); /* in-place */
+            if (write_chunk(fd, chunk, to_read) != 0) return 1;
+            pos       += (off_t)to_read;
+            remaining -= to_read;
+        }
+        if (lseek(fd, 0, SEEK_SET) < 0) { perror("lseek memfd"); return 1; }
+
+        if (e->is_main) {
             main_fd = fd;
         } else {
             if (nlibs >= MAX_FILES) {
@@ -200,31 +250,32 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 return 1;
             }
             lib_fds[nlibs] = fd;
-            memcpy(lib_names[nlibs], name, nlen + 1); /* nlen <= MAX_NAME, null already set */
+            memcpy(lib_names[nlibs], e->name, strlen(e->name) + 1);
             nlibs++;
         }
     }
 
-    /* Wipe key and bundle from memory */
-    explicit_bzero(key, sizeof(key));
-    explicit_bzero(bundle, bundle_sz);
-    free(bundle);
+    /* Wipe key and chunk buffer */
+    explicit_bzero(key,   sizeof(key));
+    explicit_bzero(chunk, CHUNK_SIZE);
+    free(chunk);
+    close(self);
 
     if (main_fd < 0) {
         fprintf(stderr, "[antirev] no main binary in bundle\n");
         return 1;
     }
 
-    /* 5. Write embedded dlopen shim to a memfd */
+    /* 3. Write embedded dlopen shim to a memfd */
     int shim_fd = -1;
     if (nlibs > 0) {
-        shim_fd = write_memfd("antirev_shim.so",
-                              dlopen_shim_blob, dlopen_shim_blob_len);
+        shim_fd = make_memfd("antirev_shim.so");
         if (shim_fd < 0) return 1;
+        if (write_chunk(shim_fd, dlopen_shim_blob, dlopen_shim_blob_len) != 0) return 1;
+        if (lseek(shim_fd, 0, SEEK_SET) < 0) { perror("lseek shim"); return 1; }
     }
 
-    /* 6. Build ANTIREV_FD_MAP="libfoo.so=6,libbar.so=7,..." */
-    /* Max entry: MAX_NAME + 1('=') + 10(fd digits) + 1(',') */
+    /* 4. Build ANTIREV_FD_MAP="libfoo.so=6,libbar.so=7,..." */
     char *fd_map = NULL;
     if (nlibs > 0) {
         size_t map_sz = (size_t)nlibs * (MAX_NAME + 13) + 1;
@@ -232,8 +283,6 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         if (!fd_map) { perror("malloc fd_map"); return 1; }
         fd_map[0] = '\0';
         for (int i = 0; i < nlibs; i++) {
-            /* Build "name=fd" entry without triggering GCC format-truncation
-             * false-positive: lib_names entries are bounded by MAX_NAME. */
             char entry[MAX_NAME + 32];
             size_t n = 0;
             if (i > 0) entry[n++] = ',';
@@ -244,11 +293,10 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
     }
 
-    /* 7. Build new envp */
+    /* 5. Build new envp */
     int envc = 0;
     while (envp[envc]) envc++;
 
-    /* +3 slots: LD_PRELOAD, ANTIREV_FD_MAP, NULL sentinel */
     char **new_env = malloc((size_t)(envc + 3) * sizeof(char *));
     if (!new_env) { perror("malloc env"); return 1; }
 
@@ -265,7 +313,6 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
 
     int ei = 0;
     for (int j = 0; j < envc; j++) {
-        /* Drop old LD_PRELOAD and ANTIREV_FD_MAP if present */
         if (nlibs > 0 && strncmp(envp[j], "LD_PRELOAD=",     11) == 0) continue;
         if (nlibs > 0 && strncmp(envp[j], "ANTIREV_FD_MAP=", 15) == 0) continue;
         new_env[ei++] = envp[j];
@@ -276,12 +323,8 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     }
     new_env[ei] = NULL;
 
-    /* 8. Replace this process with the decrypted binary — no fork, same PID */
+    /* 6. Replace this process with the decrypted binary — no fork, same PID */
     fexecve(main_fd, argv, new_env);
     perror("fexecve");
-    return 1;
-
-truncated:
-    fprintf(stderr, "[antirev] bundle truncated\n");
     return 1;
 }
