@@ -11,3 +11,7 @@ bench/project/
 *.o
 *.so
 *.protected
+
+# Python cache
+__pycache__/
+*.pyc
