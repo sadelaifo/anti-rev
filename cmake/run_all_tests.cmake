@@ -10,6 +10,7 @@ set(TESTS
     test_dlopen       # dlopen protected .so
     test_multi_so     # two protected .so files
     test_linked       # DT_NEEDED library via LD_AUDIT
+    test_fork_exec    # fork+exec child inherits audit shim
     test_wrong_key    # wrong key -> clean failure
     test_tamper       # bit-flipped ciphertext -> clean failure
 )

@@ -308,6 +308,41 @@ add_custom_target(test_linked
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_fork_exec — child process spawned via fork()+exec() must be able
+#  to dlopen an encrypted .so via the inherited LD_AUDIT shim
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_test_bin("${CMAKE_BINARY_DIR}/fork_exec_parent"
+    gcc "${CMAKE_SOURCE_DIR}/tests/fork_exec/parent.c")
+add_custom_target(fork_exec_parent DEPENDS "${CMAKE_BINARY_DIR}/fork_exec_parent")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/fork_exec_child"
+    gcc "${CMAKE_SOURCE_DIR}/tests/fork_exec/child.c")
+add_custom_target(fork_exec_child DEPENDS "${CMAKE_BINARY_DIR}/fork_exec_child")
+
+add_custom_target(test_fork_exec
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_fork_exec ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${CMAKE_BINARY_DIR}/fork_exec.key"
+            --libs       "${CMAKE_BINARY_DIR}/mylib.so"
+            --output-dir "${CMAKE_BINARY_DIR}/encrypted"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/fork_exec_parent"
+            --key    "${CMAKE_BINARY_DIR}/fork_exec.key"
+            --output "${CMAKE_BINARY_DIR}/fork_exec_parent.protected"
+    COMMAND ${CMAKE_COMMAND} -E env
+            "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
+            "${CMAKE_BINARY_DIR}/fork_exec_parent.protected"
+            "${CMAKE_BINARY_DIR}/fork_exec_child"
+            "${CMAKE_BINARY_DIR}/encrypted/mylib.so"
+    DEPENDS stub mylib fork_exec_parent fork_exec_child
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "fork+exec child inherits audit shim test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_wrong_key — protected binary must fail cleanly with wrong key
 # ═══════════════════════════════════════════════════════════════════════
 

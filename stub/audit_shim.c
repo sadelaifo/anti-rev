@@ -48,9 +48,11 @@ static void load_key(void)
     if (!s)
         return;
     int kfd = atoi(s);
-    if (read(kfd, g_key, KEY_SIZE) == KEY_SIZE)
+    if (pread(kfd, g_key, KEY_SIZE, 0) == KEY_SIZE)
         g_key_ready = 1;
-    close(kfd);
+    /* Do NOT close kfd — it must survive fork+exec so child processes
+     * (e.g. daemon binaries spawned by the main process) can also read
+     * the key.  The fd has no O_CLOEXEC and is inherited across exec. */
 }
 
 /* ------------------------------------------------------------------ */
