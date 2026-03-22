@@ -30,6 +30,19 @@ function(compile_audit_shim OUTPUT COMPILER)
     )
 endfunction()
 
+# ── Helper: compile the exe shim (readlink interceptor) ───────────────
+# Usage: compile_exe_shim(<output.so> <compiler>)
+function(compile_exe_shim OUTPUT COMPILER)
+    add_custom_command(
+        OUTPUT  "${OUTPUT}"
+        COMMAND "${COMPILER}" -shared -fPIC -O2 -fvisibility=hidden
+                -o "${OUTPUT}"
+                "${CMAKE_SOURCE_DIR}/stub/exe_shim.c"
+        DEPENDS "${CMAKE_SOURCE_DIR}/stub/exe_shim.c"
+        COMMENT "Building exe shim: ${OUTPUT}"
+    )
+endfunction()
+
 # ── Helper: generate C blob header from a binary file ─────────────────
 # Usage: make_blob_header(<output.h> <input.so> <varname> <dep_target>)
 function(make_blob_header OUTPUT INPUT VARNAME DEP)
@@ -43,8 +56,8 @@ function(make_blob_header OUTPUT INPUT VARNAME DEP)
 endfunction()
 
 # ── Helper: build a stub binary with a given compiler ─────────────────
-# Usage: build_stub(<output> <compiler> <stripper> <audit_blob_dep>)
-function(build_stub OUTPUT COMPILER STRIPPER AUDIT_BLOB_DEP)
+# Usage: build_stub(<output> <compiler> <stripper> <audit_blob_dep> <exe_blob_dep>)
+function(build_stub OUTPUT COMPILER STRIPPER AUDIT_BLOB_DEP EXE_BLOB_DEP)
     # Extra flags: pass -static for cross-compiled (non-native) stubs so they run
     # on QEMU user-mode (no ARM64 dynamic linker on the host) and on embedded targets.
     # Native x86-64 stub stays dynamically linked (faster startup, smaller binary).
@@ -67,6 +80,7 @@ function(build_stub OUTPUT COMPILER STRIPPER AUDIT_BLOB_DEP)
             "${CMAKE_SOURCE_DIR}/stub/crypto.c"
             "${CMAKE_SOURCE_DIR}/stub/crypto.h"
             "${AUDIT_BLOB_DEP}"
+            "${EXE_BLOB_DEP}"
         COMMENT "Building and stripping stub: ${OUTPUT}"
     )
 endfunction()
@@ -80,13 +94,22 @@ set(STUB_X86    "${CMAKE_BINARY_DIR}/stub")
 set(AUDIT_X86        "${CMAKE_BINARY_DIR}/audit_shim_x86_64.so")
 set(AUDIT_BLOB_X86_H "${CMAKE_BINARY_DIR}/audit_shim_blob.h")
 
+set(EXE_SHIM_X86        "${CMAKE_BINARY_DIR}/exe_shim_x86_64.so")
+set(EXE_SHIM_BLOB_X86_H "${CMAKE_BINARY_DIR}/exe_shim_blob.h")
+
 compile_audit_shim("${AUDIT_X86}" gcc)
 add_custom_target(audit_shim_x86 DEPENDS "${AUDIT_X86}")
 
 make_blob_header("${AUDIT_BLOB_X86_H}" "${AUDIT_X86}" "audit_shim_blob" "${AUDIT_X86}")
 add_custom_target(audit_shim_blob_h DEPENDS "${AUDIT_BLOB_X86_H}")
 
-build_stub("${STUB_X86}" gcc strip "${AUDIT_BLOB_X86_H}")
+compile_exe_shim("${EXE_SHIM_X86}" gcc)
+add_custom_target(exe_shim_x86 DEPENDS "${EXE_SHIM_X86}")
+
+make_blob_header("${EXE_SHIM_BLOB_X86_H}" "${EXE_SHIM_X86}" "exe_shim_blob" "${EXE_SHIM_X86}")
+add_custom_target(exe_shim_blob_h DEPENDS "${EXE_SHIM_BLOB_X86_H}")
+
+build_stub("${STUB_X86}" gcc strip "${AUDIT_BLOB_X86_H}" "${EXE_SHIM_BLOB_X86_H}")
 add_custom_target(stub ALL DEPENDS "${STUB_X86}")
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -99,13 +122,22 @@ if(AARCH64_GCC)
     set(AUDIT_ARM64        "${CMAKE_BINARY_DIR}/audit_shim_aarch64.so")
     set(AUDIT_BLOB_ARM64_H "${CMAKE_BINARY_DIR}/audit_shim_blob_aarch64.h")
 
+    set(EXE_SHIM_ARM64        "${CMAKE_BINARY_DIR}/exe_shim_aarch64.so")
+    set(EXE_SHIM_BLOB_ARM64_H "${CMAKE_BINARY_DIR}/exe_shim_blob_aarch64.h")
+
     compile_audit_shim("${AUDIT_ARM64}" "${AARCH64_GCC}")
     add_custom_target(audit_shim_aarch64 DEPENDS "${AUDIT_ARM64}")
 
     make_blob_header("${AUDIT_BLOB_ARM64_H}" "${AUDIT_ARM64}" "audit_shim_blob" "${AUDIT_ARM64}")
     add_custom_target(audit_shim_blob_aarch64_h DEPENDS "${AUDIT_BLOB_ARM64_H}")
 
-    build_stub("${STUB_ARM64}" "${AARCH64_GCC}" aarch64-linux-gnu-strip "${AUDIT_BLOB_ARM64_H}")
+    compile_exe_shim("${EXE_SHIM_ARM64}" "${AARCH64_GCC}")
+    add_custom_target(exe_shim_aarch64 DEPENDS "${EXE_SHIM_ARM64}")
+
+    make_blob_header("${EXE_SHIM_BLOB_ARM64_H}" "${EXE_SHIM_ARM64}" "exe_shim_blob" "${EXE_SHIM_ARM64}")
+    add_custom_target(exe_shim_blob_aarch64_h DEPENDS "${EXE_SHIM_BLOB_ARM64_H}")
+
+    build_stub("${STUB_ARM64}" "${AARCH64_GCC}" aarch64-linux-gnu-strip "${AUDIT_BLOB_ARM64_H}" "${EXE_SHIM_BLOB_ARM64_H}")
     add_custom_target(stub_aarch64 ALL DEPENDS "${STUB_ARM64}")
 endif()
 
@@ -339,6 +371,35 @@ add_custom_target(test_fork_exec
     DEPENDS stub mylib fork_exec_parent fork_exec_child
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
     COMMENT "fork+exec child inherits audit shim test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_proc_self_exe — readlink("/proc/self/exe") must return the real
+#  on-disk path, not a memfd path, after fexecve
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/proc_self_exe_test"
+    COMMAND gcc -O2
+            -o "${CMAKE_BINARY_DIR}/proc_self_exe_test"
+            "${CMAKE_SOURCE_DIR}/tests/proc_self_exe/main.c"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/proc_self_exe/main.c"
+    COMMENT "Building test binary: proc_self_exe_test"
+)
+add_custom_target(proc_self_exe_test DEPENDS "${CMAKE_BINARY_DIR}/proc_self_exe_test")
+
+add_custom_target(test_proc_self_exe
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_proc_self_exe ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/proc_self_exe_test"
+            --key    "${CMAKE_BINARY_DIR}/proc_self_exe.key"
+            --output "${CMAKE_BINARY_DIR}/proc_self_exe_test.protected"
+    COMMAND "${CMAKE_BINARY_DIR}/proc_self_exe_test.protected"
+    DEPENDS stub proc_self_exe_test
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "/proc/self/exe readlink interception test"
     USES_TERMINAL
 )
 
