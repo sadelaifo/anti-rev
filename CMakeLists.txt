@@ -375,6 +375,68 @@ add_custom_target(test_fork_exec
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_multi_process — full chain: PM → gRPC daemon → work process
+#  (fork+exec, encrypted .so, /proc/self/exe, all in one test)
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_lib("${CMAKE_BINARY_DIR}/libwork.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/multi_process/libwork.c")
+add_custom_target(libwork DEPENDS "${CMAKE_BINARY_DIR}/libwork.so")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/work_process"
+    gcc "${CMAKE_SOURCE_DIR}/tests/multi_process/work_process.c")
+add_custom_target(work_process_bin DEPENDS "${CMAKE_BINARY_DIR}/work_process")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/grpc_daemon_sim"
+    gcc "${CMAKE_SOURCE_DIR}/tests/multi_process/grpc_daemon.c")
+add_custom_target(grpc_daemon_sim DEPENDS "${CMAKE_BINARY_DIR}/grpc_daemon_sim")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/pm_sim"
+    COMMAND gcc -O2
+            -o "${CMAKE_BINARY_DIR}/pm_sim"
+            "${CMAKE_SOURCE_DIR}/tests/multi_process/pm.c"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/multi_process/pm.c"
+    COMMENT "Building test binary: pm_sim"
+)
+add_custom_target(pm_sim DEPENDS "${CMAKE_BINARY_DIR}/pm_sim")
+
+add_custom_target(test_multi_process
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_multi_process ==="
+    # Encrypt the shared library
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${CMAKE_BINARY_DIR}/multi_process.key"
+            --libs       "${CMAKE_BINARY_DIR}/libwork.so"
+            --output-dir "${CMAKE_BINARY_DIR}/encrypted"
+    # Protect all three binaries with the same key
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/work_process"
+            --key    "${CMAKE_BINARY_DIR}/multi_process.key"
+            --output "${CMAKE_BINARY_DIR}/work_process.protected"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/grpc_daemon_sim"
+            --key    "${CMAKE_BINARY_DIR}/multi_process.key"
+            --output "${CMAKE_BINARY_DIR}/grpc_daemon_sim.protected"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/pm_sim"
+            --key    "${CMAKE_BINARY_DIR}/multi_process.key"
+            --output "${CMAKE_BINARY_DIR}/pm_sim.protected"
+    # Run the orchestration script
+    COMMAND bash "${CMAKE_SOURCE_DIR}/tests/multi_process/run_test.sh"
+            "${CMAKE_BINARY_DIR}/grpc_daemon_sim.protected"
+            "${CMAKE_BINARY_DIR}/pm_sim.protected"
+            "${CMAKE_BINARY_DIR}/work_process.protected"
+            "${CMAKE_BINARY_DIR}/encrypted/libwork.so"
+    DEPENDS stub libwork work_process_bin grpc_daemon_sim pm_sim
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "Multi-process chain test: PM -> gRPC daemon -> work process"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_proc_self_exe — readlink("/proc/self/exe") must return the real
 #  on-disk path, not a memfd path, after fexecve
 # ═══════════════════════════════════════════════════════════════════════
