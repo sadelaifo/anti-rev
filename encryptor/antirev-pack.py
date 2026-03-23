@@ -16,20 +16,24 @@ Config format:
     #   x86_64:  ./build/stub
     #   aarch64: ./build/stub_aarch64
 
-    blacklist:                         # optional: items to skip (copied as-is)
+    blacklist:                         # optional: ELF files to skip entirely
       - redis-server                   # exact filename match
       - libcrypto.so*                  # glob/wildcard pattern
       - third_party/                   # subdirectory (trailing slash)
       - lib/legacy                     # subdirectory (no trailing slash also works)
       - bin/debug_tool                 # specific relative path
 
+    copy:                              # optional: non-ELF files to copy as-is
+      - etc/                           # copy entire config directory
+      - bin/start.sh                   # copy a specific file
+      - *.conf                         # copy by pattern
+
 What it does:
   - Recursively scans install_dir for all ELF files (executables and libraries)
   - Classifies each as executable (ET_EXEC/ET_DYN without .so) or shared library
-  - Skips blacklisted files and directories (copied as-is instead)
+  - Skips blacklisted ELF files entirely (not copied, not encrypted)
+  - Only copies non-ELF files that match the 'copy' list (if omitted, nothing copied)
   - Protects executables with the stub, encrypts shared libraries
-  - Copies all non-ELF files as-is
-  - output_dir is a drop-in replacement: no config or script changes needed
   - Uses parallel workers for encryption, protection, and file copies
 """
 
@@ -238,12 +242,14 @@ def main():
             sys.exit(f"[error] stub not found for {arch}: {stub}")
 
     key = load_or_create_key(key_path)
+    copylist = compile_blacklist(cfg.get('copy', []))
 
     # ── Scan all files ────────────────────────────────────────────────
     exe_files  = []   # (rel_path, arch, abs_path)
     lib_files  = []   # abs_path
     copy_files = []   # abs_path
     skipped    = []   # rel_path
+    ignored    = 0    # non-ELF files not in copy list
 
     for src in sorted(install_dir.rglob('*')):
         if not src.is_file():
@@ -252,13 +258,16 @@ def main():
         rel = str(src.relative_to(install_dir))
 
         if is_blacklisted(rel, blacklist):
-            copy_files.append(src)
             skipped.append(rel)
             continue
 
         elf_info = classify_elf(src)
         if elf_info is None:
-            copy_files.append(src)
+            # Non-ELF: only copy if it matches the copy list
+            if copylist and is_blacklisted(rel, copylist):
+                copy_files.append(src)
+            else:
+                ignored += 1
             continue
 
         kind, arch = elf_info
@@ -271,7 +280,8 @@ def main():
     print(f"[pack] Scanned {install_dir}")
     print(f"[pack]   Executables:  {len(exe_files)}")
     print(f"[pack]   Libraries:   {len(lib_files)}")
-    print(f"[pack]   Other files: {len(copy_files)}")
+    print(f"[pack]   Copy:        {len(copy_files)}")
+    print(f"[pack]   Ignored:     {ignored}")
     print(f"[pack]   Workers:     {workers}")
     if skipped:
         print(f"[pack]   Blacklisted: {len(skipped)}")
