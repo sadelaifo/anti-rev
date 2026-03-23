@@ -5,6 +5,10 @@
  * equivalent "/proc/<pid>/exe") and returns the real on-disk path stored
  * in ANTIREV_REAL_EXE, which the stub captured before fexecve().
  *
+ * Also restores the process comm (visible in ps -o comm, /proc/pid/comm)
+ * to the original binary name via prctl(PR_SET_NAME) in a constructor,
+ * so that tools like `ps`, `top`, and `pgrep` show the expected name.
+ *
  * Without this, any code that calls readlink("/proc/self/exe") would see
  * "/memfd:binary_name (deleted)" and fail to locate config files, sockets,
  * or other resources that are resolved relative to the binary's real path.
@@ -19,7 +23,23 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/syscall.h>
+#include <sys/prctl.h>
 #include <fcntl.h>
+
+/* Runs before main() — restore the process name from ANTIREV_REAL_EXE */
+__attribute__((constructor))
+static void restore_comm(void)
+{
+    const char *real = getenv("ANTIREV_REAL_EXE");
+    if (!real)
+        return;
+    /* Extract basename */
+    const char *base = strrchr(real, '/');
+    base = base ? base + 1 : real;
+    /* PR_SET_NAME truncates to 15 chars (TASK_COMM_LEN - 1), which matches
+     * what ps/top/pgrep display — no need to handle this ourselves. */
+    prctl(PR_SET_NAME, (unsigned long)base, 0, 0, 0);
+}
 
 static int is_self_exe(const char *path)
 {
