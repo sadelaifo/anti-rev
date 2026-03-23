@@ -30,14 +30,16 @@ What it does:
   - Protects executables with the stub, encrypts shared libraries
   - Copies all non-ELF files as-is
   - output_dir is a drop-in replacement: no config or script changes needed
+  - Uses parallel workers for encryption, protection, and file copies
 """
 
 import argparse
 import fnmatch
+import os
 import shutil
 import struct
-import subprocess
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 try:
@@ -66,121 +68,133 @@ def classify_elf(path: Path) -> tuple[str, str] | None:
     """
     try:
         with open(path, 'rb') as f:
-            magic = f.read(4)
-            if magic != ELF_MAGIC:
+            # Single read of the first 20 bytes covers everything we need:
+            # [0:4]   ELF magic
+            # [5]     endianness
+            # [16:18] e_type
+            # [18:20] e_machine
+            hdr = f.read(20)
+            if len(hdr) < 20 or hdr[:4] != ELF_MAGIC:
                 return None
 
-            # ELF header: e_ident[4] = class, [5] = endianness
-            f.seek(4)
-            ei_class = struct.unpack('B', f.read(1))[0]   # 1=32bit, 2=64bit
-            ei_data  = struct.unpack('B', f.read(1))[0]    # 1=LE, 2=BE
+            endian = '<' if hdr[5] == 1 else '>'
+            e_type    = struct.unpack_from(f'{endian}H', hdr, 16)[0]
+            e_machine = struct.unpack_from(f'{endian}H', hdr, 18)[0]
 
-            endian = '<' if ei_data == 1 else '>'
+            arch = 'aarch64' if e_machine == EM_AARCH64 else 'x86_64'
 
-            # e_type at offset 16 (2 bytes)
-            f.seek(16)
-            e_type = struct.unpack(f'{endian}H', f.read(2))[0]
-
-            # e_machine at offset 18 (2 bytes)
-            e_machine = struct.unpack(f'{endian}H', f.read(2))[0]
-
-            if e_machine == EM_AARCH64:
-                arch = 'aarch64'
-            else:
-                arch = 'x86_64'
-
-            # Classify: .so files are libraries, everything else that is
-            # ET_EXEC or ET_DYN (PIE executables) is an executable.
-            # Many modern executables are ET_DYN (PIE), so we use the
-            # filename to distinguish: if any component contains ".so"
-            # it's a library.
-            name = path.name
-            is_so = '.so' in name
-
+            is_so = '.so' in path.name
             if e_type == ET_EXEC:
                 kind = 'exe'
             elif e_type == ET_DYN:
                 kind = 'lib' if is_so else 'exe'
             else:
-                return None  # ET_REL, ET_CORE, etc. — skip
+                return None
 
             return kind, arch
-    except (OSError, struct.error):
+    except OSError:
         return None
 
 
-def is_blacklisted(rel_path: str, blacklist: list[str]) -> bool:
-    """Check if a relative path matches any blacklist entry.
+def is_blacklisted(rel_path: str, blacklist: list[tuple[str, str]]) -> bool:
+    """Check if a relative path matches any pre-classified blacklist entry.
 
-    Blacklist entries can be:
-      - Exact filename:      "redis-server"    matches any file with that name
-      - Glob pattern:        "libcrypto.so*"   matches filenames via fnmatch
-      - Subdirectory:        "third_party/"    matches anything under that dir
-      - Relative path:       "bin/debug_tool"  matches that exact relative path
+    Each entry is (pattern, kind) where kind is 'dir', 'path', or 'name'.
     """
     name = Path(rel_path).name
-    # Normalize to forward slashes for consistent matching
     rel_normalized = rel_path.replace('\\', '/')
 
-    for entry in blacklist:
-        entry = entry.replace('\\', '/')
-
-        # Subdirectory match: entry ends with / or matches a directory prefix
-        if entry.endswith('/'):
-            dir_prefix = entry  # e.g. "third_party/"
-            if rel_normalized.startswith(dir_prefix) or \
-               rel_normalized == entry.rstrip('/'):
+    for pattern, kind in blacklist:
+        if kind == 'dir':
+            if rel_normalized.startswith(pattern) or \
+               rel_normalized == pattern.rstrip('/'):
                 return True
-            continue
-
-        # Check if entry looks like a relative path (contains /)
-        if '/' in entry:
-            # Exact relative path match or directory prefix match
-            if rel_normalized == entry:
+        elif kind == 'path':
+            if rel_normalized == pattern or \
+               rel_normalized.startswith(pattern + '/'):
                 return True
-            # Also treat as directory prefix (e.g. "lib/legacy" skips
-            # "lib/legacy/foo.so")
-            if rel_normalized.startswith(entry + '/'):
+        else:  # 'name'
+            if fnmatch.fnmatch(name, pattern):
                 return True
-            continue
-
-        # Filename match (exact or glob pattern)
-        if fnmatch.fnmatch(name, entry):
-            return True
 
     return False
 
 
-def encrypt_lib(src: Path, dst: Path, key: bytes):
-    data = src.read_bytes()
+def compile_blacklist(raw: list[str]) -> list[tuple[str, str]]:
+    """Pre-classify blacklist entries once instead of per-file."""
+    compiled = []
+    for entry in raw:
+        entry = entry.replace('\\', '/')
+        if entry.endswith('/'):
+            compiled.append((entry, 'dir'))
+        elif '/' in entry:
+            compiled.append((entry, 'path'))
+        else:
+            compiled.append((entry, 'name'))
+    return compiled
+
+
+# ── Worker functions (run in child processes) ─────────────────────────
+
+def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
+    """Encrypt a single .so file. Returns status string."""
+    src_p, dst_p = Path(src), Path(dst)
+    data = src_p.read_bytes()
     iv, tag, ct = encrypt_data(data, key)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_bytes(MAGIC + iv + tag + ct)
-    print(f"[pack] Encrypted  lib: {str(src.name):<30}  "
-          f"{len(data):>10,} -> {dst.stat().st_size:>10,} bytes")
+    dst_p.parent.mkdir(parents=True, exist_ok=True)
+    dst_p.write_bytes(MAGIC + iv + tag + ct)
+    out_size = dst_p.stat().st_size
+    return (f"[pack] Encrypted  lib: {src_p.name:<30}  "
+            f"{len(data):>10,} -> {out_size:>10,} bytes")
 
 
-def protect_exe(src: Path, stub: Path, dst: Path, key_path: Path):
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run([
-        sys.executable,
-        str(Path(__file__).parent / 'protect.py'),
-        'protect-exe',
-        '--stub',   str(stub),
-        '--main',   str(src),
-        '--key',    str(key_path),
-        '--output', str(dst),
-    ], capture_output=True, text=True)
-    if result.returncode != 0:
-        sys.exit(f"[error] protect-exe failed for {src}:\n{result.stderr}")
-    for line in result.stdout.splitlines():
-        if 'Encrypted main' in line or 'Protected binary' in line:
-            print(f"[pack] {line.strip().lstrip('[antirev] ')}")
+def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes) -> str:
+    """Encrypt and bundle an executable in-process. Returns status string."""
+    src_p  = Path(src)
+    stub_p = Path(stub)
+    dst_p  = Path(dst)
+
+    data = src_p.read_bytes()
+    iv, tag, ct = encrypt_data(data, key)
+    name_b = src_p.name.encode()
+
+    entry  = struct.pack("<H", len(name_b))
+    entry += name_b
+    entry += struct.pack("<B", 1)   # flags: is_main
+    entry += iv
+    entry += tag
+    entry += struct.pack("<Q", len(ct))
+    entry += ct
+
+    bundle = struct.pack("<I", 1) + entry
+
+    stub_data     = stub_p.read_bytes()
+    bundle_offset = len(stub_data)
+    trailer       = struct.pack("<Q", bundle_offset) + key + MAGIC
+
+    dst_p.parent.mkdir(parents=True, exist_ok=True)
+    dst_p.write_bytes(stub_data + bundle + trailer)
+    os.chmod(str(dst_p), 0o755)
+
+    out_size = dst_p.stat().st_size
+    return (f"[pack] Protected  exe: {src_p.name:<30}  "
+            f"{len(data):>10,} -> {out_size:>10,} bytes")
+
+
+def _copy_worker(items: list[tuple[str, str]]) -> int:
+    """Copy a batch of files. Returns count."""
+    for src, dst in items:
+        dst_p = Path(dst)
+        dst_p.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst_p)
+    return len(items)
 
 
 def main():
     ap = argparse.ArgumentParser(description="antirev config-driven batch protector")
     ap.add_argument("config", help="YAML config file")
+    ap.add_argument("-j", "--jobs", type=int, default=0,
+                    help="Number of parallel workers (default: CPU count)")
     args = ap.parse_args()
 
     config_path = Path(args.config)
@@ -200,7 +214,8 @@ def main():
     install_dir = Path(cfg['install_dir']).resolve()
     output_dir  = Path(cfg['output_dir']).resolve()
     key_path    = (config_path.parent / cfg.get('key', 'antirev.key')).resolve()
-    blacklist   = cfg.get('blacklist', [])
+    blacklist   = compile_blacklist(cfg.get('blacklist', []))
+    workers     = args.jobs if args.jobs > 0 else (os.cpu_count() or 4)
 
     # Build arch -> stub mapping (supports single 'stub' or multi-arch 'stubs')
     stubs: dict[str, Path] = {}
@@ -208,13 +223,11 @@ def main():
         for arch, p in cfg['stubs'].items():
             stubs[arch] = (config_path.parent / p).resolve()
     elif 'stub' in cfg:
-        # Single stub — detect its architecture and also use as fallback
         single = (config_path.parent / cfg['stub']).resolve()
         elf_info = classify_elf(single)
         if elf_info:
             stubs[elf_info[1]] = single
         else:
-            # Can't detect arch, assign to both as fallback
             stubs['x86_64'] = single
             stubs['aarch64'] = single
 
@@ -230,7 +243,7 @@ def main():
     exe_files  = []   # (rel_path, arch, abs_path)
     lib_files  = []   # abs_path
     copy_files = []   # abs_path
-    skipped    = []   # (rel_path, reason)
+    skipped    = []   # rel_path
 
     for src in sorted(install_dir.rglob('*')):
         if not src.is_file():
@@ -240,7 +253,7 @@ def main():
 
         if is_blacklisted(rel, blacklist):
             copy_files.append(src)
-            skipped.append((rel, 'blacklisted'))
+            skipped.append(rel)
             continue
 
         elf_info = classify_elf(src)
@@ -259,37 +272,73 @@ def main():
     print(f"[pack]   Executables:  {len(exe_files)}")
     print(f"[pack]   Libraries:   {len(lib_files)}")
     print(f"[pack]   Other files: {len(copy_files)}")
+    print(f"[pack]   Workers:     {workers}")
     if skipped:
         print(f"[pack]   Blacklisted: {len(skipped)}")
-        for rel, reason in skipped:
+        for rel in skipped:
             print(f"[pack]     skip: {rel}")
     print()
 
-    # ── Encrypt shared libraries ──────────────────────────────────────
+    # ── Encrypt shared libraries (parallel) ───────────────────────────
     if lib_files:
         print(f"[pack] Encrypting {len(lib_files)} shared "
               f"librar{'y' if len(lib_files) == 1 else 'ies'}...")
-        for src in lib_files:
-            encrypt_lib(src, output_dir / src.relative_to(install_dir), key)
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _encrypt_lib_worker,
+                    str(src),
+                    str(output_dir / src.relative_to(install_dir)),
+                    key,
+                ): src
+                for src in lib_files
+            }
+            for fut in as_completed(futures):
+                try:
+                    print(fut.result())
+                except Exception as e:
+                    sys.exit(f"[error] encrypt failed for {futures[fut]}: {e}")
         print()
 
-    # ── Protect executables ───────────────────────────────────────────
+    # ── Protect executables (parallel) ────────────────────────────────
     if exe_files:
         print(f"[pack] Protecting {len(exe_files)} executable(s)...")
         for rel, arch, src in exe_files:
             if arch not in stubs:
                 sys.exit(f"[error] no stub for arch '{arch}' "
                          f"(needed by {rel}). Add it to 'stubs' in config.")
-            protect_exe(src, stubs[arch], output_dir / rel, key_path)
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _protect_exe_worker,
+                    str(src),
+                    str(stubs[arch]),
+                    str(output_dir / rel),
+                    key,
+                ): rel
+                for rel, arch, src in exe_files
+            }
+            for fut in as_completed(futures):
+                try:
+                    print(fut.result())
+                except Exception as e:
+                    sys.exit(f"[error] protect failed for {futures[fut]}: {e}")
         print()
 
-    # ── Copy everything else as-is ────────────────────────────────────
+    # ── Copy everything else (parallel, batched) ──────────────────────
     if copy_files:
-        for src in copy_files:
-            dst = output_dir / src.relative_to(install_dir)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-        print(f"[pack] Copied {len(copy_files)} file(s) as-is")
+        pairs = [
+            (str(src), str(output_dir / src.relative_to(install_dir)))
+            for src in copy_files
+        ]
+        # Split into batches — one per worker, minimum 1
+        batch_size = max(1, len(pairs) // workers)
+        batches = [pairs[i:i + batch_size]
+                   for i in range(0, len(pairs), batch_size)]
+
+        with ProcessPoolExecutor(max_workers=min(workers, len(batches))) as pool:
+            total = sum(pool.map(_copy_worker, batches))
+        print(f"[pack] Copied {total} file(s) as-is")
         print()
 
     print(f"[pack] Done")
