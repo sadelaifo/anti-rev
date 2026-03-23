@@ -16,9 +16,24 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/mman.h>
+#include <sys/syscall.h>
 #include <stdint.h>
 #include "crypto.h"
+
+/* Use raw syscall instead of glibc wrapper — the wrapper may not be
+ * available when loaded via LD_AUDIT into a process whose libc lacks
+ * the memfd_create symbol (glibc < 2.27) or during early linker init. */
+#ifndef __NR_memfd_create
+#  if defined(__x86_64__)
+#    define __NR_memfd_create 319
+#  elif defined(__aarch64__)
+#    define __NR_memfd_create 279
+#  endif
+#endif
+static inline int raw_memfd_create(const char *name, unsigned int flags)
+{
+    return (int)syscall(__NR_memfd_create, name, flags);
+}
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
@@ -119,7 +134,7 @@ static int decrypt_to_memfd(int src_fd, off_t ct_off, uint64_t ct_size,
     }
 
     /* Pass B: CTR decrypt → memfd */
-    int mfd = memfd_create(name, 0 /* no MFD_CLOEXEC */);
+    int mfd = raw_memfd_create(name, 0 /* no MFD_CLOEXEC */);
     if (mfd < 0) { free(buf); return -1; }
 
     aes256gcm_init(&ctx, g_key, iv);
