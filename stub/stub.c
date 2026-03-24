@@ -304,12 +304,15 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
     }
 
-    char **new_env = malloc((size_t)(envc + 5) * sizeof(char *));
+    /* +7: LD_AUDIT, KEY_FD, KEY_HEX, REAL_EXE, MAIN_FD, LD_PRELOAD, NULL */
+    char **new_env = malloc((size_t)(envc + 7) * sizeof(char *));
     if (!new_env) { perror("malloc env"); return 1; }
 
     char ld_audit_entry[64];
     char key_fd_entry[32];
+    char key_hex_entry[KEY_SIZE * 2 + 32];
     char real_exe_entry[4096 + 32];
+    char main_fd_entry[32];
 
     snprintf(ld_audit_entry, sizeof(ld_audit_entry),
              "LD_AUDIT=/proc/self/fd/%d", audit_shim_fd);
@@ -317,6 +320,22 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
              "ANTIREV_KEY_FD=%d", key_fd);
     snprintf(real_exe_entry, sizeof(real_exe_entry),
              "ANTIREV_REAL_EXE=%s", real_exe);
+    snprintf(main_fd_entry, sizeof(main_fd_entry),
+             "ANTIREV_MAIN_FD=%d", main_fd);
+
+    /* Encode key as hex for ANTIREV_KEY_HEX (survives daemon fd-close).
+     * We already wiped the key[] array, so re-read from key_fd. */
+    {
+        uint8_t key_tmp[KEY_SIZE];
+        if (pread(key_fd, key_tmp, KEY_SIZE, 0) != KEY_SIZE) {
+            perror("pread key_fd for hex"); return 1;
+        }
+        char *p = key_hex_entry;
+        p += sprintf(p, "ANTIREV_KEY_HEX=");
+        for (int i = 0; i < KEY_SIZE; i++)
+            p += sprintf(p, "%02x", key_tmp[i]);
+        explicit_bzero(key_tmp, KEY_SIZE);
+    }
 
     /* Prepend our exe shim to any existing LD_PRELOAD entries */
     size_t preload_len = 64 + (existing_preload ? 1 + strlen(existing_preload) : 0);
@@ -333,17 +352,21 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     for (int j = 0; j < envc; j++) {
         if (strncmp(envp[j], "LD_AUDIT=",          9) == 0) continue;
         if (strncmp(envp[j], "ANTIREV_KEY_FD=",   15) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_KEY_HEX=",  16) == 0) continue;
         if (strncmp(envp[j], "LD_PRELOAD=",       11) == 0) continue;
         if (strncmp(envp[j], "ANTIREV_REAL_EXE=", 17) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_MAIN_FD=",  16) == 0) continue;
         new_env[ei++] = envp[j];
     }
     new_env[ei++] = ld_audit_entry;
     new_env[ei++] = key_fd_entry;
+    new_env[ei++] = key_hex_entry;
     new_env[ei++] = real_exe_entry;
+    new_env[ei++] = main_fd_entry;
     new_env[ei++] = ld_preload_entry;
     new_env[ei]   = NULL;
 
-    /* 6. Replace this process with the decrypted binary — no fork, same PID */
+    /* 7. Replace this process with the decrypted binary — no fork, same PID */
     fexecve(main_fd, argv, new_env);
     perror("fexecve");
     return 1;

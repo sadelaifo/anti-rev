@@ -2,11 +2,16 @@
  * antirev rtld-audit shim — loaded via LD_AUDIT into the target binary.
  *
  * Reads the AES-256 key from the fd given in ANTIREV_KEY_FD (a memfd written
- * by the stub before fexecve).  In la_objsearch(), intercepts any absolute
+ * by the stub before fexecve), or from ANTIREV_KEY_HEX env var as fallback
+ * (survives daemon fd-close).  In la_objsearch(), intercepts any absolute
  * path that points to an antirev-encrypted .so file (magic "ANTREV01"),
  * decrypts it to a new memfd, and returns "/proc/self/fd/<N>" so the dynamic
  * linker maps the plaintext image.  Decrypted fds are cached so each library
  * is only decrypted once.  Unknown paths pass through unchanged.
+ *
+ * Thread safety: cache uses atomic slot reservation (lock-free).
+ * Daemon compat: self-healing cache re-decrypts if fds were closed.
+ * seccomp compat: falls back to /dev/shm or /tmp if memfd_create is blocked.
  */
 
 #define _GNU_SOURCE
@@ -17,6 +22,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 #include <stdint.h>
 #include "crypto.h"
 
@@ -49,60 +55,139 @@ static inline int raw_memfd_create(const char *name, unsigned int flags)
 #define MAX_CACHE    128
 
 /* ------------------------------------------------------------------ */
-/*  Key storage                                                        */
+/*  Anonymous fd creation with fallback (Fix #4: seccomp compat)       */
+/* ------------------------------------------------------------------ */
+
+static int make_anon_fd(const char *name)
+{
+    /* Try memfd_create first (most secure: never touches disk) */
+    int fd = raw_memfd_create(name, 0);
+    if (fd >= 0)
+        return fd;
+
+    /* Fallback: /dev/shm (tmpfs, usually not blocked by seccomp) */
+    char path[256];
+    snprintf(path, sizeof(path), "/dev/shm/.antirev_%d_%s", (int)getpid(), name);
+    fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0700);
+    if (fd >= 0) {
+        unlink(path);   /* immediate unlink — fd stays valid */
+        return fd;
+    }
+
+    /* Last resort: /tmp (briefly visible on disk until unlink) */
+    snprintf(path, sizeof(path), "/tmp/.antirev_%d_%s", (int)getpid(), name);
+    fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0700);
+    if (fd >= 0) {
+        unlink(path);
+        return fd;
+    }
+
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Key storage (Fix #1: daemon fd-close compat)                       */
 /* ------------------------------------------------------------------ */
 
 static uint8_t g_key[KEY_SIZE];
 static int     g_key_ready = 0;
 
+static int hex_to_bytes(const char *hex, uint8_t *out, size_t out_len)
+{
+    for (size_t i = 0; i < out_len; i++) {
+        int hi, lo;
+        char c;
+
+        c = hex[2 * i];
+        if      (c >= '0' && c <= '9') hi = c - '0';
+        else if (c >= 'a' && c <= 'f') hi = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') hi = c - 'A' + 10;
+        else return -1;
+
+        c = hex[2 * i + 1];
+        if      (c >= '0' && c <= '9') lo = c - '0';
+        else if (c >= 'a' && c <= 'f') lo = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') lo = c - 'A' + 10;
+        else return -1;
+
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return 0;
+}
+
 static void load_key(void)
 {
     if (g_key_ready)
         return;
+
+    /* Primary: read from key fd (set by stub) */
     const char *s = getenv("ANTIREV_KEY_FD");
-    if (!s)
-        return;
-    int kfd = atoi(s);
-    if (pread(kfd, g_key, KEY_SIZE, 0) == KEY_SIZE)
-        g_key_ready = 1;
-    /* Do NOT close kfd — it must survive fork+exec so child processes
-     * (e.g. daemon binaries spawned by the main process) can also read
-     * the key.  The fd has no O_CLOEXEC and is inherited across exec. */
+    if (s) {
+        int kfd = atoi(s);
+        if (pread(kfd, g_key, KEY_SIZE, 0) == KEY_SIZE) {
+            g_key_ready = 1;
+            return;
+        }
+    }
+
+    /* Fallback: hex-encoded key in env (survives daemon fd-close) */
+    const char *hex = getenv("ANTIREV_KEY_HEX");
+    if (hex && strlen(hex) >= KEY_SIZE * 2) {
+        if (hex_to_bytes(hex, g_key, KEY_SIZE) == 0)
+            g_key_ready = 1;
+    }
 }
 
 /* ------------------------------------------------------------------ */
-/*  Decrypted-library cache                                            */
+/*  Decrypted-library cache (Fix #7: thread-safe, Fix #1: self-heal)   */
 /* ------------------------------------------------------------------ */
 
 static struct {
-    char src_path[512];
-    char fd_path[32];    /* "/proc/self/fd/N" — persistent, returned to linker */
-    int  fd;
+    char     src_path[512];
+    char     fd_path[32];    /* "/proc/self/fd/N" */
+    int      fd;
+    volatile int ready;      /* set with release store after entry is written */
 } g_cache[MAX_CACHE];
-static int g_cache_n = 0;
+static volatile int g_cache_n = 0;
 
 static const char *cache_lookup(const char *path)
 {
-    for (int i = 0; i < g_cache_n; i++)
-        if (strcmp(g_cache[i].src_path, path) == 0)
+    int n = __atomic_load_n(&g_cache_n, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        if (!__atomic_load_n(&g_cache[i].ready, __ATOMIC_ACQUIRE))
+            continue;
+        if (strcmp(g_cache[i].src_path, path) == 0) {
+            /* Self-healing: check if the fd is still valid */
+            if (fcntl(g_cache[i].fd, F_GETFD) == -1) {
+                /* fd was closed (daemon fd-close); invalidate entry */
+                __atomic_store_n(&g_cache[i].ready, 0, __ATOMIC_RELEASE);
+                return NULL;
+            }
             return g_cache[i].fd_path;
+        }
+    }
     return NULL;
 }
 
 static const char *cache_insert(const char *path, int fd)
 {
-    if (g_cache_n >= MAX_CACHE)
+    int slot = __atomic_fetch_add(&g_cache_n, 1, __ATOMIC_SEQ_CST);
+    if (slot >= MAX_CACHE) {
+        /* Undo the increment — slot is invalid */
+        __atomic_fetch_sub(&g_cache_n, 1, __ATOMIC_SEQ_CST);
         return NULL;
-    int i = g_cache_n++;
-    strncpy(g_cache[i].src_path, path, sizeof(g_cache[i].src_path) - 1);
-    g_cache[i].src_path[sizeof(g_cache[i].src_path) - 1] = '\0';
-    g_cache[i].fd = fd;
-    snprintf(g_cache[i].fd_path, sizeof(g_cache[i].fd_path), "/proc/self/fd/%d", fd);
-    return g_cache[i].fd_path;
+    }
+    strncpy(g_cache[slot].src_path, path, sizeof(g_cache[slot].src_path) - 1);
+    g_cache[slot].src_path[sizeof(g_cache[slot].src_path) - 1] = '\0';
+    g_cache[slot].fd = fd;
+    snprintf(g_cache[slot].fd_path, sizeof(g_cache[slot].fd_path),
+             "/proc/self/fd/%d", fd);
+    __atomic_store_n(&g_cache[slot].ready, 1, __ATOMIC_RELEASE);
+    return g_cache[slot].fd_path;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Two-pass streaming decryption → memfd                             */
+/*  Two-pass streaming decryption → anonymous fd                       */
 /* ------------------------------------------------------------------ */
 
 static int decrypt_to_memfd(int src_fd, off_t ct_off, uint64_t ct_size,
@@ -133,8 +218,8 @@ static int decrypt_to_memfd(int src_fd, off_t ct_off, uint64_t ct_size,
         return -1;
     }
 
-    /* Pass B: CTR decrypt → memfd */
-    int mfd = raw_memfd_create(name, 0 /* no MFD_CLOEXEC */);
+    /* Pass B: CTR decrypt → anonymous fd */
+    int mfd = make_anon_fd(name);
     if (mfd < 0) { free(buf); return -1; }
 
     aes256gcm_init(&ctx, g_key, iv);
@@ -164,7 +249,7 @@ static int decrypt_to_memfd(int src_fd, off_t ct_off, uint64_t ct_size,
 
 static const char *try_decrypt(const char *path)
 {
-    /* Cache hit */
+    /* Cache hit (with self-healing: returns NULL if cached fd was closed) */
     const char *cached = cache_lookup(path);
     if (cached)
         return cached;
