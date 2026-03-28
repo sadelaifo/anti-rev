@@ -3,17 +3,22 @@
  *
  * Intercepts:
  *   - readlink/readlinkat for "/proc/self/exe" → returns ANTIREV_REAL_EXE
+ *   - __readlink_chk/__readlinkat_chk (fortified variants)
  *   - realpath/canonicalize_file_name for /proc/self/exe → returns real path
  *   - getauxval(AT_EXECFN)                     → returns ANTIREV_REAL_EXE
- *   - open/openat for the protected binary      → redirects to decrypted memfd
  *   - prctl(PR_SET_NAME) in constructor         → restores original process name
+ *   - program_invocation_name/short_name        → patched in constructor
+ *
+ * All interceptions only activate for the protected process itself (detected
+ * by checking if /proc/self/exe points to a memfd). Child processes that
+ * inherit LD_PRELOAD pass through to real libc functions untouched.
  *
  * Without this, code that reads /proc/self/exe would see "/memfd:name (deleted)"
  * and fail to locate config files, sockets, or other resources relative to the
- * binary's real path. Programs that self-read (checksumming, license verification)
- * would read the encrypted stub+bundle instead of the original binary.
+ * binary's real path.
  *
- * Uses raw syscalls for fallthrough — no recursion risk, no dlsym dependency.
+ * Uses raw syscalls for fallthrough — no recursion risk, no dlsym dependency
+ * (except for realpath where raw syscall fallthrough is not possible).
  */
 
 #define _GNU_SOURCE
@@ -22,26 +27,85 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
 #include <sys/auxv.h>
 #include <fcntl.h>
-#include <stdarg.h>
+
+/* glibc globals — declared in <errno.h> with _GNU_SOURCE */
+extern char *program_invocation_name;
+extern char *program_invocation_short_name;
 
 /* ------------------------------------------------------------------ */
-/*  Constructor: restore process comm name                             */
+/*  Owner process tracking                                             */
 /* ------------------------------------------------------------------ */
+
+/* PID of the process that was actually protected by antirev.
+ * Child processes inherit LD_PRELOAD but should NOT have their
+ * /proc/self/exe, realpath, etc. intercepted — they are different
+ * binaries and ANTIREV_REAL_EXE refers to the parent. */
+static pid_t g_owner_pid = 0;
+
+static int is_owner_process(void)
+{
+    return g_owner_pid != 0 && getpid() == g_owner_pid;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Cached libc realpath pointers                                      */
+/* ------------------------------------------------------------------ */
+
+static char *(*g_libc_realpath)(const char *, char *) = NULL;
+static char *(*g_libc_realpath_chk)(const char *, char *, size_t) = NULL;
+
+/* ------------------------------------------------------------------ */
+/*  Constructor: restore process identity                              */
+/* ------------------------------------------------------------------ */
+
+static char g_inv_name[4096];
+static char g_inv_short[256];
 
 __attribute__((constructor))
-static void restore_comm(void)
+static void restore_identity(void)
 {
+    /* Resolve libc realpath symbols early, before any calls */
+    g_libc_realpath = dlsym(RTLD_NEXT, "realpath");
+    g_libc_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
+
     const char *real = getenv("ANTIREV_REAL_EXE");
     if (!real)
         return;
+
+    /* Check if /proc/self/exe points to a memfd — if so, this process
+     * was launched via fexecve and we are the owner. If not, we are a
+     * child process that inherited LD_PRELOAD and should not intercept. */
+    char exe_buf[256];
+    ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
+                                 "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    if (n <= 0)
+        return;
+    exe_buf[n] = '\0';
+
+    if (strstr(exe_buf, "memfd:") == NULL)
+        return;
+
+    g_owner_pid = getpid();
+
     const char *base = strrchr(real, '/');
     base = base ? base + 1 : real;
-    /* PR_SET_NAME truncates to 15 chars (TASK_COMM_LEN - 1) */
+
+    /* Restore process comm (ps -o comm, /proc/pid/comm) */
     prctl(PR_SET_NAME, (unsigned long)base, 0, 0, 0);
+
+    /* Restore program_invocation_name and program_invocation_short_name */
+    strncpy(g_inv_name, real, sizeof(g_inv_name) - 1);
+    g_inv_name[sizeof(g_inv_name) - 1] = '\0';
+    strncpy(g_inv_short, base, sizeof(g_inv_short) - 1);
+    g_inv_short[sizeof(g_inv_short) - 1] = '\0';
+
+    program_invocation_name       = g_inv_name;
+    program_invocation_short_name = g_inv_short;
 }
 
 /* ------------------------------------------------------------------ */
@@ -50,32 +114,13 @@ static void restore_comm(void)
 
 static int is_self_exe(const char *path)
 {
+    if (!is_owner_process())
+        return 0;
     if (strcmp(path, "/proc/self/exe") == 0)
         return 1;
     char pidpath[64];
     snprintf(pidpath, sizeof(pidpath), "/proc/%d/exe", (int)getpid());
     return strcmp(path, pidpath) == 0;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Helper: check if path matches the protected binary on disk         */
-/*  (Fix #3: self-read redirect)                                       */
-/* ------------------------------------------------------------------ */
-
-static int is_self_binary(const char *path)
-{
-    const char *real = getenv("ANTIREV_REAL_EXE");
-    if (!real)
-        return 0;
-    return strcmp(path, real) == 0;
-}
-
-static int get_main_fd(void)
-{
-    const char *s = getenv("ANTIREV_MAIN_FD");
-    if (!s)
-        return -1;
-    return atoi(s);
 }
 
 /* ------------------------------------------------------------------ */
@@ -112,24 +157,29 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)
     return (ssize_t)syscall(SYS_readlinkat, dirfd, path, buf, bufsiz);
 }
 
+/* Fortified variants — called when compiled with _FORTIFY_SOURCE >= 1 */
+__attribute__((visibility("default")))
+ssize_t __readlink_chk(const char *path, char *buf, size_t bufsiz,
+                       size_t buflen)
+{
+    (void)buflen;
+    return readlink(path, buf, bufsiz);
+}
+
+__attribute__((visibility("default")))
+ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf,
+                         size_t bufsiz, size_t buflen)
+{
+    (void)buflen;
+    return readlinkat(dirfd, path, buf, bufsiz);
+}
+
 /* ------------------------------------------------------------------ */
 /*  realpath / canonicalize_file_name interception                     */
 /*  glibc's realpath() uses internal __readlink which bypasses         */
 /*  LD_PRELOAD, so we must intercept realpath itself.                  */
 /*  Qt's QCoreApplication::applicationFilePath() uses this path.       */
 /* ------------------------------------------------------------------ */
-
-/* Cached libc function pointers — resolved once to avoid repeated dlsym
- * and to prevent cross-wrapper recursion issues. */
-static char *(*g_libc_realpath)(const char *, char *) = NULL;
-static char *(*g_libc_realpath_chk)(const char *, char *, size_t) = NULL;
-
-__attribute__((constructor))
-static void resolve_realpath_syms(void)
-{
-    g_libc_realpath = dlsym(RTLD_NEXT, "realpath");
-    g_libc_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
-}
 
 static char *fill_real_exe(char *resolved)
 {
@@ -194,24 +244,21 @@ char *__realpath_chk(const char *path, char *resolved, size_t resolved_len)
 __attribute__((visibility("default")))
 unsigned long getauxval(unsigned long type)
 {
-    if (type == AT_EXECFN) {
+    if (type == AT_EXECFN && is_owner_process()) {
         const char *real = getenv("ANTIREV_REAL_EXE");
         if (real)
             return (unsigned long)real;
     }
 
-    /* Fallthrough: walk the auxiliary vector directly.
-     * The auxv sits in memory right after the environment strings:
-     *   [argv...] NULL [envp...] NULL [auxv_t entries...] AT_NULL
-     * We access it via /proc/self/auxv to avoid fragile stack walking. */
+    /* Fallthrough: read /proc/self/auxv via raw syscall */
     int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/auxv", O_RDONLY);
     if (fd < 0)
         return 0;
 
     unsigned long result = 0;
-    unsigned long pair[2];  /* auxv_t: {a_type, a_val} */
+    unsigned long pair[2];
     while (syscall(SYS_read, fd, pair, sizeof(pair)) == (long)sizeof(pair)) {
-        if (pair[0] == 0)  /* AT_NULL */
+        if (pair[0] == 0)
             break;
         if (pair[0] == type) {
             result = pair[1];
@@ -220,55 +267,4 @@ unsigned long getauxval(unsigned long type)
     }
     syscall(SYS_close, fd);
     return result;
-}
-
-/* ------------------------------------------------------------------ */
-/*  open / openat interception (Fix #3: self-read redirect)            */
-/* ------------------------------------------------------------------ */
-
-__attribute__((visibility("default")))
-int open(const char *path, int flags, ...)
-{
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list ap;
-        va_start(ap, flags);
-        mode = (mode_t)va_arg(ap, int);
-        va_end(ap);
-    }
-
-    /* If opening the protected binary for reading, redirect to decrypted memfd */
-    if (is_self_binary(path) && (flags & O_ACCMODE) == O_RDONLY) {
-        int main_fd = get_main_fd();
-        if (main_fd >= 0) {
-            char fd_path[64];
-            snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
-            return (int)syscall(SYS_openat, AT_FDCWD, fd_path, O_RDONLY);
-        }
-    }
-
-    return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
-}
-
-__attribute__((visibility("default")))
-int openat(int dirfd, const char *path, int flags, ...)
-{
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list ap;
-        va_start(ap, flags);
-        mode = (mode_t)va_arg(ap, int);
-        va_end(ap);
-    }
-
-    if (is_self_binary(path) && (flags & O_ACCMODE) == O_RDONLY) {
-        int main_fd = get_main_fd();
-        if (main_fd >= 0) {
-            char fd_path[64];
-            snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
-            return (int)syscall(SYS_openat, AT_FDCWD, fd_path, O_RDONLY);
-        }
-    }
-
-    return (int)syscall(SYS_openat, dirfd, path, flags, mode);
 }
