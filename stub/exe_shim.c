@@ -26,12 +26,29 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <dlfcn.h>
 #include <errno.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
 #include <sys/auxv.h>
 #include <fcntl.h>
+
+/* Weak references to dlopen/dlsym/dlclose — these may not be available
+ * in simple utilities (grep, date, etc.) that don't link libdl.
+ * On glibc 2.34+ they're in libc itself, on older systems in libdl.so. */
+__attribute__((weak)) void *dlopen(const char *, int);
+__attribute__((weak)) void *dlsym(void *, const char *);
+__attribute__((weak)) int   dlclose(void *);
+
+/* dl constants — define ourselves to avoid needing dlfcn.h */
+#ifndef RTLD_NEXT
+#  define RTLD_NEXT    ((void *) -1L)
+#endif
+#ifndef RTLD_LAZY
+#  define RTLD_LAZY    0x00001
+#endif
+#ifndef RTLD_NOLOAD
+#  define RTLD_NOLOAD  0x00004
+#endif
 
 /* glibc globals — declared in <errno.h> with _GNU_SOURCE */
 extern char *program_invocation_name;
@@ -66,19 +83,44 @@ static char *(*g_libc_realpath_chk)(const char *, char *, size_t) = NULL;
 static char g_inv_name[4096];
 static char g_inv_short[256];
 
+/* Resolve libc realpath using the best available method.
+ * Tries dlopen(libc) first (handles multi-shim), falls back to RTLD_NEXT. */
+static void resolve_libc_realpath(void)
+{
+    /* Method 1: dlopen libc directly (safe with multiple exe_shims) */
+    if (dlopen && dlsym) {
+        void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
+        if (libc) {
+            g_libc_realpath = dlsym(libc, "realpath");
+            g_libc_realpath_chk = dlsym(libc, "__realpath_chk");
+            if (dlclose) dlclose(libc);
+            if (g_libc_realpath)
+                return;
+        }
+        /* Method 2: RTLD_NEXT (works when only one exe_shim loaded) */
+        g_libc_realpath = dlsym(RTLD_NEXT, "realpath");
+        g_libc_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
+    }
+    /* Method 3: no dlsym available — g_libc_realpath stays NULL.
+     * This only affects simple utilities (grep, date) that don't call
+     * realpath anyway. The wrapper returns NULL for non-self-exe paths. */
+}
+
 __attribute__((constructor))
 static void restore_identity(void)
 {
+    /* Resolve libc realpath for ALL processes — needed for the realpath
+     * wrapper fallthrough even in non-protected child processes. Uses
+     * weak dlopen/dlsym so it won't crash utilities that lack libdl. */
+    resolve_libc_realpath();
+
     const char *real = getenv("ANTIREV_REAL_EXE");
     if (!real)
         return;
 
     /* Check if /proc/self/exe points to a memfd — if so, this process
      * was launched via fexecve and we are the owner. If not, we are a
-     * child process (or shell utility) that inherited LD_PRELOAD and
-     * should not intercept.  This check runs BEFORE any dlopen/dlsym
-     * calls, so utilities like grep/date that don't link libdl won't
-     * crash on missing dlopen symbols. */
+     * child process that inherited LD_PRELOAD and should not intercept. */
     char exe_buf[256];
     ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
                                  "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
@@ -90,17 +132,6 @@ static void restore_identity(void)
         return;
 
     g_owner_pid = getpid();
-
-    /* Resolve libc realpath symbols from libc.so.6 directly.
-     * RTLD_NEXT won't work when multiple exe_shims are loaded (protected
-     * parent spawns protected child — both add exe_shim to LD_PRELOAD).
-     * Only called for protected processes (memfd check passed above). */
-    void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
-    if (libc) {
-        g_libc_realpath = dlsym(libc, "realpath");
-        g_libc_realpath_chk = dlsym(libc, "__realpath_chk");
-        dlclose(libc);
-    }
 
     const char *base = strrchr(real, '/');
     base = base ? base + 1 : real;
