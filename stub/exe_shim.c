@@ -69,9 +69,17 @@ static char g_inv_short[256];
 __attribute__((constructor))
 static void restore_identity(void)
 {
-    /* Resolve libc realpath symbols early, before any calls */
-    g_libc_realpath = dlsym(RTLD_NEXT, "realpath");
-    g_libc_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
+    /* Resolve libc realpath symbols from libc.so.6 directly.
+     * RTLD_NEXT won't work when multiple exe_shims are loaded (protected
+     * parent spawns protected child — both add exe_shim to LD_PRELOAD).
+     * RTLD_NEXT from the second shim finds the first shim's realpath
+     * instead of libc's, causing infinite loops or NULL. */
+    void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
+    if (libc) {
+        g_libc_realpath = dlsym(libc, "realpath");
+        g_libc_realpath_chk = dlsym(libc, "__realpath_chk");
+        dlclose(libc);
+    }
 
     const char *real = getenv("ANTIREV_REAL_EXE");
     if (!real)
