@@ -3,6 +3,7 @@
  *
  * Intercepts:
  *   - readlink/readlinkat for "/proc/self/exe" → returns ANTIREV_REAL_EXE
+ *   - realpath/canonicalize_file_name for /proc/self/exe → returns real path
  *   - getauxval(AT_EXECFN)                     → returns ANTIREV_REAL_EXE
  *   - open/openat for the protected binary      → redirects to decrypted memfd
  *   - prctl(PR_SET_NAME) in constructor         → restores original process name
@@ -109,6 +110,81 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)
         }
     }
     return (ssize_t)syscall(SYS_readlinkat, dirfd, path, buf, bufsiz);
+}
+
+/* ------------------------------------------------------------------ */
+/*  realpath / canonicalize_file_name interception                     */
+/*  glibc's realpath() uses internal __readlink which bypasses         */
+/*  LD_PRELOAD, so we must intercept realpath itself.                  */
+/*  Qt's QCoreApplication::applicationFilePath() uses this path.       */
+/* ------------------------------------------------------------------ */
+
+__attribute__((visibility("default")))
+char *realpath(const char *path, char *resolved)
+{
+    if (path && is_self_exe(path)) {
+        const char *real = getenv("ANTIREV_REAL_EXE");
+        if (real) {
+            /* Resolve ANTIREV_REAL_EXE through the real realpath
+             * by calling the raw syscall path resolution.
+             * We can't call libc realpath (that's us), so we just
+             * return the path directly — it's already absolute. */
+            size_t len = strlen(real);
+            if (!resolved) {
+                resolved = malloc(len + 1);
+                if (!resolved)
+                    return NULL;
+            }
+            memcpy(resolved, real, len + 1);
+            return resolved;
+        }
+    }
+
+    /* Fallthrough: use dlsym to find the real realpath in libc */
+    static char *(*real_realpath)(const char *, char *) = NULL;
+    if (!real_realpath) {
+        real_realpath = dlsym(RTLD_NEXT, "realpath");
+        if (!real_realpath)
+            return NULL;
+    }
+    return real_realpath(path, resolved);
+}
+
+/* GNU extension — same as realpath(path, NULL) */
+__attribute__((visibility("default")))
+char *canonicalize_file_name(const char *path)
+{
+    return realpath(path, NULL);
+}
+
+/* __realpath_chk — fortified version called when _FORTIFY_SOURCE is enabled */
+__attribute__((visibility("default")))
+char *__realpath_chk(const char *path, char *resolved, size_t resolved_len)
+{
+    if (path && is_self_exe(path)) {
+        const char *real = getenv("ANTIREV_REAL_EXE");
+        if (real) {
+            size_t len = strlen(real);
+            if (resolved && len >= resolved_len) {
+                return NULL;  /* buffer too small */
+            }
+            if (!resolved) {
+                resolved = malloc(len + 1);
+                if (!resolved)
+                    return NULL;
+            }
+            memcpy(resolved, real, len + 1);
+            return resolved;
+        }
+    }
+
+    static char *(*real_realpath_chk)(const char *, char *, size_t) = NULL;
+    if (!real_realpath_chk) {
+        real_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
+        if (!real_realpath_chk)
+            return realpath(path, resolved);
+    }
+    return real_realpath_chk(path, resolved, resolved_len);
 }
 
 /* ------------------------------------------------------------------ */
