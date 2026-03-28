@@ -41,22 +41,48 @@ extern char *program_invocation_short_name;
 static char g_inv_name[4096];
 static char g_inv_short[256];
 
+/* PID of the process that was actually protected by antirev.
+ * Child processes inherit LD_PRELOAD but should NOT have their
+ * /proc/self/exe, realpath, etc. intercepted — they are different
+ * binaries and ANTIREV_REAL_EXE refers to the parent. */
+static pid_t g_owner_pid = 0;
+
+/* Returns 1 if the current process is the one antirev protected */
+static int is_owner_process(void)
+{
+    return g_owner_pid != 0 && getpid() == g_owner_pid;
+}
+
 __attribute__((constructor))
 static void restore_identity(void)
 {
     const char *real = getenv("ANTIREV_REAL_EXE");
     if (!real)
         return;
+
+    /* Check if /proc/self/exe points to a memfd — if so, this process
+     * was launched via fexecve and we are the owner. If not, we are a
+     * child process that inherited LD_PRELOAD and should not intercept. */
+    char exe_buf[256];
+    ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
+                                 "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    if (n <= 0)
+        return;
+    exe_buf[n] = '\0';
+
+    /* Only activate for processes running from memfd (i.e., protected binaries) */
+    if (strstr(exe_buf, "memfd:") == NULL)
+        return;
+
+    g_owner_pid = getpid();
+
     const char *base = strrchr(real, '/');
     base = base ? base + 1 : real;
 
     /* Restore process comm (ps -o comm, /proc/pid/comm) */
     prctl(PR_SET_NAME, (unsigned long)base, 0, 0, 0);
 
-    /* Restore program_invocation_name and program_invocation_short_name.
-     * These glibc globals are used by logging frameworks, error messages,
-     * and some path-discovery code. After fexecve from memfd, they point
-     * to the memfd path or argv[0] which may not be the real path. */
+    /* Restore program_invocation_name and program_invocation_short_name */
     strncpy(g_inv_name, real, sizeof(g_inv_name) - 1);
     g_inv_name[sizeof(g_inv_name) - 1] = '\0';
     strncpy(g_inv_short, base, sizeof(g_inv_short) - 1);
@@ -72,6 +98,9 @@ static void restore_identity(void)
 
 static int is_self_exe(const char *path)
 {
+    /* Only intercept for the protected process, not inherited children */
+    if (!is_owner_process())
+        return 0;
     if (strcmp(path, "/proc/self/exe") == 0)
         return 1;
     char pidpath[64];
@@ -213,7 +242,7 @@ char *__realpath_chk(const char *path, char *resolved, size_t resolved_len)
 __attribute__((visibility("default")))
 unsigned long getauxval(unsigned long type)
 {
-    if (type == AT_EXECFN) {
+    if (type == AT_EXECFN && is_owner_process()) {
         const char *real = getenv("ANTIREV_REAL_EXE");
         if (real)
             return (unsigned long)real;
