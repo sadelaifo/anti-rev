@@ -5,8 +5,8 @@
  *   - readlink/readlinkat for "/proc/self/exe" → returns ANTIREV_REAL_EXE
  *   - realpath/canonicalize_file_name for /proc/self/exe → returns real path
  *   - getauxval(AT_EXECFN)                     → returns ANTIREV_REAL_EXE
- *   - open/openat for the protected binary      → redirects to decrypted memfd
  *   - prctl(PR_SET_NAME) in constructor         → restores original process name
+ *   - program_invocation_name/short_name        → patched in constructor
  *
  * Without this, code that reads /proc/self/exe would see "/memfd:name (deleted)"
  * and fail to locate config files, sockets, or other resources relative to the
@@ -27,7 +27,6 @@
 #include <sys/prctl.h>
 #include <sys/auxv.h>
 #include <fcntl.h>
-#include <stdarg.h>
 
 /* glibc globals — declared in <errno.h> with _GNU_SOURCE */
 extern char *program_invocation_name;
@@ -80,26 +79,6 @@ static int is_self_exe(const char *path)
     return strcmp(path, pidpath) == 0;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Helper: check if path matches the protected binary on disk         */
-/*  (Fix #3: self-read redirect)                                       */
-/* ------------------------------------------------------------------ */
-
-static int is_self_binary(const char *path)
-{
-    const char *real = getenv("ANTIREV_REAL_EXE");
-    if (!real)
-        return 0;
-    return strcmp(path, real) == 0;
-}
-
-static int get_main_fd(void)
-{
-    const char *s = getenv("ANTIREV_MAIN_FD");
-    if (!s)
-        return -1;
-    return atoi(s);
-}
 
 /* ------------------------------------------------------------------ */
 /*  readlink / readlinkat interception                                  */
@@ -262,53 +241,7 @@ unsigned long getauxval(unsigned long type)
     return result;
 }
 
-/* ------------------------------------------------------------------ */
-/*  open / openat interception (Fix #3: self-read redirect)            */
-/* ------------------------------------------------------------------ */
-
-__attribute__((visibility("default")))
-int open(const char *path, int flags, ...)
-{
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list ap;
-        va_start(ap, flags);
-        mode = (mode_t)va_arg(ap, int);
-        va_end(ap);
-    }
-
-    /* If opening the protected binary for reading, redirect to decrypted memfd */
-    if (is_self_binary(path) && (flags & O_ACCMODE) == O_RDONLY) {
-        int main_fd = get_main_fd();
-        if (main_fd >= 0) {
-            char fd_path[64];
-            snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
-            return (int)syscall(SYS_openat, AT_FDCWD, fd_path, O_RDONLY);
-        }
-    }
-
-    return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
-}
-
-__attribute__((visibility("default")))
-int openat(int dirfd, const char *path, int flags, ...)
-{
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list ap;
-        va_start(ap, flags);
-        mode = (mode_t)va_arg(ap, int);
-        va_end(ap);
-    }
-
-    if (is_self_binary(path) && (flags & O_ACCMODE) == O_RDONLY) {
-        int main_fd = get_main_fd();
-        if (main_fd >= 0) {
-            char fd_path[64];
-            snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
-            return (int)syscall(SYS_openat, AT_FDCWD, fd_path, O_RDONLY);
-        }
-    }
-
-    return (int)syscall(SYS_openat, dirfd, path, flags, mode);
-}
+/* open/openat interception removed — intercepting these broadly caused
+ * breakage in normal file operations (config file loading, Qt plugins, etc.).
+ * The self-read redirect (Fix #3) is deferred until a targeted solution
+ * can be implemented without side effects. */
