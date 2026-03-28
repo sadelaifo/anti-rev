@@ -466,6 +466,184 @@ add_custom_target(test_proc_self_exe
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_realpath — realpath/canonicalize_file_name on /proc/self/exe
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/realpath_test"
+    COMMAND gcc -O2
+            -o "${CMAKE_BINARY_DIR}/realpath_test"
+            "${CMAKE_SOURCE_DIR}/tests/realpath/main.c"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/realpath/main.c"
+    COMMENT "Building test binary: realpath_test"
+)
+add_custom_target(realpath_test DEPENDS "${CMAKE_BINARY_DIR}/realpath_test")
+
+add_custom_target(test_realpath
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_realpath ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/realpath_test"
+            --key    "${CMAKE_BINARY_DIR}/realpath.key"
+            --output "${CMAKE_BINARY_DIR}/realpath_test.protected"
+    COMMAND "${CMAKE_BINARY_DIR}/realpath_test.protected"
+    DEPENDS stub realpath_test
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "realpath/canonicalize_file_name interception test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_getauxval — getauxval(AT_EXECFN) returns real path, not memfd
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/getauxval_test"
+    COMMAND gcc -O2
+            -o "${CMAKE_BINARY_DIR}/getauxval_test"
+            "${CMAKE_SOURCE_DIR}/tests/getauxval/main.c"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/getauxval/main.c"
+    COMMENT "Building test binary: getauxval_test"
+)
+add_custom_target(getauxval_test DEPENDS "${CMAKE_BINARY_DIR}/getauxval_test")
+
+add_custom_target(test_getauxval
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_getauxval ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/getauxval_test"
+            --key    "${CMAKE_BINARY_DIR}/getauxval.key"
+            --output "${CMAKE_BINARY_DIR}/getauxval_test.protected"
+    COMMAND "${CMAKE_BINARY_DIR}/getauxval_test.protected"
+    DEPENDS stub getauxval_test
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "getauxval(AT_EXECFN) interception test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_comm_name — /proc/self/comm restored to original binary name
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/comm_name_test"
+    COMMAND gcc -O2
+            -o "${CMAKE_BINARY_DIR}/comm_name_test"
+            "${CMAKE_SOURCE_DIR}/tests/comm_name/main.c"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/comm_name/main.c"
+    COMMENT "Building test binary: comm_name_test"
+)
+add_custom_target(comm_name_test DEPENDS "${CMAKE_BINARY_DIR}/comm_name_test")
+
+add_custom_target(test_comm_name
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_comm_name ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/comm_name_test"
+            --key    "${CMAKE_BINARY_DIR}/comm_name.key"
+            --output "${CMAKE_BINARY_DIR}/comm_name_test.protected"
+    COMMAND "${CMAKE_BINARY_DIR}/comm_name_test.protected"
+    DEPENDS stub comm_name_test
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "process comm name restoration test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_self_read — open() on protected binary redirects to decrypted memfd
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/self_read_test"
+    COMMAND gcc -O2
+            -o "${CMAKE_BINARY_DIR}/self_read_test"
+            "${CMAKE_SOURCE_DIR}/tests/self_read/main.c"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/self_read/main.c"
+    COMMENT "Building test binary: self_read_test"
+)
+add_custom_target(self_read_test DEPENDS "${CMAKE_BINARY_DIR}/self_read_test")
+
+add_custom_target(test_self_read
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_self_read ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/self_read_test"
+            --key    "${CMAKE_BINARY_DIR}/self_read.key"
+            --output "${CMAKE_BINARY_DIR}/self_read_test.protected"
+    COMMAND "${CMAKE_BINARY_DIR}/self_read_test.protected"
+    DEPENDS stub self_read_test
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "self-read redirect test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_daemon_fdclose — close all fds then dlopen via KEY_HEX fallback
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_test_bin("${CMAKE_BINARY_DIR}/daemon_fdclose_test"
+    gcc "${CMAKE_SOURCE_DIR}/tests/daemon_fdclose/main.c")
+add_custom_target(daemon_fdclose_test DEPENDS "${CMAKE_BINARY_DIR}/daemon_fdclose_test")
+
+add_custom_target(test_daemon_fdclose
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_daemon_fdclose ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${CMAKE_BINARY_DIR}/daemon_fdclose.key"
+            --libs       "${CMAKE_BINARY_DIR}/mylib.so"
+            --output-dir "${CMAKE_BINARY_DIR}/encrypted"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/daemon_fdclose_test"
+            --key    "${CMAKE_BINARY_DIR}/daemon_fdclose.key"
+            --output "${CMAKE_BINARY_DIR}/daemon_fdclose_test.protected"
+    COMMAND ${CMAKE_COMMAND} -E env
+            "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
+            "${CMAKE_BINARY_DIR}/daemon_fdclose_test.protected"
+            "${CMAKE_BINARY_DIR}/encrypted/mylib.so"
+    DEPENDS stub mylib daemon_fdclose_test
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "daemon fd-close KEY_HEX fallback test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_concurrent_dlopen — thread-safe cache (multiple threads dlopen)
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/concurrent_dlopen_test"
+    COMMAND gcc -O2
+            -I "${CMAKE_SOURCE_DIR}/tests"
+            -o "${CMAKE_BINARY_DIR}/concurrent_dlopen_test"
+            "${CMAKE_SOURCE_DIR}/tests/concurrent_dlopen/main.c"
+            -ldl -pthread
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/concurrent_dlopen/main.c"
+    COMMENT "Building test binary: concurrent_dlopen_test"
+)
+add_custom_target(concurrent_dlopen_test DEPENDS "${CMAKE_BINARY_DIR}/concurrent_dlopen_test")
+
+add_custom_target(test_concurrent_dlopen
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_concurrent_dlopen ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${CMAKE_BINARY_DIR}/concurrent.key"
+            --libs       "${CMAKE_BINARY_DIR}/mylib.so"
+            --output-dir "${CMAKE_BINARY_DIR}/encrypted"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/concurrent_dlopen_test"
+            --key    "${CMAKE_BINARY_DIR}/concurrent.key"
+            --output "${CMAKE_BINARY_DIR}/concurrent_dlopen_test.protected"
+    COMMAND ${CMAKE_COMMAND} -E env
+            "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
+            "${CMAKE_BINARY_DIR}/concurrent_dlopen_test.protected"
+            "${CMAKE_BINARY_DIR}/encrypted/mylib.so"
+    DEPENDS stub mylib concurrent_dlopen_test
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "concurrent dlopen thread-safe cache test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_wrong_key — protected binary must fail cleanly with wrong key
 # ═══════════════════════════════════════════════════════════════════════
 
