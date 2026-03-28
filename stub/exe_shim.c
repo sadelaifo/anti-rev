@@ -69,25 +69,16 @@ static char g_inv_short[256];
 __attribute__((constructor))
 static void restore_identity(void)
 {
-    /* Resolve libc realpath symbols from libc.so.6 directly.
-     * RTLD_NEXT won't work when multiple exe_shims are loaded (protected
-     * parent spawns protected child — both add exe_shim to LD_PRELOAD).
-     * RTLD_NEXT from the second shim finds the first shim's realpath
-     * instead of libc's, causing infinite loops or NULL. */
-    void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
-    if (libc) {
-        g_libc_realpath = dlsym(libc, "realpath");
-        g_libc_realpath_chk = dlsym(libc, "__realpath_chk");
-        dlclose(libc);
-    }
-
     const char *real = getenv("ANTIREV_REAL_EXE");
     if (!real)
         return;
 
     /* Check if /proc/self/exe points to a memfd — if so, this process
      * was launched via fexecve and we are the owner. If not, we are a
-     * child process that inherited LD_PRELOAD and should not intercept. */
+     * child process (or shell utility) that inherited LD_PRELOAD and
+     * should not intercept.  This check runs BEFORE any dlopen/dlsym
+     * calls, so utilities like grep/date that don't link libdl won't
+     * crash on missing dlopen symbols. */
     char exe_buf[256];
     ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
                                  "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
@@ -99,6 +90,17 @@ static void restore_identity(void)
         return;
 
     g_owner_pid = getpid();
+
+    /* Resolve libc realpath symbols from libc.so.6 directly.
+     * RTLD_NEXT won't work when multiple exe_shims are loaded (protected
+     * parent spawns protected child — both add exe_shim to LD_PRELOAD).
+     * Only called for protected processes (memfd check passed above). */
+    void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
+    if (libc) {
+        g_libc_realpath = dlsym(libc, "realpath");
+        g_libc_realpath_chk = dlsym(libc, "__realpath_chk");
+        dlclose(libc);
+    }
 
     const char *base = strrchr(real, '/');
     base = base ? base + 1 : real;
