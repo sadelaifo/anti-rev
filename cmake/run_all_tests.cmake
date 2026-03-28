@@ -8,6 +8,7 @@ endif()
 set(TESTS
     run_test              # hello smoke test
     test_dlopen           # dlopen protected .so
+    test_plain_so         # encrypted exe + plain (unencrypted) .so
     test_multi_so         # two protected .so files
     test_linked           # DT_NEEDED library via LD_AUDIT
     test_fork_exec        # fork+exec child inherits audit shim

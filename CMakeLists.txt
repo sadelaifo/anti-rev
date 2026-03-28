@@ -261,6 +261,29 @@ add_custom_target(test_dlopen
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_plain_so — encrypted exe dlopen's an unencrypted (plain) .so
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_test_bin("${CMAKE_BINARY_DIR}/plain_so_main"
+    gcc "${CMAKE_SOURCE_DIR}/tests/plain_so/main.c")
+add_custom_target(plain_so_main DEPENDS "${CMAKE_BINARY_DIR}/plain_so_main")
+
+add_custom_target(test_plain_so
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_plain_so ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/plain_so_main"
+            --key    "${CMAKE_BINARY_DIR}/plain_so.key"
+            --output "${CMAKE_BINARY_DIR}/plain_so_main.protected"
+    COMMAND "${CMAKE_BINARY_DIR}/plain_so_main.protected"
+            "${CMAKE_BINARY_DIR}/mylib.so"
+    DEPENDS stub mylib plain_so_main
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "encrypted exe + plain (unencrypted) .so test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_multi_so — two protected shared libraries loaded via dlopen
 # ═══════════════════════════════════════════════════════════════════════
 
