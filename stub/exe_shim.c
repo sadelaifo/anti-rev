@@ -167,72 +167,71 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf,
 /*  Qt's QCoreApplication::applicationFilePath() uses this path.       */
 /* ------------------------------------------------------------------ */
 
+/* Helper: fill resolved buffer with ANTIREV_REAL_EXE */
+static char *fill_real_exe(char *resolved)
+{
+    const char *real = getenv("ANTIREV_REAL_EXE");
+    if (!real)
+        return NULL;
+    size_t len = strlen(real);
+    if (!resolved) {
+        resolved = malloc(len + 1);
+        if (!resolved)
+            return NULL;
+    }
+    memcpy(resolved, real, len + 1);
+    return resolved;
+}
+
+/* Resolve libc's real realpath once. All three wrappers share this. */
+static char *(*g_libc_realpath)(const char *, char *) = NULL;
+static char *(*g_libc_realpath_chk)(const char *, char *, size_t) = NULL;
+
+__attribute__((constructor(200)))  /* run after restore_identity (default prio) */
+static void resolve_realpath_syms(void)
+{
+    g_libc_realpath = dlsym(RTLD_NEXT, "realpath");
+    g_libc_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
+}
+
 __attribute__((visibility("default")))
 char *realpath(const char *path, char *resolved)
 {
-    if (path && is_self_exe(path)) {
-        const char *real = getenv("ANTIREV_REAL_EXE");
-        if (real) {
-            /* Resolve ANTIREV_REAL_EXE through the real realpath
-             * by calling the raw syscall path resolution.
-             * We can't call libc realpath (that's us), so we just
-             * return the path directly — it's already absolute. */
-            size_t len = strlen(real);
-            if (!resolved) {
-                resolved = malloc(len + 1);
-                if (!resolved)
-                    return NULL;
-            }
-            memcpy(resolved, real, len + 1);
-            return resolved;
-        }
-    }
+    if (path && is_self_exe(path))
+        return fill_real_exe(resolved);
 
-    /* Fallthrough: use dlsym to find the real realpath in libc */
-    static char *(*real_realpath)(const char *, char *) = NULL;
-    if (!real_realpath) {
-        real_realpath = dlsym(RTLD_NEXT, "realpath");
-        if (!real_realpath)
-            return NULL;
-    }
-    return real_realpath(path, resolved);
+    if (g_libc_realpath)
+        return g_libc_realpath(path, resolved);
+    return NULL;
 }
 
-/* GNU extension — same as realpath(path, NULL) */
 __attribute__((visibility("default")))
 char *canonicalize_file_name(const char *path)
 {
-    return realpath(path, NULL);
+    if (path && is_self_exe(path))
+        return fill_real_exe(NULL);
+
+    /* canonicalize_file_name is realpath(path, NULL) */
+    if (g_libc_realpath)
+        return g_libc_realpath(path, NULL);
+    return NULL;
 }
 
-/* __realpath_chk — fortified version called when _FORTIFY_SOURCE is enabled */
 __attribute__((visibility("default")))
 char *__realpath_chk(const char *path, char *resolved, size_t resolved_len)
 {
     if (path && is_self_exe(path)) {
         const char *real = getenv("ANTIREV_REAL_EXE");
-        if (real) {
-            size_t len = strlen(real);
-            if (resolved && len >= resolved_len) {
-                return NULL;  /* buffer too small */
-            }
-            if (!resolved) {
-                resolved = malloc(len + 1);
-                if (!resolved)
-                    return NULL;
-            }
-            memcpy(resolved, real, len + 1);
-            return resolved;
-        }
+        if (real && resolved && strlen(real) >= resolved_len)
+            return NULL;
+        return fill_real_exe(resolved);
     }
 
-    static char *(*real_realpath_chk)(const char *, char *, size_t) = NULL;
-    if (!real_realpath_chk) {
-        real_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
-        if (!real_realpath_chk)
-            return realpath(path, resolved);
-    }
-    return real_realpath_chk(path, resolved, resolved_len);
+    if (g_libc_realpath_chk)
+        return g_libc_realpath_chk(path, resolved, resolved_len);
+    if (g_libc_realpath)
+        return g_libc_realpath(path, resolved);
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
