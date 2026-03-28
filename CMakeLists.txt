@@ -284,6 +284,32 @@ add_custom_target(test_plain_so
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_plain_exe_enc_so — plain exe + encrypted .so via protect.py run
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_test_bin("${CMAKE_BINARY_DIR}/plain_exe_enc_so_main"
+    gcc "${CMAKE_SOURCE_DIR}/tests/plain_exe_enc_so/main.c")
+add_custom_target(plain_exe_enc_so_main
+    DEPENDS "${CMAKE_BINARY_DIR}/plain_exe_enc_so_main")
+
+add_custom_target(test_plain_exe_enc_so
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_plain_exe_enc_so ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${CMAKE_BINARY_DIR}/plain_exe_enc_so.key"
+            --libs       "${CMAKE_BINARY_DIR}/mylib.so"
+            --output-dir "${CMAKE_BINARY_DIR}/encrypted"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" run
+            --key        "${CMAKE_BINARY_DIR}/plain_exe_enc_so.key"
+            --audit-shim "${CMAKE_BINARY_DIR}/audit_shim_x86_64.so"
+            -- "${CMAKE_BINARY_DIR}/plain_exe_enc_so_main"
+               "${CMAKE_BINARY_DIR}/encrypted/mylib.so"
+    DEPENDS audit_shim_x86 mylib plain_exe_enc_so_main
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "plain exe + encrypted .so via protect.py run"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_multi_so — two protected shared libraries loaded via dlopen
 # ═══════════════════════════════════════════════════════════════════════
 
