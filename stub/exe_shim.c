@@ -22,26 +22,49 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
 #include <sys/auxv.h>
 #include <fcntl.h>
 #include <stdarg.h>
 
+/* glibc globals — declared in <errno.h> with _GNU_SOURCE */
+extern char *program_invocation_name;
+extern char *program_invocation_short_name;
+
 /* ------------------------------------------------------------------ */
 /*  Constructor: restore process comm name                             */
 /* ------------------------------------------------------------------ */
 
+/* Static buffers for program_invocation_name/short_name override.
+ * Must outlive the process — cannot be stack or freed. */
+static char g_inv_name[4096];
+static char g_inv_short[256];
+
 __attribute__((constructor))
-static void restore_comm(void)
+static void restore_identity(void)
 {
     const char *real = getenv("ANTIREV_REAL_EXE");
     if (!real)
         return;
     const char *base = strrchr(real, '/');
     base = base ? base + 1 : real;
-    /* PR_SET_NAME truncates to 15 chars (TASK_COMM_LEN - 1) */
+
+    /* Restore process comm (ps -o comm, /proc/pid/comm) */
     prctl(PR_SET_NAME, (unsigned long)base, 0, 0, 0);
+
+    /* Restore program_invocation_name and program_invocation_short_name.
+     * These glibc globals are used by logging frameworks, error messages,
+     * and some path-discovery code. After fexecve from memfd, they point
+     * to the memfd path or argv[0] which may not be the real path. */
+    strncpy(g_inv_name, real, sizeof(g_inv_name) - 1);
+    g_inv_name[sizeof(g_inv_name) - 1] = '\0';
+    strncpy(g_inv_short, base, sizeof(g_inv_short) - 1);
+    g_inv_short[sizeof(g_inv_short) - 1] = '\0';
+
+    program_invocation_name       = g_inv_name;
+    program_invocation_short_name = g_inv_short;
 }
 
 /* ------------------------------------------------------------------ */
@@ -110,6 +133,23 @@ ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)
         }
     }
     return (ssize_t)syscall(SYS_readlinkat, dirfd, path, buf, bufsiz);
+}
+
+/* Fortified variants — called when compiled with _FORTIFY_SOURCE >= 1 */
+__attribute__((visibility("default")))
+ssize_t __readlink_chk(const char *path, char *buf, size_t bufsiz,
+                       size_t buflen)
+{
+    (void)buflen;
+    return readlink(path, buf, bufsiz);
+}
+
+__attribute__((visibility("default")))
+ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf,
+                         size_t bufsiz, size_t buflen)
+{
+    (void)buflen;
+    return readlinkat(dirfd, path, buf, bufsiz);
 }
 
 /* ------------------------------------------------------------------ */
