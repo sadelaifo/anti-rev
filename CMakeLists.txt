@@ -551,6 +551,52 @@ add_custom_target(test_realpath
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_path_stress — comprehensive path resolution stress test
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/path_stress_test"
+    COMMAND gcc -O2
+            -o "${CMAKE_BINARY_DIR}/path_stress_test"
+            "${CMAKE_SOURCE_DIR}/tests/path_stress/main.c"
+            -ldl
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/path_stress/main.c"
+    COMMENT "Building test binary: path_stress_test"
+)
+add_custom_target(path_stress_test DEPENDS "${CMAKE_BINARY_DIR}/path_stress_test")
+
+# Without --has-libs (no LD_AUDIT)
+add_custom_target(test_path_stress
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_path_stress no_audit ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/path_stress_test"
+            --key    "${CMAKE_BINARY_DIR}/path_stress.key"
+            --output "${CMAKE_BINARY_DIR}/path_stress_test.protected"
+    COMMAND "${CMAKE_BINARY_DIR}/path_stress_test.protected"
+    DEPENDS stub path_stress_test
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "path stress test (exe-only, no LD_AUDIT)"
+    USES_TERMINAL
+)
+
+# With --has-libs (LD_AUDIT active) — matches user's real scenario
+add_custom_target(test_path_stress_audit
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_path_stress with_audit ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/path_stress_test"
+            --key    "${CMAKE_BINARY_DIR}/path_stress_audit.key"
+            --output "${CMAKE_BINARY_DIR}/path_stress_test_audit.protected"
+            --has-libs
+    COMMAND "${CMAKE_BINARY_DIR}/path_stress_test_audit.protected"
+    DEPENDS stub path_stress_test
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "path stress test (with LD_AUDIT active)"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_getauxval — getauxval(AT_EXECFN) returns real path, not memfd
 # ═══════════════════════════════════════════════════════════════════════
 
