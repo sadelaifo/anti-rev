@@ -12,24 +12,6 @@ else()
     message(STATUS "aarch64-linux-gnu-gcc not found — skipping ARM64 targets")
 endif()
 
-# ── Helper: compile the audit shim (includes crypto.c) ────────────────
-# Usage: compile_audit_shim(<output.so> <compiler>)
-function(compile_audit_shim OUTPUT COMPILER)
-    add_custom_command(
-        OUTPUT  "${OUTPUT}"
-        COMMAND "${COMPILER}" -shared -fPIC -O2 -fvisibility=hidden
-                -I "${CMAKE_SOURCE_DIR}/stub"
-                -o "${OUTPUT}"
-                "${CMAKE_SOURCE_DIR}/stub/audit_shim.c"
-                "${CMAKE_SOURCE_DIR}/stub/crypto.c"
-                -ldl
-        DEPENDS "${CMAKE_SOURCE_DIR}/stub/audit_shim.c"
-                "${CMAKE_SOURCE_DIR}/stub/crypto.c"
-                "${CMAKE_SOURCE_DIR}/stub/crypto.h"
-        COMMENT "Building audit shim: ${OUTPUT}"
-    )
-endfunction()
-
 # ── Helper: compile the exe shim (readlink interceptor) ───────────────
 # Usage: compile_exe_shim(<output.so> <compiler>)
 function(compile_exe_shim OUTPUT COMPILER)
@@ -57,8 +39,8 @@ function(make_blob_header OUTPUT INPUT VARNAME DEP)
 endfunction()
 
 # ── Helper: build a stub binary with a given compiler ─────────────────
-# Usage: build_stub(<output> <compiler> <stripper> <audit_blob_dep> <exe_blob_dep>)
-function(build_stub OUTPUT COMPILER STRIPPER AUDIT_BLOB_DEP EXE_BLOB_DEP)
+# Usage: build_stub(<output> <compiler> <stripper> <exe_blob_dep>)
+function(build_stub OUTPUT COMPILER STRIPPER EXE_BLOB_DEP)
     # Extra flags: pass -static for cross-compiled (non-native) stubs so they run
     # on QEMU user-mode (no ARM64 dynamic linker on the host) and on embedded targets.
     # Native x86-64 stub stays dynamically linked (faster startup, smaller binary).
@@ -80,7 +62,6 @@ function(build_stub OUTPUT COMPILER STRIPPER AUDIT_BLOB_DEP EXE_BLOB_DEP)
             "${CMAKE_SOURCE_DIR}/stub/stub.c"
             "${CMAKE_SOURCE_DIR}/stub/crypto.c"
             "${CMAKE_SOURCE_DIR}/stub/crypto.h"
-            "${AUDIT_BLOB_DEP}"
             "${EXE_BLOB_DEP}"
         COMMENT "Building and stripping stub: ${OUTPUT}"
     )
@@ -92,17 +73,8 @@ endfunction()
 
 set(STUB_X86    "${CMAKE_BINARY_DIR}/stub")
 
-set(AUDIT_X86        "${CMAKE_BINARY_DIR}/audit_shim_x86_64.so")
-set(AUDIT_BLOB_X86_H "${CMAKE_BINARY_DIR}/audit_shim_blob.h")
-
 set(EXE_SHIM_X86        "${CMAKE_BINARY_DIR}/exe_shim_x86_64.so")
 set(EXE_SHIM_BLOB_X86_H "${CMAKE_BINARY_DIR}/exe_shim_blob.h")
-
-compile_audit_shim("${AUDIT_X86}" gcc)
-add_custom_target(audit_shim_x86 DEPENDS "${AUDIT_X86}")
-
-make_blob_header("${AUDIT_BLOB_X86_H}" "${AUDIT_X86}" "audit_shim_blob" "${AUDIT_X86}")
-add_custom_target(audit_shim_blob_h DEPENDS "${AUDIT_BLOB_X86_H}")
 
 compile_exe_shim("${EXE_SHIM_X86}" gcc)
 add_custom_target(exe_shim_x86 DEPENDS "${EXE_SHIM_X86}")
@@ -110,7 +82,7 @@ add_custom_target(exe_shim_x86 DEPENDS "${EXE_SHIM_X86}")
 make_blob_header("${EXE_SHIM_BLOB_X86_H}" "${EXE_SHIM_X86}" "exe_shim_blob" "${EXE_SHIM_X86}")
 add_custom_target(exe_shim_blob_h DEPENDS "${EXE_SHIM_BLOB_X86_H}")
 
-build_stub("${STUB_X86}" gcc strip "${AUDIT_BLOB_X86_H}" "${EXE_SHIM_BLOB_X86_H}")
+build_stub("${STUB_X86}" gcc strip "${EXE_SHIM_BLOB_X86_H}")
 add_custom_target(stub ALL DEPENDS "${STUB_X86}")
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -120,17 +92,8 @@ add_custom_target(stub ALL DEPENDS "${STUB_X86}")
 if(AARCH64_GCC)
     set(STUB_ARM64       "${CMAKE_BINARY_DIR}/stub_aarch64")
 
-    set(AUDIT_ARM64        "${CMAKE_BINARY_DIR}/audit_shim_aarch64.so")
-    set(AUDIT_BLOB_ARM64_H "${CMAKE_BINARY_DIR}/audit_shim_blob_aarch64.h")
-
     set(EXE_SHIM_ARM64        "${CMAKE_BINARY_DIR}/exe_shim_aarch64.so")
     set(EXE_SHIM_BLOB_ARM64_H "${CMAKE_BINARY_DIR}/exe_shim_blob_aarch64.h")
-
-    compile_audit_shim("${AUDIT_ARM64}" "${AARCH64_GCC}")
-    add_custom_target(audit_shim_aarch64 DEPENDS "${AUDIT_ARM64}")
-
-    make_blob_header("${AUDIT_BLOB_ARM64_H}" "${AUDIT_ARM64}" "audit_shim_blob" "${AUDIT_ARM64}")
-    add_custom_target(audit_shim_blob_aarch64_h DEPENDS "${AUDIT_BLOB_ARM64_H}")
 
     compile_exe_shim("${EXE_SHIM_ARM64}" "${AARCH64_GCC}")
     add_custom_target(exe_shim_aarch64 DEPENDS "${EXE_SHIM_ARM64}")
@@ -138,7 +101,7 @@ if(AARCH64_GCC)
     make_blob_header("${EXE_SHIM_BLOB_ARM64_H}" "${EXE_SHIM_ARM64}" "exe_shim_blob" "${EXE_SHIM_ARM64}")
     add_custom_target(exe_shim_blob_aarch64_h DEPENDS "${EXE_SHIM_BLOB_ARM64_H}")
 
-    build_stub("${STUB_ARM64}" "${AARCH64_GCC}" aarch64-linux-gnu-strip "${AUDIT_BLOB_ARM64_H}" "${EXE_SHIM_BLOB_ARM64_H}")
+    build_stub("${STUB_ARM64}" "${AARCH64_GCC}" aarch64-linux-gnu-strip "${EXE_SHIM_BLOB_ARM64_H}")
     add_custom_target(stub_aarch64 ALL DEPENDS "${STUB_ARM64}")
 endif()
 
@@ -251,7 +214,6 @@ add_custom_target(test_dlopen
             --main   "${CMAKE_BINARY_DIR}/dlopen_main"
             --key    "${CMAKE_BINARY_DIR}/dlopen.key"
             --output "${CMAKE_BINARY_DIR}/dlopen_main.protected"
-            --has-libs
     COMMAND ${CMAKE_COMMAND}
             "-DBINARY=${CMAKE_BINARY_DIR}/dlopen_main.protected"
             "-DLD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
@@ -289,28 +251,6 @@ add_custom_target(test_plain_so
 #  test_plain_exe_enc_so — plain exe + encrypted .so via protect.py run
 # ═══════════════════════════════════════════════════════════════════════
 
-compile_test_bin("${CMAKE_BINARY_DIR}/plain_exe_enc_so_main"
-    gcc "${CMAKE_SOURCE_DIR}/tests/plain_exe_enc_so/main.c")
-add_custom_target(plain_exe_enc_so_main
-    DEPENDS "${CMAKE_BINARY_DIR}/plain_exe_enc_so_main")
-
-add_custom_target(test_plain_exe_enc_so
-    COMMAND ${CMAKE_COMMAND} -E echo "=== test_plain_exe_enc_so ==="
-    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
-            --key        "${CMAKE_BINARY_DIR}/plain_exe_enc_so.key"
-            --libs       "${CMAKE_BINARY_DIR}/mylib.so"
-            --output-dir "${CMAKE_BINARY_DIR}/encrypted"
-    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" run
-            --key        "${CMAKE_BINARY_DIR}/plain_exe_enc_so.key"
-            --audit-shim "${CMAKE_BINARY_DIR}/audit_shim_x86_64.so"
-            -- "${CMAKE_BINARY_DIR}/plain_exe_enc_so_main"
-               "${CMAKE_BINARY_DIR}/encrypted/mylib.so"
-    DEPENDS audit_shim_x86 mylib plain_exe_enc_so_main
-    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "plain exe + encrypted .so via protect.py run"
-    USES_TERMINAL
-)
-
 # ═══════════════════════════════════════════════════════════════════════
 #  test_multi_so — two protected shared libraries loaded via dlopen
 # ═══════════════════════════════════════════════════════════════════════
@@ -338,7 +278,6 @@ add_custom_target(test_multi_so
             --main   "${CMAKE_BINARY_DIR}/multi_main"
             --key    "${CMAKE_BINARY_DIR}/multi.key"
             --output "${CMAKE_BINARY_DIR}/multi_main.protected"
-            --has-libs
     COMMAND ${CMAKE_COMMAND}
             "-DBINARY=${CMAKE_BINARY_DIR}/multi_main.protected"
             "-DLD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
@@ -381,7 +320,6 @@ add_custom_target(test_linked
             --main   "${CMAKE_BINARY_DIR}/linked_main"
             --key    "${CMAKE_BINARY_DIR}/linked.key"
             --output "${CMAKE_BINARY_DIR}/linked_main.protected"
-            --has-libs
     COMMAND ${CMAKE_COMMAND}
             "-DBINARY=${CMAKE_BINARY_DIR}/linked_main.protected"
             "-DLD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
@@ -416,7 +354,6 @@ add_custom_target(test_fork_exec
             --main   "${CMAKE_BINARY_DIR}/fork_exec_parent"
             --key    "${CMAKE_BINARY_DIR}/fork_exec.key"
             --output "${CMAKE_BINARY_DIR}/fork_exec_parent.protected"
-            --has-libs
     COMMAND ${CMAKE_COMMAND} -E env
             "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
             "${CMAKE_BINARY_DIR}/fork_exec_parent.protected"
@@ -468,19 +405,16 @@ add_custom_target(test_multi_process
             --main   "${CMAKE_BINARY_DIR}/work_process"
             --key    "${CMAKE_BINARY_DIR}/multi_process.key"
             --output "${CMAKE_BINARY_DIR}/work_process.protected"
-            --has-libs
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/grpc_daemon_sim"
             --key    "${CMAKE_BINARY_DIR}/multi_process.key"
             --output "${CMAKE_BINARY_DIR}/grpc_daemon_sim.protected"
-            --has-libs
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/pm_sim"
             --key    "${CMAKE_BINARY_DIR}/multi_process.key"
             --output "${CMAKE_BINARY_DIR}/pm_sim.protected"
-            --has-libs
     # Run the orchestration script
     COMMAND bash "${CMAKE_SOURCE_DIR}/tests/multi_process/run_test.sh"
             "${CMAKE_BINARY_DIR}/grpc_daemon_sim.protected"
@@ -576,23 +510,7 @@ add_custom_target(test_path_stress
     COMMAND "${CMAKE_BINARY_DIR}/path_stress_test.protected"
     DEPENDS stub path_stress_test
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "path stress test (exe-only, no LD_AUDIT)"
-    USES_TERMINAL
-)
-
-# With --has-libs (LD_AUDIT active) — matches user's real scenario
-add_custom_target(test_path_stress_audit
-    COMMAND ${CMAKE_COMMAND} -E echo "=== test_path_stress with_audit ==="
-    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
-            --stub   "${CMAKE_BINARY_DIR}/stub"
-            --main   "${CMAKE_BINARY_DIR}/path_stress_test"
-            --key    "${CMAKE_BINARY_DIR}/path_stress_audit.key"
-            --output "${CMAKE_BINARY_DIR}/path_stress_test_audit.protected"
-            --has-libs
-    COMMAND "${CMAKE_BINARY_DIR}/path_stress_test_audit.protected"
-    DEPENDS stub path_stress_test
-    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "path stress test (with LD_AUDIT active)"
+    COMMENT "path stress test"
     USES_TERMINAL
 )
 
@@ -699,7 +617,6 @@ add_custom_target(test_daemon_fdclose
             --main   "${CMAKE_BINARY_DIR}/daemon_fdclose_test"
             --key    "${CMAKE_BINARY_DIR}/daemon_fdclose.key"
             --output "${CMAKE_BINARY_DIR}/daemon_fdclose_test.protected"
-            --has-libs
     COMMAND ${CMAKE_COMMAND} -E env
             "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
             "${CMAKE_BINARY_DIR}/daemon_fdclose_test.protected"
@@ -737,7 +654,6 @@ add_custom_target(test_concurrent_dlopen
             --main   "${CMAKE_BINARY_DIR}/concurrent_dlopen_test"
             --key    "${CMAKE_BINARY_DIR}/concurrent.key"
             --output "${CMAKE_BINARY_DIR}/concurrent_dlopen_test.protected"
-            --has-libs
     COMMAND ${CMAKE_COMMAND} -E env
             "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
             "${CMAKE_BINARY_DIR}/concurrent_dlopen_test.protected"
