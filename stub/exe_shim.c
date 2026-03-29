@@ -17,8 +17,9 @@
  * and fail to locate config files, sockets, or other resources relative to the
  * binary's real path.
  *
- * Uses raw syscalls for fallthrough — no recursion risk, no dlsym dependency
- * (except for realpath where raw syscall fallthrough is not possible).
+ * Uses raw syscalls for fallthrough — no recursion risk.
+ * Linked with -ldl for realpath resolution (dlopen/dlsym to find libc's
+ * realpath, since raw syscall fallthrough is not possible for realpath).
  */
 
 #define _GNU_SOURCE
@@ -32,23 +33,7 @@
 #include <sys/auxv.h>
 #include <fcntl.h>
 
-/* Weak references to dlopen/dlsym/dlclose — these may not be available
- * in simple utilities (grep, date, etc.) that don't link libdl.
- * On glibc 2.34+ they're in libc itself, on older systems in libdl.so. */
-__attribute__((weak)) void *dlopen(const char *, int);
-__attribute__((weak)) void *dlsym(void *, const char *);
-__attribute__((weak)) int   dlclose(void *);
-
-/* dl constants — define ourselves to avoid needing dlfcn.h */
-#ifndef RTLD_NEXT
-#  define RTLD_NEXT    ((void *) -1L)
-#endif
-#ifndef RTLD_LAZY
-#  define RTLD_LAZY    0x00001
-#endif
-#ifndef RTLD_NOLOAD
-#  define RTLD_NOLOAD  0x00004
-#endif
+#include <dlfcn.h>
 
 /* glibc globals — declared in <errno.h> with _GNU_SOURCE */
 extern char *program_invocation_name;
@@ -91,36 +76,24 @@ static void resolve_libc_realpath(void)
         return;
 
     /* Method 1: dlopen libc directly (safe with multiple exe_shims) */
-    if (dlopen && dlsym) {
-        void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
-        fprintf(stderr, "[exe_shim] resolve: dlopen=%p dlsym=%p libc_handle=%p\n",
-                (void *)(uintptr_t)dlopen, (void *)(uintptr_t)dlsym, libc);
-        if (libc) {
-            g_libc_realpath = dlsym(libc, "realpath");
-            g_libc_realpath_chk = dlsym(libc, "__realpath_chk");
-            fprintf(stderr, "[exe_shim] resolve: method1 realpath=%p chk=%p\n",
-                    (void *)(uintptr_t)g_libc_realpath, (void *)(uintptr_t)g_libc_realpath_chk);
-            if (dlclose) dlclose(libc);
-            if (g_libc_realpath)
-                return;
-        }
-        /* Method 2: RTLD_NEXT (works when only one exe_shim loaded) */
-        g_libc_realpath = dlsym(RTLD_NEXT, "realpath");
-        g_libc_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
-        fprintf(stderr, "[exe_shim] resolve: method2 realpath=%p chk=%p\n",
-                (void *)(uintptr_t)g_libc_realpath, (void *)(uintptr_t)g_libc_realpath_chk);
-    } else {
-        fprintf(stderr, "[exe_shim] resolve: dlopen=%p dlsym=%p (skipped)\n",
-                (void *)(uintptr_t)dlopen, (void *)(uintptr_t)dlsym);
+    void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
+    if (libc) {
+        g_libc_realpath = dlsym(libc, "realpath");
+        g_libc_realpath_chk = dlsym(libc, "__realpath_chk");
+        dlclose(libc);
+        if (g_libc_realpath)
+            return;
     }
+    /* Method 2: RTLD_NEXT (works when only one exe_shim loaded) */
+    g_libc_realpath = dlsym(RTLD_NEXT, "realpath");
+    g_libc_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
 }
 
 __attribute__((constructor))
 static void restore_identity(void)
 {
     /* Resolve libc realpath for ALL processes — needed for the realpath
-     * wrapper fallthrough even in non-protected child processes. Uses
-     * weak dlopen/dlsym so it won't crash utilities that lack libdl. */
+     * wrapper fallthrough even in non-protected child processes. */
     resolve_libc_realpath();
 
     const char *real = getenv("ANTIREV_REAL_EXE");

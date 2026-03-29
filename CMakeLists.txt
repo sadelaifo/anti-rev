@@ -38,6 +38,7 @@ function(compile_exe_shim OUTPUT COMPILER)
         COMMAND "${COMPILER}" -shared -fPIC -O2 -fvisibility=hidden
                 -o "${OUTPUT}"
                 "${CMAKE_SOURCE_DIR}/stub/exe_shim.c"
+                -ldl
         DEPENDS "${CMAKE_SOURCE_DIR}/stub/exe_shim.c"
         COMMENT "Building exe shim: ${OUTPUT}"
     )
