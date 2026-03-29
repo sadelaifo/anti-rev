@@ -152,7 +152,8 @@ def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
             f"{len(data):>10,} -> {out_size:>10,} bytes")
 
 
-def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes) -> str:
+def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
+                        has_libs: bool = False) -> str:
     """Encrypt and bundle an executable in-process. Returns status string."""
     src_p  = Path(src)
     stub_p = Path(stub)
@@ -170,7 +171,8 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes) -> str:
     entry += struct.pack("<Q", len(ct))
     entry += ct
 
-    bundle = struct.pack("<I", 1) + entry
+    bundle_flags = 0x01 if has_libs else 0x00
+    bundle = struct.pack("<IB", 1, bundle_flags) + entry
 
     stub_data     = stub_p.read_bytes()
     bundle_offset = len(stub_data)
@@ -311,8 +313,11 @@ def main():
         print()
 
     # ── Protect executables (parallel) ────────────────────────────────
+    has_libs = len(lib_files) > 0
     if exe_files:
         print(f"[pack] Protecting {len(exe_files)} executable(s)...")
+        if has_libs:
+            print(f"[pack]   (has_external_libs flag set — LD_AUDIT will be injected)")
         for rel, arch, src in exe_files:
             if arch not in stubs:
                 sys.exit(f"[error] no stub for arch '{arch}' "
@@ -325,6 +330,7 @@ def main():
                     str(stubs[arch]),
                     str(output_dir / rel),
                     key,
+                    has_libs,
                 ): rel
                 for rel, arch, src in exe_files
             }

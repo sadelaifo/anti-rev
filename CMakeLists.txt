@@ -250,6 +250,7 @@ add_custom_target(test_dlopen
             --main   "${CMAKE_BINARY_DIR}/dlopen_main"
             --key    "${CMAKE_BINARY_DIR}/dlopen.key"
             --output "${CMAKE_BINARY_DIR}/dlopen_main.protected"
+            --has-libs
     COMMAND ${CMAKE_COMMAND}
             "-DBINARY=${CMAKE_BINARY_DIR}/dlopen_main.protected"
             "-DLD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
@@ -336,6 +337,7 @@ add_custom_target(test_multi_so
             --main   "${CMAKE_BINARY_DIR}/multi_main"
             --key    "${CMAKE_BINARY_DIR}/multi.key"
             --output "${CMAKE_BINARY_DIR}/multi_main.protected"
+            --has-libs
     COMMAND ${CMAKE_COMMAND}
             "-DBINARY=${CMAKE_BINARY_DIR}/multi_main.protected"
             "-DLD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
@@ -378,6 +380,7 @@ add_custom_target(test_linked
             --main   "${CMAKE_BINARY_DIR}/linked_main"
             --key    "${CMAKE_BINARY_DIR}/linked.key"
             --output "${CMAKE_BINARY_DIR}/linked_main.protected"
+            --has-libs
     COMMAND ${CMAKE_COMMAND}
             "-DBINARY=${CMAKE_BINARY_DIR}/linked_main.protected"
             "-DLD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
@@ -412,6 +415,7 @@ add_custom_target(test_fork_exec
             --main   "${CMAKE_BINARY_DIR}/fork_exec_parent"
             --key    "${CMAKE_BINARY_DIR}/fork_exec.key"
             --output "${CMAKE_BINARY_DIR}/fork_exec_parent.protected"
+            --has-libs
     COMMAND ${CMAKE_COMMAND} -E env
             "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
             "${CMAKE_BINARY_DIR}/fork_exec_parent.protected"
@@ -463,16 +467,19 @@ add_custom_target(test_multi_process
             --main   "${CMAKE_BINARY_DIR}/work_process"
             --key    "${CMAKE_BINARY_DIR}/multi_process.key"
             --output "${CMAKE_BINARY_DIR}/work_process.protected"
+            --has-libs
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/grpc_daemon_sim"
             --key    "${CMAKE_BINARY_DIR}/multi_process.key"
             --output "${CMAKE_BINARY_DIR}/grpc_daemon_sim.protected"
+            --has-libs
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/pm_sim"
             --key    "${CMAKE_BINARY_DIR}/multi_process.key"
             --output "${CMAKE_BINARY_DIR}/pm_sim.protected"
+            --has-libs
     # Run the orchestration script
     COMMAND bash "${CMAKE_SOURCE_DIR}/tests/multi_process/run_test.sh"
             "${CMAKE_BINARY_DIR}/grpc_daemon_sim.protected"
@@ -645,6 +652,7 @@ add_custom_target(test_daemon_fdclose
             --main   "${CMAKE_BINARY_DIR}/daemon_fdclose_test"
             --key    "${CMAKE_BINARY_DIR}/daemon_fdclose.key"
             --output "${CMAKE_BINARY_DIR}/daemon_fdclose_test.protected"
+            --has-libs
     COMMAND ${CMAKE_COMMAND} -E env
             "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
             "${CMAKE_BINARY_DIR}/daemon_fdclose_test.protected"
@@ -682,6 +690,7 @@ add_custom_target(test_concurrent_dlopen
             --main   "${CMAKE_BINARY_DIR}/concurrent_dlopen_test"
             --key    "${CMAKE_BINARY_DIR}/concurrent.key"
             --output "${CMAKE_BINARY_DIR}/concurrent_dlopen_test.protected"
+            --has-libs
     COMMAND ${CMAKE_COMMAND} -E env
             "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
             "${CMAKE_BINARY_DIR}/concurrent_dlopen_test.protected"
