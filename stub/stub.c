@@ -274,17 +274,29 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         return 1;
     }
 
-    /* 3. Write key to memfd (audit shim reads it after fexecve via ANTIREV_KEY_FD) */
-    int key_fd = make_memfd("antirev_key");
-    if (key_fd < 0) return 1;
-    if (write_chunk(key_fd, key, KEY_SIZE) != 0) return 1;
-    if (lseek(key_fd, 0, SEEK_SET) < 0) { perror("lseek key_fd"); return 1; }
+    /* Check if bundle contains any non-main files (encrypted .so libs) 
+        If not, skip LD_AUDIT - the audit shim is unnecessary and can 
+        interfere with library loading (e.g. QT)  */
+    int has_libs = 0;
+    for (uint32_t i = 0; i < nfiles; i++) {
+        if (!entries[i].is_main) { has_libs = 1; break; }
+    }
 
-    /* 4. Write embedded audit shim to memfd */
-    int audit_shim_fd = make_memfd("antirev_audit_shim.so");
-    if (audit_shim_fd < 0) return 1;
-    if (write_chunk(audit_shim_fd, audit_shim_blob, audit_shim_blob_len) != 0) return 1;
-    if (lseek(audit_shim_fd, 0, SEEK_SET) < 0) { perror("lseek audit_shim"); return 1; }
+    /* 3. Write key + audit shim to memfds (only if encrypted libs exist) */
+    int key_fd = -1;
+    int audit_shim_fd = -1;
+
+    if (has_libs) {
+        key_fd = make_memfd("antirev_key");
+        if (key_fd < 0) return 1;
+        if (write_chunk(key_fd, key, KEY_SIZE) != 0) return 1;
+        if (lseek(key_fd, 0, SEEK_SET) < 0) { perror("lseek key_fd"); return 1; }
+        
+        audit_shim_fd = make_memfd("antirev_audit_shim.so");
+        if (audit_shim_fd < 0) return 1;
+        if (write_chunk(audit_shim_fd, audit_shim_blob, audit_shim_blob_len) != 0) return 1;
+        if (lseek(audit_shim_fd, 0, SEEK_SET) < 0) { perror("lseek audit_shim"); return 1; }
+    }
 
     /* Wipe key and chunk buffer */
     explicit_bzero(key,   sizeof(key));
@@ -321,14 +333,17 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     char real_exe_entry[4096 + 32];
     char main_fd_entry[32];
 
-    snprintf(ld_audit_entry, sizeof(ld_audit_entry),
+    ld_audit_entry[0] = '\0';
+    key_fd_entry[0]   = '\0';
+    key_hex_entry[0]  = '\0';
+
+    if (has_libs) {
+        snprintf(ld_audit_entry, sizeof(ld_audit_entry),
              "LD_AUDIT=/proc/self/fd/%d", audit_shim_fd);
-    snprintf(key_fd_entry, sizeof(key_fd_entry),
+        snprintf(key_fd_entry, sizeof(key_fd_entry),
              "ANTIREV_KEY_FD=%d", key_fd);
 
-    /* Encode key as hex for ANTIREV_KEY_HEX (survives daemon fd-close).
-     * We already wiped the key[] array, so re-read from key_fd. */
-    {
+        /* Encode key as hex for ANTIREV_KEY_HEX (survives daemon fd-close) */
         uint8_t key_tmp[KEY_SIZE];
         if (pread(key_fd, key_tmp, KEY_SIZE, 0) != KEY_SIZE) {
             perror("pread key_fd for hex"); return 1;
@@ -366,9 +381,11 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         if (strncmp(envp[j], "ANTIREV_MAIN_FD=",  16) == 0) continue;
         new_env[ei++] = envp[j];
     }
+    if (has_libs) {
     new_env[ei++] = ld_audit_entry;
     new_env[ei++] = key_fd_entry;
     new_env[ei++] = key_hex_entry;
+    }
     new_env[ei++] = real_exe_entry;
     new_env[ei++] = main_fd_entry;
     new_env[ei++] = ld_preload_entry;

@@ -64,7 +64,7 @@ EM_X86_64  = 62
 EM_AARCH64 = 183
 
 
-def classify_elf(path: Path) -> tuple[str, str] | None:
+def classify_elf(path: Path) -> tuple[str, str]:
     """Classify an ELF file. Returns (kind, arch) or None if not ELF.
 
     kind: 'exe' or 'lib'
