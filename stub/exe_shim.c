@@ -243,6 +243,10 @@ char *realpath(const char *path, char *resolved)
     if (path && is_self_exe(path))
         return fill_real_exe(resolved);
 
+    /* Lazy retry: constructor may fail when LD_AUDIT is active (linker
+       holds internal locks during early init, breaking dlopen/dlsym). */
+    if (!g_libc_realpath)
+        resolve_libc_realpath();
     if (g_libc_realpath)
         return g_libc_realpath(path, resolved);
     return NULL;
@@ -254,6 +258,8 @@ char *canonicalize_file_name(const char *path)
     if (path && is_self_exe(path))
         return fill_real_exe(NULL);
 
+    if (!g_libc_realpath)
+        resolve_libc_realpath();
     if (g_libc_realpath)
         return g_libc_realpath(path, NULL);
     return NULL;
@@ -269,6 +275,8 @@ char *__realpath_chk(const char *path, char *resolved, size_t resolved_len)
         return fill_real_exe(resolved);
     }
 
+    if (!g_libc_realpath_chk && !g_libc_realpath)
+        resolve_libc_realpath();
     if (g_libc_realpath_chk)
         return g_libc_realpath_chk(path, resolved, resolved_len);
     if (g_libc_realpath)
