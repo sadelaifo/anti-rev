@@ -83,7 +83,7 @@ def cmd_protect_exe(args):
 
     key = load_or_create_key(key_path)
 
-    # Bundle: [num_files:4B] [entry...]
+    # Bundle: [num_files:4B] [bundle_flags:1B] [entry...]
     data   = main_path.read_bytes()
     iv, tag, ct = encrypt_data(data, key)
     name_b = main_path.name.encode()
@@ -96,7 +96,8 @@ def cmd_protect_exe(args):
     entry += struct.pack("<Q", len(ct))
     entry += ct
 
-    bundle = struct.pack("<I", 1) + entry   # num_files = 1
+    bundle_flags = 0x01 if args.has_libs else 0x00
+    bundle = struct.pack("<IB", 1, bundle_flags) + entry   # num_files = 1
 
     stub_data     = stub_path.read_bytes()
     bundle_offset = len(stub_data)
@@ -178,6 +179,8 @@ def main():
     pe.add_argument("--main",   required=True, help="Main ELF to protect")
     pe.add_argument("--key",    required=True, help="Key file (hex); created if absent")
     pe.add_argument("--output", required=True, help="Output protected binary")
+    pe.add_argument("--has-libs", action="store_true", default=False,
+                    help="Signal that encrypted libs exist externally (enables LD_AUDIT)")
 
     # encrypt-lib
     el = sub.add_parser("encrypt-lib", help="Encrypt shared library file(s) in-place")

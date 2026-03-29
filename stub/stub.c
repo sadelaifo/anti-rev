@@ -2,7 +2,8 @@
  * antirev stub launcher
  *
  * Appended-bundle format (at end of this binary after protection):
- *   [num_files : 4 B LE]
+ *   [num_files     : 4 B LE]
+ *   [bundle_flags  : 1 B]        bit0 = has_external_libs
  *   for each file:
  *     [name_len : 2 B LE] [name : name_len bytes] [flags : 1 B] (bit0 = is_main)
  *     [iv       : 12 B]
@@ -165,18 +166,19 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * ---------------------------------------------------------------- */
     uint8_t tmp[2 + MAX_NAME + 1 + IV_SIZE + TAG_SIZE + 8]; /* max header */
 
-    /* Read num_files (4 bytes) */
-    if (pread(self, tmp, 4, (off_t)bundle_off) != 4) {
+    /* Read num_files (4 bytes) + bundle_flags (1 byte) */
+    if (pread(self, tmp, 5, (off_t)bundle_off) != 5) {
         perror("pread num_files"); return 1;
     }
     uint32_t nfiles = u32le(tmp);
+    uint8_t  bundle_flags = tmp[4];
     if (nfiles > MAX_FILES) {
         fprintf(stderr, "[antirev] too many files in bundle (%u)\n", nfiles);
         return 1;
     }
 
     file_entry_t entries[MAX_FILES];
-    off_t scan = (off_t)bundle_off + 4;
+    off_t scan = (off_t)bundle_off + 5;
 
     for (uint32_t i = 0; i < nfiles; i++) {
         file_entry_t *e = &entries[i];
@@ -274,12 +276,15 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         return 1;
     }
 
-    /* Check if bundle contains any non-main files (encrypted .so libs) 
-        If not, skip LD_AUDIT - the audit shim is unnecessary and can 
-        interfere with library loading (e.g. QT)  */
-    int has_libs = 0;
-    for (uint32_t i = 0; i < nfiles; i++) {
-        if (!entries[i].is_main) { has_libs = 1; break; }
+    /* Check if encrypted libs exist — either bundled or external.
+       bit0 of bundle_flags = has_external_libs (set by packer).
+       Also check for non-main files in the bundle itself.
+       If neither, skip LD_AUDIT to avoid interfering with library loading. */
+    int has_libs = (bundle_flags & 0x01) != 0;
+    if (!has_libs) {
+        for (uint32_t i = 0; i < nfiles; i++) {
+            if (!entries[i].is_main) { has_libs = 1; break; }
+        }
     }
 
     /* 3. Write key + audit shim to memfds (only if encrypted libs exist) */
