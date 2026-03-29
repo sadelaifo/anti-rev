@@ -248,7 +248,6 @@ char *realpath(const char *path, char *resolved)
     return NULL;
 }
 
-/* GNU extension — same as realpath(path, NULL) */
 __attribute__((visibility("default")))
 char *canonicalize_file_name(const char *path)
 {
@@ -260,7 +259,6 @@ char *canonicalize_file_name(const char *path)
     return NULL;
 }
 
-/* __realpath_chk — fortified version called when _FORTIFY_SOURCE is enabled */
 __attribute__((visibility("default")))
 char *__realpath_chk(const char *path, char *resolved, size_t resolved_len)
 {
