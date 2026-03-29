@@ -3,17 +3,22 @@
  *
  * Intercepts:
  *   - readlink/readlinkat for "/proc/self/exe" → returns ANTIREV_REAL_EXE
+ *   - __readlink_chk/__readlinkat_chk (fortified variants)
  *   - realpath/canonicalize_file_name for /proc/self/exe → returns real path
  *   - getauxval(AT_EXECFN)                     → returns ANTIREV_REAL_EXE
  *   - prctl(PR_SET_NAME) in constructor         → restores original process name
  *   - program_invocation_name/short_name        → patched in constructor
  *
+ * All interceptions only activate for the protected process itself (detected
+ * by checking if /proc/self/exe points to a memfd). Child processes that
+ * inherit LD_PRELOAD pass through to real libc functions untouched.
+ *
  * Without this, code that reads /proc/self/exe would see "/memfd:name (deleted)"
  * and fail to locate config files, sockets, or other resources relative to the
- * binary's real path. Programs that self-read (checksumming, license verification)
- * would read the encrypted stub+bundle instead of the original binary.
+ * binary's real path.
  *
- * Uses raw syscalls for fallthrough — no recursion risk, no dlsym dependency.
+ * Uses raw syscalls for fallthrough — no recursion risk, no dlsym dependency
+ * (except for realpath where raw syscall fallthrough is not possible).
  */
 
 #define _GNU_SOURCE
@@ -21,25 +26,37 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <dlfcn.h>
 #include <errno.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
 #include <sys/auxv.h>
 #include <fcntl.h>
 
+/* Weak references to dlopen/dlsym/dlclose — these may not be available
+ * in simple utilities (grep, date, etc.) that don't link libdl.
+ * On glibc 2.34+ they're in libc itself, on older systems in libdl.so. */
+__attribute__((weak)) void *dlopen(const char *, int);
+__attribute__((weak)) void *dlsym(void *, const char *);
+__attribute__((weak)) int   dlclose(void *);
+
+/* dl constants — define ourselves to avoid needing dlfcn.h */
+#ifndef RTLD_NEXT
+#  define RTLD_NEXT    ((void *) -1L)
+#endif
+#ifndef RTLD_LAZY
+#  define RTLD_LAZY    0x00001
+#endif
+#ifndef RTLD_NOLOAD
+#  define RTLD_NOLOAD  0x00004
+#endif
+
 /* glibc globals — declared in <errno.h> with _GNU_SOURCE */
 extern char *program_invocation_name;
 extern char *program_invocation_short_name;
 
 /* ------------------------------------------------------------------ */
-/*  Constructor: restore process comm name                             */
+/*  Owner process tracking                                             */
 /* ------------------------------------------------------------------ */
-
-/* Static buffers for program_invocation_name/short_name override.
- * Must outlive the process — cannot be stack or freed. */
-static char g_inv_name[4096];
-static char g_inv_short[256];
 
 /* PID of the process that was actually protected by antirev.
  * Child processes inherit LD_PRELOAD but should NOT have their
@@ -47,15 +64,56 @@ static char g_inv_short[256];
  * binaries and ANTIREV_REAL_EXE refers to the parent. */
 static pid_t g_owner_pid = 0;
 
-/* Returns 1 if the current process is the one antirev protected */
 static int is_owner_process(void)
 {
     return g_owner_pid != 0 && getpid() == g_owner_pid;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Cached libc realpath pointers                                      */
+/* ------------------------------------------------------------------ */
+
+static char *(*g_libc_realpath)(const char *, char *) = NULL;
+static char *(*g_libc_realpath_chk)(const char *, char *, size_t) = NULL;
+
+/* ------------------------------------------------------------------ */
+/*  Constructor: restore process identity                              */
+/* ------------------------------------------------------------------ */
+
+static char g_inv_name[4096];
+static char g_inv_short[256];
+
+/* Resolve libc realpath using the best available method.
+ * Tries dlopen(libc) first (handles multi-shim), falls back to RTLD_NEXT. */
+static void resolve_libc_realpath(void)
+{
+    /* Method 1: dlopen libc directly (safe with multiple exe_shims) */
+    if (dlopen && dlsym) {
+        void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
+        if (libc) {
+            g_libc_realpath = dlsym(libc, "realpath");
+            g_libc_realpath_chk = dlsym(libc, "__realpath_chk");
+            if (dlclose) dlclose(libc);
+            if (g_libc_realpath)
+                return;
+        }
+        /* Method 2: RTLD_NEXT (works when only one exe_shim loaded) */
+        g_libc_realpath = dlsym(RTLD_NEXT, "realpath");
+        g_libc_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
+    }
+    /* Method 3: no dlsym available — g_libc_realpath stays NULL.
+     * This only affects simple utilities (grep, date) that don't call
+     * realpath anyway. The wrapper returns NULL for non-self-exe paths. */
+}
+
 __attribute__((constructor))
 static void restore_identity(void)
 {
+    /* Resolve libc realpath for ALL processes — needed for the realpath
+     * wrapper fallthrough even in non-protected child processes. Uses
+     * weak dlopen/dlsym so it won't crash utilities that lack libdl. */
+    resolve_libc_realpath();
+
     const char *real = getenv("ANTIREV_REAL_EXE");
     if (!real)
         return;
@@ -70,7 +128,6 @@ static void restore_identity(void)
         return;
     exe_buf[n] = '\0';
 
-    /* Only activate for processes running from memfd (i.e., protected binaries) */
     if (strstr(exe_buf, "memfd:") == NULL)
         return;
 
@@ -98,7 +155,6 @@ static void restore_identity(void)
 
 static int is_self_exe(const char *path)
 {
-    /* Only intercept for the protected process, not inherited children */
     if (!is_owner_process())
         return 0;
     if (strcmp(path, "/proc/self/exe") == 0)
@@ -107,7 +163,6 @@ static int is_self_exe(const char *path)
     snprintf(pidpath, sizeof(pidpath), "/proc/%d/exe", (int)getpid());
     return strcmp(path, pidpath) == 0;
 }
-
 
 /* ------------------------------------------------------------------ */
 /*  readlink / readlinkat interception                                  */
@@ -167,7 +222,6 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf,
 /*  Qt's QCoreApplication::applicationFilePath() uses this path.       */
 /* ------------------------------------------------------------------ */
 
-/* Helper: fill resolved buffer with ANTIREV_REAL_EXE */
 static char *fill_real_exe(char *resolved)
 {
     const char *real = getenv("ANTIREV_REAL_EXE");
@@ -181,17 +235,6 @@ static char *fill_real_exe(char *resolved)
     }
     memcpy(resolved, real, len + 1);
     return resolved;
-}
-
-/* Resolve libc's real realpath once. All three wrappers share this. */
-static char *(*g_libc_realpath)(const char *, char *) = NULL;
-static char *(*g_libc_realpath_chk)(const char *, char *, size_t) = NULL;
-
-__attribute__((constructor(200)))  /* run after restore_identity (default prio) */
-static void resolve_realpath_syms(void)
-{
-    g_libc_realpath = dlsym(RTLD_NEXT, "realpath");
-    g_libc_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
 }
 
 __attribute__((visibility("default")))
@@ -211,7 +254,6 @@ char *canonicalize_file_name(const char *path)
     if (path && is_self_exe(path))
         return fill_real_exe(NULL);
 
-    /* canonicalize_file_name is realpath(path, NULL) */
     if (g_libc_realpath)
         return g_libc_realpath(path, NULL);
     return NULL;
@@ -247,18 +289,15 @@ unsigned long getauxval(unsigned long type)
             return (unsigned long)real;
     }
 
-    /* Fallthrough: walk the auxiliary vector directly.
-     * The auxv sits in memory right after the environment strings:
-     *   [argv...] NULL [envp...] NULL [auxv_t entries...] AT_NULL
-     * We access it via /proc/self/auxv to avoid fragile stack walking. */
+    /* Fallthrough: read /proc/self/auxv via raw syscall */
     int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/auxv", O_RDONLY);
     if (fd < 0)
         return 0;
 
     unsigned long result = 0;
-    unsigned long pair[2];  /* auxv_t: {a_type, a_val} */
+    unsigned long pair[2];
     while (syscall(SYS_read, fd, pair, sizeof(pair)) == (long)sizeof(pair)) {
-        if (pair[0] == 0)  /* AT_NULL */
+        if (pair[0] == 0)
             break;
         if (pair[0] == type) {
             result = pair[1];
@@ -268,8 +307,3 @@ unsigned long getauxval(unsigned long type)
     syscall(SYS_close, fd);
     return result;
 }
-
-/* open/openat interception removed — intercepting these broadly caused
- * breakage in normal file operations (config file loading, Qt plugins, etc.).
- * The self-read redirect (Fix #3) is deferred until a targeted solution
- * can be implemented without side effects. */

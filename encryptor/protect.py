@@ -17,6 +17,12 @@ Subcommands:
       protect.py encrypt-lib --key <keyfile> --libs lib1.so [lib2.so ...] \\
                              [--output-dir <dir>]
 
+  run
+      Run a plain (unencrypted) exe with the audit shim so it can dlopen
+      encrypted .so files.
+
+      protect.py run --key <keyfile> --audit-shim <shim.so> -- <exe> [args...]
+
 Key file: 32 bytes as 64 hex chars.  Created with a fresh random key if absent.
 """
 
@@ -133,6 +139,30 @@ def cmd_encrypt_lib(args):
               f"({len(data):,} → {len(enc_data):,} bytes)  → {dest}")
 
 
+# ── Subcommand: run ─────────────────────────────────────────────────
+
+def cmd_run(args):
+    """Launch a plain (unencrypted) exe with LD_AUDIT so it can dlopen encrypted .so files."""
+    key_path   = Path(args.key)
+    shim_path  = Path(args.audit_shim)
+
+    if not key_path.exists():
+        sys.exit(f"[error] key file not found: {key_path}")
+    if not shim_path.exists():
+        sys.exit(f"[error] audit shim not found: {shim_path}")
+
+    key = key_path.read_text().strip()
+    if len(bytes.fromhex(key)) != KEY_SIZE:
+        sys.exit(f"[error] key file must contain {KEY_SIZE*2} hex chars")
+
+    env = os.environ.copy()
+    env["LD_AUDIT"] = str(shim_path.resolve())
+    env["ANTIREV_KEY_HEX"] = key
+
+    argv = args.argv
+    os.execvpe(argv[0], argv, env)
+
+
 # ── Entry point ──────────────────────────────────────────────────────
 
 def main():
@@ -155,12 +185,21 @@ def main():
     el.add_argument("--libs",       required=True, nargs="+", metavar="LIB")
     el.add_argument("--output-dir", default=None,        help="Write encrypted libs here (default: in-place)")
 
+    # run
+    ru = sub.add_parser("run", help="Run a plain exe with LD_AUDIT for encrypted .so loading")
+    ru.add_argument("--key",         required=True, help="Key file (hex)")
+    ru.add_argument("--audit-shim",  required=True, help="Path to audit_shim .so")
+    ru.add_argument("argv",          nargs="+",     metavar="EXE [ARGS...]",
+                    help="Executable and its arguments")
+
     args = p.parse_args()
 
     if args.cmd == "protect-exe":
         cmd_protect_exe(args)
     elif args.cmd == "encrypt-lib":
         cmd_encrypt_lib(args)
+    elif args.cmd == "run":
+        cmd_run(args)
 
 
 if __name__ == "__main__":
