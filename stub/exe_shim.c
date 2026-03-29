@@ -87,12 +87,19 @@ static char g_inv_short[256];
  * Tries dlopen(libc) first (handles multi-shim), falls back to RTLD_NEXT. */
 static void resolve_libc_realpath(void)
 {
+    if (g_libc_realpath)
+        return;
+
     /* Method 1: dlopen libc directly (safe with multiple exe_shims) */
     if (dlopen && dlsym) {
         void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
+        fprintf(stderr, "[exe_shim] resolve: dlopen=%p dlsym=%p libc_handle=%p\n",
+                (void *)(uintptr_t)dlopen, (void *)(uintptr_t)dlsym, libc);
         if (libc) {
             g_libc_realpath = dlsym(libc, "realpath");
             g_libc_realpath_chk = dlsym(libc, "__realpath_chk");
+            fprintf(stderr, "[exe_shim] resolve: method1 realpath=%p chk=%p\n",
+                    (void *)(uintptr_t)g_libc_realpath, (void *)(uintptr_t)g_libc_realpath_chk);
             if (dlclose) dlclose(libc);
             if (g_libc_realpath)
                 return;
@@ -100,10 +107,12 @@ static void resolve_libc_realpath(void)
         /* Method 2: RTLD_NEXT (works when only one exe_shim loaded) */
         g_libc_realpath = dlsym(RTLD_NEXT, "realpath");
         g_libc_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
+        fprintf(stderr, "[exe_shim] resolve: method2 realpath=%p chk=%p\n",
+                (void *)(uintptr_t)g_libc_realpath, (void *)(uintptr_t)g_libc_realpath_chk);
+    } else {
+        fprintf(stderr, "[exe_shim] resolve: dlopen=%p dlsym=%p (skipped)\n",
+                (void *)(uintptr_t)dlopen, (void *)(uintptr_t)dlsym);
     }
-    /* Method 3: no dlsym available — g_libc_realpath stays NULL.
-     * This only affects simple utilities (grep, date) that don't call
-     * realpath anyway. The wrapper returns NULL for non-self-exe paths. */
 }
 
 __attribute__((constructor))
