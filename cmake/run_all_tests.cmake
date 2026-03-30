@@ -14,9 +14,6 @@ set(TESTS
     test_proc_self_exe    # /proc/self/exe returns real path (readlink)
     test_realpath         # realpath/canonicalize_file_name on /proc/self/exe
     test_path_stress      # comprehensive path resolution test
-    test_getauxval        # getauxval(AT_EXECFN) returns real path
-    test_comm_name        # /proc/self/comm restored to original name
-    test_self_read        # open() on protected binary -> decrypted memfd
     test_dlopen           # dlopen bundled .so by soname
     test_fork_same_lib    # fork+exec child inherits same lib via LD_PRELOAD
     test_fork_diff_lib    # parent and child use different libs independently
@@ -29,6 +26,8 @@ set(TESTS
 #   test_multi_so, test_fork_exec,
 #   test_multi_process, test_daemon_fdclose, test_concurrent_dlopen,
 #   test_plain_exe_enc_so
+# Tests disabled — source files not on this branch (exist on fix/deep-identity-shim):
+#   test_getauxval, test_comm_name, test_self_read
 
 set(PASS_COUNT 0)
 set(FAIL_COUNT 0)
