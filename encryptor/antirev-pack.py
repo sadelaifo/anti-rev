@@ -23,6 +23,16 @@ Config format:
       - lib/legacy                     # subdirectory (no trailing slash also works)
       - bin/debug_tool                 # specific relative path
 
+    libs: bundle                       # optional: bundle|daemon|skip (default: bundle)
+
+    encrypt_libs:                      # optional whitelist: only encrypt these libs
+      - libsecret.so                   #   all other libs are copied as plaintext
+      - lib/crypto/                    #   supports same patterns as blacklist
+
+    plaintext_libs:                    # optional blacklist: don't encrypt these libs
+      - libcrypto.so*                  #   all other libs are encrypted
+      - lib/3rd/                       #   (mutually exclusive with encrypt_libs)
+
     copy:                              # optional: non-ELF files to copy as-is
       - etc/                           # copy entire config directory
       - bin/start.sh                   # copy a specific file
@@ -310,12 +320,27 @@ def main():
     key = load_or_create_key(key_path)
     copylist = compile_blacklist(cfg.get('copy', []))
 
+    # ── Lib encryption filter ────────────────────────────────────────
+    # encrypt_libs (whitelist): only these libs get encrypted, rest copied as-is
+    # plaintext_libs (blacklist): these libs stay plaintext, rest get encrypted
+    # If neither is set, all libs are encrypted (original behavior).
+    # Only one of encrypt_libs / plaintext_libs may be specified.
+    raw_encrypt_libs   = cfg.get('encrypt_libs',   [])
+    raw_plaintext_libs = cfg.get('plaintext_libs',  [])
+    if raw_encrypt_libs and raw_plaintext_libs:
+        sys.exit("[error] 'encrypt_libs' and 'plaintext_libs' are mutually "
+                 "exclusive — use one or the other")
+
+    lib_whitelist = compile_blacklist(raw_encrypt_libs) if raw_encrypt_libs else []
+    lib_blacklist = compile_blacklist(raw_plaintext_libs) if raw_plaintext_libs else []
+
     # ── Scan all files ────────────────────────────────────────────────
-    exe_files  = []   # (rel_path, arch, abs_path)
-    lib_files  = []   # abs_path
-    copy_files = []   # abs_path
-    skipped    = []   # rel_path
-    ignored    = 0    # non-ELF files not in copy list
+    exe_files   = []   # (rel_path, arch, abs_path)
+    lib_files   = []   # abs_path — libs to encrypt
+    plain_libs  = []   # abs_path — libs to copy as plaintext
+    copy_files  = []   # abs_path — non-ELF files to copy
+    skipped     = []   # rel_path
+    ignored     = 0    # non-ELF files not in copy list
 
     for src in sorted(install_dir.rglob('*')):
         if not src.is_file():
@@ -340,17 +365,34 @@ def main():
         if kind == 'exe':
             exe_files.append((rel, arch, src))
         else:
-            lib_files.append(src)
+            # Determine if this lib should be encrypted or stay plaintext
+            if lib_whitelist:
+                # Whitelist mode: only encrypt if it matches
+                if is_blacklisted(rel, lib_whitelist):
+                    lib_files.append(src)
+                else:
+                    plain_libs.append(src)
+            elif lib_blacklist:
+                # Blacklist mode: encrypt unless it matches
+                if is_blacklisted(rel, lib_blacklist):
+                    plain_libs.append(src)
+                else:
+                    lib_files.append(src)
+            else:
+                # No filter: encrypt all libs
+                lib_files.append(src)
 
     # ── Report scan results ───────────────────────────────────────────
     print(f"[pack] Scanned {install_dir}")
-    print(f"[pack]   Executables:  {len(exe_files)}")
-    print(f"[pack]   Libraries:   {len(lib_files)}")
-    print(f"[pack]   Copy:        {len(copy_files)}")
-    print(f"[pack]   Ignored:     {ignored}")
-    print(f"[pack]   Workers:     {workers}")
+    print(f"[pack]   Executables:    {len(exe_files)}")
+    print(f"[pack]   Libs (encrypt): {len(lib_files)}")
+    if plain_libs:
+        print(f"[pack]   Libs (plain):   {len(plain_libs)}")
+    print(f"[pack]   Copy:           {len(copy_files)}")
+    print(f"[pack]   Ignored:        {ignored}")
+    print(f"[pack]   Workers:        {workers}")
     if skipped:
-        print(f"[pack]   Blacklisted: {len(skipped)}")
+        print(f"[pack]   Blacklisted:   {len(skipped)}")
         for rel in skipped:
             print(f"[pack]     skip: {rel}")
     print()
@@ -423,11 +465,16 @@ def main():
                     sys.exit(f"[error] protect failed for {futures[fut]}: {e}")
         print()
 
-    # ── Copy everything else (parallel, batched) ──────────────────────
-    if copy_files:
+    # ── Copy plaintext libs + other files (parallel, batched) ─────────
+    # Merge plain_libs into copy_files
+    all_copy = copy_files + plain_libs
+    if plain_libs:
+        print(f"[pack] Copying {len(plain_libs)} plaintext "
+              f"librar{'y' if len(plain_libs) == 1 else 'ies'} as-is...")
+    if all_copy:
         pairs = [
             (str(src), str(output_dir / src.relative_to(install_dir)))
-            for src in copy_files
+            for src in all_copy
         ]
         # Split into batches — one per worker, minimum 1
         batch_size = max(1, len(pairs) // workers)
