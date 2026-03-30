@@ -46,6 +46,7 @@
 #include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include "crypto.h"
 
 #ifndef __NR_memfd_create
@@ -214,7 +215,7 @@ static void daemon_serve(int listen_fd, const int *lib_fds,
         cmsg->cmsg_len   = CMSG_LEN((size_t)nlibs * sizeof(int));
         memcpy(CMSG_DATA(cmsg), lib_fds, (size_t)nlibs * sizeof(int));
 
-        sendmsg(client, &msg, 0);
+        (void)sendmsg(client, &msg, 0); /* best-effort */
         close(client);
     }
 }
@@ -298,6 +299,55 @@ static socklen_t make_sock_addr(struct sockaddr_un *addr,
 
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path)
                        + 1 + strlen(addr->sun_path + 1));
+}
+
+/* Merge local lib fds with daemon-received lib fds.
+ * Overlapping names → use daemon fd (shared), close local.
+ * Local-only → keep.  Daemon-only → add.
+ * Results written back into lib_fds/lib_names/nlibs.
+ * Bounded to MAX_FILES total. */
+static void merge_lib_fds(int *lib_fds, char (*lib_names)[MAX_NAME + 1],
+                          int *nlibs,
+                          int *recv_fds, char (*recv_names)[MAX_NAME + 1],
+                          int recv_nlibs)
+{
+    int merged_fds[MAX_FILES];
+    char merged_names[MAX_FILES][MAX_NAME + 1];
+    int nmerged = 0;
+
+    /* 1. For each local lib: use daemon fd if available */
+    for (int j = 0; j < *nlibs && nmerged < MAX_FILES; j++) {
+        int found = 0;
+        for (int k = 0; k < recv_nlibs; k++) {
+            if (recv_fds[k] >= 0
+                && strcmp(lib_names[j], recv_names[k]) == 0) {
+                merged_fds[nmerged] = recv_fds[k];
+                memcpy(merged_names[nmerged], recv_names[k], MAX_NAME + 1);
+                nmerged++;
+                close(lib_fds[j]);
+                recv_fds[k] = -1; /* mark as consumed */
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            merged_fds[nmerged] = lib_fds[j];
+            memcpy(merged_names[nmerged], lib_names[j], MAX_NAME + 1);
+            nmerged++;
+        }
+    }
+    /* 2. Add daemon-only libs */
+    for (int k = 0; k < recv_nlibs && nmerged < MAX_FILES; k++) {
+        if (recv_fds[k] >= 0) {
+            merged_fds[nmerged] = recv_fds[k];
+            memcpy(merged_names[nmerged], recv_names[k], MAX_NAME + 1);
+            nmerged++;
+        }
+    }
+
+    *nlibs = nmerged;
+    memcpy(lib_fds, merged_fds, (size_t)nmerged * sizeof(int));
+    memcpy(lib_names, merged_names, (size_t)nmerged * (MAX_NAME + 1));
 }
 
 /* ------------------------------------------------------------------ */
@@ -455,8 +505,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         if (e->is_main) {
             main_fd = fd;
         } else {
-            strncpy(lib_names[nlibs], e->name, MAX_NAME);
-            lib_names[nlibs][MAX_NAME] = '\0';
+            memcpy(lib_names[nlibs], e->name, MAX_NAME + 1);
             lib_fds[nlibs++] = fd;
         }
     }
@@ -512,11 +561,15 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * Mode C (daemon libs): no libs bundled, must receive from daemon.
      * ---------------------------------------------------------------- */
     if ((bundle_flags & BFLAG_DAEMON_LIBS) && nlibs == 0) {
-        /* Mode C: client-only — must receive libs from daemon */
+        /* Mode C: client-only — receive libs from daemon.
+         * If no daemon is running, auto-launch .antirev-libd from the
+         * same directory as our binary (first process bootstraps it). */
         struct sockaddr_un addr;
         socklen_t addr_len = make_sock_addr(&addr, key);
 
         int connected = 0;
+        int daemon_launched = 0;
+
         for (int retry = 0; retry < 50; retry++) {
             int sd = socket(AF_UNIX, SOCK_STREAM, 0);
             if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
@@ -530,11 +583,42 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 break;
             }
             if (sd >= 0) close(sd);
+
+            /* First failure: try to auto-launch the daemon */
+            if (!daemon_launched && retry == 0) {
+                /* Build path: dirname(real_exe) + "/.antirev-libd" */
+                char daemon_path[4096];
+                {
+                    char *slash = strrchr(real_exe, '/');
+                    size_t dirlen = slash ? (size_t)(slash - real_exe) : 1;
+                    if (!slash) { daemon_path[0] = '.'; dirlen = 1; }
+                    else memcpy(daemon_path, real_exe, dirlen);
+                    snprintf(daemon_path + dirlen,
+                             sizeof(daemon_path) - dirlen,
+                             "/.antirev-libd");
+                }
+
+                if (access(daemon_path, X_OK) == 0) {
+                    pid_t pid = fork();
+                    if (pid == 0) {
+                        char *dargv[] = { daemon_path, NULL };
+                        execve(daemon_path, dargv, envp);
+                        _exit(127);
+                    }
+                    if (pid > 0) {
+                        /* Wait for daemon to exit (it daemonizes itself,
+                         * so the parent exits quickly) */
+                        int st;
+                        waitpid(pid, &st, 0);
+                        daemon_launched = 1;
+                    }
+                }
+            }
+
             usleep(100000); /* 100 ms — daemon may be starting */
         }
         if (!connected) {
-            fprintf(stderr, "[antirev] failed to connect to lib daemon "
-                            "(is antirev-libd running?)\n");
+            fprintf(stderr, "[antirev] failed to connect to lib daemon\n");
             return 1;
         }
     } else if ((bundle_flags & BFLAG_HAS_LIBS) && nlibs > 0) {
@@ -544,19 +628,17 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
 
         int sd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
-            /* Daemon already running — receive shared fds */
+            /* Daemon already running — merge our libs with daemon's.
+             * For overlapping names: use daemon fd (shared copy).
+             * For names only we have: keep our local fd.
+             * For names only daemon has: add daemon fd. */
             int recv_fds[MAX_FILES];
             char recv_names[MAX_FILES][MAX_NAME + 1];
             int recv_nlibs = 0;
             if (receive_lib_fds(sd, recv_fds, recv_names, &recv_nlibs) == 0
-                && recv_nlibs > 0) {
-                /* Close our locally-decrypted lib fds, use shared ones */
-                for (int j = 0; j < nlibs; j++)
-                    close(lib_fds[j]);
-                nlibs = recv_nlibs;
-                memcpy(lib_fds, recv_fds, (size_t)nlibs * sizeof(int));
-                memcpy(lib_names, recv_names, sizeof(recv_names));
-            }
+                && recv_nlibs > 0)
+                merge_lib_fds(lib_fds, lib_names, &nlibs,
+                              recv_fds, recv_names, recv_nlibs);
             close(sd);
         } else {
             /* No daemon yet — we are the first process */
@@ -567,14 +649,18 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 && bind(listen_sd, (struct sockaddr *)&addr, addr_len) == 0) {
                 listen(listen_sd, 16);
                 pid_t pid = fork();
-                if (pid == 0) {
+                if (pid < 0) {
+                    perror("[antirev] fork daemon");
+                    close(listen_sd);
+                } else if (pid == 0) {
                     /* Daemon child — close fds we don't need */
                     close(main_fd);
                     daemon_serve(listen_sd, lib_fds, lib_names, nlibs);
                     _exit(0);
+                } else {
+                    /* Parent continues — daemon runs in background */
+                    close(listen_sd);
                 }
-                /* Parent continues — daemon runs in background */
-                close(listen_sd);
             } else {
                 /* bind() failed (race: another process won).
                  * Retry connect. */
@@ -589,14 +675,9 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                         char recv_names[MAX_FILES][MAX_NAME + 1];
                         int recv_nlibs = 0;
                         if (receive_lib_fds(sd, recv_fds, recv_names, &recv_nlibs) == 0
-                            && recv_nlibs > 0) {
-                            for (int j = 0; j < nlibs; j++)
-                                close(lib_fds[j]);
-                            nlibs = recv_nlibs;
-                            memcpy(lib_fds, recv_fds,
-                                   (size_t)nlibs * sizeof(int));
-                            memcpy(lib_names, recv_names, sizeof(recv_names));
-                        }
+                            && recv_nlibs > 0)
+                            merge_lib_fds(lib_fds, lib_names, &nlibs,
+                                          recv_fds, recv_names, recv_nlibs);
                         close(sd);
                         break;
                     }
