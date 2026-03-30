@@ -207,22 +207,18 @@ add_custom_target(dlopen_main DEPENDS "${CMAKE_BINARY_DIR}/dlopen_main")
 
 add_custom_target(test_dlopen
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen ==="
-    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
-            --key        "${CMAKE_BINARY_DIR}/dlopen.key"
-            --libs       "${CMAKE_BINARY_DIR}/mylib.so"
-            --output-dir "${CMAKE_BINARY_DIR}/encrypted"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/dlopen_main"
             --key    "${CMAKE_BINARY_DIR}/dlopen.key"
+            --libs   "${CMAKE_BINARY_DIR}/mylib.so"
             --output "${CMAKE_BINARY_DIR}/dlopen_main.protected"
     COMMAND ${CMAKE_COMMAND}
             "-DBINARY=${CMAKE_BINARY_DIR}/dlopen_main.protected"
-            "-DLD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
             -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
     DEPENDS stub mylib dlopen_main
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "dlopen test"
+    COMMENT "dlopen test (bundled .so via LD_PRELOAD)"
     USES_TERMINAL
 )
 
@@ -741,6 +737,123 @@ add_custom_target(test_tamper
     DEPENDS stub hello
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
     COMMENT "tampered ciphertext negative test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_fork_same_lib — child inherits same bundled .so via LD_PRELOAD
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_test_bin("${CMAKE_BINARY_DIR}/fork_same_parent"
+    gcc "${CMAKE_SOURCE_DIR}/tests/fork_same_lib/parent.c")
+add_custom_target(fork_same_parent DEPENDS "${CMAKE_BINARY_DIR}/fork_same_parent")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/fork_same_child"
+    gcc "${CMAKE_SOURCE_DIR}/tests/fork_same_lib/child.c")
+add_custom_target(fork_same_child DEPENDS "${CMAKE_BINARY_DIR}/fork_same_child")
+
+add_custom_target(test_fork_same_lib
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_fork_same_lib ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/fork_same_parent"
+            --key    "${CMAKE_BINARY_DIR}/fork_same.key"
+            --libs   "${CMAKE_BINARY_DIR}/mylib.so"
+            --output "${CMAKE_BINARY_DIR}/fork_same_parent.protected"
+    COMMAND "${CMAKE_BINARY_DIR}/fork_same_parent.protected"
+            "${CMAKE_BINARY_DIR}/fork_same_child"
+    DEPENDS stub mylib fork_same_parent fork_same_child
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "fork+exec child inherits same lib via LD_PRELOAD"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_fork_diff_lib — parent and child use different libs independently
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_lib("${CMAKE_BINARY_DIR}/libparent.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/fork_diff_lib/libparent.c")
+add_custom_target(libparent DEPENDS "${CMAKE_BINARY_DIR}/libparent.so")
+
+compile_lib("${CMAKE_BINARY_DIR}/libchild.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/fork_diff_lib/libchild.c")
+add_custom_target(libchild DEPENDS "${CMAKE_BINARY_DIR}/libchild.so")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/fork_diff_parent"
+    gcc "${CMAKE_SOURCE_DIR}/tests/fork_diff_lib/parent.c")
+add_custom_target(fork_diff_parent DEPENDS "${CMAKE_BINARY_DIR}/fork_diff_parent")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/fork_diff_child"
+    gcc "${CMAKE_SOURCE_DIR}/tests/fork_diff_lib/child.c")
+add_custom_target(fork_diff_child DEPENDS "${CMAKE_BINARY_DIR}/fork_diff_child")
+
+add_custom_target(test_fork_diff_lib
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_fork_diff_lib ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/fork_diff_parent"
+            --key    "${CMAKE_BINARY_DIR}/fork_diff.key"
+            --libs   "${CMAKE_BINARY_DIR}/libparent.so"
+            --output "${CMAKE_BINARY_DIR}/fork_diff_parent.protected"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/fork_diff_child"
+            --key    "${CMAKE_BINARY_DIR}/fork_diff_child.key"
+            --libs   "${CMAKE_BINARY_DIR}/libchild.so"
+            --output "${CMAKE_BINARY_DIR}/fork_diff_child.protected"
+    COMMAND "${CMAKE_BINARY_DIR}/fork_diff_parent.protected"
+            "${CMAKE_BINARY_DIR}/fork_diff_child.protected"
+    DEPENDS stub libparent libchild fork_diff_parent fork_diff_child
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "parent(libparent.so) fork+exec child(libchild.so)"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_script_multi_bin — script invokes A and B with shared + unique libs
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_lib("${CMAKE_BINARY_DIR}/libcommon.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/script_multi_bin/libcommon.c")
+compile_lib("${CMAKE_BINARY_DIR}/libA_only.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/script_multi_bin/libA_only.c")
+compile_lib("${CMAKE_BINARY_DIR}/libB_only.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/script_multi_bin/libB_only.c")
+add_custom_target(script_multi_libs
+    DEPENDS "${CMAKE_BINARY_DIR}/libcommon.so"
+            "${CMAKE_BINARY_DIR}/libA_only.so"
+            "${CMAKE_BINARY_DIR}/libB_only.so")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/proc_a"
+    gcc "${CMAKE_SOURCE_DIR}/tests/script_multi_bin/proc_a.c")
+add_custom_target(proc_a DEPENDS "${CMAKE_BINARY_DIR}/proc_a")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/proc_b"
+    gcc "${CMAKE_SOURCE_DIR}/tests/script_multi_bin/proc_b.c")
+add_custom_target(proc_b DEPENDS "${CMAKE_BINARY_DIR}/proc_b")
+
+add_custom_target(test_script_multi_bin
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_script_multi_bin ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/proc_a"
+            --key    "${CMAKE_BINARY_DIR}/script_multi.key"
+            --libs   "${CMAKE_BINARY_DIR}/libcommon.so"
+                     "${CMAKE_BINARY_DIR}/libA_only.so"
+            --output "${CMAKE_BINARY_DIR}/proc_a.protected"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/proc_b"
+            --key    "${CMAKE_BINARY_DIR}/script_multi.key"
+            --libs   "${CMAKE_BINARY_DIR}/libcommon.so"
+                     "${CMAKE_BINARY_DIR}/libB_only.so"
+            --output "${CMAKE_BINARY_DIR}/proc_b.protected"
+    COMMAND "${CMAKE_BINARY_DIR}/proc_a.protected"
+    COMMAND "${CMAKE_BINARY_DIR}/proc_b.protected"
+    DEPENDS stub script_multi_libs proc_a proc_b
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "script invokes A(common+A_only) and B(common+B_only)"
     USES_TERMINAL
 )
 
