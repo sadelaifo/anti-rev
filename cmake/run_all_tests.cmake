@@ -18,6 +18,7 @@ set(TESTS
     test_fork_same_lib    # fork+exec child inherits same lib via LD_PRELOAD
     test_fork_diff_lib    # parent and child use different libs independently
     test_script_multi_bin # script invokes A and B with shared + unique libs
+    test_lib_daemon       # centralized lib daemon serves libs to client exes
     test_wrong_key        # wrong key -> clean failure
     test_tamper           # bit-flipped ciphertext -> clean failure
 )

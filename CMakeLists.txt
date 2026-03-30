@@ -858,6 +858,24 @@ add_custom_target(test_script_multi_bin
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_lib_daemon — centralized lib daemon serves libs to client exes
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_target(test_lib_daemon
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_lib_daemon ==="
+    COMMAND bash "${CMAKE_SOURCE_DIR}/tests/lib_daemon/run_test.sh"
+            "${CMAKE_BINARY_DIR}/stub"
+            "${CMAKE_BINARY_DIR}/dlopen_main"
+            "${CMAKE_BINARY_DIR}/linked_main"
+            "${CMAKE_BINARY_DIR}/mylib.so"
+            "${CMAKE_BINARY_DIR}/liblinkedmath.so"
+    DEPENDS stub mylib liblinkedmath dlopen_main linked_main
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "lib daemon mode test (dlopen + DT_NEEDED via daemon)"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  run_tests — runs all tests and prints a summary
 # ═══════════════════════════════════════════════════════════════════════
 

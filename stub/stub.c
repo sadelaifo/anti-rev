@@ -3,7 +3,8 @@
  *
  * Appended-bundle format (at end of this binary after protection):
  *   [num_files     : 4 B LE]
- *   [bundle_flags  : 1 B]        bit0 = has_external_libs
+ *   [bundle_flags  : 1 B]        bit0 = has libs bundled
+ *                                bit1 = libs served by external daemon
  *   for each file:
  *     [name_len : 2 B LE] [name : name_len bytes] [flags : 1 B] (bit0 = is_main)
  *     [iv       : 12 B]
@@ -16,16 +17,19 @@
  *
  * Trailer is always 48 bytes at end of file.
  *
- * Runtime flow (no fork, no disk, O(chunk) peak memory):
- *   Phase 1 — scan bundle headers (tiny reads, skip ciphertext via offset)
- *   Phase 2 — per file, two streaming passes over ciphertext:
- *               Pass A: GHASH  → verify GCM tag (abort on failure)
- *               Pass B: CTR    → decrypt chunk by chunk → write to memfd
- *   Phase 3 — if bundle has libs, try to receive shared lib memfds from
- *             daemon (abstract Unix socket + SCM_RIGHTS); if no daemon yet,
- *             fork one to share our lib memfds with later processes
- *   Phase 4 — load embedded exe_shim.so into memfd
- *   Phase 5 — fexecve(main_fd) with LD_PRELOAD=exe_shim:lib1:lib2:…
+ * Three operational modes:
+ *
+ *   A) Normal exe (with or without bundled libs):
+ *      Decrypt files, optionally share lib fds via daemon, fexecve main.
+ *
+ *   B) Daemon-only (no main binary in bundle, only libs):
+ *      Decrypt all libs, bind abstract socket, serve lib fds forever.
+ *      Used as a centralized lib server so libs aren't duplicated in
+ *      every exe.
+ *
+ *   C) Client exe (BFLAG_DAEMON_LIBS, no libs in bundle):
+ *      Decrypt main exe only, connect to daemon to receive lib fds,
+ *      then fexecve with those libs on LD_PRELOAD.
  *
  * Peak stub heap: one CHUNK_SIZE buffer (~4 MB) + header table (~37 KB max).
  * All plaintext lives only in kernel memfds, never fully in user-space heap.
@@ -120,14 +124,59 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
     return 0;
 }
 
-#define BFLAG_HAS_LIBS  0x01
+#define BFLAG_HAS_LIBS     0x01
+#define BFLAG_DAEMON_LIBS  0x02  /* libs served by external daemon */
+
+/* Max size of the daemon protocol data payload:
+ * 4 bytes (nlibs) + MAX_FILES * (2 + MAX_NAME) */
+#define DAEMON_DATA_MAX  (4 + MAX_FILES * (2 + MAX_NAME))
 
 /* ------------------------------------------------------------------ */
 /*  Daemon: serve lib memfds to sibling processes via SCM_RIGHTS       */
+/*                                                                     */
+/*  Protocol: data payload contains lib count + names, ancillary data  */
+/*  carries the fds via SCM_RIGHTS.                                    */
+/*                                                                     */
+/*  Data layout:                                                       */
+/*    [uint32_t nlibs]                                                 */
+/*    for each lib:                                                    */
+/*      [uint16_t name_len] [char name[name_len]]                     */
+/*                                                                     */
+/*  Ancillary: SCM_RIGHTS with nlibs file descriptors.                 */
 /* ------------------------------------------------------------------ */
-static void daemon_serve(int listen_fd, const int *lib_fds, int nlibs)
+
+/* Build the data payload (lib count + names). Returns payload size. */
+static size_t build_daemon_payload(uint8_t *buf, size_t buflen,
+                                   const char (*names)[MAX_NAME + 1],
+                                   int nlibs)
 {
+    size_t off = 0;
+    uint32_t nl = (uint32_t)nlibs;
+    if (off + 4 > buflen) return 0;
+    memcpy(buf + off, &nl, 4);
+    off += 4;
+
+    for (int i = 0; i < nlibs; i++) {
+        uint16_t nlen = (uint16_t)strlen(names[i]);
+        if (off + 2 + nlen > buflen) return 0;
+        memcpy(buf + off, &nlen, 2);
+        off += 2;
+        memcpy(buf + off, names[i], nlen);
+        off += nlen;
+    }
+    return off;
+}
+
+static void daemon_serve(int listen_fd, const int *lib_fds,
+                         const char (*lib_names)[MAX_NAME + 1], int nlibs)
+{
+    /* Build data payload once (it never changes) */
+    uint8_t payload[DAEMON_DATA_MAX];
+    size_t payload_len = build_daemon_payload(payload, sizeof(payload),
+                                             lib_names, nlibs);
+
     /* Detach from terminal */
+    uid_t my_uid = getuid();
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
@@ -136,21 +185,19 @@ static void daemon_serve(int listen_fd, const int *lib_fds, int nlibs)
         int client = accept(listen_fd, NULL, NULL);
         if (client < 0) continue;
 
-        /* Only serve root (uid 0) */
+        /* Only serve same uid */
         struct ucred cred;
         socklen_t clen = sizeof(cred);
         if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0
-            || cred.uid != 0) {
+            || cred.uid != my_uid) {
             close(client);
             continue;
         }
 
-        /* Send lib count + fds via SCM_RIGHTS */
-        uint32_t nl = (uint32_t)nlibs;
-
+        /* Send payload + fds via SCM_RIGHTS */
         struct iovec iov;
-        iov.iov_base = &nl;
-        iov.iov_len  = sizeof(nl);
+        iov.iov_base = payload;
+        iov.iov_len  = payload_len;
 
         char cmsg_buf[CMSG_SPACE(MAX_FILES * sizeof(int))];
         memset(cmsg_buf, 0, sizeof(cmsg_buf));
@@ -172,15 +219,16 @@ static void daemon_serve(int listen_fd, const int *lib_fds, int nlibs)
     }
 }
 
-/* Try to receive lib fds from the daemon.
- * Returns 0 on success (out_fds/out_nlibs filled), -1 on failure. */
-static int receive_lib_fds(int sd, int *out_fds, int *out_nlibs)
+/* Try to receive lib fds + names from the daemon.
+ * Returns 0 on success (out_fds/out_names/out_nlibs filled), -1 on failure. */
+static int receive_lib_fds(int sd, int *out_fds,
+                           char (*out_names)[MAX_NAME + 1], int *out_nlibs)
 {
-    uint32_t nl = 0;
+    uint8_t payload[DAEMON_DATA_MAX];
 
     struct iovec iov;
-    iov.iov_base = &nl;
-    iov.iov_len  = sizeof(nl);
+    iov.iov_base = payload;
+    iov.iov_len  = sizeof(payload);
 
     char cmsg_buf[CMSG_SPACE(MAX_FILES * sizeof(int))];
     memset(cmsg_buf, 0, sizeof(cmsg_buf));
@@ -191,16 +239,36 @@ static int receive_lib_fds(int sd, int *out_fds, int *out_nlibs)
     msg.msg_control    = cmsg_buf;
     msg.msg_controllen = sizeof(cmsg_buf);
 
-    if (recvmsg(sd, &msg, 0) < 0) return -1;
+    ssize_t got = recvmsg(sd, &msg, 0);
+    if (got < 4) return -1;
+
+    /* Parse data payload */
+    uint32_t nl;
+    memcpy(&nl, payload, 4);
+    if (nl > MAX_FILES) return -1;
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) return -1;
 
     int nfds = (int)((cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int));
-    if (nfds != (int)nl || nfds > MAX_FILES) return -1;
+    if (nfds != (int)nl) return -1;
 
     memcpy(out_fds, CMSG_DATA(cmsg), (size_t)nfds * sizeof(int));
-    *out_nlibs = nfds;
+
+    /* Parse lib names */
+    size_t off = 4;
+    for (int i = 0; i < (int)nl; i++) {
+        if (off + 2 > (size_t)got) return -1;
+        uint16_t nlen;
+        memcpy(&nlen, payload + off, 2);
+        off += 2;
+        if (nlen > MAX_NAME || off + nlen > (size_t)got) return -1;
+        memcpy(out_names[i], payload + off, nlen);
+        out_names[i][nlen] = '\0';
+        off += nlen;
+    }
+
+    *out_nlibs = (int)nl;
     return 0;
 }
 
@@ -342,6 +410,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
 
     int main_fd = -1;
     int lib_fds[MAX_FILES];
+    char lib_names[MAX_FILES][MAX_NAME + 1];
     int nlibs = 0;
 
     for (uint32_t i = 0; i < nfiles; i++) {
@@ -383,10 +452,50 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
         if (lseek(fd, 0, SEEK_SET) < 0) { perror("lseek memfd"); return 1; }
 
-        if (e->is_main)
+        if (e->is_main) {
             main_fd = fd;
-        else
+        } else {
+            strncpy(lib_names[nlibs], e->name, MAX_NAME);
+            lib_names[nlibs][MAX_NAME] = '\0';
             lib_fds[nlibs++] = fd;
+        }
+    }
+
+    /* Done reading from the binary */
+    explicit_bzero(chunk, CHUNK_SIZE);
+    free(chunk);
+    close(self);
+
+    /* ----------------------------------------------------------------
+     * Mode B: Daemon-only (no main binary, only libs).
+     * Bind abstract socket and serve lib fds forever.
+     * ---------------------------------------------------------------- */
+    if (main_fd < 0 && nlibs > 0) {
+        struct sockaddr_un addr;
+        socklen_t addr_len = make_sock_addr(&addr, key);
+        explicit_bzero(key, sizeof(key));
+
+        int listen_sd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (listen_sd < 0) { perror("socket"); return 1; }
+        if (bind(listen_sd, (struct sockaddr *)&addr, addr_len) < 0) {
+            perror("[antirev] daemon bind");
+            return 1;
+        }
+        listen(listen_sd, 16);
+
+        fprintf(stderr, "[antirev] lib daemon ready (%d libs)\n", nlibs);
+
+        /* Daemonize: fork, parent exits, child serves */
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 1; }
+        if (pid > 0) {
+            /* Parent exits successfully — daemon is running */
+            _exit(0);
+        }
+        /* Child: become session leader, serve forever */
+        setsid();
+        daemon_serve(listen_sd, lib_fds, lib_names, nlibs);
+        _exit(0);  /* unreachable */
     }
 
     if (main_fd < 0) {
@@ -394,21 +503,42 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         return 1;
     }
 
-    /* Done reading from the binary — close before daemon fork so the
-     * daemon child does not hold the protected binary open (ETXTBSY). */
-    explicit_bzero(chunk, CHUNK_SIZE);
-    free(chunk);
-    close(self);
-
     /* ----------------------------------------------------------------
-     * Phase 3: daemon — share lib memfds with sibling processes.
+     * Phase 3: lib fd acquisition.
      *
-     * First process: fork a small daemon that serves lib fds via an
-     * abstract Unix socket (zero filesystem presence).
-     * Later processes: connect to the daemon, receive shared fds,
-     * close their locally-decrypted copies.
+     * Mode A (bundled libs): share our lib fds with sibling processes.
+     *   First process forks a daemon; later processes receive shared fds.
+     *
+     * Mode C (daemon libs): no libs bundled, must receive from daemon.
      * ---------------------------------------------------------------- */
-    if ((bundle_flags & BFLAG_HAS_LIBS) && nlibs > 0) {
+    if ((bundle_flags & BFLAG_DAEMON_LIBS) && nlibs == 0) {
+        /* Mode C: client-only — must receive libs from daemon */
+        struct sockaddr_un addr;
+        socklen_t addr_len = make_sock_addr(&addr, key);
+
+        int connected = 0;
+        for (int retry = 0; retry < 50; retry++) {
+            int sd = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
+                char recv_names[MAX_FILES][MAX_NAME + 1];
+                if (receive_lib_fds(sd, lib_fds, recv_names, &nlibs) == 0
+                    && nlibs > 0) {
+                    memcpy(lib_names, recv_names, sizeof(recv_names));
+                    connected = 1;
+                }
+                close(sd);
+                break;
+            }
+            if (sd >= 0) close(sd);
+            usleep(100000); /* 100 ms — daemon may be starting */
+        }
+        if (!connected) {
+            fprintf(stderr, "[antirev] failed to connect to lib daemon "
+                            "(is antirev-libd running?)\n");
+            return 1;
+        }
+    } else if ((bundle_flags & BFLAG_HAS_LIBS) && nlibs > 0) {
+        /* Mode A: bundled libs — share via daemon */
         struct sockaddr_un addr;
         socklen_t addr_len = make_sock_addr(&addr, key);
 
@@ -416,14 +546,16 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
             /* Daemon already running — receive shared fds */
             int recv_fds[MAX_FILES];
+            char recv_names[MAX_FILES][MAX_NAME + 1];
             int recv_nlibs = 0;
-            if (receive_lib_fds(sd, recv_fds, &recv_nlibs) == 0
+            if (receive_lib_fds(sd, recv_fds, recv_names, &recv_nlibs) == 0
                 && recv_nlibs > 0) {
                 /* Close our locally-decrypted lib fds, use shared ones */
                 for (int j = 0; j < nlibs; j++)
                     close(lib_fds[j]);
                 nlibs = recv_nlibs;
                 memcpy(lib_fds, recv_fds, (size_t)nlibs * sizeof(int));
+                memcpy(lib_names, recv_names, sizeof(recv_names));
             }
             close(sd);
         } else {
@@ -438,7 +570,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 if (pid == 0) {
                     /* Daemon child — close fds we don't need */
                     close(main_fd);
-                    daemon_serve(listen_sd, lib_fds, nlibs);
+                    daemon_serve(listen_sd, lib_fds, lib_names, nlibs);
                     _exit(0);
                 }
                 /* Parent continues — daemon runs in background */
@@ -454,14 +586,16 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                     if (sd >= 0
                         && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
                         int recv_fds[MAX_FILES];
+                        char recv_names[MAX_FILES][MAX_NAME + 1];
                         int recv_nlibs = 0;
-                        if (receive_lib_fds(sd, recv_fds, &recv_nlibs) == 0
+                        if (receive_lib_fds(sd, recv_fds, recv_names, &recv_nlibs) == 0
                             && recv_nlibs > 0) {
                             for (int j = 0; j < nlibs; j++)
                                 close(lib_fds[j]);
                             nlibs = recv_nlibs;
                             memcpy(lib_fds, recv_fds,
                                    (size_t)nlibs * sizeof(int));
+                            memcpy(lib_names, recv_names, sizeof(recv_names));
                         }
                         close(sd);
                         break;
