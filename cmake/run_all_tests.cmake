@@ -17,12 +17,16 @@ set(TESTS
     test_getauxval        # getauxval(AT_EXECFN) returns real path
     test_comm_name        # /proc/self/comm restored to original name
     test_self_read        # open() on protected binary -> decrypted memfd
+    test_dlopen           # dlopen bundled .so by soname
+    test_fork_same_lib    # fork+exec child inherits same lib via LD_PRELOAD
+    test_fork_diff_lib    # parent and child use different libs independently
+    test_script_multi_bin # script invokes A and B with shared + unique libs
     test_wrong_key        # wrong key -> clean failure
     test_tamper           # bit-flipped ciphertext -> clean failure
 )
 
 # Tests disabled — need further work:
-#   test_dlopen, test_multi_so, test_fork_exec,
+#   test_multi_so, test_fork_exec,
 #   test_multi_process, test_daemon_fdclose, test_concurrent_dlopen,
 #   test_plain_exe_enc_so
 
