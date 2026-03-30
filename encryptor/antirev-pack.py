@@ -52,7 +52,8 @@ except ImportError:
     sys.exit("Missing dependency: pip install pyyaml")
 
 sys.path.insert(0, str(Path(__file__).parent))
-from protect import load_or_create_key, encrypt_data, MAGIC, BFLAG_HAS_LIBS
+from protect import (load_or_create_key, encrypt_data, MAGIC,
+                     BFLAG_HAS_LIBS, BFLAG_DAEMON_LIBS)
 
 # ELF magic and type constants
 ELF_MAGIC = b'\x7fELF'
@@ -152,8 +153,46 @@ def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
             f"{len(data):>10,} -> {out_size:>10,} bytes")
 
 
+def _protect_daemon_worker(stub: str, dst: str, key: bytes,
+                           lib_paths: list[str]) -> str:
+    """Build a daemon binary: stub + encrypted libs (no main exe)."""
+    stub_p = Path(stub)
+    dst_p  = Path(dst)
+
+    lib_entries = b""
+    lib_count = 0
+    for lib_str in lib_paths:
+        lib_p = Path(lib_str)
+        lib_data = lib_p.read_bytes()
+        liv, ltag, lct = encrypt_data(lib_data, key)
+        lname_b = lib_p.name.encode()
+        le  = struct.pack("<H", len(lname_b))
+        le += lname_b
+        le += struct.pack("<B", 0)   # flags: not main
+        le += liv + ltag
+        le += struct.pack("<Q", len(lct))
+        le += lct
+        lib_entries += le
+        lib_count += 1
+
+    bundle = struct.pack("<IB", lib_count, BFLAG_HAS_LIBS) + lib_entries
+
+    stub_data     = stub_p.read_bytes()
+    bundle_offset = len(stub_data)
+    trailer       = struct.pack("<Q", bundle_offset) + key + MAGIC
+
+    dst_p.parent.mkdir(parents=True, exist_ok=True)
+    dst_p.write_bytes(stub_data + bundle + trailer)
+    os.chmod(str(dst_p), 0o755)
+
+    out_size = dst_p.stat().st_size
+    return (f"[pack] Daemon binary: {dst_p.name:<30}  "
+            f"{out_size:>10,} bytes  ({lib_count} libs)")
+
+
 def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
-                        lib_paths: list[str] = None) -> str:
+                        lib_paths: list[str] = None,
+                        daemon_libs: bool = False) -> str:
     """Encrypt and bundle an executable (+ optional libs) in-process."""
     src_p  = Path(src)
     stub_p = Path(stub)
@@ -191,7 +230,11 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
             lib_count += 1
 
     num_files = 1 + lib_count
-    flags = BFLAG_HAS_LIBS if lib_count > 0 else 0x00
+    flags = 0x00
+    if lib_count > 0:
+        flags |= BFLAG_HAS_LIBS
+    if daemon_libs:
+        flags |= BFLAG_DAEMON_LIBS
     bundle = struct.pack("<IB", num_files, flags) + entry + lib_entries
 
     stub_data     = stub_p.read_bytes()
@@ -312,10 +355,33 @@ def main():
             print(f"[pack]     skip: {rel}")
     print()
 
-    # ── Protect executables with bundled libs (parallel) ────────────────
+    # ── Lib handling mode ────────────────────────────────────────────────
+    # libs: bundle (default) — bundle all libs into every exe
+    # libs: daemon           — create one daemon binary, exes get libs from it
+    # libs: skip             — ignore libs entirely (exe-only protection)
+    libs_mode = cfg.get('libs', 'bundle')
+    if libs_mode not in ('bundle', 'daemon', 'skip'):
+        sys.exit(f"[error] invalid libs mode '{libs_mode}' "
+                 f"(must be 'bundle', 'daemon', or 'skip')")
+
+    print(f"[pack] Libs mode: {libs_mode}")
+
     lib_path_strs = [str(p) for p in lib_files] if lib_files else []
 
-    if lib_files:
+    # Create daemon binary if mode is 'daemon' and there are libs
+    if libs_mode == 'daemon' and lib_files:
+        # Use the first available stub arch for the daemon
+        daemon_arch = next(iter(stubs))
+        daemon_stub = stubs[daemon_arch]
+        daemon_path = output_dir / '.antirev-libd'
+        print(f"[pack] Building lib daemon with {len(lib_files)} "
+              f"librar{'y' if len(lib_files) == 1 else 'ies'}...")
+        result = _protect_daemon_worker(
+            str(daemon_stub), str(daemon_path), key, lib_path_strs)
+        print(result)
+        print()
+
+    if libs_mode == 'bundle' and lib_files:
         print(f"[pack] Bundling {len(lib_files)} shared "
               f"librar{'y' if len(lib_files) == 1 else 'ies'} into each executable...")
 
@@ -325,6 +391,18 @@ def main():
             if arch not in stubs:
                 sys.exit(f"[error] no stub for arch '{arch}' "
                          f"(needed by {rel}). Add it to 'stubs' in config.")
+
+        # Determine what libs to pass to each exe
+        if libs_mode == 'bundle':
+            exe_lib_paths = lib_path_strs
+            exe_daemon_libs = False
+        elif libs_mode == 'daemon':
+            exe_lib_paths = None
+            exe_daemon_libs = bool(lib_files)
+        else:  # skip
+            exe_lib_paths = None
+            exe_daemon_libs = False
+
         with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(
@@ -333,7 +411,8 @@ def main():
                     str(stubs[arch]),
                     str(output_dir / rel),
                     key,
-                    lib_path_strs,
+                    exe_lib_paths,
+                    exe_daemon_libs,
                 ): rel
                 for rel, arch, src in exe_files
             }
