@@ -71,32 +71,54 @@ def encrypt_data(data: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
 
 # ── Subcommand: protect-exe ──────────────────────────────────────────
 
+BFLAG_HAS_LIBS = 0x01
+
+
+def _build_entry(path: Path, data: bytes, key: bytes, is_main: bool) -> bytes:
+    """Build a single bundle entry (header + encrypted data)."""
+    iv, tag, ct = encrypt_data(data, key)
+    name_b = path.name.encode()
+    entry  = struct.pack("<H", len(name_b))
+    entry += name_b
+    entry += struct.pack("<B", 1 if is_main else 0)
+    entry += iv
+    entry += tag
+    entry += struct.pack("<Q", len(ct))
+    entry += ct
+    return entry
+
+
 def cmd_protect_exe(args):
     stub_path = Path(args.stub)
     main_path = Path(args.main)
     out_path  = Path(args.output)
     key_path  = Path(args.key)
+    lib_paths = [Path(p) for p in (args.libs or [])]
 
     for p, label in [(stub_path, "stub"), (main_path, "main binary")]:
         if not p.exists():
             sys.exit(f"[error] {label} not found: {p}")
+    for p in lib_paths:
+        if not p.exists():
+            sys.exit(f"[error] lib not found: {p}")
 
     key = load_or_create_key(key_path)
 
-    # Bundle: [num_files:4B] [bundle_flags:1B] [entry...]
-    data   = main_path.read_bytes()
-    iv, tag, ct = encrypt_data(data, key)
-    name_b = main_path.name.encode()
+    # Bundle: [num_files:4B] [bundle_flags:1B] [entries...]
+    main_data = main_path.read_bytes()
+    main_entry = _build_entry(main_path, main_data, key, is_main=True)
+    print(f"[antirev] Encrypted main: {main_path.name}  "
+          f"({len(main_data):,} bytes)")
 
-    entry  = struct.pack("<H", len(name_b))
-    entry += name_b
-    entry += struct.pack("<B", 1)   # flags: is_main
-    entry += iv
-    entry += tag
-    entry += struct.pack("<Q", len(ct))
-    entry += ct
+    lib_entries = b""
+    for lp in lib_paths:
+        ld = lp.read_bytes()
+        lib_entries += _build_entry(lp, ld, key, is_main=False)
+        print(f"[antirev] Bundled    lib:  {lp.name}  ({len(ld):,} bytes)")
 
-    bundle = struct.pack("<IB", 1, 0x00) + entry   # num_files = 1, flags = 0
+    num_files = 1 + len(lib_paths)
+    bundle_flags = BFLAG_HAS_LIBS if lib_paths else 0x00
+    bundle = struct.pack("<IB", num_files, bundle_flags) + main_entry + lib_entries
 
     stub_data     = stub_path.read_bytes()
     bundle_offset = len(stub_data)
@@ -106,8 +128,6 @@ def cmd_protect_exe(args):
     out_path.write_bytes(out_data)
     out_path.chmod(0o755)
 
-    print(f"[antirev] Encrypted main: {main_path.name}  "
-          f"({len(data):,} → {len(entry):,} bytes)")
     print(f"\n[antirev] Protected binary → {out_path}  ({len(out_data):,} bytes)")
     print(f"[antirev] Key file         → {key_path}  (keep secret)")
     print(f"\n[antirev] To run:\n    {out_path} [args...]")
@@ -178,6 +198,8 @@ def main():
     pe.add_argument("--main",   required=True, help="Main ELF to protect")
     pe.add_argument("--key",    required=True, help="Key file (hex); created if absent")
     pe.add_argument("--output", required=True, help="Output protected binary")
+    pe.add_argument("--libs",   nargs="*",    default=[], metavar="LIB",
+                    help="Shared libraries to bundle (encrypted, loaded via LD_PRELOAD)")
 
     # encrypt-lib
     el = sub.add_parser("encrypt-lib", help="Encrypt shared library file(s) in-place")

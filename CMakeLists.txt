@@ -167,10 +167,12 @@ endif()
 #  Helper: compile a shared library with a given compiler
 # ═══════════════════════════════════════════════════════════════════════
 function(compile_lib OUTPUT COMPILER SOURCE)
+    get_filename_component(_soname "${OUTPUT}" NAME)
     add_custom_command(
         OUTPUT  "${OUTPUT}"
         COMMAND "${COMPILER}" -shared -fPIC -O2
                 -I "${CMAKE_SOURCE_DIR}/tests"
+                -Wl,-soname,${_soname}
                 -o "${OUTPUT}" "${SOURCE}"
         DEPENDS "${SOURCE}"
         COMMENT "Building lib: ${OUTPUT}"
@@ -221,6 +223,48 @@ add_custom_target(test_dlopen
     DEPENDS stub mylib dlopen_main
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
     COMMENT "dlopen test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_preload_memfd — smoke test: DT_NEEDED satisfied via LD_PRELOAD
+#  from a memfd (no .so on disk, no LD_AUDIT)
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_lib("${CMAKE_BINARY_DIR}/libpretest.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/preload_memfd/libpretest.c")
+add_custom_target(libpretest DEPENDS "${CMAKE_BINARY_DIR}/libpretest.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/preload_launcher"
+    COMMAND gcc -O2
+            -o "${CMAKE_BINARY_DIR}/preload_launcher"
+            "${CMAKE_SOURCE_DIR}/tests/preload_memfd/launcher.c"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/preload_memfd/launcher.c"
+    COMMENT "Building preload_launcher"
+)
+add_custom_target(preload_launcher DEPENDS "${CMAKE_BINARY_DIR}/preload_launcher")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/preload_main"
+    COMMAND gcc -O2
+            -o "${CMAKE_BINARY_DIR}/preload_main"
+            "${CMAKE_SOURCE_DIR}/tests/preload_memfd/main.c"
+            -L "${CMAKE_BINARY_DIR}" -lpretest -Wl,--no-as-needed
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/preload_memfd/main.c"
+            "${CMAKE_BINARY_DIR}/libpretest.so"
+    COMMENT "Building preload_main"
+)
+add_custom_target(preload_main DEPENDS "${CMAKE_BINARY_DIR}/preload_main")
+
+add_custom_target(test_preload_memfd
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_preload_memfd ==="
+    COMMAND "${CMAKE_BINARY_DIR}/preload_launcher"
+            "${CMAKE_BINARY_DIR}/libpretest.so"
+            "${CMAKE_BINARY_DIR}/preload_main"
+    DEPENDS preload_launcher preload_main libpretest
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "LD_PRELOAD memfd DT_NEEDED satisfaction smoke test"
     USES_TERMINAL
 )
 
@@ -311,22 +355,18 @@ add_custom_target(linked_main DEPENDS "${CMAKE_BINARY_DIR}/linked_main")
 
 add_custom_target(test_linked
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_linked ==="
-    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
-            --key        "${CMAKE_BINARY_DIR}/linked.key"
-            --libs       "${CMAKE_BINARY_DIR}/liblinkedmath.so"
-            --output-dir "${CMAKE_BINARY_DIR}/encrypted"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/linked_main"
             --key    "${CMAKE_BINARY_DIR}/linked.key"
+            --libs   "${CMAKE_BINARY_DIR}/liblinkedmath.so"
             --output "${CMAKE_BINARY_DIR}/linked_main.protected"
     COMMAND ${CMAKE_COMMAND}
             "-DBINARY=${CMAKE_BINARY_DIR}/linked_main.protected"
-            "-DLD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/encrypted"
             -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
     DEPENDS stub liblinkedmath linked_main
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "DT_NEEDED LD_AUDIT test"
+    COMMENT "DT_NEEDED satisfied via LD_PRELOAD from bundled encrypted .so"
     USES_TERMINAL
 )
 

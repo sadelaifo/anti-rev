@@ -52,7 +52,7 @@ except ImportError:
     sys.exit("Missing dependency: pip install pyyaml")
 
 sys.path.insert(0, str(Path(__file__).parent))
-from protect import load_or_create_key, encrypt_data, MAGIC
+from protect import load_or_create_key, encrypt_data, MAGIC, BFLAG_HAS_LIBS
 
 # ELF magic and type constants
 ELF_MAGIC = b'\x7fELF'
@@ -152,12 +152,14 @@ def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
             f"{len(data):>10,} -> {out_size:>10,} bytes")
 
 
-def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes) -> str:
-    """Encrypt and bundle an executable in-process. Returns status string."""
+def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
+                        lib_paths: list[str] = None) -> str:
+    """Encrypt and bundle an executable (+ optional libs) in-process."""
     src_p  = Path(src)
     stub_p = Path(stub)
     dst_p  = Path(dst)
 
+    # Main exe entry
     data = src_p.read_bytes()
     iv, tag, ct = encrypt_data(data, key)
     name_b = src_p.name.encode()
@@ -170,7 +172,27 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes) -> str:
     entry += struct.pack("<Q", len(ct))
     entry += ct
 
-    bundle = struct.pack("<IB", 1, 0x00) + entry  # flags = 0
+    # Lib entries
+    lib_entries = b""
+    lib_count = 0
+    if lib_paths:
+        for lib_str in lib_paths:
+            lib_p = Path(lib_str)
+            lib_data = lib_p.read_bytes()
+            liv, ltag, lct = encrypt_data(lib_data, key)
+            lname_b = lib_p.name.encode()
+            le  = struct.pack("<H", len(lname_b))
+            le += lname_b
+            le += struct.pack("<B", 0)   # flags: not main
+            le += liv + ltag
+            le += struct.pack("<Q", len(lct))
+            le += lct
+            lib_entries += le
+            lib_count += 1
+
+    num_files = 1 + lib_count
+    flags = BFLAG_HAS_LIBS if lib_count > 0 else 0x00
+    bundle = struct.pack("<IB", num_files, flags) + entry + lib_entries
 
     stub_data     = stub_p.read_bytes()
     bundle_offset = len(stub_data)
@@ -181,8 +203,9 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes) -> str:
     os.chmod(str(dst_p), 0o755)
 
     out_size = dst_p.stat().st_size
+    libs_info = f" (+{lib_count} libs)" if lib_count else ""
     return (f"[pack] Protected  exe: {src_p.name:<30}  "
-            f"{len(data):>10,} -> {out_size:>10,} bytes")
+            f"{len(data):>10,} -> {out_size:>10,} bytes{libs_info}")
 
 
 def _copy_worker(items: list[tuple[str, str]]) -> int:
@@ -289,28 +312,13 @@ def main():
             print(f"[pack]     skip: {rel}")
     print()
 
-    # ── Encrypt shared libraries (parallel) ───────────────────────────
-    if lib_files:
-        print(f"[pack] Encrypting {len(lib_files)} shared "
-              f"librar{'y' if len(lib_files) == 1 else 'ies'}...")
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    _encrypt_lib_worker,
-                    str(src),
-                    str(output_dir / src.relative_to(install_dir)),
-                    key,
-                ): src
-                for src in lib_files
-            }
-            for fut in as_completed(futures):
-                try:
-                    print(fut.result())
-                except Exception as e:
-                    sys.exit(f"[error] encrypt failed for {futures[fut]}: {e}")
-        print()
+    # ── Protect executables with bundled libs (parallel) ────────────────
+    lib_path_strs = [str(p) for p in lib_files] if lib_files else []
 
-    # ── Protect executables (parallel) ────────────────────────────────
+    if lib_files:
+        print(f"[pack] Bundling {len(lib_files)} shared "
+              f"librar{'y' if len(lib_files) == 1 else 'ies'} into each executable...")
+
     if exe_files:
         print(f"[pack] Protecting {len(exe_files)} executable(s)...")
         for rel, arch, src in exe_files:
@@ -325,6 +333,7 @@ def main():
                     str(stubs[arch]),
                     str(output_dir / rel),
                     key,
+                    lib_path_strs,
                 ): rel
                 for rel, arch, src in exe_files
             }

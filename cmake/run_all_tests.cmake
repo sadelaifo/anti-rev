@@ -5,10 +5,12 @@ if(NOT BUILD_DIR OR NOT SRC_DIR)
     message(FATAL_ERROR "Usage: cmake -DBUILD_DIR=<path> -DSRC_DIR=<path> -P run_all_tests.cmake")
 endif()
 
-# Tests that work without LD_AUDIT (exe-only protection)
+# Tests that work with exe-only and bundled-lib protection
 set(TESTS
     run_test              # hello smoke test
+    test_preload_memfd    # LD_PRELOAD memfd DT_NEEDED smoke test
     test_plain_so         # encrypted exe + plain (unencrypted) .so
+    test_linked           # DT_NEEDED .so via bundled LD_PRELOAD memfd
     test_proc_self_exe    # /proc/self/exe returns real path (readlink)
     test_realpath         # realpath/canonicalize_file_name on /proc/self/exe
     test_path_stress      # comprehensive path resolution test
@@ -19,8 +21,8 @@ set(TESTS
     test_tamper           # bit-flipped ciphertext -> clean failure
 )
 
-# Tests disabled — require LD_AUDIT for encrypted .so loading:
-#   test_dlopen, test_multi_so, test_linked, test_fork_exec,
+# Tests disabled — need further work:
+#   test_dlopen, test_multi_so, test_fork_exec,
 #   test_multi_process, test_daemon_fdclose, test_concurrent_dlopen,
 #   test_plain_exe_enc_so
 

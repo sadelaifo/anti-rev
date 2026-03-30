@@ -21,8 +21,11 @@
  *   Phase 2 — per file, two streaming passes over ciphertext:
  *               Pass A: GHASH  → verify GCM tag (abort on failure)
  *               Pass B: CTR    → decrypt chunk by chunk → write to memfd
- *   Phase 3 — load embedded exe_shim.so into memfd
- *   Phase 4 — fexecve(main_fd) — replaces this process image (same PID)
+ *   Phase 3 — if bundle has libs, try to receive shared lib memfds from
+ *             daemon (abstract Unix socket + SCM_RIGHTS); if no daemon yet,
+ *             fork one to share our lib memfds with later processes
+ *   Phase 4 — load embedded exe_shim.so into memfd
+ *   Phase 5 — fexecve(main_fd) with LD_PRELOAD=exe_shim:lib1:lib2:…
  *
  * Peak stub heap: one CHUNK_SIZE buffer (~4 MB) + header table (~37 KB max).
  * All plaintext lives only in kernel memfds, never fully in user-space heap.
@@ -37,6 +40,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include "crypto.h"
 
 #ifndef __NR_memfd_create
@@ -115,6 +120,118 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
     return 0;
 }
 
+#define BFLAG_HAS_LIBS  0x01
+
+/* ------------------------------------------------------------------ */
+/*  Daemon: serve lib memfds to sibling processes via SCM_RIGHTS       */
+/* ------------------------------------------------------------------ */
+static void daemon_serve(int listen_fd, const int *lib_fds, int nlibs)
+{
+    /* Detach from terminal */
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+
+    for (;;) {
+        int client = accept(listen_fd, NULL, NULL);
+        if (client < 0) continue;
+
+        /* Only serve root (uid 0) */
+        struct ucred cred;
+        socklen_t clen = sizeof(cred);
+        if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0
+            || cred.uid != 0) {
+            close(client);
+            continue;
+        }
+
+        /* Send lib count + fds via SCM_RIGHTS */
+        uint32_t nl = (uint32_t)nlibs;
+
+        struct iovec iov;
+        iov.iov_base = &nl;
+        iov.iov_len  = sizeof(nl);
+
+        char cmsg_buf[CMSG_SPACE(MAX_FILES * sizeof(int))];
+        memset(cmsg_buf, 0, sizeof(cmsg_buf));
+
+        struct msghdr msg = {0};
+        msg.msg_iov        = &iov;
+        msg.msg_iovlen     = 1;
+        msg.msg_control    = cmsg_buf;
+        msg.msg_controllen = CMSG_SPACE((size_t)nlibs * sizeof(int));
+
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type  = SCM_RIGHTS;
+        cmsg->cmsg_len   = CMSG_LEN((size_t)nlibs * sizeof(int));
+        memcpy(CMSG_DATA(cmsg), lib_fds, (size_t)nlibs * sizeof(int));
+
+        sendmsg(client, &msg, 0);
+        close(client);
+    }
+}
+
+/* Try to receive lib fds from the daemon.
+ * Returns 0 on success (out_fds/out_nlibs filled), -1 on failure. */
+static int receive_lib_fds(int sd, int *out_fds, int *out_nlibs)
+{
+    uint32_t nl = 0;
+
+    struct iovec iov;
+    iov.iov_base = &nl;
+    iov.iov_len  = sizeof(nl);
+
+    char cmsg_buf[CMSG_SPACE(MAX_FILES * sizeof(int))];
+    memset(cmsg_buf, 0, sizeof(cmsg_buf));
+
+    struct msghdr msg = {0};
+    msg.msg_iov        = &iov;
+    msg.msg_iovlen     = 1;
+    msg.msg_control    = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+
+    if (recvmsg(sd, &msg, 0) < 0) return -1;
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) return -1;
+
+    int nfds = (int)((cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+    if (nfds != (int)nl || nfds > MAX_FILES) return -1;
+
+    memcpy(out_fds, CMSG_DATA(cmsg), (size_t)nfds * sizeof(int));
+    *out_nlibs = nfds;
+    return 0;
+}
+
+/* Build abstract socket address from key hash.
+ * Returns the sockaddr_un length to pass to bind/connect. */
+static socklen_t make_sock_addr(struct sockaddr_un *addr,
+                                const uint8_t key[KEY_SIZE])
+{
+    /* Derive socket name: AES_K(0^128)[0:8] → hex.
+     * This is the GHASH subkey H, deterministic per key. */
+    aes256gcm_ctx tmp;
+    uint8_t dummy_iv[IV_SIZE] = {0};
+    aes256gcm_init(&tmp, key, dummy_iv);
+    /* tmp.H now contains AES_K(0^128) */
+
+    char hex[17];
+    for (int i = 0; i < 8; i++)
+        snprintf(hex + i * 2, 3, "%02x", tmp.H[i]);
+
+    memset(addr, 0, sizeof(*addr));
+    addr->sun_family = AF_UNIX;
+    /* Abstract socket: sun_path[0] = '\0' (already zeroed), name follows */
+    snprintf(addr->sun_path + 1, sizeof(addr->sun_path) - 1,
+             "antirev_%s", hex);
+
+    explicit_bzero(&tmp, sizeof(tmp));
+
+    return (socklen_t)(offsetof(struct sockaddr_un, sun_path)
+                       + 1 + strlen(addr->sun_path + 1));
+}
+
 /* ------------------------------------------------------------------ */
 /*  main                                                               */
 /* ------------------------------------------------------------------ */
@@ -169,7 +286,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         perror("pread num_files"); return 1;
     }
     uint32_t nfiles = u32le(tmp);
-    /* uint8_t bundle_flags = tmp[4]; — reserved for future use */
+    uint8_t bundle_flags = tmp[4];
     if (nfiles > MAX_FILES) {
         fprintf(stderr, "[antirev] too many files in bundle (%u)\n", nfiles);
         return 1;
@@ -224,6 +341,8 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     if (!chunk) { perror("malloc chunk"); return 1; }
 
     int main_fd = -1;
+    int lib_fds[MAX_FILES];
+    int nlibs = 0;
 
     for (uint32_t i = 0; i < nfiles; i++) {
         file_entry_t *e = &entries[i];
@@ -246,8 +365,6 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             return 1;
         }
 
-        if (!e->is_main) continue;  /* only decrypt the main exe */
-
         /* --- Pass B: CTR decrypt + write to memfd --- */
         int fd = make_memfd(e->name);
         if (fd < 0) return 1;
@@ -266,7 +383,10 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
         if (lseek(fd, 0, SEEK_SET) < 0) { perror("lseek memfd"); return 1; }
 
-        main_fd = fd;
+        if (e->is_main)
+            main_fd = fd;
+        else
+            lib_fds[nlibs++] = fd;
     }
 
     if (main_fd < 0) {
@@ -274,19 +394,94 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         return 1;
     }
 
-    /* Wipe key and chunk buffer */
-    explicit_bzero(key,   sizeof(key));
+    /* Done reading from the binary — close before daemon fork so the
+     * daemon child does not hold the protected binary open (ETXTBSY). */
     explicit_bzero(chunk, CHUNK_SIZE);
     free(chunk);
     close(self);
 
-    /* 5. Write embedded exe shim to memfd */
+    /* ----------------------------------------------------------------
+     * Phase 3: daemon — share lib memfds with sibling processes.
+     *
+     * First process: fork a small daemon that serves lib fds via an
+     * abstract Unix socket (zero filesystem presence).
+     * Later processes: connect to the daemon, receive shared fds,
+     * close their locally-decrypted copies.
+     * ---------------------------------------------------------------- */
+    if ((bundle_flags & BFLAG_HAS_LIBS) && nlibs > 0) {
+        struct sockaddr_un addr;
+        socklen_t addr_len = make_sock_addr(&addr, key);
+
+        int sd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
+            /* Daemon already running — receive shared fds */
+            int recv_fds[MAX_FILES];
+            int recv_nlibs = 0;
+            if (receive_lib_fds(sd, recv_fds, &recv_nlibs) == 0
+                && recv_nlibs > 0) {
+                /* Close our locally-decrypted lib fds, use shared ones */
+                for (int j = 0; j < nlibs; j++)
+                    close(lib_fds[j]);
+                nlibs = recv_nlibs;
+                memcpy(lib_fds, recv_fds, (size_t)nlibs * sizeof(int));
+            }
+            close(sd);
+        } else {
+            /* No daemon yet — we are the first process */
+            if (sd >= 0) close(sd);
+
+            int listen_sd = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (listen_sd >= 0
+                && bind(listen_sd, (struct sockaddr *)&addr, addr_len) == 0) {
+                listen(listen_sd, 16);
+                pid_t pid = fork();
+                if (pid == 0) {
+                    /* Daemon child — close fds we don't need */
+                    close(main_fd);
+                    daemon_serve(listen_sd, lib_fds, nlibs);
+                    _exit(0);
+                }
+                /* Parent continues — daemon runs in background */
+                close(listen_sd);
+            } else {
+                /* bind() failed (race: another process won).
+                 * Retry connect. */
+                if (listen_sd >= 0) close(listen_sd);
+
+                for (int retry = 0; retry < 10; retry++) {
+                    usleep(10000); /* 10 ms */
+                    sd = socket(AF_UNIX, SOCK_STREAM, 0);
+                    if (sd >= 0
+                        && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
+                        int recv_fds[MAX_FILES];
+                        int recv_nlibs = 0;
+                        if (receive_lib_fds(sd, recv_fds, &recv_nlibs) == 0
+                            && recv_nlibs > 0) {
+                            for (int j = 0; j < nlibs; j++)
+                                close(lib_fds[j]);
+                            nlibs = recv_nlibs;
+                            memcpy(lib_fds, recv_fds,
+                                   (size_t)nlibs * sizeof(int));
+                        }
+                        close(sd);
+                        break;
+                    }
+                    if (sd >= 0) close(sd);
+                }
+            }
+        }
+    }
+
+    /* Wipe key (after daemon socket name derivation) */
+    explicit_bzero(key, sizeof(key));
+
+    /* Phase 4. Write embedded exe shim to memfd */
     int exe_shim_fd = make_memfd("antirev_exe_shim.so");
     if (exe_shim_fd < 0) return 1;
     if (write_chunk(exe_shim_fd, exe_shim_blob, exe_shim_blob_len) != 0) return 1;
     if (lseek(exe_shim_fd, 0, SEEK_SET) < 0) { perror("lseek exe_shim"); return 1; }
 
-    /* 6. Build new envp */
+    /* Phase 5. Build new envp */
     int envc = 0;
     while (envp[envc]) envc++;
 
@@ -311,16 +506,21 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     snprintf(main_fd_entry, sizeof(main_fd_entry),
              "ANTIREV_MAIN_FD=%d", main_fd);
 
-    /* Prepend our exe shim to any existing LD_PRELOAD entries */
-    size_t preload_len = 64 + (existing_preload ? 1 + strlen(existing_preload) : 0);
+    /* Build LD_PRELOAD: exe_shim + lib memfds + any existing preload.
+     * Each fd path is /proc/self/fd/NNN — at most ~20 chars each. */
+    size_t preload_len = 64 + (size_t)nlibs * 24
+                       + (existing_preload ? 1 + strlen(existing_preload) : 0);
     char *ld_preload_entry = malloc(preload_len);
     if (!ld_preload_entry) { perror("malloc ld_preload"); return 1; }
+
+    int off = snprintf(ld_preload_entry, preload_len,
+                       "LD_PRELOAD=/proc/self/fd/%d", exe_shim_fd);
+    for (int j = 0; j < nlibs; j++)
+        off += snprintf(ld_preload_entry + off, preload_len - (size_t)off,
+                        ":/proc/self/fd/%d", lib_fds[j]);
     if (existing_preload)
-        snprintf(ld_preload_entry, preload_len,
-                 "LD_PRELOAD=/proc/self/fd/%d:%s", exe_shim_fd, existing_preload);
-    else
-        snprintf(ld_preload_entry, preload_len,
-                 "LD_PRELOAD=/proc/self/fd/%d", exe_shim_fd);
+        snprintf(ld_preload_entry + off, preload_len - (size_t)off,
+                 ":%s", existing_preload);
 
     int ei = 0;
     for (int j = 0; j < envc; j++) {
@@ -334,7 +534,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     new_env[ei++] = ld_preload_entry;
     new_env[ei]   = NULL;
 
-    /* 7. Replace this process with the decrypted binary — no fork, same PID */
+    /* Phase 6. Replace this process with the decrypted binary — no fork, same PID */
     fexecve(main_fd, argv, new_env);
     perror("fexecve");
     return 1;
