@@ -66,7 +66,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from protect import (load_or_create_key, encrypt_data, MAGIC,
-                     BFLAG_HAS_LIBS)
+                     BFLAG_HAS_LIBS, BFLAG_DAEMON_LIBS)
 
 # ELF magic and type constants
 ELF_MAGIC = b'\x7fELF'
@@ -167,7 +167,8 @@ def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
 
 
 def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
-                        lib_paths: list[str] = None) -> str:
+                        lib_paths: list[str] = None,
+                        daemon_libs: bool = False) -> str:
     """Encrypt and bundle an executable (+ optional libs) in-process."""
     src_p  = Path(src)
     stub_p = Path(stub)
@@ -205,7 +206,11 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
             lib_count += 1
 
     num_files = 1 + lib_count
-    flags = BFLAG_HAS_LIBS if lib_count > 0 else 0x00
+    flags = 0x00
+    if lib_count > 0:
+        flags |= BFLAG_HAS_LIBS
+    if daemon_libs:
+        flags |= BFLAG_DAEMON_LIBS
     bundle = struct.pack("<IB", num_files, flags) + entry + lib_entries
 
     stub_data     = stub_p.read_bytes()
@@ -371,7 +376,9 @@ def main():
 
     lib_path_strs = [str(p) for p in lib_files] if lib_files else []
 
-    # Encrypt libs individually to output_dir as standalone encrypted files
+    # Encrypt libs individually to output_dir as standalone encrypted files,
+    # and create a lightweight daemon binary (stub + key, no bundled libs)
+    # that reads encrypted libs from disk at runtime
     if libs_mode == 'encrypt' and lib_files:
         print(f"[pack] Encrypting {len(lib_files)} lib(s) individually...")
         with ProcessPoolExecutor(max_workers=workers) as pool:
@@ -389,6 +396,20 @@ def main():
                     print(fut.result())
                 except Exception as e:
                     sys.exit(f"[error] encrypt lib failed for {futures[fut]}: {e}")
+
+        # Build lightweight daemon: stub + key only, no bundled libs
+        daemon_arch = next(iter(stubs))
+        daemon_stub = stubs[daemon_arch]
+        daemon_path = output_dir / '.antirev-libd'
+        stub_data = daemon_stub.read_bytes()
+        bundle = struct.pack("<IB", 0, 0)  # 0 files, no flags
+        bundle_offset = len(stub_data)
+        trailer = struct.pack("<Q", bundle_offset) + key + MAGIC
+        daemon_path.parent.mkdir(parents=True, exist_ok=True)
+        daemon_path.write_bytes(stub_data + bundle + trailer)
+        os.chmod(str(daemon_path), 0o755)
+        print(f"[pack] Daemon binary: {daemon_path.name}  "
+              f"({daemon_path.stat().st_size:,} bytes, reads libs from disk)")
         print()
 
     if libs_mode == 'bundle' and lib_files:
@@ -402,10 +423,16 @@ def main():
                 sys.exit(f"[error] no stub for arch '{arch}' "
                          f"(needed by {rel}). Add it to 'stubs' in config.")
 
-        # Determine what libs to bundle into each exe
-        # bundle: all encrypted libs go inside each exe
-        # encrypt/skip: libs handled separately, exes are standalone
-        exe_lib_paths = lib_path_strs if libs_mode == 'bundle' else None
+        # Determine what libs to pass to each exe
+        if libs_mode == 'bundle':
+            exe_lib_paths = lib_path_strs
+            exe_daemon_libs = False
+        elif libs_mode == 'encrypt':
+            exe_lib_paths = None
+            exe_daemon_libs = bool(lib_files)
+        else:  # skip
+            exe_lib_paths = None
+            exe_daemon_libs = False
 
         with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = {
@@ -416,6 +443,7 @@ def main():
                     str(output_dir / rel),
                     key,
                     exe_lib_paths,
+                    exe_daemon_libs,
                 ): rel
                 for rel, arch, src in exe_files
             }
