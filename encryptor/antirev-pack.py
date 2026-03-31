@@ -154,28 +154,68 @@ def compile_blacklist(raw: list[str]) -> list[tuple[str, str]]:
     return compiled
 
 
-def get_dt_needed(path: Path) -> list[str]:
-    """Get DT_NEEDED library names from an ELF binary using readelf."""
+def _parse_readelf_dynamic(path: Path) -> list[str]:
+    """Run readelf -d and return raw output lines."""
     try:
         result = subprocess.run(
             ['readelf', '-d', str(path)],
             capture_output=True, text=True, timeout=10
         )
-        needed = []
-        for line in result.stdout.splitlines():
-            m = re.search(r'\(NEEDED\)\s+Shared library: \[(.+)\]', line)
-            if m:
-                needed.append(m.group(1))
-        return needed
+        return result.stdout.splitlines()
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
 
 
+def get_dt_needed(path: Path) -> list[str]:
+    """Get DT_NEEDED library names from an ELF binary using readelf."""
+    needed = []
+    for line in _parse_readelf_dynamic(path):
+        m = re.search(r'\(NEEDED\)\s+Shared library: \[(.+)\]', line)
+        if m:
+            needed.append(m.group(1))
+    return needed
+
+
+def get_dt_soname(path: Path) -> str:
+    """Get DT_SONAME from a shared library. Returns '' if not set."""
+    for line in _parse_readelf_dynamic(path):
+        m = re.search(r'\(SONAME\)\s+Library soname: \[(.+)\]', line)
+        if m:
+            return m.group(1)
+    return ''
+
+
+def build_soname_maps(lib_files: list) -> tuple[dict, dict]:
+    """Build bidirectional soname ↔ filename mappings for encrypted libs.
+
+    Returns (soname_to_filename, lib_by_lookup) where lib_by_lookup maps
+    both sonames and filenames to the source Path for DT_NEEDED traversal.
+    """
+    soname_to_filename = {}   # soname → filename (e.g. "libFoo.so.1" → "libFoo.so.1.2.3")
+    lib_by_lookup = {}        # soname or filename → Path
+
+    for src in lib_files:
+        fname = src.name
+        lib_by_lookup[fname] = src
+
+        soname = get_dt_soname(src)
+        if soname and soname != fname:
+            soname_to_filename[soname] = fname
+            lib_by_lookup[soname] = src
+
+    return soname_to_filename, lib_by_lookup
+
+
 def get_transitive_needed(path: Path, encrypted_names: set[str],
-                          lib_by_name: dict[str, Path]) -> list[str]:
+                          soname_to_filename: dict[str, str],
+                          lib_by_lookup: dict[str, 'Path']) -> list[str]:
     """Get transitive closure of encrypted libs needed by an ELF binary.
 
     BFS: start from path's DT_NEEDED, follow through encrypted libs only.
+    Handles soname ↔ filename mismatch (e.g. DT_NEEDED says "libFoo.so.1"
+    but encrypted file is "libFoo.so.1.2.3").
+
+    Returns list of filenames (not sonames) for the needed libs.
     """
     needed = []
     visited = set()
@@ -187,13 +227,16 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
             continue
         visited.add(name)
 
-        if name not in encrypted_names:
+        # Resolve: DT_NEEDED might be a soname, map to filename
+        filename = soname_to_filename.get(name, name)
+
+        if filename not in encrypted_names:
             continue
 
-        needed.append(name)
+        needed.append(filename)
 
         # Follow this lib's own DT_NEEDED
-        lib_path = lib_by_name.get(name)
+        lib_path = lib_by_lookup.get(name)
         if lib_path:
             for dep in get_dt_needed(lib_path):
                 if dep not in visited:
@@ -498,13 +541,20 @@ def main():
 
         # In encrypt mode, determine which encrypted libs each exe needs
         # (transitive: follows DT_NEEDED chains through encrypted libs)
+        # Handles soname ↔ filename mismatch (e.g. DT_NEEDED "libFoo.so.1"
+        # but file is "libFoo.so.1.2.3")
         encrypted_names = {src.name for src in lib_files}
-        lib_by_name = {src.name: src for src in lib_files}
         exe_needed = {}
         if libs_mode == 'encrypt' and encrypted_names:
+            print(f"[pack] Building soname map for encrypted libs...")
+            soname_to_filename, lib_by_lookup = build_soname_maps(lib_files)
+            if soname_to_filename:
+                for sn, fn in soname_to_filename.items():
+                    print(f"[pack]   soname {sn} → {fn}")
             print(f"[pack] Analyzing DT_NEEDED per executable (transitive)...")
             for rel, arch, src in exe_files:
-                needed = get_transitive_needed(src, encrypted_names, lib_by_name)
+                needed = get_transitive_needed(
+                    src, encrypted_names, soname_to_filename, lib_by_lookup)
                 exe_needed[rel] = needed
 
         with ProcessPoolExecutor(max_workers=workers) as pool:
