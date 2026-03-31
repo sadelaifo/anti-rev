@@ -597,6 +597,29 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
     }
 
+    /* Parse needed-libs section (after file entries, when BFLAG_DAEMON_LIBS).
+     * Format: [num_needed:2B] [name_len:2B name:...]... */
+    int n_needed = 0;
+    char needed_names[MAX_FILES][MAX_NAME + 1];
+
+    if (bundle_flags & BFLAG_DAEMON_LIBS) {
+        uint8_t nbuf[2];
+        if (pread(self, nbuf, 2, scan) == 2) {
+            uint16_t nn = u16le(nbuf);
+            scan += 2;
+            for (int i = 0; i < (int)nn && i < MAX_FILES; i++) {
+                if (pread(self, nbuf, 2, scan) != 2) break;
+                uint16_t nl = u16le(nbuf);
+                scan += 2;
+                if (nl > MAX_NAME) break;
+                if (pread(self, needed_names[n_needed], nl, scan) != nl) break;
+                needed_names[n_needed][nl] = '\0';
+                n_needed++;
+                scan += nl;
+            }
+        }
+    }
+
     /* ----------------------------------------------------------------
      * Phase 2: for each file, stream two passes over the ciphertext.
      *   Pass A — GHASH accumulation → tag verification
@@ -850,6 +873,36 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     if (exe_shim_fd < 0) return 1;
     if (write_chunk(exe_shim_fd, exe_shim_blob, exe_shim_blob_len) != 0) return 1;
     if (lseek(exe_shim_fd, 0, SEEK_SET) < 0) { perror("lseek exe_shim"); return 1; }
+
+    /* Phase 4b. Filter libs: only keep ones this exe actually needs.
+     * If n_needed > 0, match received lib names against the needed list
+     * embedded in the bundle. Close unneeded fds. */
+    if (n_needed > 0 && nlibs > 0) {
+        int kept_fds[MAX_FILES];
+        char kept_names[MAX_FILES][MAX_NAME + 1];
+        int nkept = 0;
+
+        for (int j = 0; j < nlibs; j++) {
+            int keep = 0;
+            for (int k = 0; k < n_needed; k++) {
+                if (strcmp(lib_names[j], needed_names[k]) == 0) {
+                    keep = 1;
+                    break;
+                }
+            }
+            if (keep) {
+                kept_fds[nkept] = lib_fds[j];
+                memcpy(kept_names[nkept], lib_names[j], MAX_NAME + 1);
+                nkept++;
+            } else {
+                close(lib_fds[j]);
+            }
+        }
+
+        memcpy(lib_fds, kept_fds, (size_t)nkept * sizeof(int));
+        memcpy(lib_names, kept_names, (size_t)nkept * (MAX_NAME + 1));
+        nlibs = nkept;
+    }
 
     /* Phase 5. Build new envp */
     int envc = 0;
