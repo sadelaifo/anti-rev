@@ -74,8 +74,9 @@
 #define IV_SIZE      12   /* GCM nonce */
 #define TAG_SIZE     16   /* GCM auth tag */
 #define MAX_NAME     255
-#define MAX_FILES    128
+#define MAX_FILES    1024
 #define CHUNK_SIZE   (4 * 1024 * 1024)  /* 4 MB I/O + crypto buffer */
+#define SCM_BATCH    250  /* max fds per SCM_RIGHTS (kernel SCM_MAX_FD = 253) */
 
 /* ------------------------------------------------------------------ */
 /*  Per-file metadata collected during header scan (Phase 1)          */
@@ -130,9 +131,9 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 #define BFLAG_HAS_LIBS     0x01
 #define BFLAG_DAEMON_LIBS  0x02  /* libs served by external daemon */
 
-/* Max size of the daemon protocol data payload:
- * 4 bytes (nlibs) + MAX_FILES * (2 + MAX_NAME) */
-#define DAEMON_DATA_MAX  (4 + MAX_FILES * (2 + MAX_NAME))
+/* Max size of the daemon protocol data payload (per batch):
+ * 4 bytes (nlibs) + SCM_BATCH * (2 + MAX_NAME) */
+#define DAEMON_DATA_MAX  (4 + SCM_BATCH * (2 + MAX_NAME))
 
 /* ------------------------------------------------------------------ */
 /*  Daemon: serve lib memfds to sibling processes via SCM_RIGHTS       */
@@ -173,12 +174,6 @@ static size_t build_daemon_payload(uint8_t *buf, size_t buflen,
 static void daemon_serve(int listen_fd, const int *lib_fds,
                          const char (*lib_names)[MAX_NAME + 1], int nlibs)
 {
-    /* Build data payload once (it never changes) */
-    uint8_t payload[DAEMON_DATA_MAX];
-    size_t payload_len = build_daemon_payload(payload, sizeof(payload),
-                                             lib_names, nlibs);
-
-    /* Detach from terminal */
     uid_t my_uid = getuid();
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
@@ -197,82 +192,100 @@ static void daemon_serve(int listen_fd, const int *lib_fds,
             continue;
         }
 
-        /* Send payload + fds via SCM_RIGHTS */
-        struct iovec iov;
-        iov.iov_base = payload;
-        iov.iov_len  = payload_len;
+        /* Send libs in batches of SCM_BATCH (kernel limit: 253 fds) */
+        int ok = 1;
+        for (int off = 0; off < nlibs && ok; off += SCM_BATCH) {
+            int batch = nlibs - off;
+            if (batch > SCM_BATCH) batch = SCM_BATCH;
 
-        char cmsg_buf[CMSG_SPACE(MAX_FILES * sizeof(int))];
+            uint8_t payload[DAEMON_DATA_MAX];
+            size_t payload_len = build_daemon_payload(
+                payload, sizeof(payload), lib_names + off, batch);
+
+            struct iovec iov = { .iov_base = payload, .iov_len = payload_len };
+
+            char cmsg_buf[CMSG_SPACE(SCM_BATCH * sizeof(int))];
+            memset(cmsg_buf, 0, sizeof(cmsg_buf));
+
+            struct msghdr msg = {0};
+            msg.msg_iov        = &iov;
+            msg.msg_iovlen     = 1;
+            msg.msg_control    = cmsg_buf;
+            msg.msg_controllen = CMSG_SPACE((size_t)batch * sizeof(int));
+
+            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+            cmsg->cmsg_level = SOL_SOCKET;
+            cmsg->cmsg_type  = SCM_RIGHTS;
+            cmsg->cmsg_len   = CMSG_LEN((size_t)batch * sizeof(int));
+            memcpy(CMSG_DATA(cmsg), lib_fds + off, (size_t)batch * sizeof(int));
+
+            if (sendmsg(client, &msg, 0) < 0) ok = 0;
+        }
+
+        /* Sentinel: nlibs=0 signals end of batches */
+        uint32_t sentinel = 0;
+        (void)send(client, &sentinel, sizeof(sentinel), 0);
+
+        close(client);
+    }
+}
+
+/* Receive lib fds + names from the daemon (batched protocol).
+ * Daemon sends batches of up to SCM_BATCH fds, terminated by a
+ * sentinel message (nlibs=0).
+ * Returns 0 on success, -1 on failure. */
+static int receive_lib_fds(int sd, int *out_fds,
+                           char (*out_names)[MAX_NAME + 1], int *out_nlibs)
+{
+    *out_nlibs = 0;
+
+    for (;;) {
+        uint8_t payload[DAEMON_DATA_MAX];
+        struct iovec iov = { .iov_base = payload, .iov_len = sizeof(payload) };
+
+        char cmsg_buf[CMSG_SPACE(SCM_BATCH * sizeof(int))];
         memset(cmsg_buf, 0, sizeof(cmsg_buf));
 
         struct msghdr msg = {0};
         msg.msg_iov        = &iov;
         msg.msg_iovlen     = 1;
         msg.msg_control    = cmsg_buf;
-        msg.msg_controllen = CMSG_SPACE((size_t)nlibs * sizeof(int));
+        msg.msg_controllen = sizeof(cmsg_buf);
+
+        ssize_t got = recvmsg(sd, &msg, 0);
+        if (got < 4) return -1;
+
+        uint32_t nl;
+        memcpy(&nl, payload, 4);
+        if (nl == 0) break;  /* sentinel — no more batches */
+        if (*out_nlibs + (int)nl > MAX_FILES) return -1;
 
         struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type  = SCM_RIGHTS;
-        cmsg->cmsg_len   = CMSG_LEN((size_t)nlibs * sizeof(int));
-        memcpy(CMSG_DATA(cmsg), lib_fds, (size_t)nlibs * sizeof(int));
+        if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) return -1;
 
-        (void)sendmsg(client, &msg, 0); /* best-effort */
-        close(client);
-    }
-}
+        int nfds = (int)((cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+        if (nfds != (int)nl) return -1;
 
-/* Try to receive lib fds + names from the daemon.
- * Returns 0 on success (out_fds/out_names/out_nlibs filled), -1 on failure. */
-static int receive_lib_fds(int sd, int *out_fds,
-                           char (*out_names)[MAX_NAME + 1], int *out_nlibs)
-{
-    uint8_t payload[DAEMON_DATA_MAX];
+        memcpy(out_fds + *out_nlibs, CMSG_DATA(cmsg),
+               (size_t)nfds * sizeof(int));
 
-    struct iovec iov;
-    iov.iov_base = payload;
-    iov.iov_len  = sizeof(payload);
+        /* Parse lib names for this batch */
+        size_t off = 4;
+        for (int i = 0; i < (int)nl; i++) {
+            if (off + 2 > (size_t)got) return -1;
+            uint16_t nlen;
+            memcpy(&nlen, payload + off, 2);
+            off += 2;
+            if (nlen > MAX_NAME || off + nlen > (size_t)got) return -1;
+            memcpy(out_names[*out_nlibs + i], payload + off, nlen);
+            out_names[*out_nlibs + i][nlen] = '\0';
+            off += nlen;
+        }
 
-    char cmsg_buf[CMSG_SPACE(MAX_FILES * sizeof(int))];
-    memset(cmsg_buf, 0, sizeof(cmsg_buf));
-
-    struct msghdr msg = {0};
-    msg.msg_iov        = &iov;
-    msg.msg_iovlen     = 1;
-    msg.msg_control    = cmsg_buf;
-    msg.msg_controllen = sizeof(cmsg_buf);
-
-    ssize_t got = recvmsg(sd, &msg, 0);
-    if (got < 4) return -1;
-
-    /* Parse data payload */
-    uint32_t nl;
-    memcpy(&nl, payload, 4);
-    if (nl > MAX_FILES) return -1;
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) return -1;
-
-    int nfds = (int)((cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int));
-    if (nfds != (int)nl) return -1;
-
-    memcpy(out_fds, CMSG_DATA(cmsg), (size_t)nfds * sizeof(int));
-
-    /* Parse lib names */
-    size_t off = 4;
-    for (int i = 0; i < (int)nl; i++) {
-        if (off + 2 > (size_t)got) return -1;
-        uint16_t nlen;
-        memcpy(&nlen, payload + off, 2);
-        off += 2;
-        if (nlen > MAX_NAME || off + nlen > (size_t)got) return -1;
-        memcpy(out_names[i], payload + off, nlen);
-        out_names[i][nlen] = '\0';
-        off += nlen;
+        *out_nlibs += (int)nl;
     }
 
-    *out_nlibs = (int)nl;
-    return 0;
+    return (*out_nlibs > 0) ? 0 : -1;
 }
 
 /* Build abstract socket address from key hash.
