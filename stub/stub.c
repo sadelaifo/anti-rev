@@ -45,8 +45,10 @@
 #include <errno.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <dirent.h>
 #include "crypto.h"
 
 #ifndef __NR_memfd_create
@@ -351,6 +353,140 @@ static void merge_lib_fds(int *lib_fds, char (*lib_names)[MAX_NAME + 1],
 }
 
 /* ------------------------------------------------------------------ */
+/*  Decrypt standalone encrypted file from disk                        */
+/*  Format: ANTREV01(8) + iv(12) + tag(16) + ciphertext               */
+/*  Returns memfd on success, -1 on failure.                           */
+/* ------------------------------------------------------------------ */
+static int decrypt_enc_file(const char *path, const uint8_t *key,
+                            uint8_t *chunk)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    uint8_t hdr[MAGIC_LEN + IV_SIZE + TAG_SIZE]; /* 36 bytes */
+    if (pread(fd, hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)
+        || memcmp(hdr, MAGIC, MAGIC_LEN) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    uint8_t *iv  = hdr + MAGIC_LEN;
+    uint8_t *tag = hdr + MAGIC_LEN + IV_SIZE;
+
+    off_t fsize = lseek(fd, 0, SEEK_END);
+    off_t ct_off = (off_t)sizeof(hdr);
+    uint64_t ct_size = (uint64_t)(fsize - ct_off);
+    if (ct_size == 0) { close(fd); return -1; }
+
+    aes256gcm_ctx ctx;
+
+    /* Pass A: GHASH verify */
+    aes256gcm_init(&ctx, key, iv);
+    uint64_t remaining = ct_size;
+    off_t pos = ct_off;
+    while (remaining > 0) {
+        size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
+        ssize_t got     = pread(fd, chunk, to_read, pos);
+        if (got != (ssize_t)to_read) { close(fd); return -1; }
+        aes256gcm_ghash_update(&ctx, chunk, to_read);
+        pos       += (off_t)to_read;
+        remaining -= to_read;
+    }
+    if (aes256gcm_ghash_verify(&ctx, tag) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    /* Pass B: CTR decrypt → memfd */
+    const char *bname = strrchr(path, '/');
+    bname = bname ? bname + 1 : path;
+
+    int mfd = make_memfd(bname);
+    if (mfd < 0) { close(fd); return -1; }
+
+    aes256gcm_init(&ctx, key, iv);
+    remaining = ct_size;
+    pos       = ct_off;
+    while (remaining > 0) {
+        size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
+        ssize_t got     = pread(fd, chunk, to_read, pos);
+        if (got != (ssize_t)to_read) { close(fd); close(mfd); return -1; }
+        aes256gcm_ctr_decrypt(&ctx, chunk, chunk, to_read);
+        if (write_chunk(mfd, chunk, to_read) != 0) { close(fd); close(mfd); return -1; }
+        pos       += (off_t)to_read;
+        remaining -= to_read;
+    }
+    if (lseek(mfd, 0, SEEK_SET) < 0) { close(fd); close(mfd); return -1; }
+
+    close(fd);
+    return mfd;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Scan directory tree for encrypted .so files, decrypt to memfds     */
+/* ------------------------------------------------------------------ */
+static void scan_dir_r(const char *dir, const uint8_t *key, uint8_t *chunk,
+                       int *lib_fds, char (*lib_names)[MAX_NAME + 1],
+                       int *nlibs)
+{
+    DIR *dp = opendir(dir);
+    if (!dp) return;
+
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL && *nlibs < MAX_FILES) {
+        if (de->d_name[0] == '.') continue;
+
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            scan_dir_r(path, key, chunk, lib_fds, lib_names, nlibs);
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        if (!strstr(de->d_name, ".so")) continue;
+
+        int mfd = decrypt_enc_file(path, key, chunk);
+        if (mfd < 0) continue;
+
+        snprintf(lib_names[*nlibs], MAX_NAME + 1, "%s", de->d_name);
+        lib_fds[*nlibs] = mfd;
+        (*nlibs)++;
+
+        fprintf(stderr, "[antirev] decrypted from disk: %s\n", de->d_name);
+    }
+    closedir(dp);
+}
+
+static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
+                               int *lib_fds, char (*lib_names)[MAX_NAME + 1],
+                               int *nlibs)
+{
+    char dir[4096];
+    const char *slash = strrchr(exe_path, '/');
+    if (slash) {
+        size_t dlen = (size_t)(slash - exe_path);
+        if (dlen >= sizeof(dir)) return -1;
+        memcpy(dir, exe_path, dlen);
+        dir[dlen] = '\0';
+    } else {
+        dir[0] = '.'; dir[1] = '\0';
+    }
+
+    uint8_t *chunk = malloc(CHUNK_SIZE);
+    if (!chunk) return -1;
+
+    scan_dir_r(dir, key, chunk, lib_fds, lib_names, nlibs);
+
+    explicit_bzero(chunk, CHUNK_SIZE);
+    free(chunk);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  main                                                               */
 /* ------------------------------------------------------------------ */
 int main(int argc __attribute__((unused)), char *argv[], char *envp[])
@@ -516,10 +652,21 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     close(self);
 
     /* ----------------------------------------------------------------
-     * Mode B: Daemon-only (no main binary, only libs).
-     * Bind abstract socket and serve lib fds forever.
+     * Mode B: Daemon-only (no main binary).
+     * If libs were bundled, they're already decrypted above.
+     * If not (lightweight daemon), scan disk for encrypted .so files.
+     * Then bind abstract socket and serve lib fds forever.
      * ---------------------------------------------------------------- */
-    if (main_fd < 0 && nlibs > 0) {
+    if (main_fd < 0) {
+        if (nlibs == 0) {
+            /* Lightweight daemon — scan for encrypted libs on disk */
+            scan_encrypted_libs(real_exe, key, lib_fds, lib_names, &nlibs);
+        }
+        if (nlibs == 0) {
+            fprintf(stderr, "[antirev] no main binary and no libs found\n");
+            return 1;
+        }
+
         struct sockaddr_un addr;
         socklen_t addr_len = make_sock_addr(&addr, key);
         explicit_bzero(key, sizeof(key));
@@ -545,11 +692,6 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         setsid();
         daemon_serve(listen_sd, lib_fds, lib_names, nlibs);
         _exit(0);  /* unreachable */
-    }
-
-    if (main_fd < 0) {
-        fprintf(stderr, "[antirev] no main binary in bundle\n");
-        return 1;
     }
 
     /* ----------------------------------------------------------------
