@@ -51,7 +51,7 @@ function(build_stub OUTPUT COMPILER STRIPPER EXE_BLOB_DEP)
     endif()
     add_custom_command(
         OUTPUT  "${OUTPUT}"
-        COMMAND "${COMPILER}" -O2 -Wall -Wextra ${EXTRA_FLAGS}
+        COMMAND "${COMPILER}" -O2 -Wall -Wextra -pthread ${EXTRA_FLAGS}
                 -I "${CMAKE_BINARY_DIR}"
                 -I "${CMAKE_SOURCE_DIR}/stub"
                 -o "${OUTPUT}"
