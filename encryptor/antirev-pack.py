@@ -53,8 +53,10 @@ What it does:
 import argparse
 import fnmatch
 import os
+import re
 import shutil
 import struct
+import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -152,6 +154,23 @@ def compile_blacklist(raw: list[str]) -> list[tuple[str, str]]:
     return compiled
 
 
+def get_dt_needed(path: Path) -> list[str]:
+    """Get DT_NEEDED library names from an ELF binary using readelf."""
+    try:
+        result = subprocess.run(
+            ['readelf', '-d', str(path)],
+            capture_output=True, text=True, timeout=10
+        )
+        needed = []
+        for line in result.stdout.splitlines():
+            m = re.search(r'\(NEEDED\)\s+Shared library: \[(.+)\]', line)
+            if m:
+                needed.append(m.group(1))
+        return needed
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+
 # ── Worker functions (run in child processes) ─────────────────────────
 
 def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
@@ -168,7 +187,8 @@ def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
 
 def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
                         lib_paths: list[str] = None,
-                        daemon_libs: bool = False) -> str:
+                        daemon_libs: bool = False,
+                        needed_libs: list[str] = None) -> str:
     """Encrypt and bundle an executable (+ optional libs) in-process."""
     src_p  = Path(src)
     stub_p = Path(stub)
@@ -211,7 +231,17 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
         flags |= BFLAG_HAS_LIBS
     if daemon_libs:
         flags |= BFLAG_DAEMON_LIBS
-    bundle = struct.pack("<IB", num_files, flags) + entry + lib_entries
+
+    # Needed-libs section: tells stub which daemon libs this exe uses
+    needed_section = b""
+    if daemon_libs and needed_libs:
+        needed_section = struct.pack("<H", len(needed_libs))
+        for name in needed_libs:
+            nb = name.encode()
+            needed_section += struct.pack("<H", len(nb)) + nb
+
+    bundle = struct.pack("<IB", num_files, flags) + entry + lib_entries \
+           + needed_section
 
     stub_data     = stub_p.read_bytes()
     bundle_offset = len(stub_data)
@@ -223,8 +253,9 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
 
     out_size = dst_p.stat().st_size
     libs_info = f" (+{lib_count} libs)" if lib_count else ""
+    need_info = f" (needs {len(needed_libs)})" if needed_libs else ""
     return (f"[pack] Protected  exe: {src_p.name:<30}  "
-            f"{len(data):>10,} -> {out_size:>10,} bytes{libs_info}")
+            f"{len(data):>10,} -> {out_size:>10,} bytes{libs_info}{need_info}")
 
 
 def _copy_worker(items: list[tuple[str, str]]) -> int:
@@ -434,6 +465,17 @@ def main():
             exe_lib_paths = None
             exe_daemon_libs = False
 
+        # In encrypt mode, determine which encrypted libs each exe needs
+        # so the stub only preloads those (not all 1024)
+        encrypted_names = {src.name for src in lib_files}
+        exe_needed = {}
+        if libs_mode == 'encrypt' and encrypted_names:
+            print(f"[pack] Analyzing DT_NEEDED per executable...")
+            for rel, arch, src in exe_files:
+                dt_needed = get_dt_needed(src)
+                needed = [n for n in dt_needed if n in encrypted_names]
+                exe_needed[rel] = needed
+
         with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(
@@ -444,6 +486,7 @@ def main():
                     key,
                     exe_lib_paths,
                     exe_daemon_libs,
+                    exe_needed.get(rel, []),
                 ): rel
                 for rel, arch, src in exe_files
             }
