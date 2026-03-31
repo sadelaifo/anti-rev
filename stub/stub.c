@@ -49,6 +49,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <dirent.h>
+#include <pthread.h>
 #include "crypto.h"
 
 #ifndef __NR_memfd_create
@@ -436,17 +437,40 @@ static int decrypt_enc_file(const char *path, const uint8_t *key,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Scan directory tree for encrypted .so files, decrypt to memfds     */
+/*  Parallel decryption of encrypted .so files from disk               */
 /* ------------------------------------------------------------------ */
-static void scan_dir_r(const char *dir, const uint8_t *key, uint8_t *chunk,
-                       int *lib_fds, char (*lib_names)[MAX_NAME + 1],
-                       int *nlibs)
+
+/* Per-file decryption job */
+typedef struct {
+    char     path[4096];
+    char     name[MAX_NAME + 1];
+    const uint8_t *key;
+    int      fd;      /* result memfd, -1 on failure */
+} dec_job_t;
+
+/* Worker thread: decrypt one file */
+static void *dec_worker(void *arg)
+{
+    dec_job_t *job = (dec_job_t *)arg;
+    uint8_t *chunk = malloc(CHUNK_SIZE);
+    if (!chunk) { job->fd = -1; return NULL; }
+
+    job->fd = decrypt_enc_file(job->path, job->key, chunk);
+
+    explicit_bzero(chunk, CHUNK_SIZE);
+    free(chunk);
+    return NULL;
+}
+
+/* Recursively collect paths of encrypted .so files (ANTREV01 magic) */
+static void collect_enc_paths(const char *dir, dec_job_t *jobs, int *njobs,
+                              int max)
 {
     DIR *dp = opendir(dir);
     if (!dp) return;
 
     struct dirent *de;
-    while ((de = readdir(dp)) != NULL && *nlibs < MAX_FILES) {
+    while ((de = readdir(dp)) != NULL && *njobs < max) {
         if (de->d_name[0] == '.') continue;
 
         char path[4096];
@@ -456,24 +480,30 @@ static void scan_dir_r(const char *dir, const uint8_t *key, uint8_t *chunk,
         if (stat(path, &st) != 0) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            scan_dir_r(path, key, chunk, lib_fds, lib_names, nlibs);
+            collect_enc_paths(path, jobs, njobs, max);
             continue;
         }
         if (!S_ISREG(st.st_mode)) continue;
         if (!strstr(de->d_name, ".so")) continue;
 
-        int mfd = decrypt_enc_file(path, key, chunk);
-        if (mfd < 0) continue;
+        /* Quick magic check — avoids queuing non-encrypted files */
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        uint8_t magic[MAGIC_LEN];
+        int is_enc = (read(fd, magic, MAGIC_LEN) == MAGIC_LEN
+                      && memcmp(magic, MAGIC, MAGIC_LEN) == 0);
+        close(fd);
+        if (!is_enc) continue;
 
-        snprintf(lib_names[*nlibs], MAX_NAME + 1, "%s", de->d_name);
-        lib_fds[*nlibs] = mfd;
-        (*nlibs)++;
-
-        fprintf(stderr, "[antirev] decrypted from disk: %s\n", de->d_name);
+        snprintf(jobs[*njobs].path, sizeof(jobs[0].path), "%s", path);
+        snprintf(jobs[*njobs].name, sizeof(jobs[0].name), "%s", de->d_name);
+        jobs[*njobs].fd = -1;
+        (*njobs)++;
     }
     closedir(dp);
 }
 
+/* Scan directory, decrypt all encrypted libs in parallel using pthreads */
 static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
                                int *lib_fds, char (*lib_names)[MAX_NAME + 1],
                                int *nlibs)
@@ -489,13 +519,48 @@ static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
         dir[0] = '.'; dir[1] = '\0';
     }
 
-    uint8_t *chunk = malloc(CHUNK_SIZE);
-    if (!chunk) return -1;
+    /* Phase 1: collect encrypted file paths */
+    dec_job_t *jobs = calloc(MAX_FILES, sizeof(dec_job_t));
+    if (!jobs) return -1;
+    int njobs = 0;
+    collect_enc_paths(dir, jobs, &njobs, MAX_FILES);
 
-    scan_dir_r(dir, key, chunk, lib_fds, lib_names, nlibs);
+    if (njobs == 0) { free(jobs); return 0; }
 
-    explicit_bzero(chunk, CHUNK_SIZE);
-    free(chunk);
+    /* Phase 2: decrypt in parallel */
+    long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpus < 1) ncpus = 4;
+    int nthreads = (njobs < (int)ncpus) ? njobs : (int)ncpus;
+
+    for (int i = 0; i < njobs; i++)
+        jobs[i].key = key;
+
+    pthread_t *tids = calloc((size_t)nthreads, sizeof(pthread_t));
+    if (!tids) { free(jobs); return -1; }
+
+    /* Process in batches of nthreads */
+    for (int base = 0; base < njobs; base += nthreads) {
+        int batch = njobs - base;
+        if (batch > nthreads) batch = nthreads;
+
+        for (int t = 0; t < batch; t++)
+            pthread_create(&tids[t], NULL, dec_worker, &jobs[base + t]);
+        for (int t = 0; t < batch; t++)
+            pthread_join(tids[t], NULL);
+    }
+
+    /* Phase 3: collect results */
+    for (int i = 0; i < njobs && *nlibs < MAX_FILES; i++) {
+        if (jobs[i].fd >= 0) {
+            lib_fds[*nlibs] = jobs[i].fd;
+            memcpy(lib_names[*nlibs], jobs[i].name, MAX_NAME + 1);
+            (*nlibs)++;
+            fprintf(stderr, "[antirev] decrypted: %s\n", jobs[i].name);
+        }
+    }
+
+    free(tids);
+    free(jobs);
     return 0;
 }
 
