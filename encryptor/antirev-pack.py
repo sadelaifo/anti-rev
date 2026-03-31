@@ -171,6 +171,37 @@ def get_dt_needed(path: Path) -> list[str]:
         return []
 
 
+def get_transitive_needed(path: Path, encrypted_names: set[str],
+                          lib_by_name: dict[str, Path]) -> list[str]:
+    """Get transitive closure of encrypted libs needed by an ELF binary.
+
+    BFS: start from path's DT_NEEDED, follow through encrypted libs only.
+    """
+    needed = []
+    visited = set()
+    queue = get_dt_needed(path)
+
+    while queue:
+        name = queue.pop(0)
+        if name in visited:
+            continue
+        visited.add(name)
+
+        if name not in encrypted_names:
+            continue
+
+        needed.append(name)
+
+        # Follow this lib's own DT_NEEDED
+        lib_path = lib_by_name.get(name)
+        if lib_path:
+            for dep in get_dt_needed(lib_path):
+                if dep not in visited:
+                    queue.append(dep)
+
+    return needed
+
+
 # ── Worker functions (run in child processes) ─────────────────────────
 
 def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
@@ -466,14 +497,14 @@ def main():
             exe_daemon_libs = False
 
         # In encrypt mode, determine which encrypted libs each exe needs
-        # so the stub only preloads those (not all 1024)
+        # (transitive: follows DT_NEEDED chains through encrypted libs)
         encrypted_names = {src.name for src in lib_files}
+        lib_by_name = {src.name: src for src in lib_files}
         exe_needed = {}
         if libs_mode == 'encrypt' and encrypted_names:
-            print(f"[pack] Analyzing DT_NEEDED per executable...")
+            print(f"[pack] Analyzing DT_NEEDED per executable (transitive)...")
             for rel, arch, src in exe_files:
-                dt_needed = get_dt_needed(src)
-                needed = [n for n in dt_needed if n in encrypted_names]
+                needed = get_transitive_needed(src, encrypted_names, lib_by_name)
                 exe_needed[rel] = needed
 
         with ProcessPoolExecutor(max_workers=workers) as pool:
