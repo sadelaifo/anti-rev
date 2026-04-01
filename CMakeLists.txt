@@ -250,6 +250,155 @@ add_custom_target(test_dlopen
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_dlopen_edgecases — paths, flags, reopen, fallthrough
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_test_bin("${CMAKE_BINARY_DIR}/dlopen_edgecases"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_edgecases/main.c")
+add_custom_target(dlopen_edgecases DEPENDS "${CMAKE_BINARY_DIR}/dlopen_edgecases")
+
+add_custom_target(test_dlopen_edgecases
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_edgecases ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/dlopen_edgecases"
+            --key    "${CMAKE_BINARY_DIR}/dlopen_edgecases.key"
+            --libs   "${CMAKE_BINARY_DIR}/mylib.so"
+            --output "${CMAKE_BINARY_DIR}/dlopen_edgecases.protected"
+    COMMAND ${CMAKE_COMMAND}
+            "-DBINARY=${CMAKE_BINARY_DIR}/dlopen_edgecases.protected"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
+    DEPENDS stub mylib dlopen_edgecases
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "dlopen edge-case tests (paths, flags, reopen, fallthrough)"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_dlopen_nested — dlopen from within a protected shared library
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_lib("${CMAKE_BINARY_DIR}/libcallee.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_nested/libcallee.c")
+add_custom_target(libcallee DEPENDS "${CMAKE_BINARY_DIR}/libcallee.so")
+
+# libcaller.so needs -ldl for its internal dlopen() calls
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libcaller.so"
+    COMMAND gcc -shared -fPIC -O2
+            -I "${CMAKE_SOURCE_DIR}/tests"
+            -Wl,-soname,libcaller.so
+            -o "${CMAKE_BINARY_DIR}/libcaller.so"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_nested/libcaller.c"
+            -ldl
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_nested/libcaller.c"
+    COMMENT "Building libcaller.so (nested dlopen test)"
+)
+add_custom_target(libcaller DEPENDS "${CMAKE_BINARY_DIR}/libcaller.so")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/dlopen_nested"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_nested/main.c")
+add_custom_target(dlopen_nested_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_nested")
+
+add_custom_target(test_dlopen_nested
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_nested ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/dlopen_nested"
+            --key    "${CMAKE_BINARY_DIR}/dlopen_nested.key"
+            --libs   "${CMAKE_BINARY_DIR}/libcaller.so"
+                     "${CMAKE_BINARY_DIR}/libcallee.so"
+            --output "${CMAKE_BINARY_DIR}/dlopen_nested.protected"
+    COMMAND ${CMAKE_COMMAND}
+            "-DBINARY=${CMAKE_BINARY_DIR}/dlopen_nested.protected"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
+    DEPENDS stub libcallee libcaller dlopen_nested_bin
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "nested dlopen test (caller->callee chain via shim)"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_dlopen_transitive — encrypted lib behind unencrypted intermediary
+#
+#  exe ──DT_NEEDED──→ libbridge.so (plain)
+#                         │ DT_NEEDED
+#                         ↓
+#                    libmiddle.so (encrypted) ──dlopen──→ libinner.so (encrypted)
+#
+#  Tests that the transitive DT_NEEDED scanner discovers libmiddle.so
+#  through the unencrypted libbridge.so intermediary.
+# ═══════════════════════════════════════════════════════════════════════
+
+# libinner.so — encrypted, dlopen'd at runtime by libmiddle
+compile_lib("${CMAKE_BINARY_DIR}/libinner.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/libinner.c")
+add_custom_target(libinner DEPENDS "${CMAKE_BINARY_DIR}/libinner.so")
+
+# libmiddle.so — encrypted, DT_NEEDED by libbridge, needs -ldl for dlopen
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libmiddle.so"
+    COMMAND gcc -shared -fPIC -O2
+            -I "${CMAKE_SOURCE_DIR}/tests"
+            -Wl,-soname,libmiddle.so
+            -o "${CMAKE_BINARY_DIR}/libmiddle.so"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/libmiddle.c"
+            -ldl
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/libmiddle.c"
+    COMMENT "Building libmiddle.so (transitive test)"
+)
+add_custom_target(libmiddle DEPENDS "${CMAKE_BINARY_DIR}/libmiddle.so")
+
+# libbridge.so — unencrypted, DT_NEEDs libmiddle.so
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libbridge.so"
+    COMMAND gcc -shared -fPIC -O2
+            -I "${CMAKE_SOURCE_DIR}/tests"
+            -Wl,-soname,libbridge.so
+            -o "${CMAKE_BINARY_DIR}/libbridge.so"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/libbridge.c"
+            -L "${CMAKE_BINARY_DIR}" -lmiddle -Wl,--no-as-needed
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/libbridge.c"
+            "${CMAKE_BINARY_DIR}/libmiddle.so"
+    COMMENT "Building libbridge.so (unencrypted intermediary)"
+)
+add_custom_target(libbridge DEPENDS "${CMAKE_BINARY_DIR}/libbridge.so")
+
+# main exe — DT_NEEDs libbridge.so
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/dlopen_transitive"
+    COMMAND gcc -O2
+            -I "${CMAKE_SOURCE_DIR}/tests"
+            -o "${CMAKE_BINARY_DIR}/dlopen_transitive"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/main.c"
+            -L "${CMAKE_BINARY_DIR}" -lbridge -Wl,--no-as-needed
+            -Wl,-rpath,${CMAKE_BINARY_DIR}
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/main.c"
+            "${CMAKE_BINARY_DIR}/libbridge.so"
+    COMMENT "Building dlopen_transitive test binary"
+)
+add_custom_target(dlopen_transitive_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_transitive")
+
+add_custom_target(test_dlopen_transitive
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_transitive ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/dlopen_transitive"
+            --key    "${CMAKE_BINARY_DIR}/dlopen_transitive.key"
+            --libs   "${CMAKE_BINARY_DIR}/libmiddle.so"
+                     "${CMAKE_BINARY_DIR}/libinner.so"
+            --output "${CMAKE_BINARY_DIR}/dlopen_transitive.protected"
+    COMMAND ${CMAKE_COMMAND}
+            "-DBINARY=${CMAKE_BINARY_DIR}/dlopen_transitive.protected"
+            "-DLD_LIBRARY_PATH=${CMAKE_BINARY_DIR}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
+    DEPENDS stub libinner libmiddle libbridge dlopen_transitive_bin
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "transitive DT_NEEDED through unencrypted intermediary"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_preload_memfd — smoke test: DT_NEEDED satisfied via LD_PRELOAD
 #  from a memfd (no .so on disk, no LD_AUDIT)
 # ═══════════════════════════════════════════════════════════════════════

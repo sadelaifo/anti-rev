@@ -40,7 +40,9 @@ Key file: 32 bytes as 64 hex chars.  Created with a fresh random key if absent.
 
 import argparse
 import os
+import re
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -102,11 +104,76 @@ def _build_entry(path: Path, data: bytes, key: bytes, is_main: bool) -> bytes:
     return entry
 
 
+def _get_dt_needed(path: Path) -> list[str]:
+    """Get DT_NEEDED library names from an ELF binary using readelf."""
+    try:
+        result = subprocess.run(
+            ['readelf', '-d', str(path)],
+            capture_output=True, text=True, timeout=10
+        )
+        needed = []
+        for line in result.stdout.splitlines():
+            m = re.search(r'\(NEEDED\)\s+Shared library: \[(.+)\]', line)
+            if m:
+                needed.append(m.group(1))
+        return needed
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+
+def _build_ldconfig_cache() -> dict:
+    """Parse ldconfig -p to build soname → path mapping."""
+    try:
+        result = subprocess.run(
+            ['ldconfig', '-p'], capture_output=True, text=True, timeout=10
+        )
+        cache = {}
+        for line in result.stdout.splitlines():
+            m = re.match(r'\s+(\S+)\s+\(.*\)\s+=>\s+(\S+)', line)
+            if m:
+                cache[m.group(1)] = m.group(2)
+        return cache
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+
+
+def _get_transitive_needed(main_path: Path) -> list[str]:
+    """BFS through all DT_NEEDED deps, following unencrypted libs on disk.
+
+    Returns lib names NOT resolvable on disk (presumed encrypted) in
+    dependency-first order (deepest deps first) for LD_PRELOAD ordering.
+    """
+    ldcache = _build_ldconfig_cache()
+    needed = []
+    visited = set()
+    queue = _get_dt_needed(main_path)
+
+    while queue:
+        name = queue.pop(0)
+        if name in visited:
+            continue
+        visited.add(name)
+
+        lib_path = ldcache.get(name)
+        if lib_path:
+            # Found on disk — unencrypted system lib, follow its deps
+            for dep in _get_dt_needed(Path(lib_path)):
+                if dep not in visited:
+                    queue.append(dep)
+        else:
+            # Not on disk — presumed encrypted, needs LD_PRELOAD
+            needed.append(name)
+
+    needed.reverse()
+    return needed
+
+
 def _build_protected(stub_path: Path, out_path: Path, key: bytes,
                      bundle_entries: bytes, num_files: int,
-                     bundle_flags: int):
+                     bundle_flags: int, needed_section: bytes = b""):
     """Write stub + bundle + trailer to out_path."""
-    bundle = struct.pack("<IB", num_files, bundle_flags) + bundle_entries
+    bundle = struct.pack("<IB", num_files, bundle_flags) \
+           + bundle_entries + needed_section
 
     stub_data     = stub_path.read_bytes()
     bundle_offset = len(stub_data)
@@ -161,9 +228,19 @@ def cmd_protect_exe(args):
     if daemon_libs:
         bundle_flags |= BFLAG_DAEMON_LIBS
 
+    # Build needed-libs section: tells stub which daemon libs are DT_NEEDED
+    # (transitively, including through unencrypted intermediaries)
+    needed_section = b""
+    if daemon_libs:
+        needed_libs = _get_transitive_needed(main_path)
+        needed_section = struct.pack("<H", len(needed_libs))
+        for name in needed_libs:
+            nb = name.encode()
+            needed_section += struct.pack("<H", len(nb)) + nb
+
     out_size = _build_protected(stub_path, out_path, key,
                                 main_entry + lib_entries, num_files,
-                                bundle_flags)
+                                bundle_flags, needed_section)
 
     mode_str = ""
     if daemon_libs:

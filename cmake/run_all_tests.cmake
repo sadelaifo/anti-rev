@@ -15,6 +15,9 @@ set(TESTS
     test_realpath         # realpath/canonicalize_file_name on /proc/self/exe
     test_path_stress      # comprehensive path resolution test
     test_dlopen           # dlopen bundled .so by soname
+    test_dlopen_edgecases # dlopen edge cases (paths, flags, reopen, fallthrough)
+    test_dlopen_nested    # nested dlopen from within a protected .so
+    test_dlopen_transitive # encrypted lib behind unencrypted intermediary
     test_fork_same_lib    # fork+exec child inherits same lib via LD_PRELOAD
     test_fork_diff_lib    # parent and child use different libs independently
     test_script_multi_bin # script invokes A and B with shared + unique libs

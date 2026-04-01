@@ -154,6 +154,22 @@ def compile_blacklist(raw: list[str]) -> list[tuple[str, str]]:
     return compiled
 
 
+def _build_ldconfig_cache() -> dict:
+    """Parse ldconfig -p to build soname → path mapping."""
+    try:
+        result = subprocess.run(
+            ['ldconfig', '-p'], capture_output=True, text=True, timeout=10
+        )
+        cache = {}
+        for line in result.stdout.splitlines():
+            m = re.match(r'\s+(\S+)\s+\(.*\)\s+=>\s+(\S+)', line)
+            if m:
+                cache[m.group(1)] = m.group(2)
+        return cache
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+
+
 def _parse_readelf_dynamic(path: Path) -> list[str]:
     """Run readelf -d and return raw output lines."""
     try:
@@ -211,13 +227,17 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
                           lib_by_lookup: dict[str, 'Path']) -> list[str]:
     """Get transitive closure of encrypted libs needed by an ELF binary.
 
-    BFS: start from path's DT_NEEDED, follow through encrypted libs only.
+    BFS from path's DT_NEEDED, following through ALL libs — including
+    unencrypted intermediaries on disk — to discover encrypted deps
+    behind them (e.g. exe → libfoo.so [unencrypted] → libbar.so [encrypted]).
+
     Handles soname ↔ filename mismatch (e.g. DT_NEEDED says "libFoo.so.1"
     but encrypted file is "libFoo.so.1.2.3").
 
     Returns list of filenames (not sonames) in dependency-first order
     (deepest deps first) for correct LD_PRELOAD loading.
     """
+    ldcache = _build_ldconfig_cache()
     needed = []
     visited = set()
     queue = get_dt_needed(path)
@@ -231,17 +251,22 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
         # Resolve: DT_NEEDED might be a soname, map to filename
         filename = soname_to_filename.get(name, name)
 
-        if filename not in encrypted_names:
-            continue
-
-        needed.append(filename)
-
-        # Follow this lib's own DT_NEEDED
-        lib_path = lib_by_lookup.get(name)
-        if lib_path:
-            for dep in get_dt_needed(lib_path):
-                if dep not in visited:
-                    queue.append(dep)
+        if filename in encrypted_names:
+            needed.append(filename)
+            # Follow this encrypted lib's own DT_NEEDED
+            lib_path = lib_by_lookup.get(name) or lib_by_lookup.get(filename)
+            if lib_path:
+                for dep in get_dt_needed(lib_path):
+                    if dep not in visited:
+                        queue.append(dep)
+        else:
+            # Unencrypted lib — find on disk and follow its DT_NEEDED
+            # to discover encrypted deps behind it
+            lib_path = ldcache.get(name)
+            if lib_path:
+                for dep in get_dt_needed(Path(lib_path)):
+                    if dep not in visited:
+                        queue.append(dep)
 
     # Reverse: BFS visits parents before children, but LD_PRELOAD needs
     # dependencies loaded first (glibc resolves DT_NEEDED per entry).
