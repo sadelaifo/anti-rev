@@ -410,10 +410,14 @@ def main():
     lib_files   = []   # abs_path — libs to encrypt
     plain_libs  = []   # abs_path — libs to copy as plaintext
     copy_files  = []   # abs_path — non-ELF files to copy
+    symlinks    = []   # (abs_path, target) — symlinks to recreate in output
     skipped     = []   # rel_path
     ignored     = 0    # non-ELF files not in copy list
 
     for src in sorted(install_dir.rglob('*')):
+        if src.is_symlink():
+            symlinks.append((src, os.readlink(src)))
+            continue
         if not src.is_file():
             continue
 
@@ -460,6 +464,8 @@ def main():
     if plain_libs:
         print(f"[pack]   Libs (plain):   {len(plain_libs)}")
     print(f"[pack]   Copy:           {len(copy_files)}")
+    if symlinks:
+        print(f"[pack]   Symlinks:       {len(symlinks)}")
     print(f"[pack]   Ignored:        {ignored}")
     print(f"[pack]   Workers:        {workers}")
     if skipped:
@@ -597,6 +603,17 @@ def main():
         with ProcessPoolExecutor(max_workers=min(workers, len(batches))) as pool:
             total = sum(pool.map(_copy_worker, batches))
         print(f"[pack] Copied {total} file(s) as-is")
+        print()
+
+    # ── Recreate symlinks in output directory ────────────────────────
+    if symlinks:
+        for src, target in symlinks:
+            dst = output_dir / src.relative_to(install_dir)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            os.symlink(target, dst)
+        print(f"[pack] Recreated {len(symlinks)} symlink(s)")
         print()
 
     print(f"[pack] Done")
