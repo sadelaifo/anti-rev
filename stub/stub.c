@@ -133,6 +133,7 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 
 #define BFLAG_HAS_LIBS     0x01
 #define BFLAG_DAEMON_LIBS  0x02  /* libs served by external daemon */
+#define BFLAG_WRAPPER      0x04  /* wrapper mode: exec argv[1...] with libs */
 
 /* Max size of the daemon protocol data payload (per batch):
  * 4 bytes (nlibs) + SCM_BATCH * (2 + MAX_NAME) */
@@ -768,7 +769,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * If not (lightweight daemon), scan disk for encrypted .so files.
      * Then bind abstract socket and serve lib fds forever.
      * ---------------------------------------------------------------- */
-    if (main_fd < 0) {
+    if (main_fd < 0 && !(bundle_flags & BFLAG_WRAPPER)) {
         if (nlibs == 0) {
             /* Lightweight daemon — scan for encrypted libs on disk */
             scan_encrypted_libs(real_exe, key, lib_fds, lib_names, &nlibs);
@@ -803,6 +804,111 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         setsid();
         daemon_serve(listen_sd, lib_fds, lib_names, nlibs);
         _exit(0);  /* unreachable */
+    }
+
+    /* ----------------------------------------------------------------
+     * Mode D: Wrapper (BFLAG_WRAPPER).
+     * No main binary — connect to daemon, receive lib fds, set up
+     * LD_PRELOAD (dlopen_shim) + ANTIREV_FD_MAP (all libs), then
+     * exec argv[1...].  The dlopen_shim constructor eagerly preloads
+     * all ANTIREV_FD_MAP libs via retry loop.
+     * ---------------------------------------------------------------- */
+    if (bundle_flags & BFLAG_WRAPPER) {
+        if (argc < 2) {
+            fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
+            return 1;
+        }
+
+        /* Connect to daemon */
+        struct sockaddr_un addr;
+        socklen_t addr_len = make_sock_addr(&addr, key);
+        explicit_bzero(key, sizeof(key));
+
+        int connected = 0, daemon_launched = 0;
+        for (int retry = 0; retry < 50; retry++) {
+            int sd = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
+                char recv_names[MAX_FILES][MAX_NAME + 1];
+                if (receive_lib_fds(sd, lib_fds, recv_names, &nlibs) == 0
+                    && nlibs > 0) {
+                    memcpy(lib_names, recv_names, sizeof(recv_names));
+                    connected = 1;
+                }
+                close(sd);
+                break;
+            }
+            if (sd >= 0) close(sd);
+
+            if (!daemon_launched && retry == 0) {
+                char daemon_path[4096];
+                char *slash = strrchr(real_exe, '/');
+                size_t dirlen = slash ? (size_t)(slash - real_exe) : 1;
+                if (!slash) { daemon_path[0] = '.'; dirlen = 1; }
+                else memcpy(daemon_path, real_exe, dirlen);
+                snprintf(daemon_path + dirlen,
+                         sizeof(daemon_path) - dirlen, "/.antirev-libd");
+                if (access(daemon_path, X_OK) == 0) {
+                    pid_t pid = fork();
+                    if (pid == 0) {
+                        char *dargv[] = { daemon_path, NULL };
+                        execve(daemon_path, dargv, envp);
+                        _exit(127);
+                    }
+                    if (pid > 0) { int st; waitpid(pid, &st, 0); daemon_launched = 1; }
+                }
+            }
+            usleep(100000);
+        }
+
+        if (!connected || nlibs == 0) {
+            fprintf(stderr, "[antirev] wrapper: could not get libs from daemon\n");
+            return 1;
+        }
+        fprintf(stderr, "[antirev] wrapper: received %d libs\n", nlibs);
+
+        /* Create dlopen_shim memfd */
+        int dlopen_shim_fd = make_memfd("antirev_dlopen_shim.so");
+        if (dlopen_shim_fd < 0) return 1;
+        if (write_chunk(dlopen_shim_fd, dlopen_shim_blob, dlopen_shim_blob_len) != 0) return 1;
+        if (lseek(dlopen_shim_fd, 0, SEEK_SET) < 0) { perror("lseek"); return 1; }
+
+        /* Build ANTIREV_FD_MAP with ALL libs */
+        size_t map_len = 16 + (size_t)nlibs * (MAX_NAME + 16);
+        char *fd_map = malloc(map_len);
+        if (!fd_map) { perror("malloc"); return 1; }
+        int moff = snprintf(fd_map, map_len, "ANTIREV_FD_MAP=");
+        for (int j = 0; j < nlibs; j++) {
+            if (j > 0) fd_map[moff++] = ',';
+            moff += snprintf(fd_map + moff, map_len - (size_t)moff,
+                             "%s=%d", lib_names[j], lib_fds[j]);
+        }
+
+        /* Build LD_PRELOAD with only dlopen_shim */
+        char ld_preload[128];
+        snprintf(ld_preload, sizeof(ld_preload),
+                 "LD_PRELOAD=/proc/self/fd/%d", dlopen_shim_fd);
+
+        /* Build new environment */
+        int envc = 0;
+        while (envp[envc]) envc++;
+        char **new_env = malloc((size_t)(envc + 3) * sizeof(char *));
+        if (!new_env) { perror("malloc"); return 1; }
+        int ei = 0;
+        for (int j = 0; j < envc; j++) {
+            if (strncmp(envp[j], "LD_PRELOAD=",   11) == 0) continue;
+            if (strncmp(envp[j], "ANTIREV_FD_MAP=", 15) == 0) continue;
+            new_env[ei++] = envp[j];
+        }
+        new_env[ei++] = ld_preload;
+        new_env[ei++] = fd_map;
+        new_env[ei]   = NULL;
+
+        /* Exec the wrapped command */
+        extern char **environ;
+        environ = new_env;
+        execvp(argv[1], &argv[1]);
+        perror("execvp");
+        return 1;
     }
 
     /* ----------------------------------------------------------------

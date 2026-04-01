@@ -68,7 +68,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from protect import (load_or_create_key, encrypt_data, MAGIC,
-                     BFLAG_HAS_LIBS, BFLAG_DAEMON_LIBS)
+                     BFLAG_HAS_LIBS, BFLAG_DAEMON_LIBS, BFLAG_WRAPPER)
 
 # ELF magic and type constants
 ELF_MAGIC = b'\x7fELF'
@@ -525,6 +525,16 @@ def main():
         os.chmod(str(daemon_path), 0o755)
         print(f"[pack] Daemon binary: {daemon_path.name}  "
               f"({daemon_path.stat().st_size:,} bytes, reads libs from disk)")
+
+        # Build wrapper binary: connects to daemon, sets up env, execs argv[1...]
+        wrapper_path = output_dir / '.antirev-wrap'
+        wrap_bundle = struct.pack("<IB", 0, BFLAG_WRAPPER)
+        wrap_offset = len(stub_data)
+        wrap_trailer = struct.pack("<Q", wrap_offset) + key + MAGIC
+        wrapper_path.write_bytes(stub_data + wrap_bundle + wrap_trailer)
+        os.chmod(str(wrapper_path), 0o755)
+        print(f"[pack] Wrapper binary: {wrapper_path.name}  "
+              f"(use: .antirev-wrap <command> [args...])")
         print()
 
     if libs_mode == 'bundle' and lib_files:

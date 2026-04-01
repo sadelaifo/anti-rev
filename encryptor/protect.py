@@ -85,6 +85,7 @@ def encrypt_data(data: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
 
 BFLAG_HAS_LIBS    = 0x01
 BFLAG_DAEMON_LIBS = 0x02
+BFLAG_WRAPPER     = 0x04
 
 
 def _build_entry(path: Path, data: bytes, key: bytes, is_main: bool) -> bytes:
