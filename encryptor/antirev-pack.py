@@ -215,7 +215,8 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
     Handles soname ↔ filename mismatch (e.g. DT_NEEDED says "libFoo.so.1"
     but encrypted file is "libFoo.so.1.2.3").
 
-    Returns list of filenames (not sonames) for the needed libs.
+    Returns list of filenames (not sonames) in dependency-first order
+    (deepest deps first) for correct LD_PRELOAD loading.
     """
     needed = []
     visited = set()
@@ -242,6 +243,9 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
                 if dep not in visited:
                     queue.append(dep)
 
+    # Reverse: BFS visits parents before children, but LD_PRELOAD needs
+    # dependencies loaded first (glibc resolves DT_NEEDED per entry).
+    needed.reverse()
     return needed
 
 
