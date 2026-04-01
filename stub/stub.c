@@ -479,7 +479,8 @@ static void collect_enc_paths(const char *dir, dec_job_t *jobs, int *njobs,
         snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
 
         struct stat st;
-        if (stat(path, &st) != 0) continue;
+        if (lstat(path, &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) continue;  /* skip symlinks — avoid dupes */
 
         if (S_ISDIR(st.st_mode)) {
             collect_enc_paths(path, jobs, njobs, max);
