@@ -966,6 +966,20 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     int n_fdmap = 0;
 
     if (n_needed > 0 && nlibs > 0) {
+        /* Build preload list in needed_names order (dependency-first).
+         * The packer embeds needed_names with deepest deps first so that
+         * glibc can resolve each lib's DT_NEEDED from already-loaded libs. */
+        for (int k = 0; k < n_needed; k++) {
+            for (int j = 0; j < nlibs; j++) {
+                if (strcmp(lib_names[j], needed_names[k]) == 0) {
+                    preload_fds[n_preload] = lib_fds[j];
+                    memcpy(preload_names[n_preload], lib_names[j], MAX_NAME + 1);
+                    n_preload++;
+                    break;
+                }
+            }
+        }
+        /* Remaining libs go to ANTIREV_FD_MAP for on-demand dlopen */
         for (int j = 0; j < nlibs; j++) {
             int is_needed = 0;
             for (int k = 0; k < n_needed; k++) {
@@ -974,11 +988,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                     break;
                 }
             }
-            if (is_needed) {
-                preload_fds[n_preload] = lib_fds[j];
-                memcpy(preload_names[n_preload], lib_names[j], MAX_NAME + 1);
-                n_preload++;
-            } else {
+            if (!is_needed) {
                 fdmap_fds[n_fdmap] = lib_fds[j];
                 memcpy(fdmap_names[n_fdmap], lib_names[j], MAX_NAME + 1);
                 n_fdmap++;
