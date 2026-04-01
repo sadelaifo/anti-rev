@@ -489,6 +489,13 @@ static void collect_enc_paths(const char *dir, dec_job_t *jobs, int *njobs,
         if (!S_ISREG(st.st_mode)) continue;
         if (!strstr(de->d_name, ".so")) continue;
 
+        /* Skip duplicate filenames (same lib in different subdirs) */
+        int dup = 0;
+        for (int i = 0; i < *njobs; i++) {
+            if (strcmp(jobs[i].name, de->d_name) == 0) { dup = 1; break; }
+        }
+        if (dup) continue;
+
         /* Quick magic check — avoids queuing non-encrypted files */
         int fd = open(path, O_RDONLY);
         if (fd < 0) continue;
@@ -988,14 +995,32 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     int envc = 0;
     while (envp[envc]) envc++;
 
-    /* Find existing LD_PRELOAD to preserve it */
-    const char *existing_preload = NULL;
+    /* Find existing LD_PRELOAD, stripping /proc/self/fd/ entries from
+     * parent protected processes to prevent cascading duplicate loads. */
+    char filtered_preload[8192];
+    filtered_preload[0] = '\0';
     for (int j = 0; j < envc; j++) {
         if (strncmp(envp[j], "LD_PRELOAD=", 11) == 0) {
-            existing_preload = envp[j] + 11;
+            const char *src = envp[j] + 11;
+            int foff = 0;
+            while (*src) {
+                const char *end = src;
+                while (*end && *end != ':') end++;
+                size_t tlen = (size_t)(end - src);
+                /* Keep only real file paths, not /proc/self/fd/ memfd refs */
+                if (tlen > 0
+                    && strncmp(src, "/proc/self/fd/", 14) != 0) {
+                    if (foff > 0) filtered_preload[foff++] = ':';
+                    memcpy(filtered_preload + foff, src, tlen);
+                    foff += (int)tlen;
+                }
+                src = (*end == ':') ? end + 1 : end;
+            }
+            filtered_preload[foff] = '\0';
             break;
         }
     }
+    const char *existing_preload = filtered_preload[0] ? filtered_preload : NULL;
 
     /* +6: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP, NULL + spare */
     char **new_env = malloc((size_t)(envc + 6) * sizeof(char *));
