@@ -10,8 +10,6 @@ Subcommands:
       protect.py protect-exe --stub <stub> --main <elf> \\
                              --key <keyfile> --output <protected>
       protect.py protect-exe --stub <stub> --main <elf> \\
-                             --key <keyfile> --libs lib1.so ... --output <protected>
-      protect.py protect-exe --stub <stub> --main <elf> \\
                              --key <keyfile> --daemon-libs --output <protected>
 
   protect-daemon
@@ -193,18 +191,11 @@ def cmd_protect_exe(args):
     main_path = Path(args.main)
     out_path  = Path(args.output)
     key_path  = Path(args.key)
-    lib_paths = [Path(p) for p in (args.libs or [])]
     daemon_libs = args.daemon_libs
-
-    if daemon_libs and lib_paths:
-        sys.exit("[error] --daemon-libs and --libs are mutually exclusive")
 
     for p, label in [(stub_path, "stub"), (main_path, "main binary")]:
         if not p.exists():
             sys.exit(f"[error] {label} not found: {p}")
-    for p in lib_paths:
-        if not p.exists():
-            sys.exit(f"[error] lib not found: {p}")
 
     key = load_or_create_key(key_path)
 
@@ -214,17 +205,8 @@ def cmd_protect_exe(args):
     print(f"[antirev] Encrypted main: {main_path.name}  "
           f"({len(main_data):,} bytes)")
 
-    # Lib entries (only when bundling)
-    lib_entries = b""
-    for lp in lib_paths:
-        ld = lp.read_bytes()
-        lib_entries += _build_entry(lp, ld, key, is_main=False)
-        print(f"[antirev] Bundled    lib:  {lp.name}  ({len(ld):,} bytes)")
-
-    num_files = 1 + len(lib_paths)
+    num_files = 1
     bundle_flags = 0x00
-    if lib_paths:
-        bundle_flags |= BFLAG_HAS_LIBS
     if daemon_libs:
         bundle_flags |= BFLAG_DAEMON_LIBS
 
@@ -239,7 +221,7 @@ def cmd_protect_exe(args):
             needed_section += struct.pack("<H", len(nb)) + nb
 
     out_size = _build_protected(stub_path, out_path, key,
-                                main_entry + lib_entries, num_files,
+                                main_entry, num_files,
                                 bundle_flags, needed_section)
 
     mode_str = ""
@@ -349,10 +331,8 @@ def main():
     pe.add_argument("--main",   required=True, help="Main ELF to protect")
     pe.add_argument("--key",    required=True, help="Key file (hex); created if absent")
     pe.add_argument("--output", required=True, help="Output protected binary")
-    pe.add_argument("--libs",   nargs="*",    default=[], metavar="LIB",
-                    help="Shared libraries to bundle (encrypted, loaded via LD_PRELOAD)")
     pe.add_argument("--daemon-libs", action="store_true",
-                    help="Libs served by external daemon (do not bundle)")
+                    help="Libs served by external daemon")
 
     # protect-daemon
     pd = sub.add_parser("protect-daemon",

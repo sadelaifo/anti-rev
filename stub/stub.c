@@ -17,17 +17,14 @@
  *
  * Trailer is always 48 bytes at end of file.
  *
- * Three operational modes:
+ * Operational modes:
  *
- *   A) Normal exe (with or without bundled libs):
- *      Decrypt files, optionally share lib fds via daemon, fexecve main.
- *
- *   B) Daemon-only (no main binary in bundle, only libs):
+ *   A) Daemon-only (no main binary in bundle, only libs):
  *      Decrypt all libs, bind abstract socket, serve lib fds forever.
  *      Used as a centralized lib server so libs aren't duplicated in
  *      every exe.
  *
- *   C) Client exe (BFLAG_DAEMON_LIBS, no libs in bundle):
+ *   B) Client exe (BFLAG_DAEMON_LIBS, no libs in bundle):
  *      Decrypt main exe only, connect to daemon to receive lib fds,
  *      then fexecve with those libs on LD_PRELOAD.
  *
@@ -318,55 +315,6 @@ static socklen_t make_sock_addr(struct sockaddr_un *addr,
 
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path)
                        + 1 + strlen(addr->sun_path + 1));
-}
-
-/* Merge local lib fds with daemon-received lib fds.
- * Overlapping names → use daemon fd (shared), close local.
- * Local-only → keep.  Daemon-only → add.
- * Results written back into lib_fds/lib_names/nlibs.
- * Bounded to MAX_FILES total. */
-static void merge_lib_fds(int *lib_fds, char (*lib_names)[MAX_NAME + 1],
-                          int *nlibs,
-                          int *recv_fds, char (*recv_names)[MAX_NAME + 1],
-                          int recv_nlibs)
-{
-    int merged_fds[MAX_FILES];
-    char merged_names[MAX_FILES][MAX_NAME + 1];
-    int nmerged = 0;
-
-    /* 1. For each local lib: use daemon fd if available */
-    for (int j = 0; j < *nlibs && nmerged < MAX_FILES; j++) {
-        int found = 0;
-        for (int k = 0; k < recv_nlibs; k++) {
-            if (recv_fds[k] >= 0
-                && strcmp(lib_names[j], recv_names[k]) == 0) {
-                merged_fds[nmerged] = recv_fds[k];
-                memcpy(merged_names[nmerged], recv_names[k], MAX_NAME + 1);
-                nmerged++;
-                close(lib_fds[j]);
-                recv_fds[k] = -1; /* mark as consumed */
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            merged_fds[nmerged] = lib_fds[j];
-            memcpy(merged_names[nmerged], lib_names[j], MAX_NAME + 1);
-            nmerged++;
-        }
-    }
-    /* 2. Add daemon-only libs */
-    for (int k = 0; k < recv_nlibs && nmerged < MAX_FILES; k++) {
-        if (recv_fds[k] >= 0) {
-            merged_fds[nmerged] = recv_fds[k];
-            memcpy(merged_names[nmerged], recv_names[k], MAX_NAME + 1);
-            nmerged++;
-        }
-    }
-
-    *nlibs = nmerged;
-    memcpy(lib_fds, merged_fds, (size_t)nmerged * sizeof(int));
-    memcpy(lib_names, merged_names, (size_t)nmerged * (MAX_NAME + 1));
 }
 
 /* ------------------------------------------------------------------ */
@@ -914,9 +862,6 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     /* ----------------------------------------------------------------
      * Phase 3: lib fd acquisition.
      *
-     * Mode A (bundled libs): share our lib fds with sibling processes.
-     *   First process forks a daemon; later processes receive shared fds.
-     *
      * Mode C (daemon libs): no libs bundled, must receive from daemon.
      * ---------------------------------------------------------------- */
     if ((bundle_flags & BFLAG_DAEMON_LIBS) && nlibs == 0) {
@@ -979,70 +924,6 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         if (!connected) {
             fprintf(stderr, "[antirev] failed to connect to lib daemon\n");
             return 1;
-        }
-    } else if ((bundle_flags & BFLAG_HAS_LIBS) && nlibs > 0) {
-        /* Mode A: bundled libs — share via daemon */
-        struct sockaddr_un addr;
-        socklen_t addr_len = make_sock_addr(&addr, key);
-
-        int sd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
-            /* Daemon already running — merge our libs with daemon's.
-             * For overlapping names: use daemon fd (shared copy).
-             * For names only we have: keep our local fd.
-             * For names only daemon has: add daemon fd. */
-            int recv_fds[MAX_FILES];
-            char recv_names[MAX_FILES][MAX_NAME + 1];
-            int recv_nlibs = 0;
-            if (receive_lib_fds(sd, recv_fds, recv_names, &recv_nlibs) == 0
-                && recv_nlibs > 0)
-                merge_lib_fds(lib_fds, lib_names, &nlibs,
-                              recv_fds, recv_names, recv_nlibs);
-            close(sd);
-        } else {
-            /* No daemon yet — we are the first process */
-            if (sd >= 0) close(sd);
-
-            int listen_sd = socket(AF_UNIX, SOCK_STREAM, 0);
-            if (listen_sd >= 0
-                && bind(listen_sd, (struct sockaddr *)&addr, addr_len) == 0) {
-                listen(listen_sd, 16);
-                pid_t pid = fork();
-                if (pid < 0) {
-                    perror("[antirev] fork daemon");
-                    close(listen_sd);
-                } else if (pid == 0) {
-                    /* Daemon child — close fds we don't need */
-                    close(main_fd);
-                    daemon_serve(listen_sd, lib_fds, lib_names, nlibs);
-                    _exit(0);
-                } else {
-                    /* Parent continues — daemon runs in background */
-                    close(listen_sd);
-                }
-            } else {
-                /* bind() failed (race: another process won).
-                 * Retry connect. */
-                if (listen_sd >= 0) close(listen_sd);
-
-                for (int retry = 0; retry < 10; retry++) {
-                    usleep(10000); /* 10 ms */
-                    sd = socket(AF_UNIX, SOCK_STREAM, 0);
-                    if (sd >= 0
-                        && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
-                        int recv_fds[MAX_FILES];
-                        char recv_names[MAX_FILES][MAX_NAME + 1];
-                        int recv_nlibs = 0;
-                        if (receive_lib_fds(sd, recv_fds, recv_names, &recv_nlibs) == 0
-                            && recv_nlibs > 0)
-                            merge_lib_fds(lib_fds, lib_names, &nlibs,
-                                          recv_fds, recv_names, recv_nlibs);
-                        close(sd);
-                        break;
-                    }
-                    if (sd >= 0) close(sd);
-                }
-            }
         }
     }
 

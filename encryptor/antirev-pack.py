@@ -23,7 +23,7 @@ Config format:
       - lib/legacy                     # subdirectory (no trailing slash also works)
       - bin/debug_tool                 # specific relative path
 
-    libs: bundle                       # optional: bundle|encrypt|skip (default: bundle)
+    libs: encrypt                      # optional: encrypt|skip (default: encrypt)
 
     encrypt_libs:                      # optional whitelist: only encrypt these libs
       - libsecret.so                   #   all other libs are copied as plaintext
@@ -44,8 +44,7 @@ What it does:
   - Skips blacklisted ELF files entirely (not copied, not encrypted)
   - Only copies non-ELF files that match the 'copy' list (if omitted, nothing copied)
   - Protects executables with the stub
-  - libs=bundle: encrypts libs and bundles them into each exe
-  - libs=encrypt: encrypts libs individually as standalone files in output_dir
+  - libs=encrypt: encrypts libs individually, served via daemon at runtime
   - libs=skip: ignores libs entirely
   - Uses parallel workers for encryption, protection, and file copies
 """
@@ -289,10 +288,9 @@ def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
 
 
 def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
-                        lib_paths: list[str] = None,
                         daemon_libs: bool = False,
                         needed_libs: list[str] = None) -> str:
-    """Encrypt and bundle an executable (+ optional libs) in-process."""
+    """Encrypt an executable and wrap it in the stub launcher."""
     src_p  = Path(src)
     stub_p = Path(stub)
     dst_p  = Path(dst)
@@ -310,40 +308,20 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
     entry += struct.pack("<Q", len(ct))
     entry += ct
 
-    # Lib entries
-    lib_entries = b""
-    lib_count = 0
-    if lib_paths:
-        for lib_str in lib_paths:
-            lib_p = Path(lib_str)
-            lib_data = lib_p.read_bytes()
-            liv, ltag, lct = encrypt_data(lib_data, key)
-            lname_b = lib_p.name.encode()
-            le  = struct.pack("<H", len(lname_b))
-            le += lname_b
-            le += struct.pack("<B", 0)   # flags: not main
-            le += liv + ltag
-            le += struct.pack("<Q", len(lct))
-            le += lct
-            lib_entries += le
-            lib_count += 1
-
-    num_files = 1 + lib_count
+    num_files = 1
     flags = 0x00
-    if lib_count > 0:
-        flags |= BFLAG_HAS_LIBS
     if daemon_libs:
         flags |= BFLAG_DAEMON_LIBS
 
-    # Needed-libs section: tells stub which daemon libs this exe uses
+    # Needed-libs section: tells stub which daemon libs this exe DT_NEEDs
     needed_section = b""
-    if daemon_libs and needed_libs:
-        needed_section = struct.pack("<H", len(needed_libs))
-        for name in needed_libs:
+    if daemon_libs:
+        needed_section = struct.pack("<H", len(needed_libs or []))
+        for name in (needed_libs or []):
             nb = name.encode()
             needed_section += struct.pack("<H", len(nb)) + nb
 
-    bundle = struct.pack("<IB", num_files, flags) + entry + lib_entries \
+    bundle = struct.pack("<IB", num_files, flags) + entry \
            + needed_section
 
     stub_data     = stub_p.read_bytes()
@@ -355,10 +333,9 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
     os.chmod(str(dst_p), 0o755)
 
     out_size = dst_p.stat().st_size
-    libs_info = f" (+{lib_count} libs)" if lib_count else ""
     need_info = f" (needs {len(needed_libs)})" if needed_libs else ""
     return (f"[pack] Protected  exe: {src_p.name:<30}  "
-            f"{len(data):>10,} -> {out_size:>10,} bytes{libs_info}{need_info}")
+            f"{len(data):>10,} -> {out_size:>10,} bytes{need_info}")
 
 
 def _copy_worker(items: list[tuple[str, str]]) -> int:
@@ -504,17 +481,14 @@ def main():
     print()
 
     # ── Lib handling mode ────────────────────────────────────────────────
-    # libs: bundle  (default) — bundle all libs into every exe
-    # libs: encrypt           — encrypt libs individually to output_dir
+    # libs: encrypt (default) — encrypt libs individually, serve via daemon
     # libs: skip              — ignore libs entirely (exe-only protection)
-    libs_mode = cfg.get('libs', 'bundle')
-    if libs_mode not in ('bundle', 'encrypt', 'skip'):
+    libs_mode = cfg.get('libs', 'encrypt')
+    if libs_mode not in ('encrypt', 'skip'):
         sys.exit(f"[error] invalid libs mode '{libs_mode}' "
-                 f"(must be 'bundle', 'encrypt', or 'skip')")
+                 f"(must be 'encrypt' or 'skip')")
 
     print(f"[pack] Libs mode: {libs_mode}")
-
-    lib_path_strs = [str(p) for p in lib_files] if lib_files else []
 
     # Encrypt libs individually to output_dir as standalone encrypted files,
     # and create a lightweight daemon binary (stub + key, no bundled libs)
@@ -562,10 +536,6 @@ def main():
               f"(use: .antirev-wrap <command> [args...])")
         print()
 
-    if libs_mode == 'bundle' and lib_files:
-        print(f"[pack] Bundling {len(lib_files)} shared "
-              f"librar{'y' if len(lib_files) == 1 else 'ies'} into each executable...")
-
     if exe_files:
         print(f"[pack] Protecting {len(exe_files)} executable(s)...")
         for rel, arch, src in exe_files:
@@ -573,24 +543,12 @@ def main():
                 sys.exit(f"[error] no stub for arch '{arch}' "
                          f"(needed by {rel}). Add it to 'stubs' in config.")
 
-        # Determine what libs to pass to each exe
-        if libs_mode == 'bundle':
-            exe_lib_paths = lib_path_strs
-            exe_daemon_libs = False
-        elif libs_mode == 'encrypt':
-            exe_lib_paths = None
-            exe_daemon_libs = bool(lib_files)
-        else:  # skip
-            exe_lib_paths = None
-            exe_daemon_libs = False
+        exe_daemon_libs = libs_mode == 'encrypt' and bool(lib_files)
 
-        # In encrypt mode, determine which encrypted libs each exe needs
-        # (transitive: follows DT_NEEDED chains through encrypted libs)
-        # Handles soname ↔ filename mismatch (e.g. DT_NEEDED "libFoo.so.1"
-        # but file is "libFoo.so.1.2.3")
+        # Determine which encrypted libs each exe transitively DT_NEEDs
         encrypted_names = {src.name for src in lib_files}
         exe_needed = {}
-        if libs_mode == 'encrypt' and encrypted_names:
+        if exe_daemon_libs and encrypted_names:
             print(f"[pack] Building soname map for encrypted libs...")
             soname_to_filename, lib_by_lookup = build_soname_maps(lib_files)
             if soname_to_filename:
@@ -610,7 +568,6 @@ def main():
                     str(stubs[arch]),
                     str(output_dir / rel),
                     key,
-                    exe_lib_paths,
                     exe_daemon_libs,
                     exe_needed.get(rel, []),
                 ): rel
