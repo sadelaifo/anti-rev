@@ -624,9 +624,11 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     /* Parse needed-libs section (after file entries, when BFLAG_DAEMON_LIBS).
      * Format: [num_needed:2B] [name_len:2B name:...]... */
     int n_needed = 0;
+    int has_needed_section = 0;
     char needed_names[MAX_FILES][MAX_NAME + 1];
 
     if (bundle_flags & BFLAG_DAEMON_LIBS) {
+        has_needed_section = 1;
         uint8_t nbuf[2];
         if (pread(self, nbuf, 2, scan) == 2) {
             uint16_t nn = u16le(nbuf);
@@ -952,7 +954,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     char fdmap_names[MAX_FILES][MAX_NAME + 1];
     int n_fdmap = 0;
 
-    if (n_needed > 0 && nlibs > 0) {
+    if (has_needed_section && nlibs > 0) {
         /* Build preload list in needed_names order (dependency-first).
          * The packer embeds needed_names with deepest deps first so that
          * glibc can resolve each lib's DT_NEEDED from already-loaded libs. */
