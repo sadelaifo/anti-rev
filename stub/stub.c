@@ -47,6 +47,7 @@
 #include <sys/wait.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <time.h>
 #include "crypto.h"
 
 #ifndef __NR_memfd_create
@@ -720,6 +721,9 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * Then bind abstract socket and serve lib fds forever.
      * ---------------------------------------------------------------- */
     if (main_fd < 0 && !(bundle_flags & BFLAG_WRAPPER)) {
+        struct timespec t_start, t_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+
         if (nlibs == 0) {
             /* Lightweight daemon — scan for encrypted libs on disk */
             scan_encrypted_libs(real_exe, key, lib_fds, lib_names, &nlibs);
@@ -728,6 +732,12 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             fprintf(stderr, "[antirev] no main binary and no libs found\n");
             return 1;
         }
+
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
+        double elapsed = (double)(t_end.tv_sec - t_start.tv_sec)
+                       + (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+        fprintf(stderr, "[antirev] decrypted %d libs in %.1fs\n",
+                nlibs, elapsed);
 
         struct sockaddr_un addr;
         socklen_t addr_len = make_sock_addr(&addr, key);

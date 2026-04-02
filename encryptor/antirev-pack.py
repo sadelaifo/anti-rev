@@ -58,6 +58,7 @@ import struct
 import subprocess
 import tempfile
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -384,6 +385,8 @@ def main():
                     help="Number of parallel workers (default: CPU count)")
     args = ap.parse_args()
 
+    t_start = time.monotonic()
+
     config_path = Path(args.config)
     if not config_path.exists():
         sys.exit(f"[error] config not found: {config_path}")
@@ -642,7 +645,8 @@ def main():
         print(f"[pack] Recreated {len(symlinks)} symlink(s)")
         print()
 
-    print(f"[pack] Done")
+    elapsed = time.monotonic() - t_start
+    print(f"[pack] Done in {elapsed:.1f}s")
     print(f"[pack]   Output -> {output_dir}")
     print(f"[pack]   Key    -> {key_path}  (keep secret)")
 
