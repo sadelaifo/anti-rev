@@ -56,6 +56,7 @@ import re
 import shutil
 import struct
 import subprocess
+import tempfile
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -276,15 +277,44 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
 # ── Worker functions (run in child processes) ─────────────────────────
 
 def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
-    """Encrypt a single .so file. Returns status string."""
+    """Encrypt a single .so file. Returns status string.
+
+    If the lib has no DT_SONAME, patch a copy with patchelf before
+    encrypting so that glibc can match the LD_PRELOAD'd memfd to
+    DT_NEEDED entries at runtime.
+    """
     src_p, dst_p = Path(src), Path(dst)
-    data = src_p.read_bytes()
+    patched = None
+    soname_note = ""
+
+    # Check if SONAME is missing
+    if not get_dt_soname(src_p):
+        tmp_dir = tempfile.mkdtemp(prefix="antirev_patch_")
+        patched = Path(tmp_dir) / src_p.name
+        shutil.copy2(src_p, patched)
+        try:
+            subprocess.run(
+                ["patchelf", "--set-soname", src_p.name, str(patched)],
+                check=True, capture_output=True, text=True)
+            soname_note = " [patched SONAME]"
+        except FileNotFoundError:
+            sys.exit("[error] patchelf not found — required for libs without "
+                     "DT_SONAME. Install it: https://github.com/NixOS/patchelf")
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"[error] patchelf failed on {src_p.name}: {e.stderr}")
+
+    data = (patched or src_p).read_bytes()
+
+    # Clean up temp file
+    if patched:
+        shutil.rmtree(patched.parent, ignore_errors=True)
+
     iv, tag, ct = encrypt_data(data, key)
     dst_p.parent.mkdir(parents=True, exist_ok=True)
     dst_p.write_bytes(MAGIC + iv + tag + ct)
     out_size = dst_p.stat().st_size
     return (f"[pack] Encrypted  lib: {src_p.name:<30}  "
-            f"{len(data):>10,} -> {out_size:>10,} bytes")
+            f"{len(data):>10,} -> {out_size:>10,} bytes{soname_note}")
 
 
 def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
