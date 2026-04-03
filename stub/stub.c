@@ -45,6 +45,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <dirent.h>
 #include <pthread.h>
 #include <time.h>
@@ -723,6 +724,13 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * Then bind abstract socket and serve lib fds forever.
      * ---------------------------------------------------------------- */
     if (main_fd < 0 && !(bundle_flags & BFLAG_WRAPPER)) {
+        /* Raise fd limit: daemon holds ~nlibs memfds + listen socket */
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+
         struct timespec t_start, t_end;
         clock_gettime(CLOCK_MONOTONIC, &t_start);
 
@@ -779,6 +787,13 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         if (argc < 2) {
             fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
             return 1;
+        }
+
+        /* Raise fd limit: we'll receive ~nlibs fds via SCM_RIGHTS */
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &rl);
         }
 
         /* Connect to daemon */
@@ -882,6 +897,14 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         /* Mode C: client-only — receive libs from daemon.
          * If no daemon is running, auto-launch .antirev-libd from the
          * same directory as our binary (first process bootstraps it). */
+
+        /* Raise fd limit: we'll receive ~nlibs fds via SCM_RIGHTS */
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+
         struct sockaddr_un addr;
         socklen_t addr_len = make_sock_addr(&addr, key);
 
