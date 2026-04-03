@@ -106,9 +106,9 @@ class AntirevClient:
                     binary (key is extracted from the ANTREV01 trailer).
     """
 
-    def __init__(self, key_source: str | Path):
+    def __init__(self, key_source):
         self._key = _load_key(Path(key_source))
-        self._libs: dict[str, int] = {}
+        self._libs = {}
         self._connect()
 
     def _connect(self):
@@ -156,18 +156,18 @@ class AntirevClient:
                     self._libs[name] = received_fds[i]
 
     @property
-    def libs(self) -> dict[str, int]:
+    def libs(self):
         """Dict of available libs: {name: fd}."""
         return dict(self._libs)
 
-    def fd(self, name: str) -> int:
+    def fd(self, name):
         """Get the memfd number for a lib by name."""
         if name not in self._libs:
             avail = ', '.join(sorted(self._libs))
             raise KeyError(f"'{name}' not found (available: {avail})")
         return self._libs[name]
 
-    def cdll(self, name: str, mode=ct.DEFAULT_MODE) -> ct.CDLL:
+    def cdll(self, name, mode=ct.DEFAULT_MODE):
         """Load an encrypted lib as ctypes.CDLL."""
         return ct.CDLL(f"/proc/self/fd/{self.fd(name)}", mode=mode)
 
@@ -198,7 +198,7 @@ class AntirevClient:
 
 # ── Auto-patch helper ──────────────────────────────────────────────
 
-def _find_key_source() -> Path:
+def _find_key_source():
     """Find key source: ANTIREV_KEY env, or .antirev-libd near caller."""
     env = os.environ.get("ANTIREV_KEY")
     if env:
@@ -220,7 +220,7 @@ def _find_key_source() -> Path:
     )
 
 
-def activate(key_source: str | Path | None = None) -> AntirevClient:
+def activate(key_source=None):
     """Connect to daemon and patch ctypes.CDLL for transparent loading.
 
     Args:
