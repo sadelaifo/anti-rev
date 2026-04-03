@@ -48,6 +48,7 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <time.h>
+#include <signal.h>
 #include "crypto.h"
 
 #ifndef __NR_memfd_create
@@ -177,6 +178,7 @@ static void daemon_serve(int listen_fd, const int *lib_fds,
                          const char (*lib_names)[MAX_NAME + 1], int nlibs)
 {
     uid_t my_uid = getuid();
+    signal(SIGPIPE, SIG_IGN);
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
     close(STDERR_FILENO);

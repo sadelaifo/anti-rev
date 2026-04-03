@@ -145,6 +145,8 @@ def compile_blacklist(raw: list[str]) -> list[tuple[str, str]]:
     """Pre-classify blacklist entries once instead of per-file."""
     compiled = []
     for entry in raw:
+        if not entry:
+            continue
         entry = entry.replace('\\', '/')
         if entry.endswith('/'):
             compiled.append((entry, 'dir'))
