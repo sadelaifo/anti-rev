@@ -5,7 +5,7 @@ Connects to the running antirev-libd daemon, receives decrypted lib
 fds via SCM_RIGHTS, and provides ctypes.CDLL loading.  No pip
 dependencies — uses system libcrypto via ctypes.
 
-Usage:
+Usage (explicit):
     from antirev_client import AntirevClient
 
     client = AntirevClient("/path/to/antirev.key")
@@ -14,13 +14,29 @@ Usage:
 
     # List available libs:
     print(client.libs)
+
+Usage (auto-patch — for scripts that call ctypes.CDLL directly):
+    from antirev_client import activate
+
+    activate("/path/to/.antirev-libd")  # or key file
+
+    # Now ctypes.CDLL transparently loads encrypted libs:
+    import ctypes
+    lib = ctypes.CDLL("libFoo.so")  # redirected to memfd
+
+Key source discovery for activate():
+    1. Explicit path argument
+    2. ANTIREV_KEY env var (path to key file or daemon binary)
+    3. .antirev-libd in the script's directory
 """
 
 import array
 import ctypes as ct
 import ctypes.util
+import os
 import socket
 import struct
+import sys
 from pathlib import Path
 
 KEY_SIZE = 32
@@ -154,3 +170,70 @@ class AntirevClient:
     def cdll(self, name: str, mode=ct.DEFAULT_MODE) -> ct.CDLL:
         """Load an encrypted lib as ctypes.CDLL."""
         return ct.CDLL(f"/proc/self/fd/{self.fd(name)}", mode=mode)
+
+    def patch_ctypes(self):
+        """Monkey-patch ctypes.CDLL to transparently load encrypted libs.
+
+        After calling this, any ctypes.CDLL("libFoo.so") where libFoo.so
+        is served by the daemon will be redirected to the decrypted memfd.
+        """
+        fd_map = self._libs
+        # Save the real CDLL before we replace it — used by the
+        # patched class as its base so we never double-intercept.
+        _RealCDLL = getattr(ct.CDLL, '_antirev_real', ct.CDLL)
+
+        class _PatchedCDLL(_RealCDLL):
+            _antirev_real = _RealCDLL
+
+            def __init__(self, name, *args, **kwargs):
+                if name:
+                    base = name.rsplit('/', 1)[-1]
+                    if base in fd_map:
+                        name = f"/proc/self/fd/{fd_map[base]}"
+                super().__init__(name, *args, **kwargs)
+
+        ct.CDLL = _PatchedCDLL
+        ct.cdll._dlltype = _PatchedCDLL
+
+
+# ── Auto-patch helper ──────────────────────────────────────────────
+
+def _find_key_source() -> Path:
+    """Find key source: ANTIREV_KEY env, or .antirev-libd near caller."""
+    env = os.environ.get("ANTIREV_KEY")
+    if env:
+        p = Path(env)
+        if p.exists():
+            return p
+        raise FileNotFoundError(f"ANTIREV_KEY={env} does not exist")
+
+    # Search near the calling script
+    main = getattr(sys.modules.get("__main__"), "__file__", None)
+    if main:
+        candidate = Path(main).resolve().parent / ".antirev-libd"
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        "Cannot find antirev key. Set ANTIREV_KEY env var or place "
+        ".antirev-libd next to your script."
+    )
+
+
+def activate(key_source: str | Path | None = None) -> AntirevClient:
+    """Connect to daemon and patch ctypes.CDLL for transparent loading.
+
+    Args:
+        key_source: path to key file or daemon binary. If None,
+                    auto-discovers via ANTIREV_KEY env or .antirev-libd.
+
+    Returns:
+        The AntirevClient instance (for introspection / manual use).
+    """
+    if key_source is None:
+        key_source = _find_key_source()
+    client = AntirevClient(key_source)
+    client.patch_ctypes()
+    print(f"[antirev] patched ctypes.CDLL ({len(client._libs)} libs)",
+          file=sys.stderr)
+    return client
