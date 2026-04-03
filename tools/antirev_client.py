@@ -269,30 +269,36 @@ class AntirevClient:
         """Load an encrypted lib as ctypes.CDLL."""
         return ct.CDLL(f"/proc/self/fd/{self.fd(name)}", mode=mode)
 
-    def patch_ctypes(self):
-        """Monkey-patch ctypes.CDLL to transparently load encrypted libs.
+    def preload_all(self):
+        """Load ALL daemon libs with RTLD_GLOBAL in dependency order.
 
-        When a daemon-served lib is loaded, any DT_NEEDED deps that are
-        also in the daemon are resolved on-demand (loaded with RTLD_GLOBAL)
-        before the requested lib. This avoids eagerly loading all libs.
+        Mirrors the C stub's LD_PRELOAD behavior: all libs are globally
+        available so implicit cross-lib symbol references resolve.
+        Uses DT_NEEDED to topologically sort — leaves first, so each
+        lib's constructor finds its deps already loaded.
         """
         fd_map = self._libs
         _RealCDLL = getattr(ct.CDLL, '_antirev_real', ct.CDLL)
         loaded = set()
 
-        def _load_with_deps(name):
-            """Load a lib after loading its encrypted deps (depth-first).
-
-            Parses ELF DT_NEEDED to determine exact deps, recurses for
-            any that are in fd_map, then loads this lib with RTLD_GLOBAL.
-            """
+        def _load(name):
             if name in loaded or name not in fd_map:
                 return
-            loaded.add(name)  # mark early to prevent cycles
+            loaded.add(name)
             for dep in _get_needed(fd_map[name]):
-                _load_with_deps(dep)
+                _load(dep)
             _RealCDLL(f"/proc/self/fd/{fd_map[name]}",
                       mode=ct.RTLD_GLOBAL)
+
+        for name in fd_map:
+            _load(name)
+
+        self._preloaded = loaded
+
+    def patch_ctypes(self):
+        """Monkey-patch ctypes.CDLL to redirect encrypted lib loads."""
+        fd_map = self._libs
+        _RealCDLL = getattr(ct.CDLL, '_antirev_real', ct.CDLL)
 
         class _PatchedCDLL(_RealCDLL):
             _antirev_real = _RealCDLL
@@ -301,7 +307,6 @@ class AntirevClient:
                 if name:
                     base = name.rsplit('/', 1)[-1]
                     if base in fd_map:
-                        _load_with_deps(base)
                         name = f"/proc/self/fd/{fd_map[base]}"
                 super().__init__(name, *args, **kwargs)
 
@@ -346,7 +351,8 @@ def activate(key_source=None):
     if key_source is None:
         key_source = _find_key_source()
     client = AntirevClient(key_source)
+    client.preload_all()
     client.patch_ctypes()
-    print(f"[antirev] patched ctypes.CDLL ({len(client._libs)} libs available)",
+    print(f"[antirev] loaded {len(client._preloaded)} libs, ctypes.CDLL patched",
           file=sys.stderr)
     return client

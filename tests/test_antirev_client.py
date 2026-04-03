@@ -139,7 +139,7 @@ check("_get_needed(outer) has libmiddle", "libmiddle.so" in outer_needed, True)
 middle_needed = _get_needed(middle_fd)
 check("_get_needed(middle) has libinner", "libinner.so" in middle_needed, True)
 
-# Patch ctypes with all 3 libs — none pre-loaded.
+# preload_all loads everything in dep order (leaves first)
 client = object.__new__(AntirevClient)
 client._key = key
 client._libs = {
@@ -147,9 +147,12 @@ client._libs = {
     "libmiddle.so": middle_fd,
     "libinner.so": inner_fd,
 }
+client.preload_all()
 client.patch_ctypes()
 
-# Loading libouter should depth-first load libinner, libmiddle, then libouter
+check("preload_all loaded all 3", len(client._preloaded), 3)
+
+# ctypes.CDLL should work — all deps already globally loaded
 handle = ct.CDLL("libouter.so")
 check("3-level dep chain", handle.outer_val() == 330, True)
 
