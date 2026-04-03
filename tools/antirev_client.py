@@ -43,6 +43,94 @@ KEY_SIZE = 32
 SCM_BATCH = 250
 
 
+# ── ELF DT_NEEDED parser (pure Python, no external tools) ──────────
+
+def _get_needed(fd):
+    """Parse DT_NEEDED entries from an ELF at /proc/self/fd/<fd>."""
+    path = f"/proc/self/fd/{fd}"
+    with open(path, 'rb') as f:
+        ident = f.read(16)
+        if ident[:4] != b'\x7fELF':
+            return []
+        is64 = (ident[4] == 2)
+
+        # Read e_phoff, e_phentsize, e_phnum
+        if is64:
+            f.seek(32); e_phoff = struct.unpack('<Q', f.read(8))[0]
+            f.seek(54); e_phentsize, e_phnum = struct.unpack('<HH', f.read(4))
+        else:
+            f.seek(28); e_phoff = struct.unpack('<I', f.read(4))[0]
+            f.seek(42); e_phentsize, e_phnum = struct.unpack('<HH', f.read(4))
+
+        # Read all program headers
+        f.seek(e_phoff)
+        phdrs = f.read(e_phentsize * e_phnum)
+
+        # Find PT_DYNAMIC and collect PT_LOAD segments
+        dyn_off = dyn_sz = 0
+        loads = []
+        for i in range(e_phnum):
+            base = i * e_phentsize
+            p_type = struct.unpack_from('<I', phdrs, base)[0]
+            if is64:
+                p_off = struct.unpack_from('<Q', phdrs, base + 8)[0]
+                p_va = struct.unpack_from('<Q', phdrs, base + 16)[0]
+                p_fsz = struct.unpack_from('<Q', phdrs, base + 32)[0]
+            else:
+                p_off = struct.unpack_from('<I', phdrs, base + 4)[0]
+                p_va = struct.unpack_from('<I', phdrs, base + 8)[0]
+                p_fsz = struct.unpack_from('<I', phdrs, base + 16)[0]
+            if p_type == 2:  # PT_DYNAMIC
+                dyn_off, dyn_sz = p_off, p_fsz
+            elif p_type == 1:  # PT_LOAD
+                loads.append((p_va, p_off, p_fsz))
+
+        if not dyn_off:
+            return []
+
+        # Parse dynamic entries → find DT_NEEDED offsets and DT_STRTAB addr
+        f.seek(dyn_off)
+        dyn = f.read(dyn_sz)
+        esz = 16 if is64 else 8
+        fmt = '<qQ' if is64 else '<iI'
+
+        needed_offs = []
+        strtab_va = 0
+        for i in range(0, len(dyn), esz):
+            d_tag, d_val = struct.unpack_from(fmt, dyn, i)
+            if d_tag == 0:
+                break
+            if d_tag == 1:   # DT_NEEDED
+                needed_offs.append(d_val)
+            elif d_tag == 5:  # DT_STRTAB
+                strtab_va = d_val
+
+        if not needed_offs or not strtab_va:
+            return []
+
+        # Convert strtab virtual address → file offset via PT_LOAD
+        strtab_foff = 0
+        for va, foff, fsz in loads:
+            if va <= strtab_va < va + fsz:
+                strtab_foff = foff + (strtab_va - va)
+                break
+        if not strtab_foff:
+            return []
+
+        # Read null-terminated strings
+        names = []
+        for off in needed_offs:
+            f.seek(strtab_foff + off)
+            raw = b''
+            while True:
+                c = f.read(1)
+                if not c or c == b'\x00':
+                    break
+                raw += c
+            names.append(raw.decode())
+        return names
+
+
 # ── AES helper (system libcrypto, no pip deps) ──────────────────────
 
 def _aes256_ecb_block(key, block):
@@ -193,33 +281,18 @@ class AntirevClient:
         loaded = set()
 
         def _load_with_deps(name):
-            """Load a lib and discover+load its encrypted deps iteratively.
+            """Load a lib after loading its encrypted deps (depth-first).
 
-            Tries to load each needed lib. On failure, parses the error
-            to discover missing deps (also in fd_map), adds them to the
-            set, and retries. No recursion, no exception chaining.
+            Parses ELF DT_NEEDED to determine exact deps, recurses for
+            any that are in fd_map, then loads this lib with RTLD_GLOBAL.
             """
-            needed = {name}
-            for _ in range(len(fd_map) + 1):
-                prev_needed = len(needed)
-                progress = False
-                for lib in list(needed - loaded):
-                    try:
-                        _RealCDLL(f"/proc/self/fd/{fd_map[lib]}",
-                                  mode=ct.RTLD_GLOBAL)
-                        loaded.add(lib)
-                        progress = True
-                    except OSError as e:
-                        msg = str(e)
-                        for dep in fd_map:
-                            if dep in msg and dep not in loaded \
-                                    and dep not in needed:
-                                needed.add(dep)
-                                break
-                if not (needed - loaded):
-                    return
-                if not progress and len(needed) == prev_needed:
-                    return  # truly stuck: nothing loaded, no new deps
+            if name in loaded or name not in fd_map:
+                return
+            loaded.add(name)  # mark early to prevent cycles
+            for dep in _get_needed(fd_map[name]):
+                _load_with_deps(dep)
+            _RealCDLL(f"/proc/self/fd/{fd_map[name]}",
+                      mode=ct.RTLD_GLOBAL)
 
         class _PatchedCDLL(_RealCDLL):
             _antirev_real = _RealCDLL

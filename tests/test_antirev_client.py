@@ -10,7 +10,8 @@ import tempfile
 # Make tools/ importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
 from antirev_client import (
-    _aes256_ecb_block, _compute_sock_name, _load_key, AntirevClient,
+    _aes256_ecb_block, _compute_sock_name, _load_key, _get_needed,
+    AntirevClient,
 )
 
 PASS = 0
@@ -76,12 +77,11 @@ with tempfile.NamedTemporaryFile(delete=False) as f:
 check("trailer extract", _load_key(Path(bin_path)), trailer_key)
 os.unlink(bin_path)
 
-# ── 4. on-demand dep resolution (patch_ctypes + real memfds) ────────
+# ── 4. ELF DT_NEEDED parser + dep resolution ───────────────────────
 
-print("[4] on-demand dep resolution")
+print("[4] _get_needed + dep resolution")
 
 # Build 3 tiny .so files: libouter → libmiddle → libinner (transitive chain).
-# Verify that loading libouter auto-resolves the full chain iteratively.
 import subprocess, tempfile
 
 tmpdir = tempfile.mkdtemp(prefix="antirev_test_")
@@ -132,6 +132,13 @@ inner_fd = so_to_memfd(inner_so)
 middle_fd = so_to_memfd(middle_so)
 outer_fd = so_to_memfd(outer_so)
 
+# Verify ELF parser returns correct DT_NEEDED
+check("_get_needed(inner) = []", _get_needed(inner_fd), [])
+outer_needed = _get_needed(outer_fd)
+check("_get_needed(outer) has libmiddle", "libmiddle.so" in outer_needed, True)
+middle_needed = _get_needed(middle_fd)
+check("_get_needed(middle) has libinner", "libinner.so" in middle_needed, True)
+
 # Patch ctypes with all 3 libs — none pre-loaded.
 client = object.__new__(AntirevClient)
 client._key = key
@@ -142,7 +149,7 @@ client._libs = {
 }
 client.patch_ctypes()
 
-# Loading libouter should iteratively discover and load libmiddle, libinner
+# Loading libouter should depth-first load libinner, libmiddle, then libouter
 handle = ct.CDLL("libouter.so")
 check("3-level dep chain", handle.outer_val() == 330, True)
 
