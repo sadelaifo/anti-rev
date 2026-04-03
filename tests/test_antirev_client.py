@@ -76,9 +76,70 @@ with tempfile.NamedTemporaryFile(delete=False) as f:
 check("trailer extract", _load_key(Path(bin_path)), trailer_key)
 os.unlink(bin_path)
 
-# ── 4. patch_ctypes ─────────────────────────────────────────────────
+# ── 4. preload_all (retry loop with real memfds) ────────────────────
 
-print("[4] patch_ctypes")
+print("[4] preload_all")
+
+# Build two tiny .so files: libinner has no deps, libouter DT_NEEDED libinner.
+# Write them to memfds and verify the retry loop resolves the ordering.
+import subprocess, tempfile
+
+tmpdir = tempfile.mkdtemp(prefix="antirev_test_")
+
+# libinner.c — leaf library, no deps
+inner_c = os.path.join(tmpdir, "libinner.c")
+with open(inner_c, 'w') as f:
+    f.write("int inner_val(void) { return 42; }\n")
+inner_so = os.path.join(tmpdir, "libinner.so")
+subprocess.check_call([
+    "gcc", "-shared", "-fPIC", "-Wl,-soname,libinner.so",
+    "-o", inner_so, inner_c])
+
+# libouter.c — depends on libinner
+outer_c = os.path.join(tmpdir, "libouter.c")
+with open(outer_c, 'w') as f:
+    f.write("int inner_val(void);\n"
+            "int outer_val(void) { return inner_val() + 1; }\n")
+outer_so = os.path.join(tmpdir, "libouter.so")
+subprocess.check_call([
+    "gcc", "-shared", "-fPIC", "-Wl,-soname,libouter.so",
+    "-o", outer_so, outer_c, "-L", tmpdir, "-linner", "-Wl,--no-as-needed"])
+
+# Copy both into memfds
+import mmap
+def so_to_memfd(path):
+    import ctypes, ctypes.util
+    libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+    libc.memfd_create.restype = ctypes.c_int
+    libc.memfd_create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    fd = libc.memfd_create(os.path.basename(path).encode(), 0)
+    with open(path, 'rb') as f:
+        data = f.read()
+    os.write(fd, data)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return fd
+
+inner_fd = so_to_memfd(inner_so)
+outer_fd = so_to_memfd(outer_so)
+
+# Intentionally put outer FIRST — needs retry to resolve
+client = object.__new__(AntirevClient)
+client._key = key
+client._libs = {"libouter.so": outer_fd, "libinner.so": inner_fd}
+client.preload_all()
+
+# Verify both are loaded — dlopen should find them globally
+handle = ct.CDLL(f"/proc/self/fd/{outer_fd}")
+check("preload resolves deps via retry", handle.outer_val() == 43, True)
+
+os.close(inner_fd)
+os.close(outer_fd)
+import shutil
+shutil.rmtree(tmpdir)
+
+# ── 5. patch_ctypes ─────────────────────────────────────────────────
+
+print("[5] patch_ctypes")
 
 # Create a client without connecting to daemon — just test the patch.
 # We'll manually set _libs and call patch_ctypes.

@@ -181,6 +181,28 @@ class AntirevClient:
         """Load an encrypted lib as ctypes.CDLL."""
         return ct.CDLL(f"/proc/self/fd/{self.fd(name)}", mode=mode)
 
+    def preload_all(self):
+        """Pre-load all libs with RTLD_GLOBAL so DT_NEEDED chains resolve.
+
+        Uses a retry loop: libs whose dependencies aren't loaded yet will
+        fail, but succeed on a later pass once their deps are in.
+        """
+        pending = dict(self._libs)
+        prev_count = -1
+        while pending and len(pending) != prev_count:
+            prev_count = len(pending)
+            still_pending = {}
+            for name, fd in pending.items():
+                try:
+                    ct.CDLL(f"/proc/self/fd/{fd}", mode=ct.RTLD_GLOBAL)
+                except OSError:
+                    still_pending[name] = fd
+            pending = still_pending
+        if pending:
+            names = ', '.join(sorted(pending))
+            print(f"[antirev] warning: failed to pre-load: {names}",
+                  file=sys.stderr)
+
     def patch_ctypes(self):
         """Monkey-patch ctypes.CDLL to transparently load encrypted libs.
 
@@ -243,7 +265,8 @@ def activate(key_source=None):
     if key_source is None:
         key_source = _find_key_source()
     client = AntirevClient(key_source)
+    client.preload_all()
     client.patch_ctypes()
-    print(f"[antirev] patched ctypes.CDLL ({len(client._libs)} libs)",
+    print(f"[antirev] loaded {len(client._libs)} libs, ctypes.CDLL patched",
           file=sys.stderr)
     return client
