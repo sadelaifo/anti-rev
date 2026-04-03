@@ -7,8 +7,8 @@
  *
  * Also intercepts Python ctypes and any other code that calls C dlopen().
  *
- * Constructor: eagerly preloads all ANTIREV_FD_MAP libs with a retry loop
- * to handle dependency ordering automatically (leaf deps loaded first).
+ * Libs are loaded on-demand: only when something actually calls dlopen()
+ * for a lib in ANTIREV_FD_MAP does the shim redirect to the memfd.
  */
 
 #define _GNU_SOURCE
@@ -24,54 +24,6 @@ static void *get_real_dlopen(void)
     if (!real_dlopen_fn)
         real_dlopen_fn = dlsym(RTLD_NEXT, "dlopen");
     return real_dlopen_fn;
-}
-
-/* Preload all ANTIREV_FD_MAP libs at startup.  Retry loop handles
- * dependency ordering: leaf libs load first, dependents in later passes. */
-__attribute__((constructor))
-static void antirev_preload(void)
-{
-    if (!get_real_dlopen()) return;
-    const char *map = getenv("ANTIREV_FD_MAP");
-    if (!map || !*map) return;
-
-    char *buf = strdup(map);
-    if (!buf) return;
-
-    /* Parse entries */
-    #define MAX_PRELOAD 1024
-    int  fds[MAX_PRELOAD];
-    char loaded[MAX_PRELOAD];
-    int  count = 0;
-
-    char *save = NULL;
-    for (char *tok = strtok_r(buf, ",", &save);
-         tok && count < MAX_PRELOAD;
-         tok = strtok_r(NULL, ",", &save)) {
-        char *eq = strchr(tok, '=');
-        if (eq) {
-            fds[count] = atoi(eq + 1);
-            loaded[count] = 0;
-            count++;
-        }
-    }
-    free(buf);
-
-    int remaining = count;
-    for (int pass = 0; pass < count && remaining > 0; pass++) {
-        int progress = 0;
-        for (int i = 0; i < count; i++) {
-            if (loaded[i]) continue;
-            char path[64];
-            snprintf(path, sizeof(path), "/proc/self/fd/%d", fds[i]);
-            if (real_dlopen_fn(path, RTLD_NOW | RTLD_GLOBAL)) {
-                loaded[i] = 1;
-                remaining--;
-                progress = 1;
-            }
-        }
-        if (!progress) break;
-    }
 }
 
 __attribute__((visibility("default")))

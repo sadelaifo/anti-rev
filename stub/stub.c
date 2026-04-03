@@ -993,11 +993,19 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 n_fdmap++;
             }
         }
+        fprintf(stderr, "[antirev] split: %d on LD_PRELOAD, %d on FD_MAP "
+                "(needed=%d, daemon=%d)\n",
+                n_preload, n_fdmap, n_needed, nlibs);
+        for (int k = 0; k < n_preload; k++)
+            fprintf(stderr, "[antirev]   PRELOAD: %s (fd %d)\n",
+                    preload_names[k], preload_fds[k]);
     } else {
         /* No needed list — all libs go on LD_PRELOAD (backward compat) */
         memcpy(preload_fds, lib_fds, (size_t)nlibs * sizeof(int));
         memcpy(preload_names, lib_names, (size_t)nlibs * (MAX_NAME + 1));
         n_preload = nlibs;
+        fprintf(stderr, "[antirev] backward compat: all %d libs on LD_PRELOAD\n",
+                nlibs);
     }
 
     /* Phase 5. Build new envp */
