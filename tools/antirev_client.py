@@ -45,13 +45,23 @@ SCM_BATCH = 250
 
 # ── AES helper (system libcrypto, no pip deps) ──────────────────────
 
-def _aes256_ecb_block(key: bytes, block: bytes) -> bytes:
+def _aes256_ecb_block(key, block):
     """AES-256-ECB encrypt one 16-byte block using system libcrypto."""
     path = ct.util.find_library("crypto") or "libcrypto.so.3"
     lib = ct.CDLL(path)
 
-    lib.EVP_CIPHER_CTX_new.restype = ct.c_void_p
-    lib.EVP_aes_256_ecb.restype = ct.c_void_p
+    _vp = ct.c_void_p
+    _cp = ct.c_char_p
+    _ip = ct.POINTER(ct.c_int)
+
+    lib.EVP_CIPHER_CTX_new.restype = _vp
+    lib.EVP_CIPHER_CTX_new.argtypes = []
+    lib.EVP_aes_256_ecb.restype = _vp
+    lib.EVP_aes_256_ecb.argtypes = []
+    lib.EVP_EncryptInit_ex.argtypes = [_vp, _vp, _vp, _cp, _cp]
+    lib.EVP_CIPHER_CTX_set_padding.argtypes = [_vp, ct.c_int]
+    lib.EVP_EncryptUpdate.argtypes = [_vp, _cp, _ip, _cp, ct.c_int]
+    lib.EVP_CIPHER_CTX_free.argtypes = [_vp]
 
     ctx = lib.EVP_CIPHER_CTX_new()
     if not ctx:
@@ -69,7 +79,7 @@ def _aes256_ecb_block(key: bytes, block: bytes) -> bytes:
         lib.EVP_CIPHER_CTX_free(ctx)
 
 
-def _compute_sock_name(key: bytes) -> str:
+def _compute_sock_name(key):
     """Derive the daemon's abstract socket name from the key.
 
     Matches stub.c make_sock_addr(): AES_K(0^16)[0:8] → hex.
@@ -80,7 +90,7 @@ def _compute_sock_name(key: bytes) -> str:
 
 # ── Key loading ─────────────────────────────────────────────────────
 
-def _load_key(path: Path) -> bytes:
+def _load_key(path):
     """Load 32-byte key from hex file or daemon/stub trailer."""
     data = path.read_bytes()
 
