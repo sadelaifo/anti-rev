@@ -80,32 +80,13 @@ os.unlink(bin_path)
 
 print("[4] on-demand dep resolution")
 
-# Build two tiny .so files: libinner has no deps, libouter DT_NEEDED libinner.
-# Verify that loading libouter via patched ctypes.CDLL auto-loads libinner.
+# Build 3 tiny .so files: libouter → libmiddle → libinner (transitive chain).
+# Verify that loading libouter auto-resolves the full chain iteratively.
 import subprocess, tempfile
 
 tmpdir = tempfile.mkdtemp(prefix="antirev_test_")
 
-# libinner.c — leaf library, no deps
-inner_c = os.path.join(tmpdir, "libinner.c")
-with open(inner_c, 'w') as f:
-    f.write("int inner_val(void) { return 42; }\n")
-inner_so = os.path.join(tmpdir, "libinner.so")
-subprocess.check_call([
-    "gcc", "-shared", "-fPIC", "-Wl,-soname,libinner.so",
-    "-o", inner_so, inner_c])
-
-# libouter.c — depends on libinner
-outer_c = os.path.join(tmpdir, "libouter.c")
-with open(outer_c, 'w') as f:
-    f.write("int inner_val(void);\n"
-            "int outer_val(void) { return inner_val() + 1; }\n")
-outer_so = os.path.join(tmpdir, "libouter.so")
-subprocess.check_call([
-    "gcc", "-shared", "-fPIC", "-Wl,-soname,libouter.so",
-    "-o", outer_so, outer_c, "-L", tmpdir, "-linner", "-Wl,--no-as-needed"])
-
-# Copy both into memfds
+# Copy .so into a memfd
 def so_to_memfd(path):
     import ctypes, ctypes.util
     libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
@@ -118,22 +99,55 @@ def so_to_memfd(path):
     os.lseek(fd, 0, os.SEEK_SET)
     return fd
 
+# libinner.c — leaf, no deps
+inner_c = os.path.join(tmpdir, "libinner.c")
+with open(inner_c, 'w') as f:
+    f.write("int inner_val(void) { return 10; }\n")
+inner_so = os.path.join(tmpdir, "libinner.so")
+subprocess.check_call([
+    "gcc", "-shared", "-fPIC", "-Wl,-soname,libinner.so",
+    "-o", inner_so, inner_c])
+
+# libmiddle.c — depends on libinner
+middle_c = os.path.join(tmpdir, "libmiddle.c")
+with open(middle_c, 'w') as f:
+    f.write("int inner_val(void);\n"
+            "int middle_val(void) { return inner_val() + 20; }\n")
+middle_so = os.path.join(tmpdir, "libmiddle.so")
+subprocess.check_call([
+    "gcc", "-shared", "-fPIC", "-Wl,-soname,libmiddle.so",
+    "-o", middle_so, middle_c, "-L", tmpdir, "-linner", "-Wl,--no-as-needed"])
+
+# libouter.c — depends on libmiddle
+outer_c = os.path.join(tmpdir, "libouter.c")
+with open(outer_c, 'w') as f:
+    f.write("int middle_val(void);\n"
+            "int outer_val(void) { return middle_val() + 300; }\n")
+outer_so = os.path.join(tmpdir, "libouter.so")
+subprocess.check_call([
+    "gcc", "-shared", "-fPIC", "-Wl,-soname,libouter.so",
+    "-o", outer_so, outer_c, "-L", tmpdir, "-lmiddle", "-Wl,--no-as-needed"])
+
 inner_fd = so_to_memfd(inner_so)
+middle_fd = so_to_memfd(middle_so)
 outer_fd = so_to_memfd(outer_so)
 
-# Patch ctypes with both libs available but NOT pre-loaded.
-# Loading libouter.so should auto-resolve libinner.so on demand.
+# Patch ctypes with all 3 libs — none pre-loaded.
 client = object.__new__(AntirevClient)
 client._key = key
-client._libs = {"libouter.so": outer_fd, "libinner.so": inner_fd}
+client._libs = {
+    "libouter.so": outer_fd,
+    "libmiddle.so": middle_fd,
+    "libinner.so": inner_fd,
+}
 client.patch_ctypes()
 
-# This should trigger: load libouter → fails (needs libinner) →
-# auto-loads libinner with RTLD_GLOBAL → retries libouter → succeeds
+# Loading libouter should iteratively discover and load libmiddle, libinner
 handle = ct.CDLL("libouter.so")
-check("on-demand dep resolution", handle.outer_val() == 43, True)
+check("3-level dep chain", handle.outer_val() == 330, True)
 
 os.close(inner_fd)
+os.close(middle_fd)
 os.close(outer_fd)
 import shutil
 shutil.rmtree(tmpdir)

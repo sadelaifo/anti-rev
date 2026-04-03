@@ -192,34 +192,34 @@ class AntirevClient:
         _RealCDLL = getattr(ct.CDLL, '_antirev_real', ct.CDLL)
         loaded = set()
 
-        def _load_dep(dep_name):
-            """Load a single dep with RTLD_GLOBAL so the linker can find it."""
-            if dep_name in loaded or dep_name not in fd_map:
-                return
-            loaded.add(dep_name)
-            _RealCDLL(f"/proc/self/fd/{fd_map[dep_name]}",
-                      mode=ct.RTLD_GLOBAL)
+        def _load_with_deps(name):
+            """Load a lib and discover+load its encrypted deps iteratively.
 
-        def _resolve_deps(name):
-            """Try loading; on dep failure, load the missing dep and retry."""
-            path = f"/proc/self/fd/{fd_map[name]}"
-            for _ in range(len(fd_map)):
-                try:
-                    return _RealCDLL(path, mode=ct.RTLD_GLOBAL)
-                except OSError as e:
-                    msg = str(e)
-                    # Find which daemon lib is missing from the error msg.
-                    # Errors look like "libFoo.so: cannot open shared object"
-                    # or "libFoo.so: invalid ELF header"
-                    resolved = False
-                    for dep in fd_map:
-                        if dep in msg and dep not in loaded:
-                            _resolve_deps(dep)
-                            resolved = True
-                            break
-                    if not resolved:
-                        raise
-            return _RealCDLL(path, mode=ct.RTLD_GLOBAL)
+            Tries to load each needed lib. On failure, parses the error
+            to discover missing deps (also in fd_map), adds them to the
+            set, and retries. No recursion, no exception chaining.
+            """
+            needed = {name}
+            for _ in range(len(fd_map) + 1):
+                prev_needed = len(needed)
+                progress = False
+                for lib in list(needed - loaded):
+                    try:
+                        _RealCDLL(f"/proc/self/fd/{fd_map[lib]}",
+                                  mode=ct.RTLD_GLOBAL)
+                        loaded.add(lib)
+                        progress = True
+                    except OSError as e:
+                        msg = str(e)
+                        for dep in fd_map:
+                            if dep in msg and dep not in loaded \
+                                    and dep not in needed:
+                                needed.add(dep)
+                                break
+                if not (needed - loaded):
+                    return
+                if not progress and len(needed) == prev_needed:
+                    return  # truly stuck: nothing loaded, no new deps
 
         class _PatchedCDLL(_RealCDLL):
             _antirev_real = _RealCDLL
@@ -228,7 +228,7 @@ class AntirevClient:
                 if name:
                     base = name.rsplit('/', 1)[-1]
                     if base in fd_map:
-                        _resolve_deps(base)
+                        _load_with_deps(base)
                         name = f"/proc/self/fd/{fd_map[base]}"
                 super().__init__(name, *args, **kwargs)
 
