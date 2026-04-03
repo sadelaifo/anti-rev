@@ -181,38 +181,45 @@ class AntirevClient:
         """Load an encrypted lib as ctypes.CDLL."""
         return ct.CDLL(f"/proc/self/fd/{self.fd(name)}", mode=mode)
 
-    def preload_all(self):
-        """Pre-load all libs with RTLD_GLOBAL so DT_NEEDED chains resolve.
-
-        Uses a retry loop: libs whose dependencies aren't loaded yet will
-        fail, but succeed on a later pass once their deps are in.
-        """
-        pending = dict(self._libs)
-        prev_count = -1
-        while pending and len(pending) != prev_count:
-            prev_count = len(pending)
-            still_pending = {}
-            for name, fd in pending.items():
-                try:
-                    ct.CDLL(f"/proc/self/fd/{fd}", mode=ct.RTLD_GLOBAL)
-                except OSError:
-                    still_pending[name] = fd
-            pending = still_pending
-        if pending:
-            names = ', '.join(sorted(pending))
-            print(f"[antirev] warning: failed to pre-load: {names}",
-                  file=sys.stderr)
-
     def patch_ctypes(self):
         """Monkey-patch ctypes.CDLL to transparently load encrypted libs.
 
-        After calling this, any ctypes.CDLL("libFoo.so") where libFoo.so
-        is served by the daemon will be redirected to the decrypted memfd.
+        When a daemon-served lib is loaded, any DT_NEEDED deps that are
+        also in the daemon are resolved on-demand (loaded with RTLD_GLOBAL)
+        before the requested lib. This avoids eagerly loading all libs.
         """
         fd_map = self._libs
-        # Save the real CDLL before we replace it — used by the
-        # patched class as its base so we never double-intercept.
         _RealCDLL = getattr(ct.CDLL, '_antirev_real', ct.CDLL)
+        loaded = set()
+
+        def _load_dep(dep_name):
+            """Load a single dep with RTLD_GLOBAL so the linker can find it."""
+            if dep_name in loaded or dep_name not in fd_map:
+                return
+            loaded.add(dep_name)
+            _RealCDLL(f"/proc/self/fd/{fd_map[dep_name]}",
+                      mode=ct.RTLD_GLOBAL)
+
+        def _resolve_deps(name):
+            """Try loading; on dep failure, load the missing dep and retry."""
+            path = f"/proc/self/fd/{fd_map[name]}"
+            for _ in range(len(fd_map)):
+                try:
+                    return _RealCDLL(path, mode=ct.RTLD_GLOBAL)
+                except OSError as e:
+                    msg = str(e)
+                    # Find which daemon lib is missing from the error msg.
+                    # Errors look like "libFoo.so: cannot open shared object"
+                    # or "libFoo.so: invalid ELF header"
+                    resolved = False
+                    for dep in fd_map:
+                        if dep in msg and dep not in loaded:
+                            _resolve_deps(dep)
+                            resolved = True
+                            break
+                    if not resolved:
+                        raise
+            return _RealCDLL(path, mode=ct.RTLD_GLOBAL)
 
         class _PatchedCDLL(_RealCDLL):
             _antirev_real = _RealCDLL
@@ -221,6 +228,7 @@ class AntirevClient:
                 if name:
                     base = name.rsplit('/', 1)[-1]
                     if base in fd_map:
+                        _resolve_deps(base)
                         name = f"/proc/self/fd/{fd_map[base]}"
                 super().__init__(name, *args, **kwargs)
 
@@ -265,8 +273,7 @@ def activate(key_source=None):
     if key_source is None:
         key_source = _find_key_source()
     client = AntirevClient(key_source)
-    client.preload_all()
     client.patch_ctypes()
-    print(f"[antirev] loaded {len(client._libs)} libs, ctypes.CDLL patched",
+    print(f"[antirev] patched ctypes.CDLL ({len(client._libs)} libs available)",
           file=sys.stderr)
     return client

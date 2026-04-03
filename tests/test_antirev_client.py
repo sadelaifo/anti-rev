@@ -76,12 +76,12 @@ with tempfile.NamedTemporaryFile(delete=False) as f:
 check("trailer extract", _load_key(Path(bin_path)), trailer_key)
 os.unlink(bin_path)
 
-# ── 4. preload_all (retry loop with real memfds) ────────────────────
+# ── 4. on-demand dep resolution (patch_ctypes + real memfds) ────────
 
-print("[4] preload_all")
+print("[4] on-demand dep resolution")
 
 # Build two tiny .so files: libinner has no deps, libouter DT_NEEDED libinner.
-# Write them to memfds and verify the retry loop resolves the ordering.
+# Verify that loading libouter via patched ctypes.CDLL auto-loads libinner.
 import subprocess, tempfile
 
 tmpdir = tempfile.mkdtemp(prefix="antirev_test_")
@@ -106,7 +106,6 @@ subprocess.check_call([
     "-o", outer_so, outer_c, "-L", tmpdir, "-linner", "-Wl,--no-as-needed"])
 
 # Copy both into memfds
-import mmap
 def so_to_memfd(path):
     import ctypes, ctypes.util
     libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
@@ -122,27 +121,28 @@ def so_to_memfd(path):
 inner_fd = so_to_memfd(inner_so)
 outer_fd = so_to_memfd(outer_so)
 
-# Intentionally put outer FIRST — needs retry to resolve
+# Patch ctypes with both libs available but NOT pre-loaded.
+# Loading libouter.so should auto-resolve libinner.so on demand.
 client = object.__new__(AntirevClient)
 client._key = key
 client._libs = {"libouter.so": outer_fd, "libinner.so": inner_fd}
-client.preload_all()
+client.patch_ctypes()
 
-# Verify both are loaded — dlopen should find them globally
-handle = ct.CDLL(f"/proc/self/fd/{outer_fd}")
-check("preload resolves deps via retry", handle.outer_val() == 43, True)
+# This should trigger: load libouter → fails (needs libinner) →
+# auto-loads libinner with RTLD_GLOBAL → retries libouter → succeeds
+handle = ct.CDLL("libouter.so")
+check("on-demand dep resolution", handle.outer_val() == 43, True)
 
 os.close(inner_fd)
 os.close(outer_fd)
 import shutil
 shutil.rmtree(tmpdir)
 
-# ── 5. patch_ctypes ─────────────────────────────────────────────────
+# ── 5. patch_ctypes passthrough ────────────────────────────────────
 
-print("[5] patch_ctypes")
+print("[5] patch_ctypes passthrough")
 
-# Create a client without connecting to daemon — just test the patch.
-# We'll manually set _libs and call patch_ctypes.
+# Re-patch with a fake fd to test passthrough behavior
 client = object.__new__(AntirevClient)
 client._key = key
 client._libs = {"libfake.so": 999}
