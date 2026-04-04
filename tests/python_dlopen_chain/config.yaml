@@ -1,0 +1,18 @@
+install_dir: .
+output_dir: ./protected
+key: ./test.key
+stub: ../../build/stub
+libs: encrypt
+
+# Only encrypt libfoo.so and libtee.so; libbar.so stays plaintext
+encrypt_libs:
+  - libfoo.so
+  - libtee.so
+
+blacklist:
+  - "*.py"
+  - "*.yaml"
+  - "*.sh"
+  - "*.key"
+  - "*.c"
+  - protected/

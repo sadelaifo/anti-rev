@@ -45,90 +45,104 @@ SCM_BATCH = 250
 
 # ── ELF DT_NEEDED parser (pure Python, no external tools) ──────────
 
+def _parse_elf_needed(f):
+    """Parse DT_NEEDED entries from an open ELF file object."""
+    f.seek(0)
+    ident = f.read(16)
+    if ident[:4] != b'\x7fELF':
+        return []
+    is64 = (ident[4] == 2)
+
+    # Read e_phoff, e_phentsize, e_phnum
+    if is64:
+        f.seek(32); e_phoff = struct.unpack('<Q', f.read(8))[0]
+        f.seek(54); e_phentsize, e_phnum = struct.unpack('<HH', f.read(4))
+    else:
+        f.seek(28); e_phoff = struct.unpack('<I', f.read(4))[0]
+        f.seek(42); e_phentsize, e_phnum = struct.unpack('<HH', f.read(4))
+
+    # Read all program headers
+    f.seek(e_phoff)
+    phdrs = f.read(e_phentsize * e_phnum)
+
+    # Find PT_DYNAMIC and collect PT_LOAD segments
+    dyn_off = dyn_sz = 0
+    loads = []
+    for i in range(e_phnum):
+        base = i * e_phentsize
+        p_type = struct.unpack_from('<I', phdrs, base)[0]
+        if is64:
+            p_off = struct.unpack_from('<Q', phdrs, base + 8)[0]
+            p_va = struct.unpack_from('<Q', phdrs, base + 16)[0]
+            p_fsz = struct.unpack_from('<Q', phdrs, base + 32)[0]
+        else:
+            p_off = struct.unpack_from('<I', phdrs, base + 4)[0]
+            p_va = struct.unpack_from('<I', phdrs, base + 8)[0]
+            p_fsz = struct.unpack_from('<I', phdrs, base + 16)[0]
+        if p_type == 2:  # PT_DYNAMIC
+            dyn_off, dyn_sz = p_off, p_fsz
+        elif p_type == 1:  # PT_LOAD
+            loads.append((p_va, p_off, p_fsz))
+
+    if not dyn_off:
+        return []
+
+    # Parse dynamic entries → find DT_NEEDED offsets and DT_STRTAB addr
+    f.seek(dyn_off)
+    dyn = f.read(dyn_sz)
+    esz = 16 if is64 else 8
+    fmt = '<qQ' if is64 else '<iI'
+
+    needed_offs = []
+    strtab_va = 0
+    for i in range(0, len(dyn), esz):
+        d_tag, d_val = struct.unpack_from(fmt, dyn, i)
+        if d_tag == 0:
+            break
+        if d_tag == 1:   # DT_NEEDED
+            needed_offs.append(d_val)
+        elif d_tag == 5:  # DT_STRTAB
+            strtab_va = d_val
+
+    if not needed_offs or not strtab_va:
+        return []
+
+    # Convert strtab virtual address → file offset via PT_LOAD
+    strtab_foff = 0
+    for va, foff, fsz in loads:
+        if va <= strtab_va < va + fsz:
+            strtab_foff = foff + (strtab_va - va)
+            break
+    if not strtab_foff:
+        return []
+
+    # Read null-terminated strings
+    names = []
+    for off in needed_offs:
+        f.seek(strtab_foff + off)
+        raw = b''
+        while True:
+            c = f.read(1)
+            if not c or c == b'\x00':
+                break
+            raw += c
+        names.append(raw.decode())
+    return names
+
+
 def _get_needed(fd):
     """Parse DT_NEEDED entries from an ELF at /proc/self/fd/<fd>."""
-    path = f"/proc/self/fd/{fd}"
-    with open(path, 'rb') as f:
-        ident = f.read(16)
-        if ident[:4] != b'\x7fELF':
-            return []
-        is64 = (ident[4] == 2)
+    with open(f"/proc/self/fd/{fd}", 'rb') as f:
+        return _parse_elf_needed(f)
 
-        # Read e_phoff, e_phentsize, e_phnum
-        if is64:
-            f.seek(32); e_phoff = struct.unpack('<Q', f.read(8))[0]
-            f.seek(54); e_phentsize, e_phnum = struct.unpack('<HH', f.read(4))
-        else:
-            f.seek(28); e_phoff = struct.unpack('<I', f.read(4))[0]
-            f.seek(42); e_phentsize, e_phnum = struct.unpack('<HH', f.read(4))
 
-        # Read all program headers
-        f.seek(e_phoff)
-        phdrs = f.read(e_phentsize * e_phnum)
-
-        # Find PT_DYNAMIC and collect PT_LOAD segments
-        dyn_off = dyn_sz = 0
-        loads = []
-        for i in range(e_phnum):
-            base = i * e_phentsize
-            p_type = struct.unpack_from('<I', phdrs, base)[0]
-            if is64:
-                p_off = struct.unpack_from('<Q', phdrs, base + 8)[0]
-                p_va = struct.unpack_from('<Q', phdrs, base + 16)[0]
-                p_fsz = struct.unpack_from('<Q', phdrs, base + 32)[0]
-            else:
-                p_off = struct.unpack_from('<I', phdrs, base + 4)[0]
-                p_va = struct.unpack_from('<I', phdrs, base + 8)[0]
-                p_fsz = struct.unpack_from('<I', phdrs, base + 16)[0]
-            if p_type == 2:  # PT_DYNAMIC
-                dyn_off, dyn_sz = p_off, p_fsz
-            elif p_type == 1:  # PT_LOAD
-                loads.append((p_va, p_off, p_fsz))
-
-        if not dyn_off:
-            return []
-
-        # Parse dynamic entries → find DT_NEEDED offsets and DT_STRTAB addr
-        f.seek(dyn_off)
-        dyn = f.read(dyn_sz)
-        esz = 16 if is64 else 8
-        fmt = '<qQ' if is64 else '<iI'
-
-        needed_offs = []
-        strtab_va = 0
-        for i in range(0, len(dyn), esz):
-            d_tag, d_val = struct.unpack_from(fmt, dyn, i)
-            if d_tag == 0:
-                break
-            if d_tag == 1:   # DT_NEEDED
-                needed_offs.append(d_val)
-            elif d_tag == 5:  # DT_STRTAB
-                strtab_va = d_val
-
-        if not needed_offs or not strtab_va:
-            return []
-
-        # Convert strtab virtual address → file offset via PT_LOAD
-        strtab_foff = 0
-        for va, foff, fsz in loads:
-            if va <= strtab_va < va + fsz:
-                strtab_foff = foff + (strtab_va - va)
-                break
-        if not strtab_foff:
-            return []
-
-        # Read null-terminated strings
-        names = []
-        for off in needed_offs:
-            f.seek(strtab_foff + off)
-            raw = b''
-            while True:
-                c = f.read(1)
-                if not c or c == b'\x00':
-                    break
-                raw += c
-            names.append(raw.decode())
-        return names
+def _get_needed_from_path(path):
+    """Parse DT_NEEDED entries from an ELF file on disk."""
+    try:
+        with open(path, 'rb') as f:
+            return _parse_elf_needed(f)
+    except OSError:
+        return []
 
 
 # ── AES helper (system libcrypto, no pip deps) ──────────────────────
@@ -276,24 +290,45 @@ class AntirevClient:
         available so implicit cross-lib symbol references resolve.
         Uses DT_NEEDED to topologically sort — leaves first, so each
         lib's constructor finds its deps already loaded.
+
+        Follows DT_NEEDED through unencrypted intermediaries on disk
+        (e.g. encrypted A → unencrypted B → encrypted C) so that C
+        is loaded before A.
         """
         fd_map = self._libs
         _RealCDLL = getattr(ct.CDLL, '_antirev_real', ct.CDLL)
         loaded = set()
 
         def _load(name):
-            if name in loaded or name not in fd_map:
+            if name in loaded:
                 return
             loaded.add(name)
-            for dep in _get_needed(fd_map[name]):
-                _load(dep)
-            _RealCDLL(f"/proc/self/fd/{fd_map[name]}",
-                      mode=ct.RTLD_GLOBAL)
+            if name in fd_map:
+                # Encrypted lib — parse deps from the memfd
+                for dep in _get_needed(fd_map[name]):
+                    _load(dep)
+                _RealCDLL(f"/proc/self/fd/{fd_map[name]}",
+                          mode=ct.RTLD_GLOBAL)
+            else:
+                # Unencrypted intermediary — find on disk via ctypes
+                # and follow its DT_NEEDED to discover encrypted deps
+                disk_path = ct.util.find_library(
+                    name.replace('lib', '', 1).split('.so')[0])
+                if not disk_path:
+                    # Try LD_LIBRARY_PATH / standard paths directly
+                    for d in os.environ.get('LD_LIBRARY_PATH', '').split(':'):
+                        candidate = os.path.join(d, name) if d else None
+                        if candidate and os.path.isfile(candidate):
+                            disk_path = candidate
+                            break
+                if disk_path:
+                    for dep in _get_needed_from_path(disk_path):
+                        _load(dep)
 
         for name in fd_map:
             _load(name)
 
-        self._preloaded = loaded
+        self._preloaded = {n for n in loaded if n in fd_map}
 
     def patch_ctypes(self):
         """Monkey-patch ctypes.CDLL to redirect encrypted lib loads."""
