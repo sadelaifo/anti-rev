@@ -347,6 +347,12 @@ static int decrypt_enc_file(const char *path, const uint8_t *key,
     uint64_t ct_size = (uint64_t)(fsize - ct_off);
     if (ct_size == 0) { close(fd); return -1; }
 
+    const char *bname = strrchr(path, '/');
+    bname = bname ? bname + 1 : path;
+
+    int mfd = make_memfd(bname);
+    if (mfd < 0) { close(fd); return -1; }
+
     aes256gcm_ctx ctx;
 
     /* Pass A: GHASH verify */
@@ -356,23 +362,17 @@ static int decrypt_enc_file(const char *path, const uint8_t *key,
     while (remaining > 0) {
         size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
         ssize_t got     = pread(fd, chunk, to_read, pos);
-        if (got != (ssize_t)to_read) { close(fd); return -1; }
+        if (got != (ssize_t)to_read) { close(fd); close(mfd); return -1; }
         aes256gcm_ghash_update(&ctx, chunk, to_read);
         pos       += (off_t)to_read;
         remaining -= to_read;
     }
     if (aes256gcm_ghash_verify(&ctx, tag) != 0) {
-        close(fd);
+        close(fd); close(mfd);
         return -1;
     }
 
     /* Pass B: CTR decrypt → memfd */
-    const char *bname = strrchr(path, '/');
-    bname = bname ? bname + 1 : path;
-
-    int mfd = make_memfd(bname);
-    if (mfd < 0) { close(fd); return -1; }
-
     aes256gcm_init(&ctx, key, iv);
     remaining = ct_size;
     pos       = ct_off;
@@ -690,14 +690,14 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         int fd = make_memfd(e->name);
         if (fd < 0) return 1;
 
-        aes256gcm_init(&ctx, key, e->iv);  /* reset counter for decryption pass */
+        aes256gcm_init(&ctx, key, e->iv);
         remaining = e->ct_size;
         pos       = (off_t)e->ct_offset;
         while (remaining > 0) {
             size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
             ssize_t got     = pread(self, chunk, to_read, pos);
             if (got != (ssize_t)to_read) { perror("pread ciphertext"); return 1; }
-            aes256gcm_ctr_decrypt(&ctx, chunk, chunk, to_read); /* in-place */
+            aes256gcm_ctr_decrypt(&ctx, chunk, chunk, to_read);
             if (write_chunk(fd, chunk, to_read) != 0) return 1;
             pos       += (off_t)to_read;
             remaining -= to_read;

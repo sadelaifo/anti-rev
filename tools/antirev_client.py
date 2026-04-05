@@ -299,6 +299,17 @@ class AntirevClient:
         _RealCDLL = getattr(ct.CDLL, '_antirev_real', ct.CDLL)
         loaded = set()
 
+        def _resolve_disk(name):
+            """Find an unencrypted lib on disk, return path or None."""
+            disk_path = ct.util.find_library(
+                name.replace('lib', '', 1).split('.so')[0])
+            if not disk_path:
+                for d in os.environ.get('LD_LIBRARY_PATH', '').split(':'):
+                    candidate = os.path.join(d, name) if d else None
+                    if candidate and os.path.isfile(candidate):
+                        return candidate
+            return disk_path
+
         def _load(name):
             if name in loaded:
                 return
@@ -312,20 +323,24 @@ class AntirevClient:
             else:
                 # Unencrypted intermediary — find on disk via ctypes
                 # and follow its DT_NEEDED to discover encrypted deps
-                disk_path = ct.util.find_library(
-                    name.replace('lib', '', 1).split('.so')[0])
-                if not disk_path:
-                    # Try LD_LIBRARY_PATH / standard paths directly
-                    for d in os.environ.get('LD_LIBRARY_PATH', '').split(':'):
-                        candidate = os.path.join(d, name) if d else None
-                        if candidate and os.path.isfile(candidate):
-                            disk_path = candidate
-                            break
+                disk_path = _resolve_disk(name)
                 if disk_path:
                     for dep in _get_needed_from_path(disk_path):
                         _load(dep)
 
+        # Sort: load libs with fewer DT_NEEDED entries first.  Libs
+        # with fewer deps are more likely "providers" (leaf libs) and
+        # should be globally available before "consumer" libs whose
+        # constructors might dlopen other libs at init time.  This
+        # mirrors LD_PRELOAD semantics where all libs are mapped before
+        # any constructor runs — ctypes.CDLL runs constructors
+        # immediately, so order matters.
+        dep_count = {}
         for name in fd_map:
+            dep_count[name] = len(_get_needed(fd_map[name]))
+        load_order = sorted(fd_map, key=lambda n: (dep_count[n], n))
+
+        for name in load_order:
             _load(name)
 
         self._preloaded = {n for n in loaded if n in fd_map}
