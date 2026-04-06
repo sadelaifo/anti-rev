@@ -321,12 +321,18 @@ class AntirevClient:
                 _RealCDLL(f"/proc/self/fd/{fd_map[name]}",
                           mode=ct.RTLD_GLOBAL)
             else:
-                # Unencrypted intermediary — find on disk via ctypes
-                # and follow its DT_NEEDED to discover encrypted deps
+                # Unencrypted dep — find on disk, load with RTLD_GLOBAL
+                # so symbols are available when encrypted libs loaded from
+                # memfd (memfd breaks $ORIGIN RPATH resolution).  Also
+                # follow its DT_NEEDED to discover encrypted deps behind it.
                 disk_path = _resolve_disk(name)
                 if disk_path:
                     for dep in _get_needed_from_path(disk_path):
                         _load(dep)
+                    try:
+                        _RealCDLL(disk_path, mode=ct.RTLD_GLOBAL)
+                    except OSError:
+                        pass  # already loaded or transient
 
         # Sort: load libs with fewer DT_NEEDED entries first.  Libs
         # with fewer deps are more likely "providers" (leaf libs) and
