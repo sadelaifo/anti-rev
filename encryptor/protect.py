@@ -120,19 +120,35 @@ def _get_dt_needed(path: Path) -> list[str]:
 
 
 def _build_ldconfig_cache() -> dict:
-    """Parse ldconfig -p to build soname → path mapping."""
+    """Parse ldconfig -p to build soname → path mapping.
+
+    Also indexes LD_LIBRARY_PATH entries so that libs in custom
+    directories (not registered in ldconfig) are discoverable.
+    """
+    cache = {}
+    # LD_LIBRARY_PATH first — gives precedence to custom dirs, same
+    # priority order as the runtime dynamic linker.
+    for d in os.environ.get('LD_LIBRARY_PATH', '').split(':'):
+        if not d or not os.path.isdir(d):
+            continue
+        try:
+            for name in os.listdir(d):
+                if '.so' in name and name not in cache:
+                    cache[name] = os.path.join(d, name)
+        except OSError:
+            pass
+    # ldconfig cache (lower priority — don't overwrite LD_LIBRARY_PATH hits).
     try:
         result = subprocess.run(
             ['ldconfig', '-p'], capture_output=True, text=True, timeout=10
         )
-        cache = {}
         for line in result.stdout.splitlines():
             m = re.match(r'\s+(\S+)\s+\(.*\)\s+=>\s+(\S+)', line)
-            if m:
+            if m and m.group(1) not in cache:
                 cache[m.group(1)] = m.group(2)
-        return cache
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        return {}
+        pass
+    return cache
 
 
 def _get_transitive_needed(main_path: Path) -> list[str]:
