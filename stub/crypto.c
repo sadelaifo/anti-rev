@@ -23,18 +23,22 @@ static void inc32_impl(uint8_t cb[16]);
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <cpuid.h>
-#include <wmmintrin.h>   /* AES-NI */
+#include <wmmintrin.h>   /* AES-NI + PCLMULQDQ */
 #include <emmintrin.h>   /* SSE2   */
+#include <tmmintrin.h>   /* SSSE3 (PSHUFB)     */
 
 /* Set at startup by _detect_hw() */
-static int hw_aesni = 0;
+static int hw_aesni  = 0;
+static int hw_pclmul = 0;
 
 __attribute__((constructor))
 static void _detect_hw(void)
 {
     unsigned a, b, c, d;
-    if (__get_cpuid(1, &a, &b, &c, &d))
-        hw_aesni = !!(c & (1u << 25));   /* AES-NI */
+    if (__get_cpuid(1, &a, &b, &c, &d)) {
+        hw_aesni  = !!(c & (1u << 25));   /* AES-NI    */
+        hw_pclmul = !!(c & (1u <<  1));   /* PCLMULQDQ */
+    }
 }
 
 /* ---- AES-256 key expansion (AES-NI) ---- */
@@ -100,7 +104,29 @@ static inline __m128i ni_aes256_enc(__m128i block, const __m128i rk[15])
     return _mm_aesenclast_si128(block, rk[14]);
 }
 
-/* ---- AES-NI init / ctr_decrypt (GHASH uses software path) ---- */
+/* 4-wide AES-256 encryption — lets the CPU pipeline interleave rounds */
+__attribute__((target("aes")))
+static inline void ni_aes256_enc4(__m128i *b0, __m128i *b1,
+                                  __m128i *b2, __m128i *b3,
+                                  const __m128i rk[15])
+{
+    *b0 = _mm_xor_si128(*b0, rk[0]);
+    *b1 = _mm_xor_si128(*b1, rk[0]);
+    *b2 = _mm_xor_si128(*b2, rk[0]);
+    *b3 = _mm_xor_si128(*b3, rk[0]);
+    for (int r = 1; r < 14; r++) {
+        *b0 = _mm_aesenc_si128(*b0, rk[r]);
+        *b1 = _mm_aesenc_si128(*b1, rk[r]);
+        *b2 = _mm_aesenc_si128(*b2, rk[r]);
+        *b3 = _mm_aesenc_si128(*b3, rk[r]);
+    }
+    *b0 = _mm_aesenclast_si128(*b0, rk[14]);
+    *b1 = _mm_aesenclast_si128(*b1, rk[14]);
+    *b2 = _mm_aesenclast_si128(*b2, rk[14]);
+    *b3 = _mm_aesenclast_si128(*b3, rk[14]);
+}
+
+/* ---- AES-NI init / ctr_decrypt ---- */
 
 __attribute__((target("aes")))
 static void ni_init(aes256gcm_ctx *ctx,
@@ -142,16 +168,33 @@ static void ni_ctr_decrypt(aes256gcm_ctx *ctx,
         done++;
     }
 
-    /* Full blocks */
+    /* 4-wide blocks (AES pipeline interleaving) */
+    while (done + 64 <= len) {
+        __m128i c0 = _mm_loadu_si128((const __m128i *)ctx->ctr); inc32_impl(ctx->ctr);
+        __m128i c1 = _mm_loadu_si128((const __m128i *)ctx->ctr); inc32_impl(ctx->ctr);
+        __m128i c2 = _mm_loadu_si128((const __m128i *)ctx->ctr); inc32_impl(ctx->ctr);
+        __m128i c3 = _mm_loadu_si128((const __m128i *)ctx->ctr); inc32_impl(ctx->ctr);
+        ni_aes256_enc4(&c0, &c1, &c2, &c3, rk);
+        __m128i d0 = _mm_loadu_si128((const __m128i *)(ct + done));
+        __m128i d1 = _mm_loadu_si128((const __m128i *)(ct + done + 16));
+        __m128i d2 = _mm_loadu_si128((const __m128i *)(ct + done + 32));
+        __m128i d3 = _mm_loadu_si128((const __m128i *)(ct + done + 48));
+        _mm_storeu_si128((__m128i *)(pt + done),      _mm_xor_si128(d0, c0));
+        _mm_storeu_si128((__m128i *)(pt + done + 16), _mm_xor_si128(d1, c1));
+        _mm_storeu_si128((__m128i *)(pt + done + 32), _mm_xor_si128(d2, c2));
+        _mm_storeu_si128((__m128i *)(pt + done + 48), _mm_xor_si128(d3, c3));
+        done += 64;
+    }
+    /* Remaining 1-3 full blocks */
     while (done + 16 <= len) {
         __m128i ctr = _mm_loadu_si128((const __m128i *)ctx->ctr);
         __m128i ks  = ni_aes256_enc(ctr, rk);
         inc32_impl(ctx->ctr);
         __m128i c = _mm_loadu_si128((const __m128i *)(ct + done));
         _mm_storeu_si128((__m128i *)(pt + done), _mm_xor_si128(c, ks));
-        ctx->ks_used = 16;
         done += 16;
     }
+    ctx->ks_used = 16;
 
     /* Trailing partial */
     if (done < len) {
@@ -165,6 +208,104 @@ static void ni_ctr_decrypt(aes256gcm_ctx *ctx,
             done++;
         }
     }
+}
+
+/* ---- PCLMULQDQ GHASH (carryless multiply + shift-XOR reduction) ---- */
+
+static const uint8_t _ghash_bswap[16] __attribute__((aligned(16))) =
+    {15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0};
+
+/* Byte-swap H and multiply by x (left-shift 1 bit with reduction) to
+ * compensate for the reflected-domain CLMUL convention.  Without this
+ * shift, the result is off by a factor of x. */
+__attribute__((target("pclmul,ssse3")))
+static inline __m128i _ghash_prep_h(const uint8_t H[16], __m128i bswap)
+{
+    __m128i h = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)H), bswap);
+    /* Save bit 127 before shift */
+    __m128i top = _mm_srli_si128(_mm_srli_epi64(h, 63), 8);
+    /* Left-shift h by 1, carry from low lane to high lane */
+    __m128i lo_carry = _mm_slli_si128(_mm_srli_epi64(h, 63), 8);
+    h = _mm_or_si128(_mm_slli_epi64(h, 1), lo_carry);
+    /* If bit 127 was set, reduce: XOR with reflected polynomial constant
+     * x^127 + x^126 + x^121 + 1 = 0xC200000000000000_0000000000000001 */
+    __m128i mask = _mm_shuffle_epi32(
+        _mm_sub_epi64(_mm_setzero_si128(), top), 0x44);
+    return _mm_xor_si128(h, _mm_and_si128(
+        _mm_set_epi64x((long long)0xC200000000000000ULL, 1LL), mask));
+}
+
+/* Single-block GHASH: state = (state ^ block) * H   in GF(2^128) */
+__attribute__((target("pclmul,ssse3")))
+static void ni_ghash_update_blk(uint8_t state[16], const uint8_t H[16],
+                                const uint8_t block[16])
+{
+    __m128i bswap = _mm_load_si128((const __m128i *)_ghash_bswap);
+    __m128i S = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)state), bswap);
+    __m128i B = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)block), bswap);
+    __m128i h = _ghash_prep_h(H, bswap);
+
+    S = _mm_xor_si128(S, B);
+
+    /* Karatsuba multiply: S * h  → 256-bit (T1 : T0) */
+    __m128i T0 = _mm_clmulepi64_si128(S, h, 0x00);
+    __m128i T1 = _mm_clmulepi64_si128(S, h, 0x11);
+    __m128i T2 = _mm_xor_si128(_mm_clmulepi64_si128(S, h, 0x01),
+                                _mm_clmulepi64_si128(S, h, 0x10));
+    T0 = _mm_xor_si128(T0, _mm_slli_si128(T2, 8));
+    T1 = _mm_xor_si128(T1, _mm_srli_si128(T2, 8));
+
+    /* Reduce mod x^128 + x^127 + x^126 + x^121 + 1  (reflected poly).
+     * Two-phase shift-XOR from Intel CLMUL whitepaper. */
+    __m128i D = _mm_xor_si128(_mm_xor_si128(_mm_slli_epi64(T0, 63),
+                                             _mm_slli_epi64(T0, 62)),
+                              _mm_slli_epi64(T0, 57));
+    T0 = _mm_xor_si128(T0, _mm_slli_si128(D, 8));
+    T1 = _mm_xor_si128(T1, _mm_srli_si128(D, 8));
+
+    T1 = _mm_xor_si128(T1, _mm_xor_si128(T0,
+            _mm_xor_si128(_mm_srli_epi64(T0, 1),
+            _mm_xor_si128(_mm_srli_epi64(T0, 2),
+                          _mm_srli_epi64(T0, 7)))));
+
+    _mm_storeu_si128((__m128i *)state, _mm_shuffle_epi8(T1, bswap));
+}
+
+/* Multi-block GHASH: keeps state in reflected form across blocks to
+ * avoid per-block byte-swap overhead (2 swaps saved per block). */
+__attribute__((target("pclmul,ssse3")))
+static void ni_ghash_update_bulk(uint8_t state[16], const uint8_t H[16],
+                                 const uint8_t *data, size_t nblocks)
+{
+    __m128i bswap = _mm_load_si128((const __m128i *)_ghash_bswap);
+    __m128i h = _ghash_prep_h(H, bswap);
+    __m128i S = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)state), bswap);
+
+    for (size_t i = 0; i < nblocks; i++) {
+        __m128i B = _mm_shuffle_epi8(
+            _mm_loadu_si128((const __m128i *)(data + i * 16)), bswap);
+        S = _mm_xor_si128(S, B);
+
+        __m128i T0 = _mm_clmulepi64_si128(S, h, 0x00);
+        __m128i T1 = _mm_clmulepi64_si128(S, h, 0x11);
+        __m128i T2 = _mm_xor_si128(_mm_clmulepi64_si128(S, h, 0x01),
+                                    _mm_clmulepi64_si128(S, h, 0x10));
+        T0 = _mm_xor_si128(T0, _mm_slli_si128(T2, 8));
+        T1 = _mm_xor_si128(T1, _mm_srli_si128(T2, 8));
+
+        __m128i D = _mm_xor_si128(_mm_xor_si128(_mm_slli_epi64(T0, 63),
+                                                 _mm_slli_epi64(T0, 62)),
+                                  _mm_slli_epi64(T0, 57));
+        T0 = _mm_xor_si128(T0, _mm_slli_si128(D, 8));
+        T1 = _mm_xor_si128(T1, _mm_srli_si128(D, 8));
+
+        S = _mm_xor_si128(T1, _mm_xor_si128(T0,
+                _mm_xor_si128(_mm_srli_epi64(T0, 1),
+                _mm_xor_si128(_mm_srli_epi64(T0, 2),
+                              _mm_srli_epi64(T0, 7)))));
+    }
+
+    _mm_storeu_si128((__m128i *)state, _mm_shuffle_epi8(S, bswap));
 }
 
 #endif /* x86-64 */
@@ -317,6 +458,16 @@ static void sw_ghash_update_blk(uint8_t state[16], const uint8_t H[16],
     memcpy(state, result, 16);
 }
 
+/* Dispatch wrapper: use PCLMULQDQ when available, else software */
+static inline void ghash_blk(uint8_t state[16], const uint8_t H[16],
+                              const uint8_t block[16])
+{
+#if defined(__x86_64__) || defined(_M_X64)
+    if (hw_pclmul) { ni_ghash_update_blk(state, H, block); return; }
+#endif
+    sw_ghash_update_blk(state, H, block);
+}
+
 /* ================================================================== */
 /*  Public streaming API (dispatches to HW or SW)                      */
 /* ================================================================== */
@@ -361,13 +512,24 @@ void aes256gcm_ghash_update(aes256gcm_ctx *ctx,
         ctx->ghash_buf_len += take;
         pos += take;
         if (ctx->ghash_buf_len == 16) {
-            sw_ghash_update_blk(ctx->ghash, ctx->H, ctx->ghash_buf);
+            ghash_blk(ctx->ghash, ctx->H, ctx->ghash_buf);
             ctx->ghash_buf_len = 0;
         }
     }
-    while (pos + 16 <= len) {
-        sw_ghash_update_blk(ctx->ghash, ctx->H, ct + pos);
-        pos += 16;
+#if defined(__x86_64__) || defined(_M_X64)
+    if (hw_pclmul) {
+        size_t nblocks = (len - pos) / 16;
+        if (nblocks > 0) {
+            ni_ghash_update_bulk(ctx->ghash, ctx->H, ct + pos, nblocks);
+            pos += nblocks * 16;
+        }
+    } else
+#endif
+    {
+        while (pos + 16 <= len) {
+            sw_ghash_update_blk(ctx->ghash, ctx->H, ct + pos);
+            pos += 16;
+        }
     }
     size_t rem = len - pos;
     if (rem > 0) {
@@ -385,7 +547,7 @@ int aes256gcm_ghash_verify(const aes256gcm_ctx *ctx, const uint8_t tag[16])
     if (ctx->ghash_buf_len > 0) {
         uint8_t padded[16] = {0};
         memcpy(padded, ctx->ghash_buf, ctx->ghash_buf_len);
-        sw_ghash_update_blk(ghash, ctx->H, padded);
+        ghash_blk(ghash, ctx->H, padded);
     }
 
     uint8_t len_block[16] = {0};
@@ -398,7 +560,7 @@ int aes256gcm_ghash_verify(const aes256gcm_ctx *ctx, const uint8_t tag[16])
     len_block[13] = (uint8_t)(ct_bits >> 16);
     len_block[14] = (uint8_t)(ct_bits >>  8);
     len_block[15] = (uint8_t) ct_bits;
-    sw_ghash_update_blk(ghash, ctx->H, len_block);
+    ghash_blk(ghash, ctx->H, len_block);
 
     uint8_t T[16];
     memcpy(T, ctx->J0, 16);
@@ -450,33 +612,82 @@ void aes256gcm_ctr_decrypt(aes256gcm_ctx *ctx,
     }
 }
 
-/* Single-pass: GHASH + CTR simultaneously (one pass over data).
- * Uses AES-NI for CTR when available, software GHASH always. */
+/* Single-pass: GHASH + CTR simultaneously (one read of ciphertext).
+ * GHASH must read each block before CTR decryption overwrites it,
+ * so ct == pt (in-place) is safe.  Uses 4-wide CTR pipelining. */
 void aes256gcm_onepass(aes256gcm_ctx *ctx,
                        const uint8_t *ct, uint8_t *pt, size_t len)
 {
     size_t pos = 0;
-    while (pos + 16 <= len) {
-        /* GHASH over ciphertext (before decryption overwrites it) */
-        sw_ghash_update_blk(ctx->ghash, ctx->H, ct + pos);
 
-        /* CTR decrypt */
 #if defined(__x86_64__) || defined(_M_X64)
-        if (hw_aesni) {
+    if (hw_aesni) {
+        const __m128i *rk = (const __m128i *)ctx->rk;
+
+        /* 4-wide blocks: GHASH 4 blocks, then CTR decrypt 4-wide */
+        while (pos + 64 <= len) {
+            if (hw_pclmul)
+                ni_ghash_update_bulk(ctx->ghash, ctx->H, ct + pos, 4);
+            else
+                for (int k = 0; k < 4; k++)
+                    sw_ghash_update_blk(ctx->ghash, ctx->H, ct + pos + k * 16);
+
+            __m128i c0 = _mm_loadu_si128((const __m128i *)ctx->ctr); inc32_impl(ctx->ctr);
+            __m128i c1 = _mm_loadu_si128((const __m128i *)ctx->ctr); inc32_impl(ctx->ctr);
+            __m128i c2 = _mm_loadu_si128((const __m128i *)ctx->ctr); inc32_impl(ctx->ctr);
+            __m128i c3 = _mm_loadu_si128((const __m128i *)ctx->ctr); inc32_impl(ctx->ctr);
+            ni_aes256_enc4(&c0, &c1, &c2, &c3, rk);
+            __m128i d0 = _mm_loadu_si128((const __m128i *)(ct + pos));
+            __m128i d1 = _mm_loadu_si128((const __m128i *)(ct + pos + 16));
+            __m128i d2 = _mm_loadu_si128((const __m128i *)(ct + pos + 32));
+            __m128i d3 = _mm_loadu_si128((const __m128i *)(ct + pos + 48));
+            _mm_storeu_si128((__m128i *)(pt + pos),      _mm_xor_si128(d0, c0));
+            _mm_storeu_si128((__m128i *)(pt + pos + 16), _mm_xor_si128(d1, c1));
+            _mm_storeu_si128((__m128i *)(pt + pos + 32), _mm_xor_si128(d2, c2));
+            _mm_storeu_si128((__m128i *)(pt + pos + 48), _mm_xor_si128(d3, c3));
+            pos += 64;
+        }
+
+        /* Remaining full blocks (1-3) */
+        while (pos + 16 <= len) {
+            ghash_blk(ctx->ghash, ctx->H, ct + pos);
             __m128i ctr = _mm_loadu_si128((const __m128i *)ctx->ctr);
-            __m128i ks = ni_aes256_enc(ctr, (const __m128i *)ctx->rk);
+            __m128i ks = ni_aes256_enc(ctr, rk);
             inc32_impl(ctx->ctr);
             __m128i c = _mm_loadu_si128((const __m128i *)(ct + pos));
             _mm_storeu_si128((__m128i *)(pt + pos), _mm_xor_si128(c, ks));
-        } else
-#endif
-        {
-            memcpy(ctx->ks, ctx->ctr, 16);
-            sw_aes256_enc(ctx->rk, ctx->ks);
-            inc32_impl(ctx->ctr);
-            for (int j = 0; j < 16; j++)
-                pt[pos + j] = ct[pos + j] ^ ctx->ks[j];
+            pos += 16;
         }
+
+        /* Trailing partial block */
+        if (pos < len) {
+            uint8_t padded[16] = {0};
+            memcpy(padded, ct + pos, len - pos);
+            ghash_blk(ctx->ghash, ctx->H, padded);
+            __m128i ctr = _mm_loadu_si128((const __m128i *)ctx->ctr);
+            __m128i ks = ni_aes256_enc(ctr, rk);
+            inc32_impl(ctx->ctr);
+            _mm_storeu_si128((__m128i *)ctx->ks, ks);
+            ctx->ks_used = 0;
+            while (pos < len) {
+                pt[pos] = ct[pos] ^ ctx->ks[ctx->ks_used++];
+                pos++;
+            }
+        }
+
+        ctx->ghash_bytes += len;
+        return;
+    }
+#endif
+
+    /* Software fallback */
+    while (pos + 16 <= len) {
+        sw_ghash_update_blk(ctx->ghash, ctx->H, ct + pos);
+        memcpy(ctx->ks, ctx->ctr, 16);
+        sw_aes256_enc(ctx->rk, ctx->ks);
+        inc32_impl(ctx->ctr);
+        for (int j = 0; j < 16; j++)
+            pt[pos + j] = ct[pos + j] ^ ctx->ks[j];
         pos += 16;
     }
     if (pos < len) {
@@ -484,13 +695,6 @@ void aes256gcm_onepass(aes256gcm_ctx *ctx,
         memcpy(padded, ct + pos, len - pos);
         sw_ghash_update_blk(ctx->ghash, ctx->H, padded);
         memcpy(ctx->ks, ctx->ctr, 16);
-#if defined(__x86_64__) || defined(_M_X64)
-        if (hw_aesni) {
-            __m128i ctr = _mm_loadu_si128((const __m128i *)ctx->ctr);
-            __m128i ks = ni_aes256_enc(ctr, (const __m128i *)ctx->rk);
-            _mm_storeu_si128((__m128i *)ctx->ks, ks);
-        } else
-#endif
         sw_aes256_enc(ctx->rk, ctx->ks);
         inc32_impl(ctx->ctr);
         ctx->ks_used = 0;

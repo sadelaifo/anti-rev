@@ -78,7 +78,7 @@
 #define TAG_SIZE     16   /* GCM auth tag */
 #define MAX_NAME     255
 #define MAX_FILES    1024
-#define CHUNK_SIZE   (4 * 1024 * 1024)  /* 4 MB I/O + crypto buffer */
+#define CHUNK_SIZE   (16 * 1024 * 1024)  /* 16 MB I/O + crypto buffer */
 #define SCM_BATCH    250  /* max fds per SCM_RIGHTS (kernel SCM_MAX_FD = 253) */
 
 /* ------------------------------------------------------------------ */
@@ -355,7 +355,7 @@ static int decrypt_enc_file(const char *path, const uint8_t *key,
 
     aes256gcm_ctx ctx;
 
-    /* Pass A: GHASH verify */
+    /* Single pass: GHASH + CTR simultaneously (halves disk I/O) */
     aes256gcm_init(&ctx, key, iv);
     uint64_t remaining = ct_size;
     off_t pos = ct_off;
@@ -363,27 +363,15 @@ static int decrypt_enc_file(const char *path, const uint8_t *key,
         size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
         ssize_t got     = pread(fd, chunk, to_read, pos);
         if (got != (ssize_t)to_read) { close(fd); close(mfd); return -1; }
-        aes256gcm_ghash_update(&ctx, chunk, to_read);
+        aes256gcm_onepass(&ctx, chunk, chunk, to_read);
+        if (write_chunk(mfd, chunk, to_read) != 0) { close(fd); close(mfd); return -1; }
         pos       += (off_t)to_read;
         remaining -= to_read;
     }
     if (aes256gcm_ghash_verify(&ctx, tag) != 0) {
+        if (ftruncate(mfd, 0)) { /* wipe plaintext */ }
         close(fd); close(mfd);
         return -1;
-    }
-
-    /* Pass B: CTR decrypt → memfd */
-    aes256gcm_init(&ctx, key, iv);
-    remaining = ct_size;
-    pos       = ct_off;
-    while (remaining > 0) {
-        size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
-        ssize_t got     = pread(fd, chunk, to_read, pos);
-        if (got != (ssize_t)to_read) { close(fd); close(mfd); return -1; }
-        aes256gcm_ctr_decrypt(&ctx, chunk, chunk, to_read);
-        if (write_chunk(mfd, chunk, to_read) != 0) { close(fd); close(mfd); return -1; }
-        pos       += (off_t)to_read;
-        remaining -= to_read;
     }
     if (lseek(mfd, 0, SEEK_SET) < 0) { close(fd); close(mfd); return -1; }
 
@@ -403,14 +391,25 @@ typedef struct {
     int      fd;      /* result memfd, -1 on failure */
 } dec_job_t;
 
-/* Worker thread: decrypt one file */
-static void *dec_worker(void *arg)
-{
-    dec_job_t *job = (dec_job_t *)arg;
-    uint8_t *chunk = malloc(CHUNK_SIZE);
-    if (!chunk) { job->fd = -1; return NULL; }
+/* Work-stealing pool: each thread grabs next available job */
+typedef struct {
+    dec_job_t   *jobs;
+    int          njobs;
+    volatile int next;   /* atomic counter for work stealing */
+} dec_pool_t;
 
-    job->fd = decrypt_enc_file(job->path, job->key, chunk);
+static void *pool_worker(void *arg)
+{
+    dec_pool_t *pool = (dec_pool_t *)arg;
+    uint8_t *chunk = malloc(CHUNK_SIZE);
+    if (!chunk) return NULL;
+
+    for (;;) {
+        int idx = __sync_fetch_and_add(&pool->next, 1);
+        if (idx >= pool->njobs) break;
+        pool->jobs[idx].fd = decrypt_enc_file(pool->jobs[idx].path,
+                                               pool->jobs[idx].key, chunk);
+    }
 
     explicit_bzero(chunk, CHUNK_SIZE);
     free(chunk);
@@ -498,19 +497,14 @@ static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
     for (int i = 0; i < njobs; i++)
         jobs[i].key = key;
 
+    dec_pool_t pool = { .jobs = jobs, .njobs = njobs, .next = 0 };
     pthread_t *tids = calloc((size_t)nthreads, sizeof(pthread_t));
     if (!tids) { free(jobs); return -1; }
 
-    /* Process in batches of nthreads */
-    for (int base = 0; base < njobs; base += nthreads) {
-        int batch = njobs - base;
-        if (batch > nthreads) batch = nthreads;
-
-        for (int t = 0; t < batch; t++)
-            pthread_create(&tids[t], NULL, dec_worker, &jobs[base + t]);
-        for (int t = 0; t < batch; t++)
-            pthread_join(tids[t], NULL);
-    }
+    for (int t = 0; t < nthreads; t++)
+        pthread_create(&tids[t], NULL, pool_worker, &pool);
+    for (int t = 0; t < nthreads; t++)
+        pthread_join(tids[t], NULL);
 
     /* Phase 3: collect results */
     for (int i = 0; i < njobs && *nlibs < MAX_FILES; i++) {
@@ -651,9 +645,9 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     }
 
     /* ----------------------------------------------------------------
-     * Phase 2: for each file, stream two passes over the ciphertext.
-     *   Pass A — GHASH accumulation → tag verification
-     *   Pass B — CTR decryption chunk by chunk → write to memfd
+     * Phase 2: for each file, single-pass GHASH + CTR decryption.
+     * Reads ciphertext once, writes plaintext to memfd, then verifies
+     * the authentication tag.  On auth failure, plaintext is wiped.
      *
      * Peak user-space heap: one CHUNK_SIZE buffer.
      * ---------------------------------------------------------------- */
@@ -669,7 +663,10 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         file_entry_t *e = &entries[i];
         aes256gcm_ctx ctx;
 
-        /* --- Pass A: GHASH --- */
+        /* Single pass: GHASH + CTR simultaneously (halves I/O) */
+        int fd = make_memfd(e->name);
+        if (fd < 0) return 1;
+
         aes256gcm_init(&ctx, key, e->iv);
         uint64_t remaining = e->ct_size;
         off_t    pos       = (off_t)e->ct_offset;
@@ -677,30 +674,16 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
             ssize_t got     = pread(self, chunk, to_read, pos);
             if (got != (ssize_t)to_read) { perror("pread ciphertext"); return 1; }
-            aes256gcm_ghash_update(&ctx, chunk, to_read);
+            aes256gcm_onepass(&ctx, chunk, chunk, to_read);
+            if (write_chunk(fd, chunk, to_read) != 0) return 1;
             pos       += (off_t)to_read;
             remaining -= to_read;
         }
         if (aes256gcm_ghash_verify(&ctx, e->tag) != 0) {
             fprintf(stderr, "[antirev] decryption failed for '%s'\n", e->name);
+            if (ftruncate(fd, 0)) { /* wipe plaintext */ }
+            close(fd);
             return 1;
-        }
-
-        /* --- Pass B: CTR decrypt + write to memfd --- */
-        int fd = make_memfd(e->name);
-        if (fd < 0) return 1;
-
-        aes256gcm_init(&ctx, key, e->iv);
-        remaining = e->ct_size;
-        pos       = (off_t)e->ct_offset;
-        while (remaining > 0) {
-            size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
-            ssize_t got     = pread(self, chunk, to_read, pos);
-            if (got != (ssize_t)to_read) { perror("pread ciphertext"); return 1; }
-            aes256gcm_ctr_decrypt(&ctx, chunk, chunk, to_read);
-            if (write_chunk(fd, chunk, to_read) != 0) return 1;
-            pos       += (off_t)to_read;
-            remaining -= to_read;
         }
         if (lseek(fd, 0, SEEK_SET) < 0) { perror("lseek memfd"); return 1; }
 
