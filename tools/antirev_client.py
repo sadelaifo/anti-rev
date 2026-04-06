@@ -301,14 +301,20 @@ class AntirevClient:
 
         def _resolve_disk(name):
             """Find an unencrypted lib on disk, return path or None."""
-            disk_path = ct.util.find_library(
+            # Prefer LD_LIBRARY_PATH — gives real file paths that we can
+            # open() for DT_NEEDED parsing.  find_library() on Linux only
+            # returns a bare soname (not a path), so DT_NEEDED following
+            # fails and custom lib dirs (not in ldconfig) are missed.
+            for d in os.environ.get('LD_LIBRARY_PATH', '').split(':'):
+                if not d:
+                    continue
+                candidate = os.path.join(d, name)
+                if os.path.isfile(candidate):
+                    return candidate
+            # Fallback: find_library (ldconfig cache).  Returns soname on
+            # Linux (usable by dlopen, but not openable as a file path).
+            return ct.util.find_library(
                 name.replace('lib', '', 1).split('.so')[0])
-            if not disk_path:
-                for d in os.environ.get('LD_LIBRARY_PATH', '').split(':'):
-                    candidate = os.path.join(d, name) if d else None
-                    if candidate and os.path.isfile(candidate):
-                        return candidate
-            return disk_path
 
         def _load(name):
             if name in loaded:
@@ -329,10 +335,13 @@ class AntirevClient:
                 if disk_path:
                     for dep in _get_needed_from_path(disk_path):
                         _load(dep)
-                    try:
-                        _RealCDLL(disk_path, mode=ct.RTLD_GLOBAL)
-                    except OSError:
-                        pass  # already loaded or transient
+                # Always attempt load even if _resolve_disk failed —
+                # dlopen has its own search (LD_LIBRARY_PATH, ld.so.cache,
+                # /usr/lib, etc.) and may succeed where find_library didn't.
+                try:
+                    _RealCDLL(disk_path or name, mode=ct.RTLD_GLOBAL)
+                except OSError:
+                    pass  # already loaded or transient
 
         # Sort: load libs with fewer DT_NEEDED entries first.  Libs
         # with fewer deps are more likely "providers" (leaf libs) and
