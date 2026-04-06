@@ -45,12 +45,15 @@ SCM_BATCH = 250
 
 # ── ELF DT_NEEDED parser (pure Python, no external tools) ──────────
 
-def _parse_elf_needed(f):
-    """Parse DT_NEEDED entries from an open ELF file object."""
+def _parse_elf_dynamic(f):
+    """Parse DT_NEEDED and DT_SONAME from an open ELF file object.
+
+    Returns (needed_list, soname_or_None).
+    """
     f.seek(0)
     ident = f.read(16)
     if ident[:4] != b'\x7fELF':
-        return []
+        return [], None
     is64 = (ident[4] == 2)
 
     # Read e_phoff, e_phentsize, e_phnum
@@ -85,15 +88,16 @@ def _parse_elf_needed(f):
             loads.append((p_va, p_off, p_fsz))
 
     if not dyn_off:
-        return []
+        return [], None
 
-    # Parse dynamic entries → find DT_NEEDED offsets and DT_STRTAB addr
+    # Parse dynamic entries → DT_NEEDED offsets, DT_SONAME, DT_STRTAB
     f.seek(dyn_off)
     dyn = f.read(dyn_sz)
     esz = 16 if is64 else 8
     fmt = '<qQ' if is64 else '<iI'
 
     needed_offs = []
+    soname_off = None
     strtab_va = 0
     for i in range(0, len(dyn), esz):
         d_tag, d_val = struct.unpack_from(fmt, dyn, i)
@@ -103,9 +107,11 @@ def _parse_elf_needed(f):
             needed_offs.append(d_val)
         elif d_tag == 5:  # DT_STRTAB
             strtab_va = d_val
+        elif d_tag == 14:  # DT_SONAME
+            soname_off = d_val
 
-    if not needed_offs or not strtab_va:
-        return []
+    if not strtab_va:
+        return [], None
 
     # Convert strtab virtual address → file offset via PT_LOAD
     strtab_foff = 0
@@ -114,11 +120,9 @@ def _parse_elf_needed(f):
             strtab_foff = foff + (strtab_va - va)
             break
     if not strtab_foff:
-        return []
+        return [], None
 
-    # Read null-terminated strings
-    names = []
-    for off in needed_offs:
+    def _read_str(off):
         f.seek(strtab_foff + off)
         raw = b''
         while True:
@@ -126,23 +130,32 @@ def _parse_elf_needed(f):
             if not c or c == b'\x00':
                 break
             raw += c
-        names.append(raw.decode())
-    return names
+        return raw.decode()
+
+    names = [_read_str(off) for off in needed_offs]
+    soname = _read_str(soname_off) if soname_off is not None else None
+    return names, soname
 
 
 def _get_needed(fd):
     """Parse DT_NEEDED entries from an ELF at /proc/self/fd/<fd>."""
     with open(f"/proc/self/fd/{fd}", 'rb') as f:
-        return _parse_elf_needed(f)
+        return _parse_elf_dynamic(f)[0]
 
 
 def _get_needed_from_path(path):
     """Parse DT_NEEDED entries from an ELF file on disk."""
     try:
         with open(path, 'rb') as f:
-            return _parse_elf_needed(f)
+            return _parse_elf_dynamic(f)[0]
     except OSError:
         return []
+
+
+def _get_soname(fd):
+    """Parse DT_SONAME from an ELF at /proc/self/fd/<fd>."""
+    with open(f"/proc/self/fd/{fd}", 'rb') as f:
+        return _parse_elf_dynamic(f)[1]
 
 
 # ── AES helper (system libcrypto, no pip deps) ──────────────────────
@@ -223,6 +236,7 @@ class AntirevClient:
         self._libs = {}
         self._loaded = set()   # tracks libs processed by _ensure_loaded
         self._connect()
+        self._build_soname_map()
 
     def _connect(self):
         sock_name = _compute_sock_name(self._key)
@@ -268,6 +282,19 @@ class AntirevClient:
                 if i < len(received_fds):
                     self._libs[name] = received_fds[i]
 
+    def _build_soname_map(self):
+        """Map DT_SONAME → fd_map key for each encrypted lib.
+
+        DT_NEEDED entries use sonames (e.g. "libB.so.1") but the daemon
+        sends filenames (e.g. "libB.so.1.2.3").  This map lets
+        _ensure_loaded resolve sonames to fd_map keys.
+        """
+        self._soname_to_key = {}
+        for name, fd in self._libs.items():
+            soname = _get_soname(fd)
+            if soname and soname != name:
+                self._soname_to_key[soname] = name
+
     @property
     def libs(self):
         """Dict of available libs: {name: fd}."""
@@ -275,10 +302,11 @@ class AntirevClient:
 
     def fd(self, name):
         """Get the memfd number for a lib by name."""
-        if name not in self._libs:
+        key = self._soname_to_key.get(name, name)
+        if key not in self._libs:
             avail = ', '.join(sorted(self._libs))
             raise KeyError(f"'{name}' not found (available: {avail})")
-        return self._libs[name]
+        return self._libs[key]
 
     def cdll(self, name, mode=ct.DEFAULT_MODE):
         """Load an encrypted lib as ctypes.CDLL."""
@@ -310,6 +338,9 @@ class AntirevClient:
         them) and pre-loaded with RTLD_GLOBAL so $ORIGIN RPATH deps
         resolve correctly when consumers load from memfd.
         """
+        # Resolve soname → filename (DT_NEEDED uses sonames like
+        # "libB.so.1", but fd_map is keyed by filename "libB.so.1.2.3").
+        name = self._soname_to_key.get(name, name)
         if name in self._loaded:
             return
         self._loaded.add(name)
@@ -358,6 +389,7 @@ class AntirevClient:
         """
         client = self
         fd_map = self._libs
+        soname_map = self._soname_to_key
         _RealCDLL = getattr(ct.CDLL, '_antirev_real', ct.CDLL)
 
         class _PatchedCDLL(_RealCDLL):
@@ -366,11 +398,11 @@ class AntirevClient:
             def __init__(self, name, *args, **kwargs):
                 if name:
                     base = name.rsplit('/', 1)[-1]
-                    if base in fd_map:
-                        # On-demand: preload only this lib's encrypted
-                        # deps, then redirect to memfd.
-                        client._ensure_loaded(base)
-                        name = f"/proc/self/fd/{fd_map[base]}"
+                    # Resolve soname → filename if needed
+                    key = soname_map.get(base, base)
+                    if key in fd_map:
+                        client._ensure_loaded(key)
+                        name = f"/proc/self/fd/{fd_map[key]}"
                 super().__init__(name, *args, **kwargs)
 
         ct.CDLL = _PatchedCDLL
