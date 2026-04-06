@@ -221,6 +221,7 @@ class AntirevClient:
     def __init__(self, key_source):
         self._key = _load_key(Path(key_source))
         self._libs = {}
+        self._loaded = set()   # tracks libs processed by _ensure_loaded
         self._connect()
 
     def _connect(self):
@@ -283,85 +284,79 @@ class AntirevClient:
         """Load an encrypted lib as ctypes.CDLL."""
         return ct.CDLL(f"/proc/self/fd/{self.fd(name)}", mode=mode)
 
+    @staticmethod
+    def _resolve_disk(name):
+        """Find an unencrypted lib on disk, return path or None."""
+        # Prefer LD_LIBRARY_PATH — gives real file paths that we can
+        # open() for DT_NEEDED parsing.  find_library() on Linux only
+        # returns a bare soname (not a path), so DT_NEEDED following
+        # fails and custom lib dirs (not in ldconfig) are missed.
+        for d in os.environ.get('LD_LIBRARY_PATH', '').split(':'):
+            if not d:
+                continue
+            candidate = os.path.join(d, name)
+            if os.path.isfile(candidate):
+                return candidate
+        # Fallback: find_library (ldconfig cache).  Returns soname on
+        # Linux (usable by dlopen, but not openable as a file path).
+        return ct.util.find_library(
+            name.replace('lib', '', 1).split('.so')[0])
+
+    def _ensure_loaded(self, name):
+        """Recursively preload `name` and its transitive deps.
+
+        Encrypted libs are loaded from memfd with RTLD_GLOBAL.
+        Unencrypted libs are followed (to discover encrypted deps behind
+        them) and pre-loaded with RTLD_GLOBAL so $ORIGIN RPATH deps
+        resolve correctly when consumers load from memfd.
+        """
+        if name in self._loaded:
+            return
+        self._loaded.add(name)
+        _Real = getattr(ct.CDLL, '_antirev_real', ct.CDLL)
+
+        if name in self._libs:
+            # Encrypted lib — load deps first, then load with RTLD_GLOBAL
+            for dep in _get_needed(self._libs[name]):
+                self._ensure_loaded(dep)
+            _Real(f"/proc/self/fd/{self._libs[name]}",
+                  mode=ct.RTLD_GLOBAL)
+        else:
+            # Unencrypted dep — follow DT_NEEDED to discover encrypted
+            # deps behind it, then pre-load with RTLD_GLOBAL.
+            disk_path = self._resolve_disk(name)
+            if disk_path:
+                for dep in _get_needed_from_path(disk_path):
+                    self._ensure_loaded(dep)
+            try:
+                _Real(disk_path or name, mode=ct.RTLD_GLOBAL)
+            except OSError:
+                pass  # system lib already loaded, or linker will find it
+
     def preload_all(self):
         """Load ALL daemon libs with RTLD_GLOBAL in dependency order.
 
-        Mirrors the C stub's LD_PRELOAD behavior: all libs are globally
-        available so implicit cross-lib symbol references resolve.
-        Uses DT_NEEDED to topologically sort — leaves first, so each
-        lib's constructor finds its deps already loaded.
+        Needed when encrypted libs have C constructors that dlopen other
+        encrypted libs at init time (constructor dlopens aren't visible
+        in DT_NEEDED, so on-demand loading can't discover them).
 
-        Follows DT_NEEDED through unencrypted intermediaries on disk
-        (e.g. encrypted A → unencrypted B → encrypted C) so that C
-        is loaded before A.
+        For normal DT_NEEDED chains, on-demand loading via patch_ctypes()
+        is preferred — it only loads the transitive deps actually needed.
         """
-        fd_map = self._libs
-        _RealCDLL = getattr(ct.CDLL, '_antirev_real', ct.CDLL)
-        loaded = set()
-
-        def _resolve_disk(name):
-            """Find an unencrypted lib on disk, return path or None."""
-            # Prefer LD_LIBRARY_PATH — gives real file paths that we can
-            # open() for DT_NEEDED parsing.  find_library() on Linux only
-            # returns a bare soname (not a path), so DT_NEEDED following
-            # fails and custom lib dirs (not in ldconfig) are missed.
-            for d in os.environ.get('LD_LIBRARY_PATH', '').split(':'):
-                if not d:
-                    continue
-                candidate = os.path.join(d, name)
-                if os.path.isfile(candidate):
-                    return candidate
-            # Fallback: find_library (ldconfig cache).  Returns soname on
-            # Linux (usable by dlopen, but not openable as a file path).
-            return ct.util.find_library(
-                name.replace('lib', '', 1).split('.so')[0])
-
-        def _load(name):
-            if name in loaded:
-                return
-            loaded.add(name)
-            if name in fd_map:
-                # Encrypted lib — parse deps from the memfd
-                for dep in _get_needed(fd_map[name]):
-                    _load(dep)
-                _RealCDLL(f"/proc/self/fd/{fd_map[name]}",
-                          mode=ct.RTLD_GLOBAL)
-            else:
-                # Unencrypted dep — find on disk, load with RTLD_GLOBAL
-                # so symbols are available when encrypted libs loaded from
-                # memfd (memfd breaks $ORIGIN RPATH resolution).  Also
-                # follow its DT_NEEDED to discover encrypted deps behind it.
-                disk_path = _resolve_disk(name)
-                if disk_path:
-                    for dep in _get_needed_from_path(disk_path):
-                        _load(dep)
-                # Always attempt load even if _resolve_disk failed —
-                # dlopen has its own search (LD_LIBRARY_PATH, ld.so.cache,
-                # /usr/lib, etc.) and may succeed where find_library didn't.
-                try:
-                    _RealCDLL(disk_path or name, mode=ct.RTLD_GLOBAL)
-                except OSError:
-                    pass  # already loaded or transient
-
-        # Sort: load libs with fewer DT_NEEDED entries first.  Libs
-        # with fewer deps are more likely "providers" (leaf libs) and
-        # should be globally available before "consumer" libs whose
-        # constructors might dlopen other libs at init time.  This
-        # mirrors LD_PRELOAD semantics where all libs are mapped before
-        # any constructor runs — ctypes.CDLL runs constructors
-        # immediately, so order matters.
         dep_count = {}
-        for name in fd_map:
-            dep_count[name] = len(_get_needed(fd_map[name]))
-        load_order = sorted(fd_map, key=lambda n: (dep_count[n], n))
-
-        for name in load_order:
-            _load(name)
-
-        self._preloaded = {n for n in loaded if n in fd_map}
+        for name in self._libs:
+            dep_count[name] = len(_get_needed(self._libs[name]))
+        for name in sorted(self._libs, key=lambda n: (dep_count[n], n)):
+            self._ensure_loaded(name)
 
     def patch_ctypes(self):
-        """Monkey-patch ctypes.CDLL to redirect encrypted lib loads."""
+        """Monkey-patch ctypes.CDLL for on-demand encrypted lib loading.
+
+        When ctypes.CDLL("libfoo.so") is called, only foo's transitive
+        encrypted deps (from DT_NEEDED) are preloaded — not all daemon
+        libs.  Unneeded libs like zzz are never touched.
+        """
+        client = self
         fd_map = self._libs
         _RealCDLL = getattr(ct.CDLL, '_antirev_real', ct.CDLL)
 
@@ -372,6 +367,9 @@ class AntirevClient:
                 if name:
                     base = name.rsplit('/', 1)[-1]
                     if base in fd_map:
+                        # On-demand: preload only this lib's encrypted
+                        # deps, then redirect to memfd.
+                        client._ensure_loaded(base)
                         name = f"/proc/self/fd/{fd_map[base]}"
                 super().__init__(name, *args, **kwargs)
 
@@ -403,12 +401,17 @@ def _find_key_source():
     )
 
 
-def activate(key_source=None):
-    """Connect to daemon and patch ctypes.CDLL for transparent loading.
+def activate(key_source=None, preload='on_demand'):
+    """Connect to daemon and patch ctypes.CDLL for encrypted lib loading.
 
     Args:
         key_source: path to key file or daemon binary. If None,
                     auto-discovers via ANTIREV_KEY env or .antirev-libd.
+        preload: 'on_demand' (default) — load encrypted deps only when
+                     ctypes.CDLL() is called, based on DT_NEEDED.
+                 'all' — preload ALL daemon libs upfront (needed when
+                     encrypted libs have C constructors that dlopen
+                     other encrypted libs at init time).
 
     Returns:
         The AntirevClient instance (for introspection / manual use).
@@ -416,8 +419,11 @@ def activate(key_source=None):
     if key_source is None:
         key_source = _find_key_source()
     client = AntirevClient(key_source)
-    client.preload_all()
+    if preload == 'all':
+        client.preload_all()
     client.patch_ctypes()
-    print(f"[antirev] loaded {len(client._preloaded)} libs, ctypes.CDLL patched",
-          file=sys.stderr)
+    n = len(client._loaded & set(client._libs)) if client._loaded else 0
+    mode = f"preloaded {n}" if preload == 'all' else "on-demand"
+    print(f"[antirev] {len(client._libs)} libs available ({mode}), "
+          f"ctypes.CDLL patched", file=sys.stderr)
     return client

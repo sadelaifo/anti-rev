@@ -104,7 +104,9 @@ sys.path.insert(0, {os.path.join(ROOT, 'tools')!r})
 from antirev_client import activate
 import ctypes
 
-client = activate({key_path!r})
+# preload='all' needed because libfoo's C constructor dlopens libbar
+# (not visible in DT_NEEDED, so on-demand loading can't discover it)
+client = activate({key_path!r}, preload='all')
 print("libs=" + repr(sorted(client.libs.keys())), file=sys.stderr)
 
 lib = ctypes.CDLL("libfoo.so")
