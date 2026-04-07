@@ -37,6 +37,7 @@ import os
 import socket
 import struct
 import sys
+import tempfile
 from pathlib import Path
 
 KEY_SIZE = 32
@@ -235,6 +236,7 @@ class AntirevClient:
         self._key = _load_key(Path(key_source))
         self._libs = {}
         self._loaded = set()   # tracks libs processed by _ensure_loaded
+        self._link_dir = tempfile.mkdtemp(prefix="antirev_")
         self._connect()
         self._build_soname_map()
 
@@ -347,14 +349,20 @@ class AntirevClient:
         _Real = getattr(ct.CDLL, '_antirev_real', ct.CDLL)
 
         if name in self._libs:
-            # Encrypted lib — load deps first, then load with RTLD_GLOBAL
-            deps = _get_needed(self._libs[name])
+            # Encrypted lib — load deps first, then load via soname symlink
+            # so glibc registers the lib under its soname (not the memfd
+            # path), allowing DT_NEEDED resolution to find it.
+            fd = self._libs[name]
+            deps = _get_needed(fd)
             import sys; print(f"[dbg] ENCRYPTED {name} deps={deps}",
                               file=sys.stderr)
             for dep in deps:
                 self._ensure_loaded(dep)
-            _Real(f"/proc/self/fd/{self._libs[name]}",
-                  mode=ct.RTLD_GLOBAL)
+            soname = _get_soname(fd) or name
+            link = os.path.join(self._link_dir, soname)
+            if not os.path.exists(link):
+                os.symlink(f"/proc/self/fd/{fd}", link)
+            _Real(link, mode=ct.RTLD_GLOBAL)
         else:
             # Unencrypted dep — follow DT_NEEDED to discover encrypted
             # deps behind it, then pre-load with RTLD_GLOBAL.
@@ -406,7 +414,8 @@ class AntirevClient:
                     key = soname_map.get(base, base)
                     if key in fd_map:
                         client._ensure_loaded(key)
-                        name = f"/proc/self/fd/{fd_map[key]}"
+                        soname = _get_soname(fd_map[key]) or key
+                        name = os.path.join(client._link_dir, soname)
                 super().__init__(name, *args, **kwargs)
 
         ct.CDLL = _PatchedCDLL
