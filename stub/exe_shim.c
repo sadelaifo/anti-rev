@@ -299,8 +299,11 @@ static char *fill_real_exe(char *resolved)
 __attribute__((visibility("default")))
 char *realpath(const char *path, char *resolved)
 {
-    if (path && is_self_exe(path))
-        return fill_real_exe(resolved);
+    if (path && is_self_exe(path)) {
+        char *r = fill_real_exe(resolved);
+        fprintf(stderr, "[dbg] realpath(%s) -> %s\n", path, r ? r : "(null)");
+        return r;
+    }
 
     /* Lazy retry: constructor may fail when LD_AUDIT is active (linker
        holds internal locks during early init, breaking dlopen/dlsym). */
