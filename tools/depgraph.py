@@ -136,7 +136,7 @@ def build_dep_graph(root: str, search_dirs: list[str],
 
 # ── Topological sort ─────────────────────────────────────────────────
 
-def _find_cycle(edges: dict[str, list[str]], nodes: set[str]) -> list[str] | None:
+def _find_cycle(edges: dict[str, list[str]], nodes: set[str]) -> list[str]:
     """DFS to find one cycle among *nodes*.  Returns the cycle as a list, or None."""
     WHITE, GRAY, BLACK = 0, 1, 2
     color = {n: WHITE for n in nodes}
