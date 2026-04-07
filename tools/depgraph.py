@@ -136,8 +136,47 @@ def build_dep_graph(root: str, search_dirs: list[str],
 
 # ── Topological sort ─────────────────────────────────────────────────
 
+def _find_cycle(edges: dict[str, list[str]], nodes: set[str]) -> list[str] | None:
+    """DFS to find one cycle among *nodes*.  Returns the cycle as a list, or None."""
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {n: WHITE for n in nodes}
+    parent = {}
+
+    def dfs(u):
+        color[u] = GRAY
+        for v in edges.get(u, []):
+            if v not in color:
+                continue
+            if color[v] == GRAY:
+                # back-edge → extract cycle
+                cycle = [v, u]
+                p = u
+                while p != v:
+                    p = parent.get(p)
+                    if p is None:
+                        break
+                    cycle.append(p)
+                cycle.reverse()
+                return cycle
+            if color[v] == WHITE:
+                parent[v] = u
+                cyc = dfs(v)
+                if cyc:
+                    return cyc
+        color[u] = BLACK
+        return None
+
+    for n in nodes:
+        if color[n] == WHITE:
+            cyc = dfs(n)
+            if cyc:
+                return cyc
+    return None
+
+
 def topo_sort(edges: dict[str, list[str]], root: str) -> list[str]:
-    """Kahn's algorithm. Returns libs in dependency-first order."""
+    """Kahn's algorithm. Returns libs in dependency-first order.
+    Raises ValueError if the graph contains a cycle."""
     all_nodes = set(edges.keys())
     for children in edges.values():
         all_nodes.update(children)
@@ -160,6 +199,12 @@ def topo_sort(edges: dict[str, list[str]], root: str) -> list[str]:
             in_degree[child] -= 1
             if in_degree[child] == 0:
                 queue.append(child)
+
+    if len(result) < len(all_nodes):
+        cycle_nodes = all_nodes - set(result)
+        cycle = _find_cycle(edges, cycle_nodes)
+        cycle_str = " → ".join(cycle + [cycle[0]]) if cycle else ", ".join(sorted(cycle_nodes))
+        raise ValueError(f"dependency cycle detected: {cycle_str}")
 
     # Reverse: dependencies first (leaf libs first)
     result.reverse()
