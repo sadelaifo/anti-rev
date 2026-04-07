@@ -348,13 +348,17 @@ class AntirevClient:
 
         if name in self._libs:
             # Encrypted lib — load deps first, then load with RTLD_GLOBAL
-            for dep in _get_needed(self._libs[name]):
+            deps = _get_needed(self._libs[name])
+            import sys; print(f"[dbg] ENCRYPTED {name} deps={deps}",
+                              file=sys.stderr)
+            for dep in deps:
                 self._ensure_loaded(dep)
             _Real(f"/proc/self/fd/{self._libs[name]}",
                   mode=ct.RTLD_GLOBAL)
         else:
             # Unencrypted dep — follow DT_NEEDED to discover encrypted
             # deps behind it, then pre-load with RTLD_GLOBAL.
+            import sys; print(f"[dbg] DISK {name}", file=sys.stderr)
             disk_path = self._resolve_disk(name)
             if disk_path:
                 for dep in _get_needed_from_path(disk_path):
