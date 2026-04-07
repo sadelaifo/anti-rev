@@ -70,7 +70,7 @@ def build_ldconfig_cache() -> dict[str, str]:
 
 
 def resolve_lib(name: str, search_dirs: list[str],
-                ldcache: dict[str, str]) -> str | None:
+                ldcache: dict[str, str]) -> str :
     """Resolve a library name to a file path."""
     # Direct path
     if '/' in name and os.path.isfile(name):
