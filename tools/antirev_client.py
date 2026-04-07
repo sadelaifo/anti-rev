@@ -237,6 +237,11 @@ class AntirevClient:
         self._libs = {}
         self._loaded = set()   # tracks libs processed by _ensure_loaded
         self._link_dir = tempfile.mkdtemp(prefix="antirev_")
+        # Prepend symlink dir to LD_LIBRARY_PATH so glibc's DT_NEEDED
+        # resolution finds our soname symlinks (→ memfd) before any
+        # encrypted copies on disk.
+        ld_path = os.environ.get('LD_LIBRARY_PATH', '')
+        os.environ['LD_LIBRARY_PATH'] = self._link_dir + (':' + ld_path if ld_path else '')
         self._connect()
         self._build_soname_map()
 
