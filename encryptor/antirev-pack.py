@@ -60,7 +60,7 @@ import subprocess
 import tempfile
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 try:
@@ -202,6 +202,68 @@ def _parse_readelf_dynamic(path: Path) -> list[str]:
         return []
 
 
+def _parse_dynamic_one(path: str) -> tuple[str, str, list[str]]:
+    """Parse DT_SONAME and DT_NEEDED from a single ELF in one readelf call.
+
+    Returns (path, soname, needed_list).
+    """
+    try:
+        result = subprocess.run(
+            ['readelf', '-d', path],
+            capture_output=True, text=True, timeout=10
+        )
+        out = result.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return path, '', []
+
+    soname = ''
+    needed = []
+    for line in out.splitlines():
+        m = re.search(r'\(NEEDED\)\s+Shared library: \[(.+)\]', line)
+        if m:
+            needed.append(m.group(1))
+            continue
+        m = re.search(r'\(SONAME\)\s+Library soname: \[(.+)\]', line)
+        if m:
+            soname = m.group(1)
+    return path, soname, needed
+
+
+# ── Bulk parallel ELF parser ────────────────────────────────────────
+
+class _ElfCache:
+    """Cache soname + DT_NEEDED for many ELFs, parsed in parallel."""
+
+    def __init__(self):
+        self._soname = {}    # abs-path-str → soname
+        self._needed = {}    # abs-path-str → [needed, ...]
+
+    def bulk_parse(self, paths):
+        """Parse all *paths* in parallel using ThreadPoolExecutor."""
+        str_paths = [str(p) for p in paths]
+        n_workers = min(os.cpu_count() or 4, len(str_paths), 64)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            for p, soname, needed in pool.map(_parse_dynamic_one, str_paths):
+                self._soname[p] = soname
+                self._needed[p] = needed
+
+    def get_soname(self, path) -> str:
+        key = str(path)
+        if key not in self._soname:
+            _, soname, needed = _parse_dynamic_one(key)
+            self._soname[key] = soname
+            self._needed[key] = needed
+        return self._soname[key]
+
+    def get_needed(self, path) -> list[str]:
+        key = str(path)
+        if key not in self._needed:
+            _, soname, needed = _parse_dynamic_one(key)
+            self._soname[key] = soname
+            self._needed[key] = needed
+        return self._needed[key]
+
+
 def get_dt_needed(path: Path) -> list[str]:
     """Get DT_NEEDED library names from an ELF binary using readelf."""
     needed = []
@@ -221,20 +283,22 @@ def get_dt_soname(path: Path) -> str:
     return ''
 
 
-def build_soname_maps(lib_files: list) -> tuple[dict, dict]:
-    """Build bidirectional soname ↔ filename mappings for encrypted libs.
+def build_soname_maps(lib_files: list, cache: _ElfCache) -> tuple[dict, dict]:
+    """Build bidirectional soname <-> filename mappings for encrypted libs.
+
+    Uses *cache* (pre-populated via bulk_parse) so no subprocess calls.
 
     Returns (soname_to_filename, lib_by_lookup) where lib_by_lookup maps
     both sonames and filenames to the source Path for DT_NEEDED traversal.
     """
-    soname_to_filename = {}   # soname → filename (e.g. "libFoo.so.1" → "libFoo.so.1.2.3")
-    lib_by_lookup = {}        # soname or filename → Path
+    soname_to_filename = {}   # soname -> filename
+    lib_by_lookup = {}        # soname or filename -> Path
 
     for src in lib_files:
         fname = src.name
         lib_by_lookup[fname] = src
 
-        soname = get_dt_soname(src)
+        soname = cache.get_soname(src)
         if soname and soname != fname:
             soname_to_filename[soname] = fname
             lib_by_lookup[soname] = src
@@ -244,23 +308,24 @@ def build_soname_maps(lib_files: list) -> tuple[dict, dict]:
 
 def get_transitive_needed(path: Path, encrypted_names: set[str],
                           soname_to_filename: dict[str, str],
-                          lib_by_lookup: dict[str, 'Path']) -> list[str]:
+                          lib_by_lookup: dict[str, 'Path'],
+                          cache: _ElfCache,
+                          ldcache: dict) -> list[str]:
     """Get transitive closure of encrypted libs needed by an ELF binary.
 
     BFS from path's DT_NEEDED, following through ALL libs — including
     unencrypted intermediaries on disk — to discover encrypted deps
-    behind them (e.g. exe → libfoo.so [unencrypted] → libbar.so [encrypted]).
+    behind them (e.g. exe -> libfoo.so [unencrypted] -> libbar.so [encrypted]).
 
-    Handles soname ↔ filename mismatch (e.g. DT_NEEDED says "libFoo.so.1"
-    but encrypted file is "libFoo.so.1.2.3").
+    Uses *cache* for encrypted libs (no subprocess calls) and falls back
+    to a single readelf for system libs not in the cache.
 
     Returns list of filenames (not sonames) in dependency-first order
     (deepest deps first) for correct LD_PRELOAD loading.
     """
-    ldcache = _build_ldconfig_cache()
     needed = []
     visited = set()
-    queue = get_dt_needed(path)
+    queue = cache.get_needed(path)
 
     while queue:
         name = queue.pop(0)
@@ -273,10 +338,10 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
 
         if filename in encrypted_names:
             needed.append(filename)
-            # Follow this encrypted lib's own DT_NEEDED
+            # Follow this encrypted lib's own DT_NEEDED (from cache)
             lib_path = lib_by_lookup.get(name) or lib_by_lookup.get(filename)
             if lib_path:
-                for dep in get_dt_needed(lib_path):
+                for dep in cache.get_needed(lib_path):
                     if dep not in visited:
                         queue.append(dep)
         else:
@@ -284,7 +349,7 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
             # to discover encrypted deps behind it
             lib_path = ldcache.get(name)
             if lib_path:
-                for dep in get_dt_needed(Path(lib_path)):
+                for dep in cache.get_needed(lib_path):
                     if dep not in visited:
                         queue.append(dep)
 
@@ -601,15 +666,26 @@ def main():
         encrypted_names = {src.name for src in lib_files}
         exe_needed = {}
         if exe_daemon_libs and encrypted_names:
-            print(f"[pack] Building soname map for encrypted libs...")
-            soname_to_filename, lib_by_lookup = build_soname_maps(lib_files)
+            # Parallel bulk-parse: one readelf per ELF, all in parallel
+            elf_cache = _ElfCache()
+            all_parse = [src for src in lib_files] + [src for _, _, src in exe_files]
+            t0 = time.monotonic()
+            print("[pack] Parsing {} ELFs in parallel...".format(len(all_parse)))
+            elf_cache.bulk_parse(all_parse)
+            print("[pack]   done in {:.1f}s".format(time.monotonic() - t0))
+
+            print("[pack] Building soname map for encrypted libs...")
+            soname_to_filename, lib_by_lookup = build_soname_maps(
+                lib_files, elf_cache)
             if soname_to_filename:
                 for sn, fn in soname_to_filename.items():
-                    print(f"[pack]   soname {sn} → {fn}")
-            print(f"[pack] Analyzing DT_NEEDED per executable (transitive)...")
+                    print("[pack]   soname {} -> {}".format(sn, fn))
+            ldcache = _build_ldconfig_cache()
+            print("[pack] Analyzing DT_NEEDED per executable (transitive)...")
             for rel, arch, src in exe_files:
                 needed = get_transitive_needed(
-                    src, encrypted_names, soname_to_filename, lib_by_lookup)
+                    src, encrypted_names, soname_to_filename, lib_by_lookup,
+                    elf_cache, ldcache)
                 exe_needed[rel] = needed
 
         with ProcessPoolExecutor(max_workers=workers) as pool:
