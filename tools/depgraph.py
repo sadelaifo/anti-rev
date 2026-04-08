@@ -25,6 +25,7 @@ import struct
 import subprocess
 import sys
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ELF_MAGIC = b'\x7fELF'
@@ -114,6 +115,60 @@ def get_defined_syms(path: str) -> set[str]:
                 name = name.split("@")[0]
             syms.add(name)
     return syms
+
+
+# ── Combined ELF parser (single readelf call per file) ──────────────
+
+def parse_elf_all(path: str) -> tuple[str, list[str], set[str], set[str]]:
+    """Parse soname, DT_NEEDED, defined syms, and undefined syms in one shot.
+
+    Runs a single ``readelf -d --dyn-syms -W`` invocation, which is ~3x
+    faster than three separate calls.
+
+    Returns (soname, dt_needed, defined_syms, undefined_syms).
+    """
+    try:
+        out = subprocess.check_output(
+            ["readelf", "-d", "--dyn-syms", "-W", path],
+            stderr=subprocess.DEVNULL, text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "", [], set(), set()
+
+    soname = ""
+    dt_needed: list[str] = []
+    defined: set[str] = set()
+    undefined: set[str] = set()
+
+    for line in out.splitlines():
+        # Dynamic section entries
+        m = re.search(r'\(NEEDED\)\s+Shared library: \[(.+)\]', line)
+        if m:
+            dt_needed.append(m.group(1))
+            continue
+        m = re.search(r'\(SONAME\)\s+Library soname: \[(.+)\]', line)
+        if m:
+            soname = m.group(1)
+            continue
+        # Symbol table entries
+        # Format: Num Value Size Type Bind Vis Ndx Name
+        parts = line.split()
+        if len(parts) >= 8:
+            ndx, bind, name = parts[6], parts[4], parts[7]
+            if not name:
+                continue
+            if ndx == "UND":
+                if bind != "WEAK":
+                    undefined.add(name)
+            else:
+                if bind != "LOCAL":
+                    clean = name
+                    if "@@" in clean:
+                        clean = clean.split("@@")[0]
+                    elif "@" in clean:
+                        clean = clean.split("@")[0]
+                    defined.add(clean)
+
+    return soname, dt_needed, defined, undefined
 
 
 # ── ELF discovery ───────────────────────────────────────────────────
@@ -893,45 +948,80 @@ def run_no_undefined(targets: list[str],
 
     # Discover all ELFs in top_dir — these form the provider index
     all_dir_elfs = scan_elfs(top_dir)
-    all_dir_set = set(all_dir_elfs)
+
+    # ── Parallel parse: one readelf call per ELF, all in parallel ───
+    print(f"[no-undefined] Indexing {len(all_dir_elfs)} ELF files "
+          f"in {top_dir} ...")
+
+    # Cache: realpath → (soname, dt_needed, defined, undefined)
+    _elf_cache: dict[str, tuple[str, list[str], set[str], set[str]]] = {}
+
+    n_workers = min(os.cpu_count() or 4, len(all_dir_elfs), 64)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(parse_elf_all, p): p for p in all_dir_elfs}
+        for fut in as_completed(futures):
+            p = futures[fut]
+            _elf_cache[p] = fut.result()
 
     # soname/filename → realpath for local DT_NEEDED resolution
     local_map: dict[str, str] = {}
     for p in all_dir_elfs:
         local_map[os.path.basename(p)] = p
-        soname = get_dt_soname(p)
+        soname = _elf_cache[p][0]
         if soname:
             local_map[soname] = p
 
-    # Symbol cache: realpath → defined syms  (avoids calling readelf twice)
-    _def_cache: dict[str, set[str]] = {}
-
-    def cached_defined(p: str) -> set[str]:
-        if p not in _def_cache:
-            _def_cache[p] = get_defined_syms(p)
-        return _def_cache[p]
-
     # Build provider index: sym → [realpath, ...] within top_dir
-    print(f"[no-undefined] Indexing {len(all_dir_elfs)} ELF files "
-          f"in {top_dir} ...")
     sym_providers: dict[str, list[str]] = defaultdict(list)
     for p in all_dir_elfs:
-        for s in cached_defined(p):
+        for s in _elf_cache[p][2]:  # defined syms
             sym_providers[s].append(p)
+
+    def cached_defined(p: str) -> set[str]:
+        if p in _elf_cache:
+            return _elf_cache[p][2]
+        # Fallback for system libs outside top_dir (parse + cache)
+        _elf_cache[p] = parse_elf_all(p)
+        return _elf_cache[p][2]
+
+    def cached_needed(p: str) -> list[str]:
+        if p in _elf_cache:
+            return _elf_cache[p][1]
+        _elf_cache[p] = parse_elf_all(p)
+        return _elf_cache[p][1]
+
+    def cached_undefined(p: str) -> set[str]:
+        if p in _elf_cache:
+            return _elf_cache[p][3]
+        _elf_cache[p] = parse_elf_all(p)
+        return _elf_cache[p][3]
+
+    def resolve_transitive_cached(path: str, visited: set[str]):
+        """Walk DT_NEEDED chain using cached data (no subprocess calls)."""
+        for name in cached_needed(path):
+            resolved = local_map.get(name)
+            if not resolved:
+                resolved = resolve_lib(name, search_dirs, ldcache)
+            if not resolved:
+                continue
+            resolved = os.path.realpath(resolved)
+            if resolved in visited:
+                continue
+            visited.add(resolved)
+            resolve_transitive_cached(resolved, visited)
 
     # Check each target
     results = []
 
     for target in targets:
         target = os.path.realpath(target)
-        undef = get_undefined_syms(target)
+        undef = cached_undefined(target)
         if not undef:
             continue
 
         # Resolve full transitive DT_NEEDED chain
         trans_paths: set[str] = set()
-        _resolve_transitive(target, trans_paths, search_dirs,
-                            local_map, ldcache)
+        resolve_transitive_cached(target, trans_paths)
 
         # Symbols available through the DT_NEEDED chain
         available = cached_defined(target).copy()
