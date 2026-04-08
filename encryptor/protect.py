@@ -35,6 +35,7 @@ Subcommands:
 
 Key file: 32 bytes as 64 hex chars.  Created with a fresh random key if absent.
 """
+from __future__ import annotations
 
 import argparse
 import os

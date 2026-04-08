@@ -48,6 +48,7 @@ What it does:
   - libs=skip: ignores libs entirely
   - Uses parallel workers for encryption, protection, and file copies
 """
+from __future__ import annotations
 
 import argparse
 import fnmatch

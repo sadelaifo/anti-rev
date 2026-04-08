@@ -16,6 +16,7 @@ Examples:
     python3 depgraph.py /opt/myapp/ --no-undefined   # scan dir for missing deps
     python3 depgraph.py ./libfoo.so --no-undefined   # scan single lib
 """
+from __future__ import annotations
 
 import argparse
 import os
