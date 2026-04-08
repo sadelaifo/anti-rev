@@ -362,19 +362,20 @@ class AntirevClient:
             # path), allowing DT_NEEDED resolution to find it.
             fd = self._libs[name]
             deps = _get_needed(fd)
-            import sys; print(f"[dbg] ENCRYPTED {name} deps={deps}",
-                              file=sys.stderr)
             for dep in deps:
                 self._ensure_loaded(dep)
             soname = _get_soname(fd) or name
             link = os.path.join(self._link_dir, soname)
             if not os.path.exists(link):
-                os.symlink(f"/proc/self/fd/{fd}", link)
-            _Real(link, mode=ct.RTLD_GLOBAL)
+                os.symlink("/proc/self/fd/{}".format(fd), link)
+            try:
+                _Real(link, mode=ct.RTLD_GLOBAL)
+            except OSError as e:
+                print("[antirev] warning: failed to preload {}: {}".format(
+                    name, e), file=sys.stderr)
         else:
             # Unencrypted dep — follow DT_NEEDED to discover encrypted
             # deps behind it, then pre-load with RTLD_GLOBAL.
-            import sys; print(f"[dbg] DISK {name}", file=sys.stderr)
             disk_path = self._resolve_disk(name)
             if disk_path:
                 for dep in _get_needed_from_path(disk_path):
