@@ -6,7 +6,9 @@
       "Bash(git push:*)",
       "Bash(git pull:*)",
       "Bash(git stash:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(python:*)",
+      "Bash(chmod +x:*)"
     ]
   }
 }

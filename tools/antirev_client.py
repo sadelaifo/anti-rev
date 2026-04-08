@@ -406,10 +406,11 @@ class AntirevClient:
 
         Intercepts ``import`` of native .so extensions that are encrypted
         on disk, loading them from the daemon's memfd instead.  Also
-        pre-loads encrypted DT_NEEDED deps of *non*-encrypted extensions
-        so ld.so finds them in the link map at dlopen time.
-
-        Call preload_all() first for the most robust behaviour.
+        walks the transitive DT_NEEDED chain of *non*-encrypted extensions
+        (including through unencrypted intermediaries) and preloads only
+        the encrypted deps that each specific import actually needs.
+        This matches stub.c's selective LD_PRELOAD approach and avoids
+        conflicts from loading unrelated libs globally.
         """
         import importlib.abc
         import importlib.machinery
@@ -453,13 +454,13 @@ class AntirevClient:
                                 fullname, memfd, loader=loader)
 
                         if hdr[:4] == b'\x7fELF':
-                            # Non-encrypted extension — preload any
-                            # encrypted libs in its DT_NEEDED chain so
+                            # Non-encrypted extension — preload encrypted
+                            # libs in its transitive DT_NEEDED chain so
                             # ld.so finds them when it dlopen's this file.
+                            # _ensure_loaded follows unencrypted intermediaries
+                            # too, so ext→unenc→enc chains are covered.
                             for dep in _get_needed_from_path(fpath):
-                                dk = client._soname_to_key.get(dep, dep)
-                                if dk in client._libs:
-                                    client._ensure_loaded(dk)
+                                client._ensure_loaded(dep)
                         return None  # let normal import handle it
                 return None
 
@@ -519,25 +520,26 @@ def _find_key_source():
     )
 
 
-def activate(key_source=None, preload='all'):
+def activate(key_source=None, preload='on_demand'):
     """Connect to daemon and transparently load encrypted libs.
 
     Patches both Python's ``import`` (for encrypted native extensions)
-    and ``ctypes.CDLL`` (for explicit ctypes loading).  By default all
-    daemon libs are preloaded with RTLD_GLOBAL so that DT_NEEDED
-    resolution of non-encrypted extensions finds encrypted deps in the
-    link map.
+    and ``ctypes.CDLL`` (for explicit ctypes loading).  The import hook
+    automatically preloads only the transitive encrypted deps of each
+    extension as it is imported — matching stub.c's approach of only
+    preloading what each binary actually needs.
 
     Args:
         key_source: path to key file or daemon binary. If None,
                     auto-discovers via ANTIREV_KEY env or .antirev-libd.
-        preload: 'all' (default) — preload ALL daemon libs upfront.
-                     Required for Python ``import`` of native extensions
-                     whose DT_NEEDED chains include encrypted libs.
-                 'on_demand' — only load when ctypes.CDLL() is called.
-                     The import hook still intercepts encrypted .so
-                     extensions, but non-encrypted extensions that
-                     DT_NEED encrypted libs may fail at import time.
+        preload: 'on_demand' (default) — load encrypted deps only when
+                     an import or ctypes.CDLL() actually needs them.
+                     Avoids conflicts from loading unrelated libs (e.g.
+                     protobuf descriptor collisions between two gRPC
+                     .so files that are never used together).
+                 'all' — preload ALL daemon libs upfront.  Use only
+                     when encrypted libs have C constructors that
+                     dlopen other encrypted libs at init time.
 
     Returns:
         The AntirevClient instance (for introspection / manual use).
