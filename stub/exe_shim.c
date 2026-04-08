@@ -48,31 +48,10 @@ extern char *program_invocation_short_name;
  * /proc/self/exe, realpath, etc. intercepted — they are different
  * binaries and ANTIREV_REAL_EXE refers to the parent. */
 static pid_t g_owner_pid = 0;
-static int g_owner_checked = 0;  /* 1 = constructor has determined ownership */
 
-/* Lazy ownership check — covers calls that arrive before the constructor
- * (e.g. C++ global static initializers in DT_NEEDED libraries). */
 static int is_owner_process(void)
 {
-    if (g_owner_checked)
-        return g_owner_pid != 0 && getpid() == g_owner_pid;
-
-    /* Constructor hasn't run yet.  Detect ownership on the fly by
-     * checking if /proc/self/exe points to a memfd. */
-    if (!getenv("ANTIREV_REAL_EXE"))
-        return 0;
-    char exe_buf[256];
-    ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
-                                 "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
-    if (n > 0) {
-        exe_buf[n] = '\0';
-        if (strstr(exe_buf, "memfd:") != NULL) {
-            g_owner_pid = getpid();
-            g_owner_checked = 1;
-            return 1;
-        }
-    }
-    return 0;
+    return g_owner_pid != 0 && getpid() == g_owner_pid;
 }
 
 /* ------------------------------------------------------------------ */
@@ -138,6 +117,8 @@ static void restore_identity(void)
             is_owner = 1;
     }
 
+    fprintf(stderr, "[dbg] exe_shim ctor: /proc/self/exe -> %s\n", exe_buf);
+
     if (!is_owner) {
         /* QEMU fallback: check if ANTIREV_MAIN_FD points to a memfd */
         const char *main_fd_str = getenv("ANTIREV_MAIN_FD");
@@ -157,7 +138,7 @@ static void restore_identity(void)
     }
 
     if (!is_owner) {
-        g_owner_checked = 1;
+        fprintf(stderr, "[dbg] exe_shim: NOT memfd, skipping intercept\n");
         return;
     }
 
@@ -165,7 +146,7 @@ static void restore_identity(void)
     unsetenv("ANTIREV_MAIN_FD");
 
     g_owner_pid = getpid();
-    g_owner_checked = 1;
+    fprintf(stderr, "[dbg] exe_shim: owner_pid=%d\n", (int)g_owner_pid);
 
     /* Close DT_NEEDED memfds now that glibc's dynamic linker has finished
      * mapping them.  The fds are pure bookkeeping at this point — the
