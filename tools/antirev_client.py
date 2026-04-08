@@ -15,14 +15,17 @@ Usage (explicit):
     # List available libs:
     print(client.libs)
 
-Usage (auto-patch — for scripts that call ctypes.CDLL directly):
+Usage (auto-patch — works with both import and ctypes.CDLL):
     from antirev_client import activate
 
     activate("/path/to/.antirev-libd")  # or key file
 
-    # Now ctypes.CDLL transparently loads encrypted libs:
+    # Python import of encrypted native extensions now works:
+    import my_encrypted_module          # redirected to memfd
+
+    # ctypes.CDLL also transparently loads encrypted libs:
     import ctypes
-    lib = ctypes.CDLL("libFoo.so")  # redirected to memfd
+    lib = ctypes.CDLL("libFoo.so")     # redirected to memfd
 
 Key source discovery for activate():
     1. Explicit path argument
@@ -397,6 +400,70 @@ class AntirevClient:
         for name in sorted(self._libs, key=lambda n: (dep_count[n], n)):
             self._ensure_loaded(name)
 
+    def patch_import(self):
+        """Install sys.meta_path hook for encrypted Python extension modules.
+
+        Intercepts ``import`` of native .so extensions that are encrypted
+        on disk, loading them from the daemon's memfd instead.  Also
+        pre-loads encrypted DT_NEEDED deps of *non*-encrypted extensions
+        so ld.so finds them in the link map at dlopen time.
+
+        Call preload_all() first for the most robust behaviour.
+        """
+        import importlib.abc
+        import importlib.machinery
+        import importlib.util
+
+        client = self
+        MAGIC = b"ANTREV01"
+        ext_suffixes = importlib.machinery.EXTENSION_SUFFIXES
+
+        class _Finder(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path, target=None):
+                tail = fullname.rsplit('.', 1)[-1]
+                search = list(path) if path else sys.path
+
+                for suffix in ext_suffixes:
+                    fname = tail + suffix
+                    for d in search:
+                        if not isinstance(d, str):
+                            continue
+                        fpath = os.path.join(d, fname)
+                        if not os.path.isfile(fpath):
+                            continue
+                        try:
+                            with open(fpath, 'rb') as f:
+                                hdr = f.read(8)
+                        except OSError:
+                            continue
+
+                        if hdr == MAGIC:
+                            # Encrypted extension — redirect to memfd
+                            base = os.path.basename(fpath)
+                            key = client._soname_to_key.get(base, base)
+                            if key not in client._libs:
+                                return None
+                            client._ensure_loaded(key)
+                            fd = client._libs[key]
+                            memfd = "/proc/self/fd/{}".format(fd)
+                            loader = importlib.machinery.ExtensionFileLoader(
+                                fullname, memfd)
+                            return importlib.util.spec_from_file_location(
+                                fullname, memfd, loader=loader)
+
+                        if hdr[:4] == b'\x7fELF':
+                            # Non-encrypted extension — preload any
+                            # encrypted libs in its DT_NEEDED chain so
+                            # ld.so finds them when it dlopen's this file.
+                            for dep in _get_needed_from_path(fpath):
+                                dk = client._soname_to_key.get(dep, dep)
+                                if dk in client._libs:
+                                    client._ensure_loaded(dk)
+                        return None  # let normal import handle it
+                return None
+
+        sys.meta_path.insert(0, _Finder())
+
     def patch_ctypes(self):
         """Monkey-patch ctypes.CDLL for on-demand encrypted lib loading.
 
@@ -451,17 +518,25 @@ def _find_key_source():
     )
 
 
-def activate(key_source=None, preload='on_demand'):
-    """Connect to daemon and patch ctypes.CDLL for encrypted lib loading.
+def activate(key_source=None, preload='all'):
+    """Connect to daemon and transparently load encrypted libs.
+
+    Patches both Python's ``import`` (for encrypted native extensions)
+    and ``ctypes.CDLL`` (for explicit ctypes loading).  By default all
+    daemon libs are preloaded with RTLD_GLOBAL so that DT_NEEDED
+    resolution of non-encrypted extensions finds encrypted deps in the
+    link map.
 
     Args:
         key_source: path to key file or daemon binary. If None,
                     auto-discovers via ANTIREV_KEY env or .antirev-libd.
-        preload: 'on_demand' (default) — load encrypted deps only when
-                     ctypes.CDLL() is called, based on DT_NEEDED.
-                 'all' — preload ALL daemon libs upfront (needed when
-                     encrypted libs have C constructors that dlopen
-                     other encrypted libs at init time).
+        preload: 'all' (default) — preload ALL daemon libs upfront.
+                     Required for Python ``import`` of native extensions
+                     whose DT_NEEDED chains include encrypted libs.
+                 'on_demand' — only load when ctypes.CDLL() is called.
+                     The import hook still intercepts encrypted .so
+                     extensions, but non-encrypted extensions that
+                     DT_NEED encrypted libs may fail at import time.
 
     Returns:
         The AntirevClient instance (for introspection / manual use).
@@ -471,9 +546,11 @@ def activate(key_source=None, preload='on_demand'):
     client = AntirevClient(key_source)
     if preload == 'all':
         client.preload_all()
+    client.patch_import()
     client.patch_ctypes()
     n = len(client._loaded & set(client._libs)) if client._loaded else 0
-    mode = f"preloaded {n}" if preload == 'all' else "on-demand"
-    print(f"[antirev] {len(client._libs)} libs available ({mode}), "
-          f"ctypes.CDLL patched", file=sys.stderr)
+    mode = "preloaded {}".format(n) if preload == 'all' else "on-demand"
+    print("[antirev] {} libs available ({}), "
+          "import + ctypes.CDLL patched".format(len(client._libs), mode),
+          file=sys.stderr)
     return client
