@@ -15,6 +15,8 @@ Examples:
     python3 depgraph.py ./my_app --borrowed     # find symbols that break under dlopen
     python3 depgraph.py /opt/myapp/ --no-undefined   # scan dir for missing deps
     python3 depgraph.py ./libfoo.so --no-undefined   # scan single lib
+    python3 depgraph.py /opt/myapp/ --find-unresolved                # find locally-defined but unreachable symbols
+    python3 depgraph.py /opt/myapp/ --find-unresolved --blacklist vendor  # skip vendor/ subdirectory
 """
 from __future__ import annotations
 
@@ -29,6 +31,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ELF_MAGIC = b'\x7fELF'
+
+# Directory basenames to exclude from --find-unresolved scanning.
+# Add third-party / vendored library directories here.
+BLACKLISTED_DIRS: set[str] = set((
+    # "third_party",
+    # "vendor",
+    # "external",
+))
 
 
 # ── ELF parsing via readelf ──────────────────────────────────────────
@@ -186,6 +196,22 @@ def scan_elfs(directory: str) -> list[str]:
     """Recursively find all ELF files in a directory."""
     elfs = []
     for root, _dirs, files in os.walk(directory):
+        for name in sorted(files):
+            p = os.path.join(root, name)
+            if os.path.islink(p):
+                continue
+            if os.path.isfile(p) and is_elf(p):
+                elfs.append(os.path.realpath(p))
+    return elfs
+
+
+def scan_elfs_filtered(directory: str,
+                       blacklist: set[str] | None = None) -> list[str]:
+    """Recursively find all ELF files, skipping blacklisted directories."""
+    bl = (blacklist or set()) | BLACKLISTED_DIRS
+    elfs = []
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if d not in bl]
         for name in sorted(files):
             p = os.path.join(root, name)
             if os.path.islink(p):
@@ -1094,6 +1120,236 @@ def print_no_undefined(results: list, top_dir: str,
     return len(results)
 
 
+# ── --find-unresolved scan ─────────────────────────────────────────
+
+def _parse_dynamic(path: str) -> tuple[list[str], str]:
+    """Parse DT_NEEDED and DT_SONAME from a single readelf -d call."""
+    try:
+        out = subprocess.check_output(
+            ["readelf", "-d", path], stderr=subprocess.DEVNULL, text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return [], ""
+    needed = []
+    soname = ""
+    for line in out.splitlines():
+        m = re.search(r'\(NEEDED\)\s+Shared library: \[(.+)\]', line)
+        if m:
+            needed.append(m.group(1))
+            continue
+        m = re.search(r'\(SONAME\)\s+Library soname: \[(.+)\]', line)
+        if m:
+            soname = m.group(1)
+    return needed, soname
+
+
+def _parse_dynsyms(path: str) -> tuple[set[str], set[str]]:
+    """Parse defined and undefined dynamic symbols from one readelf call."""
+    try:
+        out = subprocess.check_output(
+            ["readelf", "--dyn-syms", "-W", path],
+            stderr=subprocess.DEVNULL, text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return set(), set()
+    defined = set()
+    undefined = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 8 or parts[7] == "":
+            continue
+        name = parts[7]
+        if parts[6] == "UND":
+            if parts[4] != "WEAK":
+                undefined.add(name)
+        else:
+            if parts[4] != "LOCAL":
+                if "@@" in name:
+                    name = name.split("@@")[0]
+                elif "@" in name:
+                    name = name.split("@")[0]
+                defined.add(name)
+    return defined, undefined
+
+
+def find_unresolved_syms(directory: str,
+                         search_dirs: list[str],
+                         ldcache: dict[str, str],
+                         blacklist: set[str] | None = None
+                         ) -> tuple[list, int]:
+    """Find ELFs whose undefined symbols exist locally but are unreachable.
+
+    Scans all ELFs in *directory* (skipping blacklisted sub-dirs).
+    For each ELF, finds undefined symbols NOT satisfied by its transitive
+    DT_NEEDED chain, then checks whether a *different* ELF in the
+    directory defines the symbol.  Those are symbols that will fail at
+    load time under dlopen / encrypted mode even though the provider is
+    right next to the consumer.
+
+    Optimised: each local ELF is parsed with only 2 readelf invocations
+    (instead of 4), and all invocations run in parallel via threads.
+
+    Returns:
+        (results, n_elfs) where results is a list of
+        (elf_path, [(sym, [provider_path, ...]), ...])
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    directory = os.path.realpath(directory)
+    all_elfs = scan_elfs_filtered(directory, blacklist)
+
+    if not all_elfs:
+        return [], 0
+
+    print(f"[find-unresolved] Indexing {len(all_elfs)} ELF files "
+          f"in {directory} ...")
+
+    # ── Phase 1: parse every local ELF in parallel ─────────────────
+    # Two readelf calls per ELF (dynamic + dynsyms) instead of four
+    # separate calls (soname, needed, defined, undefined).
+
+    def _parse_elf(path):
+        needed, soname = _parse_dynamic(path)
+        defined, undefined = _parse_dynsyms(path)
+        return path, needed, soname, defined, undefined
+
+    with ThreadPoolExecutor() as pool:
+        parsed = list(pool.map(_parse_elf, all_elfs))
+
+    # ── Phase 2: populate caches from parsed results ───────────────
+    needed_cache: dict[str, list[str]] = {}
+    def_cache: dict[str, set[str]] = {}
+    undef_cache: dict[str, set[str]] = {}
+    local_map: dict[str, str] = {}
+
+    for path, needed, soname, defined, undefined in parsed:
+        needed_cache[path] = needed
+        def_cache[path] = defined
+        undef_cache[path] = undefined
+        local_map[os.path.basename(path)] = path
+        if soname:
+            local_map[soname] = path
+
+    # On-demand cache accessors for non-local (system) libs
+    def cached_needed(p: str) -> list[str]:
+        if p not in needed_cache:
+            needed_cache[p] = get_dt_needed(p)
+        return needed_cache[p]
+
+    def cached_defined(p: str) -> set[str]:
+        if p not in def_cache:
+            def_cache[p] = get_defined_syms(p)
+        return def_cache[p]
+
+    # Provider index: sym → [local realpath, ...]
+    sym_providers: dict[str, list[str]] = defaultdict(list)
+    for path in all_elfs:
+        for s in def_cache[path]:
+            sym_providers[s].append(path)
+
+    # ── Phase 3: resolve transitive deps and check symbols ─────────
+
+    def resolve_transitive(target: str) -> set[str]:
+        """Walk DT_NEEDED tree using cached data (no extra subprocesses
+        for already-parsed ELFs)."""
+        visited: set[str] = set()
+        queue: deque[str] = deque()
+        for name in cached_needed(target):
+            resolved = local_map.get(name)
+            if not resolved:
+                resolved = resolve_lib(name, search_dirs, ldcache)
+            if resolved:
+                queue.append(os.path.realpath(resolved))
+        while queue:
+            p = queue.popleft()
+            if p in visited:
+                continue
+            visited.add(p)
+            for name in cached_needed(p):
+                r = local_map.get(name)
+                if not r:
+                    r = resolve_lib(name, search_dirs, ldcache)
+                if r:
+                    r = os.path.realpath(r)
+                    if r not in visited:
+                        queue.append(r)
+        return visited
+
+    results = []
+    for target in all_elfs:
+        undef = undef_cache[target]
+        if not undef:
+            continue
+
+        trans_paths = resolve_transitive(target)
+
+        # Symbols available through the DT_NEEDED chain
+        available = cached_defined(target).copy()
+        for dep_path in trans_paths:
+            available |= cached_defined(dep_path)
+
+        # Missing: undefined but not provided by DT_NEEDED chain
+        missing = undef - available
+
+        # For each missing sym, find providers within directory
+        problems = []
+        for sym in sorted(missing):
+            providers = [p for p in sym_providers.get(sym, [])
+                         if p != target]
+            if providers:
+                problems.append((sym, providers))
+
+        if problems:
+            results.append((target, problems))
+
+    return results, len(all_elfs)
+
+
+def print_unresolved(results: list, directory: str, n_elfs: int):
+    """Print --find-unresolved scan results."""
+    directory = os.path.realpath(directory)
+
+    print(f"\n{'='*60}")
+    print(f"  --find-unresolved: {directory}")
+    print(f"  {n_elfs} ELF files scanned")
+    print(f"{'='*60}")
+
+    if not results:
+        print(f"\n  ALL PASS — no unresolved symbols found.\n")
+        return 0
+
+    # Collect all symbols for batch demangling
+    all_syms = []
+    for _, problems in results:
+        all_syms.extend(sym for sym, _ in problems)
+    demangled = _demangle_batch(all_syms)
+
+    total_syms = 0
+    for target, problems in results:
+        rel = os.path.relpath(target, directory)
+        n = len(problems)
+        total_syms += n
+        print(f"\n  FAIL  {rel}  ({n} symbol{'s' if n != 1 else ''})")
+
+        for sym, providers in problems:
+            dm = demangled.get(sym, sym)
+            label = f"{dm}  [{sym}]" if dm != sym else sym
+            print(f"        {label}")
+            for prov in providers:
+                prov_rel = os.path.relpath(prov, directory)
+                prov_soname = get_dt_soname(prov) or os.path.basename(prov)
+                print(f"          <- {prov_rel}  "
+                      f"(link with -l{_soname_to_lflag(prov_soname)})")
+
+    print(f"\n{'─'*60}")
+    print(f"  {len(results)}/{n_elfs} FAIL  "
+          f"({total_syms} unresolved symbol{'s' if total_syms != 1 else ''} "
+          f"total)")
+    print(f"  These symbols exist in the folder but are NOT reachable")
+    print(f"  via DT_NEEDED — they will fail under dlopen/encrypted mode.")
+    print(f"  Fix: patchelf --add-needed <provider.so> <consumer>")
+    print()
+    return len(results)
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 def main():
@@ -1119,6 +1375,14 @@ def main():
                    help="Scan file or directory for ELFs with undefined "
                         "symbols not covered by DT_NEEDED (borrowed from "
                         "siblings in the same directory)")
+    p.add_argument("--find-unresolved", action="store_true",
+                   help="Scan directory for ELFs with undefined symbols "
+                        "that exist locally but are unreachable via "
+                        "DT_NEEDED (will fail under dlopen/encrypted mode)")
+    p.add_argument("--blacklist", action="append", default=[],
+                   help="Directory names to exclude from "
+                        "--find-unresolved scanning (repeatable, "
+                        "added to built-in BLACKLISTED_DIRS)")
     p.add_argument("--max-depth", type=int, default=50,
                    help="Max recursion depth (default: 50)")
     args = p.parse_args()
@@ -1152,6 +1416,24 @@ def main():
             targets, top_dir, search_dirs, ldcache)
         n_fail = print_no_undefined(
             results, top_dir, len(targets), n_dir_elfs)
+        sys.exit(1 if n_fail else 0)
+
+    # ── --find-unresolved mode ─────────────────────────────────────
+    if args.find_unresolved:
+        if not os.path.isdir(elf_path):
+            sys.exit(f"[error] --find-unresolved requires a directory: "
+                     f"{elf_path}")
+
+        search_dirs = list(args.lib_dir)
+        if "LD_LIBRARY_PATH" in os.environ:
+            search_dirs.extend(os.environ["LD_LIBRARY_PATH"].split(":"))
+        search_dirs.append(os.path.realpath(elf_path))
+
+        blacklist = set(args.blacklist) if args.blacklist else None
+        ldcache = build_ldconfig_cache()
+        results, n_elfs = find_unresolved_syms(
+            elf_path, search_dirs, ldcache, blacklist)
+        n_fail = print_unresolved(results, elf_path, n_elfs)
         sys.exit(1 if n_fail else 0)
 
     # ── Normal dep-graph mode ───────────────────────────────────────
