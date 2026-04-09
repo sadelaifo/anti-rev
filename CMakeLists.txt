@@ -390,6 +390,70 @@ add_custom_target(test_dlopen_transitive
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_dlopen_dt_needed — exe dlopen's libfoo, libfoo DT_NEEDs libbar,
+#  ALL encrypted.  Tests LD_LIBRARY_PATH symlink resolution for
+#  DT_NEEDED deps of dlopen'd libs.
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_lib("${CMAKE_BINARY_DIR}/libbar.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_dt_needed/libbar.c")
+add_custom_target(libbar DEPENDS "${CMAKE_BINARY_DIR}/libbar.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libfoo.so"
+    COMMAND gcc -shared -fPIC -O2
+            -Wl,-soname,libfoo.so
+            -o "${CMAKE_BINARY_DIR}/libfoo.so"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_dt_needed/libfoo.c"
+            -L "${CMAKE_BINARY_DIR}" -lbar -Wl,--no-as-needed
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_dt_needed/libfoo.c"
+            "${CMAKE_BINARY_DIR}/libbar.so"
+    COMMENT "Building libfoo.so (dlopen_dt_needed test)"
+)
+add_custom_target(libfoo DEPENDS "${CMAKE_BINARY_DIR}/libfoo.so")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/dlopen_dt_needed"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_dt_needed/main.c")
+add_custom_target(dlopen_dt_needed_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_dt_needed")
+
+set(_TD_DTN "${CMAKE_BINARY_DIR}/daemon_test_dlopen_dt_needed")
+add_custom_target(test_dlopen_dt_needed
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_dt_needed ==="
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_DTN}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_DTN}/enc_disk"
+    # Pack libs into daemon
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_DTN}/test.key"
+            --libs   "${CMAKE_BINARY_DIR}/libfoo.so"
+                     "${CMAKE_BINARY_DIR}/libbar.so"
+            --output "${_TD_DTN}/.antirev-libd"
+    # Put encrypted copies on disk so the linker finds them (and fails
+    # with "invalid ELF header" rather than "not found")
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key    "${_TD_DTN}/test.key"
+            --libs   "${CMAKE_BINARY_DIR}/libfoo.so"
+                     "${CMAKE_BINARY_DIR}/libbar.so"
+            --output-dir "${_TD_DTN}/enc_disk"
+    # Protect exe
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/dlopen_dt_needed"
+            --key    "${_TD_DTN}/test.key"
+            --daemon-libs
+            --output "${_TD_DTN}/test.protected"
+    # Run with LD_LIBRARY_PATH pointing to encrypted copies on disk
+    COMMAND ${CMAKE_COMMAND}
+            "-DBINARY=${_TD_DTN}/test.protected"
+            "-DLD_LIBRARY_PATH=${_TD_DTN}/enc_disk"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
+    DEPENDS stub libbar libfoo dlopen_dt_needed_bin
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "dlopen DT_NEEDED: exe->dlopen(libfoo)->DT_NEEDED(libbar), all encrypted"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_preload_memfd — smoke test: DT_NEEDED satisfied via LD_PRELOAD
 #  from a memfd (no .so on disk, no LD_AUDIT)
 # ═══════════════════════════════════════════════════════════════════════
