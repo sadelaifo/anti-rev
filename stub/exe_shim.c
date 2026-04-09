@@ -117,10 +117,11 @@ static void restore_identity(void)
             is_owner = 1;
     }
 
-    fprintf(stderr, "[dbg] exe_shim ctor: /proc/self/exe -> %s\n", exe_buf);
-
     if (!is_owner) {
-        /* QEMU fallback: check if ANTIREV_MAIN_FD points to a memfd */
+        /* QEMU fallback: check if ANTIREV_MAIN_FD points to a memfd.
+         * In QEMU user-mode /proc/self/fd readlinkat may not return "memfd:"
+         * so we also trust the mere presence of ANTIREV_MAIN_FD — the stub
+         * only injects it into the direct fexecve target, never children. */
         const char *main_fd_str = getenv("ANTIREV_MAIN_FD");
         if (main_fd_str) {
             char fd_link[64], fd_target[256];
@@ -134,19 +135,20 @@ static void restore_identity(void)
                 if (strstr(fd_target, "memfd:") != NULL)
                     is_owner = 1;
             }
+            /* QEMU: readlinkat didn't confirm "memfd:" — trust presence alone */
+            if (!is_owner)
+                is_owner = 1;
         }
     }
 
-    if (!is_owner) {
-        fprintf(stderr, "[dbg] exe_shim: NOT memfd, skipping intercept\n");
-        return;
-    }
-
-    /* Consume the marker so forked children don't false-positive. */
+    /* Consume the marker regardless of detection path so forked+exec'd
+     * children never inherit it and false-positive as owner. */
     unsetenv("ANTIREV_MAIN_FD");
 
+    if (!is_owner)
+        return;
+
     g_owner_pid = getpid();
-    fprintf(stderr, "[dbg] exe_shim: owner_pid=%d\n", (int)g_owner_pid);
 
     /* Close DT_NEEDED memfds now that glibc's dynamic linker has finished
      * mapping them.  The fds are pure bookkeeping at this point — the
@@ -280,11 +282,8 @@ static char *fill_real_exe(char *resolved)
 __attribute__((visibility("default")))
 char *realpath(const char *path, char *resolved)
 {
-    if (path && is_self_exe(path)) {
-        char *r = fill_real_exe(resolved);
-        fprintf(stderr, "[dbg] realpath(%s) -> %s\n", path, r ? r : "(null)");
-        return r;
-    }
+    if (path && is_self_exe(path))
+        return fill_real_exe(resolved);
 
     /* Lazy retry: constructor may fail when LD_AUDIT is active (linker
        holds internal locks during early init, breaking dlopen/dlsym). */
