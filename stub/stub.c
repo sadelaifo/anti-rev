@@ -2010,7 +2010,44 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         new_env[ei++] = symlink_dir_entry;
     new_env[ei]   = NULL;
 
-    /* Phase 6. Replace this process with the decrypted binary — no fork, same PID */
+    /* Phase 6. Replace this process with the decrypted binary — no fork, same PID.
+     *
+     * QEMU user-mode: directly exec the QEMU interpreter with the binary's real
+     * name as argv[0] so that "ps -ef" and process managers see the binary name
+     * (e.g. "DophiServer") instead of "qemu-aarch64-static /proc/self/fd/N".
+     * Fall back to fexecve (binfmt_misc) if no QEMU binary is found. */
+    {
+        static const char *qemu_candidates[] = {
+            "/usr/bin/qemu-aarch64-static",
+            "/usr/bin/qemu-aarch64",
+            NULL
+        };
+        const char *binname = strrchr(real_exe, '/');
+        binname = binname ? binname + 1 : real_exe;
+
+        char fd_path[32];
+        snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
+
+        int orig_argc = 0;
+        while (argv[orig_argc]) orig_argc++;
+
+        char **qargv = malloc((size_t)(orig_argc + 2) * sizeof(char *));
+        if (qargv) {
+            qargv[0] = (char *)binname;
+            qargv[1] = fd_path;
+            for (int i = 1; i < orig_argc; i++) qargv[i + 1] = argv[i];
+            qargv[orig_argc + 1] = NULL;
+
+            for (int qi = 0; qemu_candidates[qi]; qi++) {
+                struct stat st;
+                if (stat(qemu_candidates[qi], &st) == 0) {
+                    execve(qemu_candidates[qi], qargv, new_env);
+                    /* execve only returns on failure — try next candidate */
+                }
+            }
+            free(qargv);
+        }
+    }
     fexecve(main_fd, argv, new_env);
     perror("fexecve");
     return 1;
