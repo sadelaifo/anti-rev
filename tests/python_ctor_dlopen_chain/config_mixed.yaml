@@ -1,0 +1,19 @@
+install_dir: .
+output_dir: ./out_mixed
+key: ./test.key
+stub: ../../build/stub
+libs: encrypt
+
+# Only encrypt foo and zzz; bar stays plaintext
+encrypt_libs:
+  - libfoo.so
+  - libzzz.so
+
+blacklist:
+  - "*.py"
+  - "*.yaml"
+  - "*.sh"
+  - "*.key"
+  - "*.c"
+  - out_all_enc/
+  - out_mixed/

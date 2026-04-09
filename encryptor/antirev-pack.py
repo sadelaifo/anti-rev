@@ -23,7 +23,7 @@ Config format:
       - lib/legacy                     # subdirectory (no trailing slash also works)
       - bin/debug_tool                 # specific relative path
 
-    libs: bundle                       # optional: bundle|encrypt|skip (default: bundle)
+    libs: encrypt                      # optional: encrypt|skip (default: encrypt)
 
     encrypt_libs:                      # optional whitelist: only encrypt these libs
       - libsecret.so                   #   all other libs are copied as plaintext
@@ -44,11 +44,11 @@ What it does:
   - Skips blacklisted ELF files entirely (not copied, not encrypted)
   - Only copies non-ELF files that match the 'copy' list (if omitted, nothing copied)
   - Protects executables with the stub
-  - libs=bundle: encrypts libs and bundles them into each exe
-  - libs=encrypt: encrypts libs individually as standalone files in output_dir
+  - libs=encrypt: encrypts libs individually, served via daemon at runtime
   - libs=skip: ignores libs entirely
   - Uses parallel workers for encryption, protection, and file copies
 """
+from __future__ import annotations
 
 import argparse
 import fnmatch
@@ -57,8 +57,10 @@ import re
 import shutil
 import struct
 import subprocess
+import tempfile
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 try:
@@ -68,7 +70,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from protect import (load_or_create_key, encrypt_data, MAGIC,
-                     BFLAG_HAS_LIBS, BFLAG_DAEMON_LIBS)
+                     BFLAG_HAS_LIBS, BFLAG_DAEMON_LIBS, BFLAG_WRAPPER)
 
 # ELF magic and type constants
 ELF_MAGIC = b'\x7fELF'
@@ -144,6 +146,8 @@ def compile_blacklist(raw: list[str]) -> list[tuple[str, str]]:
     """Pre-classify blacklist entries once instead of per-file."""
     compiled = []
     for entry in raw:
+        if not entry:
+            continue
         entry = entry.replace('\\', '/')
         if entry.endswith('/'):
             compiled.append((entry, 'dir'))
@@ -152,6 +156,38 @@ def compile_blacklist(raw: list[str]) -> list[tuple[str, str]]:
         else:
             compiled.append((entry, 'name'))
     return compiled
+
+
+def _build_ldconfig_cache() -> dict:
+    """Parse ldconfig -p to build soname → path mapping.
+
+    Also indexes LD_LIBRARY_PATH entries so that libs in custom
+    directories (not registered in ldconfig) are discoverable.
+    """
+    cache = {}
+    # LD_LIBRARY_PATH first — gives precedence to custom dirs, same
+    # priority order as the runtime dynamic linker.
+    for d in os.environ.get('LD_LIBRARY_PATH', '').split(':'):
+        if not d or not os.path.isdir(d):
+            continue
+        try:
+            for name in os.listdir(d):
+                if '.so' in name and name not in cache:
+                    cache[name] = os.path.join(d, name)
+        except OSError:
+            pass
+    # ldconfig cache (lower priority — don't overwrite LD_LIBRARY_PATH hits).
+    try:
+        result = subprocess.run(
+            ['ldconfig', '-p'], capture_output=True, text=True, timeout=10
+        )
+        for line in result.stdout.splitlines():
+            m = re.match(r'\s+(\S+)\s+\(.*\)\s+=>\s+(\S+)', line)
+            if m and m.group(1) not in cache:
+                cache[m.group(1)] = m.group(2)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return cache
 
 
 def _parse_readelf_dynamic(path: Path) -> list[str]:
@@ -164,6 +200,68 @@ def _parse_readelf_dynamic(path: Path) -> list[str]:
         return result.stdout.splitlines()
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
+
+
+def _parse_dynamic_one(path: str) -> tuple[str, str, list[str]]:
+    """Parse DT_SONAME and DT_NEEDED from a single ELF in one readelf call.
+
+    Returns (path, soname, needed_list).
+    """
+    try:
+        result = subprocess.run(
+            ['readelf', '-d', path],
+            capture_output=True, text=True, timeout=10
+        )
+        out = result.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return path, '', []
+
+    soname = ''
+    needed = []
+    for line in out.splitlines():
+        m = re.search(r'\(NEEDED\)\s+Shared library: \[(.+)\]', line)
+        if m:
+            needed.append(m.group(1))
+            continue
+        m = re.search(r'\(SONAME\)\s+Library soname: \[(.+)\]', line)
+        if m:
+            soname = m.group(1)
+    return path, soname, needed
+
+
+# ── Bulk parallel ELF parser ────────────────────────────────────────
+
+class _ElfCache:
+    """Cache soname + DT_NEEDED for many ELFs, parsed in parallel."""
+
+    def __init__(self):
+        self._soname = {}    # abs-path-str → soname
+        self._needed = {}    # abs-path-str → [needed, ...]
+
+    def bulk_parse(self, paths):
+        """Parse all *paths* in parallel using ThreadPoolExecutor."""
+        str_paths = [str(p) for p in paths]
+        n_workers = min(os.cpu_count() or 4, len(str_paths), 64)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            for p, soname, needed in pool.map(_parse_dynamic_one, str_paths):
+                self._soname[p] = soname
+                self._needed[p] = needed
+
+    def get_soname(self, path) -> str:
+        key = str(path)
+        if key not in self._soname:
+            _, soname, needed = _parse_dynamic_one(key)
+            self._soname[key] = soname
+            self._needed[key] = needed
+        return self._soname[key]
+
+    def get_needed(self, path) -> list[str]:
+        key = str(path)
+        if key not in self._needed:
+            _, soname, needed = _parse_dynamic_one(key)
+            self._soname[key] = soname
+            self._needed[key] = needed
+        return self._needed[key]
 
 
 def get_dt_needed(path: Path) -> list[str]:
@@ -185,20 +283,22 @@ def get_dt_soname(path: Path) -> str:
     return ''
 
 
-def build_soname_maps(lib_files: list) -> tuple[dict, dict]:
-    """Build bidirectional soname ↔ filename mappings for encrypted libs.
+def build_soname_maps(lib_files: list, cache: _ElfCache) -> tuple[dict, dict]:
+    """Build bidirectional soname <-> filename mappings for encrypted libs.
+
+    Uses *cache* (pre-populated via bulk_parse) so no subprocess calls.
 
     Returns (soname_to_filename, lib_by_lookup) where lib_by_lookup maps
     both sonames and filenames to the source Path for DT_NEEDED traversal.
     """
-    soname_to_filename = {}   # soname → filename (e.g. "libFoo.so.1" → "libFoo.so.1.2.3")
-    lib_by_lookup = {}        # soname or filename → Path
+    soname_to_filename = {}   # soname -> filename
+    lib_by_lookup = {}        # soname or filename -> Path
 
     for src in lib_files:
         fname = src.name
         lib_by_lookup[fname] = src
 
-        soname = get_dt_soname(src)
+        soname = cache.get_soname(src)
         if soname and soname != fname:
             soname_to_filename[soname] = fname
             lib_by_lookup[soname] = src
@@ -208,19 +308,24 @@ def build_soname_maps(lib_files: list) -> tuple[dict, dict]:
 
 def get_transitive_needed(path: Path, encrypted_names: set[str],
                           soname_to_filename: dict[str, str],
-                          lib_by_lookup: dict[str, 'Path']) -> list[str]:
+                          lib_by_lookup: dict[str, 'Path'],
+                          cache: _ElfCache,
+                          ldcache: dict) -> list[str]:
     """Get transitive closure of encrypted libs needed by an ELF binary.
 
-    BFS: start from path's DT_NEEDED, follow through encrypted libs only.
-    Handles soname ↔ filename mismatch (e.g. DT_NEEDED says "libFoo.so.1"
-    but encrypted file is "libFoo.so.1.2.3").
+    BFS from path's DT_NEEDED, following through ALL libs — including
+    unencrypted intermediaries on disk — to discover encrypted deps
+    behind them (e.g. exe -> libfoo.so [unencrypted] -> libbar.so [encrypted]).
+
+    Uses *cache* for encrypted libs (no subprocess calls) and falls back
+    to a single readelf for system libs not in the cache.
 
     Returns list of filenames (not sonames) in dependency-first order
     (deepest deps first) for correct LD_PRELOAD loading.
     """
     needed = []
     visited = set()
-    queue = get_dt_needed(path)
+    queue = cache.get_needed(path)
 
     while queue:
         name = queue.pop(0)
@@ -231,17 +336,22 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
         # Resolve: DT_NEEDED might be a soname, map to filename
         filename = soname_to_filename.get(name, name)
 
-        if filename not in encrypted_names:
-            continue
-
-        needed.append(filename)
-
-        # Follow this lib's own DT_NEEDED
-        lib_path = lib_by_lookup.get(name)
-        if lib_path:
-            for dep in get_dt_needed(lib_path):
-                if dep not in visited:
-                    queue.append(dep)
+        if filename in encrypted_names:
+            needed.append(filename)
+            # Follow this encrypted lib's own DT_NEEDED (from cache)
+            lib_path = lib_by_lookup.get(name) or lib_by_lookup.get(filename)
+            if lib_path:
+                for dep in cache.get_needed(lib_path):
+                    if dep not in visited:
+                        queue.append(dep)
+        else:
+            # Unencrypted lib — find on disk and follow its DT_NEEDED
+            # to discover encrypted deps behind it
+            lib_path = ldcache.get(name)
+            if lib_path:
+                for dep in cache.get_needed(lib_path):
+                    if dep not in visited:
+                        queue.append(dep)
 
     # Reverse: BFS visits parents before children, but LD_PRELOAD needs
     # dependencies loaded first (glibc resolves DT_NEEDED per entry).
@@ -252,22 +362,50 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
 # ── Worker functions (run in child processes) ─────────────────────────
 
 def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
-    """Encrypt a single .so file. Returns status string."""
+    """Encrypt a single .so file. Returns status string.
+
+    If the lib has no DT_SONAME, patch a copy with patchelf before
+    encrypting so that glibc can match the LD_PRELOAD'd memfd to
+    DT_NEEDED entries at runtime.
+    """
     src_p, dst_p = Path(src), Path(dst)
-    data = src_p.read_bytes()
+    patched = None
+    soname_note = ""
+
+    # Check if SONAME is missing
+    if not get_dt_soname(src_p):
+        tmp_dir = tempfile.mkdtemp(prefix="antirev_patch_")
+        patched = Path(tmp_dir) / src_p.name
+        shutil.copy2(src_p, patched)
+        try:
+            subprocess.run(
+                ["patchelf", "--set-soname", src_p.name, str(patched)],
+                check=True, capture_output=True, text=True)
+            soname_note = " [patched SONAME]"
+        except FileNotFoundError:
+            sys.exit("[error] patchelf not found — required for libs without "
+                     "DT_SONAME. Install it: https://github.com/NixOS/patchelf")
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"[error] patchelf failed on {src_p.name}: {e.stderr}")
+
+    data = (patched or src_p).read_bytes()
+
+    # Clean up temp file
+    if patched:
+        shutil.rmtree(patched.parent, ignore_errors=True)
+
     iv, tag, ct = encrypt_data(data, key)
     dst_p.parent.mkdir(parents=True, exist_ok=True)
     dst_p.write_bytes(MAGIC + iv + tag + ct)
     out_size = dst_p.stat().st_size
     return (f"[pack] Encrypted  lib: {src_p.name:<30}  "
-            f"{len(data):>10,} -> {out_size:>10,} bytes")
+            f"{len(data):>10,} -> {out_size:>10,} bytes{soname_note}")
 
 
 def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
-                        lib_paths: list[str] = None,
                         daemon_libs: bool = False,
                         needed_libs: list[str] = None) -> str:
-    """Encrypt and bundle an executable (+ optional libs) in-process."""
+    """Encrypt an executable and wrap it in the stub launcher."""
     src_p  = Path(src)
     stub_p = Path(stub)
     dst_p  = Path(dst)
@@ -285,40 +423,20 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
     entry += struct.pack("<Q", len(ct))
     entry += ct
 
-    # Lib entries
-    lib_entries = b""
-    lib_count = 0
-    if lib_paths:
-        for lib_str in lib_paths:
-            lib_p = Path(lib_str)
-            lib_data = lib_p.read_bytes()
-            liv, ltag, lct = encrypt_data(lib_data, key)
-            lname_b = lib_p.name.encode()
-            le  = struct.pack("<H", len(lname_b))
-            le += lname_b
-            le += struct.pack("<B", 0)   # flags: not main
-            le += liv + ltag
-            le += struct.pack("<Q", len(lct))
-            le += lct
-            lib_entries += le
-            lib_count += 1
-
-    num_files = 1 + lib_count
+    num_files = 1
     flags = 0x00
-    if lib_count > 0:
-        flags |= BFLAG_HAS_LIBS
     if daemon_libs:
         flags |= BFLAG_DAEMON_LIBS
 
-    # Needed-libs section: tells stub which daemon libs this exe uses
+    # Needed-libs section: tells stub which daemon libs this exe DT_NEEDs
     needed_section = b""
-    if daemon_libs and needed_libs:
-        needed_section = struct.pack("<H", len(needed_libs))
-        for name in needed_libs:
+    if daemon_libs:
+        needed_section = struct.pack("<H", len(needed_libs or []))
+        for name in (needed_libs or []):
             nb = name.encode()
             needed_section += struct.pack("<H", len(nb)) + nb
 
-    bundle = struct.pack("<IB", num_files, flags) + entry + lib_entries \
+    bundle = struct.pack("<IB", num_files, flags) + entry \
            + needed_section
 
     stub_data     = stub_p.read_bytes()
@@ -330,10 +448,9 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
     os.chmod(str(dst_p), 0o755)
 
     out_size = dst_p.stat().st_size
-    libs_info = f" (+{lib_count} libs)" if lib_count else ""
     need_info = f" (needs {len(needed_libs)})" if needed_libs else ""
     return (f"[pack] Protected  exe: {src_p.name:<30}  "
-            f"{len(data):>10,} -> {out_size:>10,} bytes{libs_info}{need_info}")
+            f"{len(data):>10,} -> {out_size:>10,} bytes{need_info}")
 
 
 def _copy_worker(items: list[tuple[str, str]]) -> int:
@@ -351,6 +468,8 @@ def main():
     ap.add_argument("-j", "--jobs", type=int, default=0,
                     help="Number of parallel workers (default: CPU count)")
     args = ap.parse_args()
+
+    t_start = time.monotonic()
 
     config_path = Path(args.config)
     if not config_path.exists():
@@ -479,17 +598,14 @@ def main():
     print()
 
     # ── Lib handling mode ────────────────────────────────────────────────
-    # libs: bundle  (default) — bundle all libs into every exe
-    # libs: encrypt           — encrypt libs individually to output_dir
+    # libs: encrypt (default) — encrypt libs individually, serve via daemon
     # libs: skip              — ignore libs entirely (exe-only protection)
-    libs_mode = cfg.get('libs', 'bundle')
-    if libs_mode not in ('bundle', 'encrypt', 'skip'):
+    libs_mode = cfg.get('libs', 'encrypt')
+    if libs_mode not in ('encrypt', 'skip'):
         sys.exit(f"[error] invalid libs mode '{libs_mode}' "
-                 f"(must be 'bundle', 'encrypt', or 'skip')")
+                 f"(must be 'encrypt' or 'skip')")
 
     print(f"[pack] Libs mode: {libs_mode}")
-
-    lib_path_strs = [str(p) for p in lib_files] if lib_files else []
 
     # Encrypt libs individually to output_dir as standalone encrypted files,
     # and create a lightweight daemon binary (stub + key, no bundled libs)
@@ -525,11 +641,17 @@ def main():
         os.chmod(str(daemon_path), 0o755)
         print(f"[pack] Daemon binary: {daemon_path.name}  "
               f"({daemon_path.stat().st_size:,} bytes, reads libs from disk)")
-        print()
 
-    if libs_mode == 'bundle' and lib_files:
-        print(f"[pack] Bundling {len(lib_files)} shared "
-              f"librar{'y' if len(lib_files) == 1 else 'ies'} into each executable...")
+        # Build wrapper binary: connects to daemon, sets up env, execs argv[1...]
+        wrapper_path = output_dir / '.antirev-wrap'
+        wrap_bundle = struct.pack("<IB", 0, BFLAG_WRAPPER)
+        wrap_offset = len(stub_data)
+        wrap_trailer = struct.pack("<Q", wrap_offset) + key + MAGIC
+        wrapper_path.write_bytes(stub_data + wrap_bundle + wrap_trailer)
+        os.chmod(str(wrapper_path), 0o755)
+        print(f"[pack] Wrapper binary: {wrapper_path.name}  "
+              f"(use: .antirev-wrap <command> [args...])")
+        print()
 
     if exe_files:
         print(f"[pack] Protecting {len(exe_files)} executable(s)...")
@@ -538,33 +660,32 @@ def main():
                 sys.exit(f"[error] no stub for arch '{arch}' "
                          f"(needed by {rel}). Add it to 'stubs' in config.")
 
-        # Determine what libs to pass to each exe
-        if libs_mode == 'bundle':
-            exe_lib_paths = lib_path_strs
-            exe_daemon_libs = False
-        elif libs_mode == 'encrypt':
-            exe_lib_paths = None
-            exe_daemon_libs = bool(lib_files)
-        else:  # skip
-            exe_lib_paths = None
-            exe_daemon_libs = False
+        exe_daemon_libs = libs_mode == 'encrypt' and bool(lib_files)
 
-        # In encrypt mode, determine which encrypted libs each exe needs
-        # (transitive: follows DT_NEEDED chains through encrypted libs)
-        # Handles soname ↔ filename mismatch (e.g. DT_NEEDED "libFoo.so.1"
-        # but file is "libFoo.so.1.2.3")
+        # Determine which encrypted libs each exe transitively DT_NEEDs
         encrypted_names = {src.name for src in lib_files}
         exe_needed = {}
-        if libs_mode == 'encrypt' and encrypted_names:
-            print(f"[pack] Building soname map for encrypted libs...")
-            soname_to_filename, lib_by_lookup = build_soname_maps(lib_files)
+        if exe_daemon_libs and encrypted_names:
+            # Parallel bulk-parse: one readelf per ELF, all in parallel
+            elf_cache = _ElfCache()
+            all_parse = [src for src in lib_files] + [src for _, _, src in exe_files]
+            t0 = time.monotonic()
+            print("[pack] Parsing {} ELFs in parallel...".format(len(all_parse)))
+            elf_cache.bulk_parse(all_parse)
+            print("[pack]   done in {:.1f}s".format(time.monotonic() - t0))
+
+            print("[pack] Building soname map for encrypted libs...")
+            soname_to_filename, lib_by_lookup = build_soname_maps(
+                lib_files, elf_cache)
             if soname_to_filename:
                 for sn, fn in soname_to_filename.items():
-                    print(f"[pack]   soname {sn} → {fn}")
-            print(f"[pack] Analyzing DT_NEEDED per executable (transitive)...")
+                    print("[pack]   soname {} -> {}".format(sn, fn))
+            ldcache = _build_ldconfig_cache()
+            print("[pack] Analyzing DT_NEEDED per executable (transitive)...")
             for rel, arch, src in exe_files:
                 needed = get_transitive_needed(
-                    src, encrypted_names, soname_to_filename, lib_by_lookup)
+                    src, encrypted_names, soname_to_filename, lib_by_lookup,
+                    elf_cache, ldcache)
                 exe_needed[rel] = needed
 
         with ProcessPoolExecutor(max_workers=workers) as pool:
@@ -575,7 +696,6 @@ def main():
                     str(stubs[arch]),
                     str(output_dir / rel),
                     key,
-                    exe_lib_paths,
                     exe_daemon_libs,
                     exe_needed.get(rel, []),
                 ): rel
@@ -620,7 +740,8 @@ def main():
         print(f"[pack] Recreated {len(symlinks)} symlink(s)")
         print()
 
-    print(f"[pack] Done")
+    elapsed = time.monotonic() - t_start
+    print(f"[pack] Done in {elapsed:.1f}s")
     print(f"[pack]   Output -> {output_dir}")
     print(f"[pack]   Key    -> {key_path}  (keep secret)")
 

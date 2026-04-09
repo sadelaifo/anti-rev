@@ -1,0 +1,14 @@
+install_dir: .
+output_dir: ./out_all_enc
+key: ./test.key
+stub: ../../build/stub
+libs: encrypt
+
+blacklist:
+  - "*.py"
+  - "*.yaml"
+  - "*.sh"
+  - "*.key"
+  - "*.c"
+  - out_all_enc/
+  - out_mixed/

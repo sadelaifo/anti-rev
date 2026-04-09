@@ -100,18 +100,46 @@ static void restore_identity(void)
     if (!real)
         return;
 
-    /* Check if /proc/self/exe points to a memfd — if so, this process
-     * was launched via fexecve and we are the owner. If not, we are a
-     * child process that inherited LD_PRELOAD and should not intercept. */
+    /* Check if this is the protected (owner) process or a child that
+     * merely inherited LD_PRELOAD.
+     *
+     * Primary check: /proc/self/exe → "memfd:..." (normal kernel).
+     * Fallback: ANTIREV_MAIN_FD is set and the fd path contains "memfd:"
+     *   — covers QEMU user-mode where /proc/self/exe points to the QEMU
+     *   binary instead of the guest memfd. */
+    int is_owner = 0;
     char exe_buf[256];
     ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
                                  "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
-    if (n <= 0)
-        return;
-    exe_buf[n] = '\0';
+    if (n > 0) {
+        exe_buf[n] = '\0';
+        if (strstr(exe_buf, "memfd:") != NULL)
+            is_owner = 1;
+    }
 
-    if (strstr(exe_buf, "memfd:") == NULL)
+    if (!is_owner) {
+        /* QEMU fallback: check if ANTIREV_MAIN_FD points to a memfd */
+        const char *main_fd_str = getenv("ANTIREV_MAIN_FD");
+        if (main_fd_str) {
+            char fd_link[64], fd_target[256];
+            snprintf(fd_link, sizeof(fd_link),
+                     "/proc/self/fd/%s", main_fd_str);
+            ssize_t fn = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
+                                          fd_link, fd_target,
+                                          sizeof(fd_target) - 1);
+            if (fn > 0) {
+                fd_target[fn] = '\0';
+                if (strstr(fd_target, "memfd:") != NULL)
+                    is_owner = 1;
+            }
+        }
+    }
+
+    if (!is_owner)
         return;
+
+    /* Consume the marker so forked children don't false-positive. */
+    unsetenv("ANTIREV_MAIN_FD");
 
     g_owner_pid = getpid();
 

@@ -55,3 +55,9 @@ int aes256gcm_ghash_verify(const aes256gcm_ctx *ctx, const uint8_t tag[16]);
  * In-place (ct == pt) is safe. */
 void aes256gcm_ctr_decrypt(aes256gcm_ctx *ctx,
                             const uint8_t *ct, uint8_t *pt, size_t len);
+
+/* Single-pass: CTR-decrypt + GHASH accumulate ciphertext simultaneously.
+ * After all data is fed, call aes256gcm_ghash_verify() to check the tag.
+ * Avoids reading the ciphertext twice (halves I/O). */
+void aes256gcm_onepass(aes256gcm_ctx *ctx,
+                       const uint8_t *ct, uint8_t *pt, size_t len);

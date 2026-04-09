@@ -17,17 +17,14 @@
  *
  * Trailer is always 48 bytes at end of file.
  *
- * Three operational modes:
+ * Operational modes:
  *
- *   A) Normal exe (with or without bundled libs):
- *      Decrypt files, optionally share lib fds via daemon, fexecve main.
- *
- *   B) Daemon-only (no main binary in bundle, only libs):
+ *   A) Daemon-only (no main binary in bundle, only libs):
  *      Decrypt all libs, bind abstract socket, serve lib fds forever.
  *      Used as a centralized lib server so libs aren't duplicated in
  *      every exe.
  *
- *   C) Client exe (BFLAG_DAEMON_LIBS, no libs in bundle):
+ *   B) Client exe (BFLAG_DAEMON_LIBS, no libs in bundle):
  *      Decrypt main exe only, connect to daemon to receive lib fds,
  *      then fexecve with those libs on LD_PRELOAD.
  *
@@ -48,8 +45,11 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <time.h>
+#include <signal.h>
 #include "crypto.h"
 
 #ifndef __NR_memfd_create
@@ -78,7 +78,7 @@
 #define TAG_SIZE     16   /* GCM auth tag */
 #define MAX_NAME     255
 #define MAX_FILES    1024
-#define CHUNK_SIZE   (4 * 1024 * 1024)  /* 4 MB I/O + crypto buffer */
+#define CHUNK_SIZE   (16 * 1024 * 1024)  /* 16 MB I/O + crypto buffer */
 #define SCM_BATCH    250  /* max fds per SCM_RIGHTS (kernel SCM_MAX_FD = 253) */
 
 /* ------------------------------------------------------------------ */
@@ -133,6 +133,7 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 
 #define BFLAG_HAS_LIBS     0x01
 #define BFLAG_DAEMON_LIBS  0x02  /* libs served by external daemon */
+#define BFLAG_WRAPPER      0x04  /* wrapper mode: exec argv[1...] with libs */
 
 /* Max size of the daemon protocol data payload (per batch):
  * 4 bytes (nlibs) + SCM_BATCH * (2 + MAX_NAME) */
@@ -178,6 +179,7 @@ static void daemon_serve(int listen_fd, const int *lib_fds,
                          const char (*lib_names)[MAX_NAME + 1], int nlibs)
 {
     uid_t my_uid = getuid();
+    signal(SIGPIPE, SIG_IGN);
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
@@ -319,55 +321,6 @@ static socklen_t make_sock_addr(struct sockaddr_un *addr,
                        + 1 + strlen(addr->sun_path + 1));
 }
 
-/* Merge local lib fds with daemon-received lib fds.
- * Overlapping names → use daemon fd (shared), close local.
- * Local-only → keep.  Daemon-only → add.
- * Results written back into lib_fds/lib_names/nlibs.
- * Bounded to MAX_FILES total. */
-static void merge_lib_fds(int *lib_fds, char (*lib_names)[MAX_NAME + 1],
-                          int *nlibs,
-                          int *recv_fds, char (*recv_names)[MAX_NAME + 1],
-                          int recv_nlibs)
-{
-    int merged_fds[MAX_FILES];
-    char merged_names[MAX_FILES][MAX_NAME + 1];
-    int nmerged = 0;
-
-    /* 1. For each local lib: use daemon fd if available */
-    for (int j = 0; j < *nlibs && nmerged < MAX_FILES; j++) {
-        int found = 0;
-        for (int k = 0; k < recv_nlibs; k++) {
-            if (recv_fds[k] >= 0
-                && strcmp(lib_names[j], recv_names[k]) == 0) {
-                merged_fds[nmerged] = recv_fds[k];
-                memcpy(merged_names[nmerged], recv_names[k], MAX_NAME + 1);
-                nmerged++;
-                close(lib_fds[j]);
-                recv_fds[k] = -1; /* mark as consumed */
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            merged_fds[nmerged] = lib_fds[j];
-            memcpy(merged_names[nmerged], lib_names[j], MAX_NAME + 1);
-            nmerged++;
-        }
-    }
-    /* 2. Add daemon-only libs */
-    for (int k = 0; k < recv_nlibs && nmerged < MAX_FILES; k++) {
-        if (recv_fds[k] >= 0) {
-            merged_fds[nmerged] = recv_fds[k];
-            memcpy(merged_names[nmerged], recv_names[k], MAX_NAME + 1);
-            nmerged++;
-        }
-    }
-
-    *nlibs = nmerged;
-    memcpy(lib_fds, merged_fds, (size_t)nmerged * sizeof(int));
-    memcpy(lib_names, merged_names, (size_t)nmerged * (MAX_NAME + 1));
-}
-
 /* ------------------------------------------------------------------ */
 /*  Decrypt standalone encrypted file from disk                        */
 /*  Format: ANTREV01(8) + iv(12) + tag(16) + ciphertext               */
@@ -394,43 +347,31 @@ static int decrypt_enc_file(const char *path, const uint8_t *key,
     uint64_t ct_size = (uint64_t)(fsize - ct_off);
     if (ct_size == 0) { close(fd); return -1; }
 
-    aes256gcm_ctx ctx;
-
-    /* Pass A: GHASH verify */
-    aes256gcm_init(&ctx, key, iv);
-    uint64_t remaining = ct_size;
-    off_t pos = ct_off;
-    while (remaining > 0) {
-        size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
-        ssize_t got     = pread(fd, chunk, to_read, pos);
-        if (got != (ssize_t)to_read) { close(fd); return -1; }
-        aes256gcm_ghash_update(&ctx, chunk, to_read);
-        pos       += (off_t)to_read;
-        remaining -= to_read;
-    }
-    if (aes256gcm_ghash_verify(&ctx, tag) != 0) {
-        close(fd);
-        return -1;
-    }
-
-    /* Pass B: CTR decrypt → memfd */
     const char *bname = strrchr(path, '/');
     bname = bname ? bname + 1 : path;
 
     int mfd = make_memfd(bname);
     if (mfd < 0) { close(fd); return -1; }
 
+    aes256gcm_ctx ctx;
+
+    /* Single pass: GHASH + CTR simultaneously (halves disk I/O) */
     aes256gcm_init(&ctx, key, iv);
-    remaining = ct_size;
-    pos       = ct_off;
+    uint64_t remaining = ct_size;
+    off_t pos = ct_off;
     while (remaining > 0) {
         size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
         ssize_t got     = pread(fd, chunk, to_read, pos);
         if (got != (ssize_t)to_read) { close(fd); close(mfd); return -1; }
-        aes256gcm_ctr_decrypt(&ctx, chunk, chunk, to_read);
+        aes256gcm_onepass(&ctx, chunk, chunk, to_read);
         if (write_chunk(mfd, chunk, to_read) != 0) { close(fd); close(mfd); return -1; }
         pos       += (off_t)to_read;
         remaining -= to_read;
+    }
+    if (aes256gcm_ghash_verify(&ctx, tag) != 0) {
+        if (ftruncate(mfd, 0)) { /* wipe plaintext */ }
+        close(fd); close(mfd);
+        return -1;
     }
     if (lseek(mfd, 0, SEEK_SET) < 0) { close(fd); close(mfd); return -1; }
 
@@ -450,14 +391,25 @@ typedef struct {
     int      fd;      /* result memfd, -1 on failure */
 } dec_job_t;
 
-/* Worker thread: decrypt one file */
-static void *dec_worker(void *arg)
-{
-    dec_job_t *job = (dec_job_t *)arg;
-    uint8_t *chunk = malloc(CHUNK_SIZE);
-    if (!chunk) { job->fd = -1; return NULL; }
+/* Work-stealing pool: each thread grabs next available job */
+typedef struct {
+    dec_job_t   *jobs;
+    int          njobs;
+    volatile int next;   /* atomic counter for work stealing */
+} dec_pool_t;
 
-    job->fd = decrypt_enc_file(job->path, job->key, chunk);
+static void *pool_worker(void *arg)
+{
+    dec_pool_t *pool = (dec_pool_t *)arg;
+    uint8_t *chunk = malloc(CHUNK_SIZE);
+    if (!chunk) return NULL;
+
+    for (;;) {
+        int idx = __sync_fetch_and_add(&pool->next, 1);
+        if (idx >= pool->njobs) break;
+        pool->jobs[idx].fd = decrypt_enc_file(pool->jobs[idx].path,
+                                               pool->jobs[idx].key, chunk);
+    }
 
     explicit_bzero(chunk, CHUNK_SIZE);
     free(chunk);
@@ -545,19 +497,14 @@ static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
     for (int i = 0; i < njobs; i++)
         jobs[i].key = key;
 
+    dec_pool_t pool = { .jobs = jobs, .njobs = njobs, .next = 0 };
     pthread_t *tids = calloc((size_t)nthreads, sizeof(pthread_t));
     if (!tids) { free(jobs); return -1; }
 
-    /* Process in batches of nthreads */
-    for (int base = 0; base < njobs; base += nthreads) {
-        int batch = njobs - base;
-        if (batch > nthreads) batch = nthreads;
-
-        for (int t = 0; t < batch; t++)
-            pthread_create(&tids[t], NULL, dec_worker, &jobs[base + t]);
-        for (int t = 0; t < batch; t++)
-            pthread_join(tids[t], NULL);
-    }
+    for (int t = 0; t < nthreads; t++)
+        pthread_create(&tids[t], NULL, pool_worker, &pool);
+    for (int t = 0; t < nthreads; t++)
+        pthread_join(tids[t], NULL);
 
     /* Phase 3: collect results */
     for (int i = 0; i < njobs && *nlibs < MAX_FILES; i++) {
@@ -675,9 +622,11 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     /* Parse needed-libs section (after file entries, when BFLAG_DAEMON_LIBS).
      * Format: [num_needed:2B] [name_len:2B name:...]... */
     int n_needed = 0;
+    int has_needed_section = 0;
     char needed_names[MAX_FILES][MAX_NAME + 1];
 
     if (bundle_flags & BFLAG_DAEMON_LIBS) {
+        has_needed_section = 1;
         uint8_t nbuf[2];
         if (pread(self, nbuf, 2, scan) == 2) {
             uint16_t nn = u16le(nbuf);
@@ -696,9 +645,9 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     }
 
     /* ----------------------------------------------------------------
-     * Phase 2: for each file, stream two passes over the ciphertext.
-     *   Pass A — GHASH accumulation → tag verification
-     *   Pass B — CTR decryption chunk by chunk → write to memfd
+     * Phase 2: for each file, single-pass GHASH + CTR decryption.
+     * Reads ciphertext once, writes plaintext to memfd, then verifies
+     * the authentication tag.  On auth failure, plaintext is wiped.
      *
      * Peak user-space heap: one CHUNK_SIZE buffer.
      * ---------------------------------------------------------------- */
@@ -714,7 +663,10 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         file_entry_t *e = &entries[i];
         aes256gcm_ctx ctx;
 
-        /* --- Pass A: GHASH --- */
+        /* Single pass: GHASH + CTR simultaneously (halves I/O) */
+        int fd = make_memfd(e->name);
+        if (fd < 0) return 1;
+
         aes256gcm_init(&ctx, key, e->iv);
         uint64_t remaining = e->ct_size;
         off_t    pos       = (off_t)e->ct_offset;
@@ -722,30 +674,16 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
             ssize_t got     = pread(self, chunk, to_read, pos);
             if (got != (ssize_t)to_read) { perror("pread ciphertext"); return 1; }
-            aes256gcm_ghash_update(&ctx, chunk, to_read);
+            aes256gcm_onepass(&ctx, chunk, chunk, to_read);
+            if (write_chunk(fd, chunk, to_read) != 0) return 1;
             pos       += (off_t)to_read;
             remaining -= to_read;
         }
         if (aes256gcm_ghash_verify(&ctx, e->tag) != 0) {
             fprintf(stderr, "[antirev] decryption failed for '%s'\n", e->name);
+            if (ftruncate(fd, 0)) { /* wipe plaintext */ }
+            close(fd);
             return 1;
-        }
-
-        /* --- Pass B: CTR decrypt + write to memfd --- */
-        int fd = make_memfd(e->name);
-        if (fd < 0) return 1;
-
-        aes256gcm_init(&ctx, key, e->iv);  /* reset counter for decryption pass */
-        remaining = e->ct_size;
-        pos       = (off_t)e->ct_offset;
-        while (remaining > 0) {
-            size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
-            ssize_t got     = pread(self, chunk, to_read, pos);
-            if (got != (ssize_t)to_read) { perror("pread ciphertext"); return 1; }
-            aes256gcm_ctr_decrypt(&ctx, chunk, chunk, to_read); /* in-place */
-            if (write_chunk(fd, chunk, to_read) != 0) return 1;
-            pos       += (off_t)to_read;
-            remaining -= to_read;
         }
         if (lseek(fd, 0, SEEK_SET) < 0) { perror("lseek memfd"); return 1; }
 
@@ -768,7 +706,17 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * If not (lightweight daemon), scan disk for encrypted .so files.
      * Then bind abstract socket and serve lib fds forever.
      * ---------------------------------------------------------------- */
-    if (main_fd < 0) {
+    if (main_fd < 0 && !(bundle_flags & BFLAG_WRAPPER)) {
+        /* Raise fd limit: daemon holds ~nlibs memfds + listen socket */
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+
+        struct timespec t_start, t_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+
         if (nlibs == 0) {
             /* Lightweight daemon — scan for encrypted libs on disk */
             scan_encrypted_libs(real_exe, key, lib_fds, lib_names, &nlibs);
@@ -777,6 +725,12 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             fprintf(stderr, "[antirev] no main binary and no libs found\n");
             return 1;
         }
+
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
+        double elapsed = (double)(t_end.tv_sec - t_start.tv_sec)
+                       + (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+        fprintf(stderr, "[antirev] decrypted %d libs in %.1fs\n",
+                nlibs, elapsed);
 
         struct sockaddr_un addr;
         socklen_t addr_len = make_sock_addr(&addr, key);
@@ -806,10 +760,119 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     }
 
     /* ----------------------------------------------------------------
+     * Mode D: Wrapper (BFLAG_WRAPPER).
+     * No main binary — connect to daemon, receive lib fds, set up
+     * LD_PRELOAD (dlopen_shim) + ANTIREV_FD_MAP (all libs), then
+     * exec argv[1...].  The dlopen_shim constructor eagerly preloads
+     * all ANTIREV_FD_MAP libs via retry loop.
+     * ---------------------------------------------------------------- */
+    if (bundle_flags & BFLAG_WRAPPER) {
+        if (argc < 2) {
+            fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
+            return 1;
+        }
+
+        /* Raise fd limit: we'll receive ~nlibs fds via SCM_RIGHTS */
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+
+        /* Connect to daemon */
+        struct sockaddr_un addr;
+        socklen_t addr_len = make_sock_addr(&addr, key);
+        explicit_bzero(key, sizeof(key));
+
+        int connected = 0, daemon_launched = 0;
+        for (int retry = 0; retry < 50; retry++) {
+            int sd = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
+                char recv_names[MAX_FILES][MAX_NAME + 1];
+                if (receive_lib_fds(sd, lib_fds, recv_names, &nlibs) == 0
+                    && nlibs > 0) {
+                    memcpy(lib_names, recv_names, sizeof(recv_names));
+                    connected = 1;
+                }
+                close(sd);
+                break;
+            }
+            if (sd >= 0) close(sd);
+
+            if (!daemon_launched && retry == 0) {
+                char daemon_path[4096];
+                char *slash = strrchr(real_exe, '/');
+                size_t dirlen = slash ? (size_t)(slash - real_exe) : 1;
+                if (!slash) { daemon_path[0] = '.'; dirlen = 1; }
+                else memcpy(daemon_path, real_exe, dirlen);
+                snprintf(daemon_path + dirlen,
+                         sizeof(daemon_path) - dirlen, "/.antirev-libd");
+                if (access(daemon_path, X_OK) == 0) {
+                    pid_t pid = fork();
+                    if (pid == 0) {
+                        char *dargv[] = { daemon_path, NULL };
+                        execve(daemon_path, dargv, envp);
+                        _exit(127);
+                    }
+                    if (pid > 0) { int st; waitpid(pid, &st, 0); daemon_launched = 1; }
+                }
+            }
+            usleep(100000);
+        }
+
+        if (!connected || nlibs == 0) {
+            fprintf(stderr, "[antirev] wrapper: could not get libs from daemon\n");
+            return 1;
+        }
+        fprintf(stderr, "[antirev] wrapper: received %d libs\n", nlibs);
+
+        /* Create dlopen_shim memfd */
+        int dlopen_shim_fd = make_memfd("antirev_dlopen_shim.so");
+        if (dlopen_shim_fd < 0) return 1;
+        if (write_chunk(dlopen_shim_fd, dlopen_shim_blob, dlopen_shim_blob_len) != 0) return 1;
+        if (lseek(dlopen_shim_fd, 0, SEEK_SET) < 0) { perror("lseek"); return 1; }
+
+        /* Build ANTIREV_FD_MAP with ALL libs */
+        size_t map_len = 16 + (size_t)nlibs * (MAX_NAME + 16);
+        char *fd_map = malloc(map_len);
+        if (!fd_map) { perror("malloc"); return 1; }
+        int moff = snprintf(fd_map, map_len, "ANTIREV_FD_MAP=");
+        for (int j = 0; j < nlibs; j++) {
+            if (j > 0) fd_map[moff++] = ',';
+            moff += snprintf(fd_map + moff, map_len - (size_t)moff,
+                             "%s=%d", lib_names[j], lib_fds[j]);
+        }
+
+        /* Build LD_PRELOAD with only dlopen_shim */
+        char ld_preload[128];
+        snprintf(ld_preload, sizeof(ld_preload),
+                 "LD_PRELOAD=/proc/self/fd/%d", dlopen_shim_fd);
+
+        /* Build new environment */
+        int envc = 0;
+        while (envp[envc]) envc++;
+        char **new_env = malloc((size_t)(envc + 3) * sizeof(char *));
+        if (!new_env) { perror("malloc"); return 1; }
+        int ei = 0;
+        for (int j = 0; j < envc; j++) {
+            if (strncmp(envp[j], "LD_PRELOAD=",   11) == 0) continue;
+            if (strncmp(envp[j], "ANTIREV_FD_MAP=", 15) == 0) continue;
+            new_env[ei++] = envp[j];
+        }
+        new_env[ei++] = ld_preload;
+        new_env[ei++] = fd_map;
+        new_env[ei]   = NULL;
+
+        /* Exec the wrapped command */
+        extern char **environ;
+        environ = new_env;
+        execvp(argv[1], &argv[1]);
+        perror("execvp");
+        return 1;
+    }
+
+    /* ----------------------------------------------------------------
      * Phase 3: lib fd acquisition.
-     *
-     * Mode A (bundled libs): share our lib fds with sibling processes.
-     *   First process forks a daemon; later processes receive shared fds.
      *
      * Mode C (daemon libs): no libs bundled, must receive from daemon.
      * ---------------------------------------------------------------- */
@@ -817,6 +880,14 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         /* Mode C: client-only — receive libs from daemon.
          * If no daemon is running, auto-launch .antirev-libd from the
          * same directory as our binary (first process bootstraps it). */
+
+        /* Raise fd limit: we'll receive ~nlibs fds via SCM_RIGHTS */
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+
         struct sockaddr_un addr;
         socklen_t addr_len = make_sock_addr(&addr, key);
 
@@ -874,70 +945,6 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             fprintf(stderr, "[antirev] failed to connect to lib daemon\n");
             return 1;
         }
-    } else if ((bundle_flags & BFLAG_HAS_LIBS) && nlibs > 0) {
-        /* Mode A: bundled libs — share via daemon */
-        struct sockaddr_un addr;
-        socklen_t addr_len = make_sock_addr(&addr, key);
-
-        int sd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
-            /* Daemon already running — merge our libs with daemon's.
-             * For overlapping names: use daemon fd (shared copy).
-             * For names only we have: keep our local fd.
-             * For names only daemon has: add daemon fd. */
-            int recv_fds[MAX_FILES];
-            char recv_names[MAX_FILES][MAX_NAME + 1];
-            int recv_nlibs = 0;
-            if (receive_lib_fds(sd, recv_fds, recv_names, &recv_nlibs) == 0
-                && recv_nlibs > 0)
-                merge_lib_fds(lib_fds, lib_names, &nlibs,
-                              recv_fds, recv_names, recv_nlibs);
-            close(sd);
-        } else {
-            /* No daemon yet — we are the first process */
-            if (sd >= 0) close(sd);
-
-            int listen_sd = socket(AF_UNIX, SOCK_STREAM, 0);
-            if (listen_sd >= 0
-                && bind(listen_sd, (struct sockaddr *)&addr, addr_len) == 0) {
-                listen(listen_sd, 16);
-                pid_t pid = fork();
-                if (pid < 0) {
-                    perror("[antirev] fork daemon");
-                    close(listen_sd);
-                } else if (pid == 0) {
-                    /* Daemon child — close fds we don't need */
-                    close(main_fd);
-                    daemon_serve(listen_sd, lib_fds, lib_names, nlibs);
-                    _exit(0);
-                } else {
-                    /* Parent continues — daemon runs in background */
-                    close(listen_sd);
-                }
-            } else {
-                /* bind() failed (race: another process won).
-                 * Retry connect. */
-                if (listen_sd >= 0) close(listen_sd);
-
-                for (int retry = 0; retry < 10; retry++) {
-                    usleep(10000); /* 10 ms */
-                    sd = socket(AF_UNIX, SOCK_STREAM, 0);
-                    if (sd >= 0
-                        && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
-                        int recv_fds[MAX_FILES];
-                        char recv_names[MAX_FILES][MAX_NAME + 1];
-                        int recv_nlibs = 0;
-                        if (receive_lib_fds(sd, recv_fds, recv_names, &recv_nlibs) == 0
-                            && recv_nlibs > 0)
-                            merge_lib_fds(lib_fds, lib_names, &nlibs,
-                                          recv_fds, recv_names, recv_nlibs);
-                        close(sd);
-                        break;
-                    }
-                    if (sd >= 0) close(sd);
-                }
-            }
-        }
     }
 
     /* Wipe key (after daemon socket name derivation) */
@@ -965,7 +972,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     char fdmap_names[MAX_FILES][MAX_NAME + 1];
     int n_fdmap = 0;
 
-    if (n_needed > 0 && nlibs > 0) {
+    if (has_needed_section && nlibs > 0) {
         /* Build preload list in needed_names order (dependency-first).
          * The packer embeds needed_names with deepest deps first so that
          * glibc can resolve each lib's DT_NEEDED from already-loaded libs. */
@@ -994,11 +1001,19 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 n_fdmap++;
             }
         }
+        fprintf(stderr, "[antirev] split: %d on LD_PRELOAD, %d on FD_MAP "
+                "(needed=%d, daemon=%d)\n",
+                n_preload, n_fdmap, n_needed, nlibs);
+        for (int k = 0; k < n_preload; k++)
+            fprintf(stderr, "[antirev]   PRELOAD: %s (fd %d)\n",
+                    preload_names[k], preload_fds[k]);
     } else {
         /* No needed list — all libs go on LD_PRELOAD (backward compat) */
         memcpy(preload_fds, lib_fds, (size_t)nlibs * sizeof(int));
         memcpy(preload_names, lib_names, (size_t)nlibs * (MAX_NAME + 1));
         n_preload = nlibs;
+        fprintf(stderr, "[antirev] backward compat: all %d libs on LD_PRELOAD\n",
+                nlibs);
     }
 
     /* Phase 5. Build new envp */

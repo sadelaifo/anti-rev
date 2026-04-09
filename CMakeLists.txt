@@ -221,7 +221,37 @@ function(compile_test_bin OUTPUT COMPILER SOURCE)
 endfunction()
 
 # ═══════════════════════════════════════════════════════════════════════
-#  test_dlopen — main binary dlopen's a protected .so via the shim
+#  Helper: daemon-mode test (protect-daemon + protect-exe --daemon-libs)
+#  Usage: daemon_test(test_name client_bin "comment" lib1.so [lib2.so])
+#         add_dependencies(test_name stub mylib client_target ...)
+# ═══════════════════════════════════════════════════════════════════════
+function(daemon_test TEST_NAME CLIENT_BIN COMMENT_STR)
+    set(_TD "${CMAKE_BINARY_DIR}/daemon_${TEST_NAME}")
+    add_custom_target(${TEST_NAME}
+        COMMAND ${CMAKE_COMMAND} -E echo "=== ${TEST_NAME} ==="
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD}"
+        COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+                --stub   "${CMAKE_BINARY_DIR}/stub"
+                --key    "${_TD}/test.key"
+                --libs   ${ARGN}
+                --output "${_TD}/.antirev-libd"
+        COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+                --stub   "${CMAKE_BINARY_DIR}/stub"
+                --main   "${CLIENT_BIN}"
+                --key    "${_TD}/test.key"
+                --daemon-libs
+                --output "${_TD}/test.protected"
+        COMMAND ${CMAKE_COMMAND}
+                "-DBINARY=${_TD}/test.protected"
+                -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "${COMMENT_STR}"
+        USES_TERMINAL
+    )
+endfunction()
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Shared test libraries and binaries
 # ═══════════════════════════════════════════════════════════════════════
 
 compile_lib("${CMAKE_BINARY_DIR}/mylib.so"
@@ -232,20 +262,130 @@ compile_test_bin("${CMAKE_BINARY_DIR}/dlopen_main"
     gcc "${CMAKE_SOURCE_DIR}/tests/dlopen/main.c")
 add_custom_target(dlopen_main DEPENDS "${CMAKE_BINARY_DIR}/dlopen_main")
 
-add_custom_target(test_dlopen
-    COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen ==="
+# ═══════════════════════════════════════════════════════════════════════
+#  test_dlopen — main binary dlopen's a protected .so via the shim
+# ═══════════════════════════════════════════════════════════════════════
+
+daemon_test(test_dlopen "${CMAKE_BINARY_DIR}/dlopen_main"
+    "dlopen test (.so via daemon)"
+    "${CMAKE_BINARY_DIR}/mylib.so")
+add_dependencies(test_dlopen stub mylib dlopen_main)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_dlopen_edgecases — paths, flags, reopen, fallthrough
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_test_bin("${CMAKE_BINARY_DIR}/dlopen_edgecases"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_edgecases/main.c")
+add_custom_target(dlopen_edgecases DEPENDS "${CMAKE_BINARY_DIR}/dlopen_edgecases")
+
+daemon_test(test_dlopen_edgecases "${CMAKE_BINARY_DIR}/dlopen_edgecases"
+    "dlopen edge-case tests (paths, flags, reopen, fallthrough)"
+    "${CMAKE_BINARY_DIR}/mylib.so")
+add_dependencies(test_dlopen_edgecases stub mylib dlopen_edgecases)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_dlopen_nested — dlopen from within a protected shared library
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_lib("${CMAKE_BINARY_DIR}/libcallee.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_nested/libcallee.c")
+add_custom_target(libcallee DEPENDS "${CMAKE_BINARY_DIR}/libcallee.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libcaller.so"
+    COMMAND gcc -shared -fPIC -O2
+            -I "${CMAKE_SOURCE_DIR}/tests"
+            -Wl,-soname,libcaller.so
+            -o "${CMAKE_BINARY_DIR}/libcaller.so"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_nested/libcaller.c"
+            -ldl
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_nested/libcaller.c"
+    COMMENT "Building libcaller.so (nested dlopen test)"
+)
+add_custom_target(libcaller DEPENDS "${CMAKE_BINARY_DIR}/libcaller.so")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/dlopen_nested"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_nested/main.c")
+add_custom_target(dlopen_nested_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_nested")
+
+daemon_test(test_dlopen_nested "${CMAKE_BINARY_DIR}/dlopen_nested"
+    "nested dlopen test (caller->callee chain via shim)"
+    "${CMAKE_BINARY_DIR}/libcaller.so" "${CMAKE_BINARY_DIR}/libcallee.so")
+add_dependencies(test_dlopen_nested stub libcallee libcaller dlopen_nested_bin)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_dlopen_transitive — encrypted lib behind unencrypted intermediary
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_lib("${CMAKE_BINARY_DIR}/libinner.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/libinner.c")
+add_custom_target(libinner DEPENDS "${CMAKE_BINARY_DIR}/libinner.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libmiddle.so"
+    COMMAND gcc -shared -fPIC -O2
+            -I "${CMAKE_SOURCE_DIR}/tests"
+            -Wl,-soname,libmiddle.so
+            -o "${CMAKE_BINARY_DIR}/libmiddle.so"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/libmiddle.c"
+            -ldl
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/libmiddle.c"
+    COMMENT "Building libmiddle.so (transitive test)"
+)
+add_custom_target(libmiddle DEPENDS "${CMAKE_BINARY_DIR}/libmiddle.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libbridge.so"
+    COMMAND gcc -shared -fPIC -O2
+            -I "${CMAKE_SOURCE_DIR}/tests"
+            -Wl,-soname,libbridge.so
+            -o "${CMAKE_BINARY_DIR}/libbridge.so"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/libbridge.c"
+            -L "${CMAKE_BINARY_DIR}" -lmiddle -Wl,--no-as-needed
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/libbridge.c"
+            "${CMAKE_BINARY_DIR}/libmiddle.so"
+    COMMENT "Building libbridge.so (unencrypted intermediary)"
+)
+add_custom_target(libbridge DEPENDS "${CMAKE_BINARY_DIR}/libbridge.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/dlopen_transitive"
+    COMMAND gcc -O2
+            -I "${CMAKE_SOURCE_DIR}/tests"
+            -o "${CMAKE_BINARY_DIR}/dlopen_transitive"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/main.c"
+            -L "${CMAKE_BINARY_DIR}" -lbridge -Wl,--no-as-needed
+            -Wl,-rpath,${CMAKE_BINARY_DIR}
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_transitive/main.c"
+            "${CMAKE_BINARY_DIR}/libbridge.so"
+    COMMENT "Building dlopen_transitive test binary"
+)
+add_custom_target(dlopen_transitive_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_transitive")
+
+set(_TD_TRANS "${CMAKE_BINARY_DIR}/daemon_test_dlopen_transitive")
+add_custom_target(test_dlopen_transitive
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_transitive ==="
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_TRANS}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_TRANS}/test.key"
+            --libs   "${CMAKE_BINARY_DIR}/libmiddle.so"
+                     "${CMAKE_BINARY_DIR}/libinner.so"
+            --output "${_TD_TRANS}/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
-            --main   "${CMAKE_BINARY_DIR}/dlopen_main"
-            --key    "${CMAKE_BINARY_DIR}/dlopen.key"
-            --libs   "${CMAKE_BINARY_DIR}/mylib.so"
-            --output "${CMAKE_BINARY_DIR}/dlopen_main.protected"
+            --main   "${CMAKE_BINARY_DIR}/dlopen_transitive"
+            --key    "${_TD_TRANS}/test.key"
+            --daemon-libs
+            --output "${_TD_TRANS}/test.protected"
     COMMAND ${CMAKE_COMMAND}
-            "-DBINARY=${CMAKE_BINARY_DIR}/dlopen_main.protected"
+            "-DBINARY=${_TD_TRANS}/test.protected"
+            "-DLD_LIBRARY_PATH=${CMAKE_BINARY_DIR}"
             -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
-    DEPENDS stub mylib dlopen_main
+    DEPENDS stub libinner libmiddle libbridge dlopen_transitive_bin
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "dlopen test (bundled .so via LD_PRELOAD)"
+    COMMENT "transitive DT_NEEDED through unencrypted intermediary"
     USES_TERMINAL
 )
 
@@ -376,22 +516,10 @@ add_custom_command(
 )
 add_custom_target(linked_main DEPENDS "${CMAKE_BINARY_DIR}/linked_main")
 
-add_custom_target(test_linked
-    COMMAND ${CMAKE_COMMAND} -E echo "=== test_linked ==="
-    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
-            --stub   "${CMAKE_BINARY_DIR}/stub"
-            --main   "${CMAKE_BINARY_DIR}/linked_main"
-            --key    "${CMAKE_BINARY_DIR}/linked.key"
-            --libs   "${CMAKE_BINARY_DIR}/liblinkedmath.so"
-            --output "${CMAKE_BINARY_DIR}/linked_main.protected"
-    COMMAND ${CMAKE_COMMAND}
-            "-DBINARY=${CMAKE_BINARY_DIR}/linked_main.protected"
-            -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
-    DEPENDS stub liblinkedmath linked_main
-    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "DT_NEEDED satisfied via LD_PRELOAD from bundled encrypted .so"
-    USES_TERMINAL
-)
+daemon_test(test_linked "${CMAKE_BINARY_DIR}/linked_main"
+    "DT_NEEDED satisfied via daemon-served encrypted .so"
+    "${CMAKE_BINARY_DIR}/liblinkedmath.so")
+add_dependencies(test_linked stub liblinkedmath linked_main)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  test_fork_exec — child process spawned via fork()+exec() must be able
@@ -779,19 +907,26 @@ compile_test_bin("${CMAKE_BINARY_DIR}/fork_same_child"
     gcc "${CMAKE_SOURCE_DIR}/tests/fork_same_lib/child.c")
 add_custom_target(fork_same_child DEPENDS "${CMAKE_BINARY_DIR}/fork_same_child")
 
+set(_TD_FSL "${CMAKE_BINARY_DIR}/daemon_test_fork_same_lib")
 add_custom_target(test_fork_same_lib
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_fork_same_lib ==="
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_FSL}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_FSL}/test.key"
+            --libs   "${CMAKE_BINARY_DIR}/mylib.so"
+            --output "${_TD_FSL}/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/fork_same_parent"
-            --key    "${CMAKE_BINARY_DIR}/fork_same.key"
-            --libs   "${CMAKE_BINARY_DIR}/mylib.so"
-            --output "${CMAKE_BINARY_DIR}/fork_same_parent.protected"
-    COMMAND "${CMAKE_BINARY_DIR}/fork_same_parent.protected"
+            --key    "${_TD_FSL}/test.key"
+            --daemon-libs
+            --output "${_TD_FSL}/parent.protected"
+    COMMAND "${_TD_FSL}/parent.protected"
             "${CMAKE_BINARY_DIR}/fork_same_child"
     DEPENDS stub mylib fork_same_parent fork_same_child
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "fork+exec child inherits same lib via LD_PRELOAD"
+    COMMENT "fork+exec child inherits same lib via daemon"
     USES_TERMINAL
 )
 
@@ -815,25 +950,40 @@ compile_test_bin("${CMAKE_BINARY_DIR}/fork_diff_child"
     gcc "${CMAKE_SOURCE_DIR}/tests/fork_diff_lib/child.c")
 add_custom_target(fork_diff_child DEPENDS "${CMAKE_BINARY_DIR}/fork_diff_child")
 
+set(_TD_FDL "${CMAKE_BINARY_DIR}/daemon_test_fork_diff_lib")
 add_custom_target(test_fork_diff_lib
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_fork_diff_lib ==="
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_FDL}/parent" "${_TD_FDL}/child"
+    # Daemon + client for parent (libparent.so)
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_FDL}/parent/test.key"
+            --libs   "${CMAKE_BINARY_DIR}/libparent.so"
+            --output "${_TD_FDL}/parent/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/fork_diff_parent"
-            --key    "${CMAKE_BINARY_DIR}/fork_diff.key"
-            --libs   "${CMAKE_BINARY_DIR}/libparent.so"
-            --output "${CMAKE_BINARY_DIR}/fork_diff_parent.protected"
+            --key    "${_TD_FDL}/parent/test.key"
+            --daemon-libs
+            --output "${_TD_FDL}/parent/parent.protected"
+    # Daemon + client for child (libchild.so, different key)
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_FDL}/child/test.key"
+            --libs   "${CMAKE_BINARY_DIR}/libchild.so"
+            --output "${_TD_FDL}/child/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/fork_diff_child"
-            --key    "${CMAKE_BINARY_DIR}/fork_diff_child.key"
-            --libs   "${CMAKE_BINARY_DIR}/libchild.so"
-            --output "${CMAKE_BINARY_DIR}/fork_diff_child.protected"
-    COMMAND "${CMAKE_BINARY_DIR}/fork_diff_parent.protected"
-            "${CMAKE_BINARY_DIR}/fork_diff_child.protected"
+            --key    "${_TD_FDL}/child/test.key"
+            --daemon-libs
+            --output "${_TD_FDL}/child/child.protected"
+    # Run: parent execs child
+    COMMAND "${_TD_FDL}/parent/parent.protected"
+            "${_TD_FDL}/child/child.protected"
     DEPENDS stub libparent libchild fork_diff_parent fork_diff_child
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "parent(libparent.so) fork+exec child(libchild.so)"
+    COMMENT "parent(libparent.so) fork+exec child(libchild.so) via daemon"
     USES_TERMINAL
 )
 
@@ -860,27 +1010,35 @@ compile_test_bin("${CMAKE_BINARY_DIR}/proc_b"
     gcc "${CMAKE_SOURCE_DIR}/tests/script_multi_bin/proc_b.c")
 add_custom_target(proc_b DEPENDS "${CMAKE_BINARY_DIR}/proc_b")
 
+set(_TD_SMB "${CMAKE_BINARY_DIR}/daemon_test_script_multi_bin")
 add_custom_target(test_script_multi_bin
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_script_multi_bin ==="
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_SMB}"
+    # One daemon serves all libs (same key for both clients)
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_SMB}/test.key"
+            --libs   "${CMAKE_BINARY_DIR}/libcommon.so"
+                     "${CMAKE_BINARY_DIR}/libA_only.so"
+                     "${CMAKE_BINARY_DIR}/libB_only.so"
+            --output "${_TD_SMB}/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/proc_a"
-            --key    "${CMAKE_BINARY_DIR}/script_multi.key"
-            --libs   "${CMAKE_BINARY_DIR}/libcommon.so"
-                     "${CMAKE_BINARY_DIR}/libA_only.so"
-            --output "${CMAKE_BINARY_DIR}/proc_a.protected"
+            --key    "${_TD_SMB}/test.key"
+            --daemon-libs
+            --output "${_TD_SMB}/proc_a.protected"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/proc_b"
-            --key    "${CMAKE_BINARY_DIR}/script_multi.key"
-            --libs   "${CMAKE_BINARY_DIR}/libcommon.so"
-                     "${CMAKE_BINARY_DIR}/libB_only.so"
-            --output "${CMAKE_BINARY_DIR}/proc_b.protected"
-    COMMAND "${CMAKE_BINARY_DIR}/proc_a.protected"
-    COMMAND "${CMAKE_BINARY_DIR}/proc_b.protected"
+            --key    "${_TD_SMB}/test.key"
+            --daemon-libs
+            --output "${_TD_SMB}/proc_b.protected"
+    COMMAND "${_TD_SMB}/proc_a.protected"
+    COMMAND "${_TD_SMB}/proc_b.protected"
     DEPENDS stub script_multi_libs proc_a proc_b
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "script invokes A(common+A_only) and B(common+B_only)"
+    COMMENT "A(common+A_only) and B(common+B_only) via daemon"
     USES_TERMINAL
 )
 
