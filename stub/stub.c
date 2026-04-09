@@ -1016,6 +1016,36 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 nlibs);
     }
 
+    /* Phase 4c. Create symlink dir so the dynamic linker can resolve
+     * DT_NEEDED references to encrypted libs.  For each lib (both
+     * LD_PRELOAD and FD_MAP), create a symlink:
+     *   /tmp/antirev_XXXXXX/libfoo.so → /proc/self/fd/N
+     * Then prepend this dir to LD_LIBRARY_PATH.  This covers the case
+     * where a runtime-dlopen'd lib has an encrypted lib as DT_NEEDED —
+     * the linker finds the symlink, follows it to the decrypted memfd. */
+    char link_dir[] = "/tmp/antirev_XXXXXX";
+    char *link_dir_ptr = mkdtemp(link_dir);
+    if (link_dir_ptr) {
+        for (int j = 0; j < n_preload; j++) {
+            char lpath[sizeof(link_dir) + MAX_NAME + 2];
+            char target[64];
+            snprintf(lpath, sizeof(lpath), "%s/%s", link_dir, preload_names[j]);
+            snprintf(target, sizeof(target), "/proc/self/fd/%d", preload_fds[j]);
+            if (symlink(target, lpath) < 0)
+                perror("[antirev] symlink");
+        }
+        for (int j = 0; j < n_fdmap; j++) {
+            char lpath[sizeof(link_dir) + MAX_NAME + 2];
+            char target[64];
+            snprintf(lpath, sizeof(lpath), "%s/%s", link_dir, fdmap_names[j]);
+            snprintf(target, sizeof(target), "/proc/self/fd/%d", fdmap_fds[j]);
+            if (symlink(target, lpath) < 0)
+                perror("[antirev] symlink");
+        }
+        fprintf(stderr, "[antirev] symlink dir: %s (%d links)\n",
+                link_dir, n_preload + n_fdmap);
+    }
+
     /* Phase 5. Build new envp */
     int envc = 0;
     while (envp[envc]) envc++;
@@ -1047,8 +1077,32 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     }
     const char *existing_preload = filtered_preload[0] ? filtered_preload : NULL;
 
-    /* +6: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP, NULL + spare */
-    char **new_env = malloc((size_t)(envc + 6) * sizeof(char *));
+    /* Build LD_LIBRARY_PATH: prepend symlink dir so the linker finds
+     * encrypted libs when resolving DT_NEEDED of dlopen'd libraries. */
+    char *ld_libpath_entry = NULL;
+    if (link_dir_ptr) {
+        const char *existing_libpath = NULL;
+        for (int j = 0; j < envc; j++) {
+            if (strncmp(envp[j], "LD_LIBRARY_PATH=", 16) == 0) {
+                existing_libpath = envp[j] + 16;
+                break;
+            }
+        }
+        size_t lp_len = 17 + strlen(link_dir)
+                       + (existing_libpath ? 1 + strlen(existing_libpath) : 0);
+        ld_libpath_entry = malloc(lp_len);
+        if (ld_libpath_entry) {
+            if (existing_libpath && *existing_libpath)
+                snprintf(ld_libpath_entry, lp_len,
+                         "LD_LIBRARY_PATH=%s:%s", link_dir, existing_libpath);
+            else
+                snprintf(ld_libpath_entry, lp_len,
+                         "LD_LIBRARY_PATH=%s", link_dir);
+        }
+    }
+
+    /* +7: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP, LD_LIBRARY_PATH, NULL + spare */
+    char **new_env = malloc((size_t)(envc + 7) * sizeof(char *));
     if (!new_env) { perror("malloc env"); return 1; }
 
     char real_exe_entry[4096 + 32];
@@ -1094,6 +1148,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     int ei = 0;
     for (int j = 0; j < envc; j++) {
         if (strncmp(envp[j], "LD_PRELOAD=",       11) == 0) continue;
+        if (strncmp(envp[j], "LD_LIBRARY_PATH=",  16) == 0) continue;
         if (strncmp(envp[j], "ANTIREV_REAL_EXE=", 17) == 0) continue;
         if (strncmp(envp[j], "ANTIREV_MAIN_FD=",  16) == 0) continue;
         if (strncmp(envp[j], "ANTIREV_FD_MAP=",   15) == 0) continue;
@@ -1104,6 +1159,8 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     new_env[ei++] = ld_preload_entry;
     if (fd_map_entry)
         new_env[ei++] = fd_map_entry;
+    if (ld_libpath_entry)
+        new_env[ei++] = ld_libpath_entry;
     new_env[ei]   = NULL;
 
     /* Phase 6. Replace this process with the decrypted binary — no fork, same PID */

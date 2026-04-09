@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 
 static void *(*real_dlopen_fn)(const char *, int) = NULL;
 
