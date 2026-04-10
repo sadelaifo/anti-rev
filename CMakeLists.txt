@@ -712,6 +712,40 @@ add_custom_target(test_proc_self_exe
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_ctor_readlink — readlink("/proc/self/exe") called from a C++
+#  global static initializer in a DT_NEEDED library (before exe_shim's
+#  constructor) must return the real path, not memfd.
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libctor_readlink.so"
+    COMMAND g++ -shared -fPIC -O2
+            -Wl,-soname,libctor_readlink.so
+            -o "${CMAKE_BINARY_DIR}/libctor_readlink.so"
+            "${CMAKE_SOURCE_DIR}/tests/ctor_readlink/libctor_readlink.cpp"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/ctor_readlink/libctor_readlink.cpp"
+    COMMENT "Building lib: libctor_readlink.so"
+)
+add_custom_target(libctor_readlink DEPENDS "${CMAKE_BINARY_DIR}/libctor_readlink.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/ctor_readlink_main"
+    COMMAND gcc -O2
+            -o "${CMAKE_BINARY_DIR}/ctor_readlink_main"
+            "${CMAKE_SOURCE_DIR}/tests/ctor_readlink/main.c"
+            -L "${CMAKE_BINARY_DIR}" -lctor_readlink
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/ctor_readlink/main.c"
+            "${CMAKE_BINARY_DIR}/libctor_readlink.so"
+    COMMENT "Building test binary: ctor_readlink_main"
+)
+add_custom_target(ctor_readlink_main DEPENDS "${CMAKE_BINARY_DIR}/ctor_readlink_main")
+
+daemon_test(test_ctor_readlink "${CMAKE_BINARY_DIR}/ctor_readlink_main"
+    "C++ ctor readlink before exe_shim constructor"
+    "${CMAKE_BINARY_DIR}/libctor_readlink.so")
+add_dependencies(test_ctor_readlink stub libctor_readlink ctor_readlink_main)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_realpath — realpath/canonicalize_file_name on /proc/self/exe
 # ═══════════════════════════════════════════════════════════════════════
 
