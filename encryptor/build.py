@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-Build script to compile Python source files using Nuitka or Cython.
+Build script to compile/obfuscate Python source files.
 
 Usage:
-    python build.py nuitka              # compile main programs with Nuitka
-    python build.py cython              # compile libraries with Cython
-    python build.py all                 # Nuitka for mains + Cython for libs
+    python build.py cython              # compile with Cython (fast)
+    python build.py nuitka              # compile with Nuitka (slower, standalone)
+    python build.py pyarmor             # obfuscate with PyArmor (needs license)
     python build.py clean               # remove build artifacts
 
-Nuitka strategies:
-    shared      (default) One shared runtime + compiled modules.
-                          Output: ~300MB total instead of ~300GB.
-                          Build time: ~15-30 min instead of ~2 hours.
-    per-script  Legacy mode: standalone build per script (slow, large).
+Backends:
+    cython      Fast compilation to .so/.pyd via Cython.
+    nuitka      Compiles to C then native binary. Strategies:
+                  shared     (default) One shared runtime + compiled modules.
+                  per-script Legacy mode: standalone build per script (slow).
+    pyarmor     Obfuscates Python source with PyArmor.
 
 Configure MAINS_DIR, LIBS_DIR, and other settings below.
 """
@@ -113,6 +114,8 @@ def check_tool(name):
             print("    pip install nuitka")
         elif name == "cython" or name == "cythonize":
             print("    pip install cython")
+        elif name == "pyarmor":
+            print("    pip install pyarmor")
         sys.exit(1)
 
 
@@ -763,8 +766,8 @@ def cleanup_cython_artifacts(libs_dir):
     return removed
 
 
-def build_cython(libs_dir, output_dir):
-    """Compile all library files with Cython."""
+def build_cython_libs(libs_dir, output_dir):
+    """Compile library files with Cython (used by nuitka 'all' mode)."""
     check_tool("cython")
 
     py_files = find_py_files(libs_dir)
@@ -791,6 +794,196 @@ def build_cython(libs_dir, output_dir):
     build_dir = Path(output_dir) / "_cython_build"
     if build_dir.exists():
         shutil.rmtree(build_dir)
+
+
+def build_cython_all(mains_dir, libs_dir, output_dir):
+    """Compile both mains and libs with Cython.
+
+    Produces .so/.pyd files for all sources and creates thin launcher
+    scripts for each main entry point.
+    """
+    check_tool("cython")
+
+    all_py = []
+    all_dirs = []
+
+    if Path(mains_dir).is_dir():
+        all_py.extend(find_py_files(mains_dir))
+        all_dirs.append(mains_dir)
+    if Path(libs_dir).is_dir():
+        all_py.extend(find_py_files(libs_dir))
+        all_dirs.append(libs_dir)
+
+    if not all_py:
+        print(f"[WARN] No .py files found in '{mains_dir}' or '{libs_dir}'")
+        return
+
+    mains = find_py_files(mains_dir) if Path(mains_dir).is_dir() else []
+    libs = find_py_files(libs_dir) if Path(libs_dir).is_dir() else []
+
+    print(f"\n{'='*60}")
+    print(f"[Cython] Compiling {len(mains)} main(s) + {len(libs)} lib(s)")
+    print(f"         Workers: {get_workers()}")
+    print(f"{'='*60}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    cython_dist = Path(output_dir) / "cython_dist"
+    cython_dist.mkdir(parents=True, exist_ok=True)
+
+    # --- Step 1: Compile all files with Cython ---
+    print(f"\n  Step 1/3: Compiling {len(all_py)} files with Cython ...")
+
+    for src_dir in all_dirs:
+        py_files = find_py_files(src_dir)
+        if not py_files:
+            continue
+        success = cython_compile_batch(py_files, src_dir, output_dir)
+        if not success:
+            print(f"  [cython] FAILED compiling {src_dir}")
+            for d in all_dirs:
+                cleanup_cython_artifacts(d)
+            return
+
+    # --- Step 2: Collect compiled outputs ---
+    print(f"\n  Step 2/3: Collecting compiled outputs ...")
+
+    copied = 0
+    for src_dir in all_dirs:
+        src_path = Path(src_dir)
+        for ext_pattern in ("*.so", "*.pyd"):
+            for f in src_path.rglob(ext_pattern):
+                rel = f.relative_to(src_path)
+                dest = cython_dist / src_dir / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, dest)
+                copied += 1
+
+        # Copy __init__.py and non-Python resource files
+        for f in src_path.rglob("*"):
+            if f.is_file():
+                rel = f.relative_to(src_path)
+                dest = cython_dist / src_dir / rel
+                if f.name == "__init__.py":
+                    if not dest.exists():
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(f, dest)
+                elif f.suffix not in (".py", ".pyc", ".c", ".so", ".pyd"):
+                    if not dest.exists():
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(f, dest)
+
+    print(f"           Collected {copied} compiled files")
+
+    # Clean source tree artifacts
+    for d in all_dirs:
+        cleanup_cython_artifacts(d)
+
+    # --- Step 3: Create launcher scripts ---
+    print(f"\n  Step 3/3: Creating launchers ...")
+
+    scripts_dir = Path(output_dir) / "bin"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    for main_file in mains:
+        rel = main_file.relative_to(mains_dir)
+        module_parts = list(rel.parts)
+        if module_parts[-1].endswith(".py"):
+            module_parts[-1] = module_parts[-1][:-3]
+        module_name = ".".join(module_parts)
+
+        # Wrapper name
+        wrapper_name = module_name.replace(".", "_")
+        if wrapper_name.endswith("___init__"):
+            wrapper_name = wrapper_name[:-len("___init__")]
+
+        # Unix launcher
+        launcher = scripts_dir / wrapper_name
+        launcher.write_text(
+            f'#!/bin/sh\n'
+            f'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+            f'PYTHONPATH="$DIR/../cython_dist/{mains_dir}:$DIR/../cython_dist/{libs_dir}:$PYTHONPATH" '
+            f'exec python3 -c "import {module_name}" "$@"\n'
+        )
+        launcher.chmod(0o755)
+
+        # Windows launcher
+        launcher_bat = scripts_dir / f"{wrapper_name}.bat"
+        launcher_bat.write_text(
+            f'@echo off\r\n'
+            f'set "PYTHONPATH=%~dp0\\..\\cython_dist\\{mains_dir};'
+            f'%~dp0\\..\\cython_dist\\{libs_dir};%PYTHONPATH%"\r\n'
+            f'python -c "import {module_name}" %*\r\n'
+        )
+
+    print(f"           Created {len(mains)} launchers in bin/")
+
+    # Clean up build dir
+    build_dir = Path(output_dir) / "_cython_build"
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+
+    print(f"\n[Cython] Done: {copied} compiled files")
+    print(f"         Output:   {cython_dist}/")
+    print(f"         Launchers: {scripts_dir}/")
+
+
+# ============================================================
+# PyArmor obfuscation
+# ============================================================
+
+def build_pyarmor(mains_dir, libs_dir, output_dir):
+    """Obfuscate mains and libs with PyArmor."""
+    check_tool("pyarmor")
+
+    mains = find_py_files(mains_dir) if Path(mains_dir).is_dir() else []
+    libs = find_py_files(libs_dir) if Path(libs_dir).is_dir() else []
+
+    if not mains and not libs:
+        print(f"[WARN] No .py files found in '{mains_dir}' or '{libs_dir}'")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"[PyArmor] Obfuscating {len(mains)} main(s) + {len(libs)} lib(s)")
+    print(f"{'='*60}")
+
+    pyarmor_dist = Path(output_dir) / "pyarmor_dist"
+    os.makedirs(pyarmor_dist, exist_ok=True)
+
+    # Obfuscate each source directory
+    for src_dir in [mains_dir, libs_dir]:
+        if not Path(src_dir).is_dir():
+            continue
+
+        print(f"\n  [pyarmor] Obfuscating {src_dir}/ ...")
+        t0 = time.time()
+        cmd = [
+            "pyarmor", "gen",
+            "-O", str(pyarmor_dist / src_dir),
+            "-r",  # recursive
+            str(src_dir),
+        ]
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        elapsed = time.time() - t0
+
+        if result.returncode != 0:
+            print(f"  [pyarmor] FAILED {src_dir} ({elapsed:.1f}s)")
+            log_path = Path(output_dir) / f"pyarmor_{Path(src_dir).name}.log"
+            log_path.write_text(result.stdout)
+            print(f"           Log: {log_path}")
+            print(f"           Last 20 lines:")
+            for line in result.stdout.strip().splitlines()[-20:]:
+                print(f"           {line}")
+            return
+
+        print(f"  [pyarmor] OK {src_dir} ({elapsed:.1f}s)")
+
+    print(f"\n[PyArmor] Done")
+    print(f"         Output: {pyarmor_dist}/")
 
 
 # ============================================================
@@ -835,23 +1028,22 @@ def clean(output_dir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compile Python source with Nuitka and/or Cython",
+        description="Compile/obfuscate Python source with Cython, Nuitka, or PyArmor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python build.py nuitka                # shared-runtime mode (fast, small)
-    python build.py nuitka -s per-script  # legacy standalone-per-script mode
-    python build.py cython                # compile libs/ with Cython
-    python build.py all                   # both (shared Nuitka + Cython)
+    python build.py cython                # compile all with Cython (fast)
+    python build.py nuitka                # compile all with Nuitka (shared-runtime)
+    python build.py nuitka -s per-script  # Nuitka standalone-per-script (slow)
+    python build.py pyarmor               # obfuscate with PyArmor
     python build.py clean                 # remove build artifacts
-    python build.py nuitka -m src/        # custom mains directory
-    python build.py cython -l pkg/        # custom libs directory
+    python build.py cython -m src/ -l pkg/  # custom directories
         """,
     )
     parser.add_argument(
         "mode",
-        choices=["nuitka", "cython", "all", "clean"],
-        help="Build mode",
+        choices=["cython", "nuitka", "pyarmor", "clean"],
+        help="Build mode: cython (fast), nuitka (standalone), pyarmor (obfuscate)",
     )
     parser.add_argument(
         "-m", "--mains-dir",
@@ -904,33 +1096,35 @@ Examples:
             manifest_path.unlink()
             print("[Info] Cleared incremental build cache")
 
-    # Validate directories exist
-    if args.mode in ("nuitka", "all"):
-        if not Path(args.mains_dir).is_dir():
-            print(f"[ERROR] Mains directory not found: {args.mains_dir}")
-            print(f"        Create it or use -m to specify a different path")
-            sys.exit(1)
+    # Validate that at least one source directory exists
+    has_mains = Path(args.mains_dir).is_dir()
+    has_libs = Path(args.libs_dir).is_dir()
 
-    if args.mode in ("cython", "all"):
-        if not Path(args.libs_dir).is_dir():
-            print(f"[ERROR] Libs directory not found: {args.libs_dir}")
-            print(f"        Create it or use -l to specify a different path")
-            sys.exit(1)
+    if not has_mains and not has_libs:
+        print(f"[ERROR] No source directories found:")
+        print(f"        mains: {args.mains_dir} (not found)")
+        print(f"        libs:  {args.libs_dir} (not found)")
+        print(f"        Use -m and/or -l to specify paths")
+        sys.exit(1)
 
     t_start = time.time()
 
-    if args.mode in ("nuitka", "all"):
+    if args.mode == "cython":
+        build_cython_all(args.mains_dir, args.libs_dir, args.output_dir)
+
+    elif args.mode == "nuitka":
         if args.strategy == "shared":
             build_nuitka_shared(args.mains_dir, args.libs_dir, args.output_dir)
         else:
             build_nuitka_per_script(args.mains_dir, args.output_dir)
+        # Also compile libs with Cython if libs dir exists
+        if has_libs:
+            build_cython_libs(args.libs_dir, args.output_dir)
+            if args.strategy == "shared":
+                integrate_libs_to_shared(args.output_dir)
 
-    if args.mode in ("cython", "all"):
-        build_cython(args.libs_dir, args.output_dir)
-
-    # In 'all' + 'shared' mode, integrate Cython libs into shared_dist
-    if args.mode == "all" and args.strategy == "shared":
-        integrate_libs_to_shared(args.output_dir)
+    elif args.mode == "pyarmor":
+        build_pyarmor(args.mains_dir, args.libs_dir, args.output_dir)
 
     elapsed = time.time() - t_start
     print(f"\n{'='*60}")
