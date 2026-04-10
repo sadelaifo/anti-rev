@@ -16,7 +16,8 @@ plain=0
 
 for f in $(find "$DIR" -type f 2>/dev/null); do
     # ELF detection: compare first 4 bytes with \x7fELF via dd+printf
-    header=$(dd if="$f" bs=1 count=4 2>/dev/null)
+    # Suppress "null byte ignored" warning for non-ELF files
+    { header=$(dd if="$f" bs=1 count=4 2>/dev/null); } 2>/dev/null
     [ "$header" = "$ELF_MAGIC" ] || continue
 
     total=$((total + 1))
