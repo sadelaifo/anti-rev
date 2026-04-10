@@ -9,17 +9,19 @@ if [ ! -d "$DIR" ]; then
     exit 1
 fi
 
+ELF_MAGIC=$(printf '\177ELF')
 total=0
 encrypted=0
 plain=0
 
 for f in $(find "$DIR" -type f 2>/dev/null); do
-    # Check ELF: skip \x7f (confuses grep), match "ELF" from bytes 2-4
-    dd if="$f" bs=1 skip=1 count=3 2>/dev/null | grep -q "ELF" || continue
+    # ELF detection: compare first 4 bytes with \x7fELF via dd+printf
+    header=$(dd if="$f" bs=1 count=4 2>/dev/null)
+    [ "$header" = "$ELF_MAGIC" ] || continue
 
     total=$((total + 1))
 
-    # Check anti-rev magic in last 8 bytes (pipe, no variable)
+    # ANTREV01 check: pipe to grep (pure ASCII, no null byte issues)
     if tail -c 8 "$f" 2>/dev/null | grep -q "ANTREV01"; then
         encrypted=$((encrypted + 1))
         echo "[encrypted] $f"
