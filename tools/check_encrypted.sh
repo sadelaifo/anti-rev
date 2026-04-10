@@ -14,8 +14,8 @@ encrypted=0
 plain=0
 
 for f in $(find "$DIR" -type f 2>/dev/null); do
-    # Check ELF: look for "ELF" in first 4 bytes (avoids null byte issues)
-    dd if="$f" bs=1 count=4 2>/dev/null | grep -q "ELF" || continue
+    # Check ELF: skip \x7f (confuses grep), match "ELF" from bytes 2-4
+    dd if="$f" bs=1 skip=1 count=3 2>/dev/null | grep -q "ELF" || continue
 
     total=$((total + 1))
 
