@@ -292,11 +292,27 @@ def build_nuitka_per_script(mains_dir, output_dir):
 # Nuitka compilation — shared runtime strategy
 # ============================================================
 
-def preprocess_main_for_module(source_path, temp_dir):
+def qualified_module_name(source_path, mains_dir):
+    """Derive a dotted module name relative to mains_dir.
+
+    e.g. mains/pkg1/__init__.py -> pkg1.__init__
+         mains/foo.py           -> foo
+    """
+    rel = Path(source_path).relative_to(mains_dir)
+    parts = list(rel.parts)
+    if parts[-1].endswith(".py"):
+        parts[-1] = parts[-1][:-3]
+    return ".".join(parts)
+
+
+def preprocess_main_for_module(source_path, temp_dir, mains_dir):
     """Preprocess a main script for module compilation.
 
     Replaces ``if __name__ == "__main__":`` with ``if True:`` so that
     entry-point code executes when the launcher imports the module.
+
+    Preserves directory structure under temp_dir so that Nuitka sees the
+    correct package layout (avoids collisions between e.g. two __init__.py).
     """
     source = Path(source_path).read_text(encoding="utf-8", errors="replace")
     processed = re.sub(
@@ -304,9 +320,9 @@ def preprocess_main_for_module(source_path, temp_dir):
         "if True:",
         source,
     )
-    file_dir = Path(temp_dir) / Path(source_path).stem
-    file_dir.mkdir(parents=True, exist_ok=True)
-    dest = file_dir / Path(source_path).name
+    rel = Path(source_path).relative_to(mains_dir)
+    dest = Path(temp_dir) / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(processed, encoding="utf-8")
     return dest
 
@@ -366,16 +382,17 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
         print(f"[WARN] No .py files found in '{mains_dir}'")
         return
 
-    # Check for duplicate filenames
+    # Check for duplicate qualified module names
     seen = {}
     for f in mains:
-        if f.stem in seen:
-            print(f"[ERROR] Duplicate main script name '{f.stem}':")
-            print(f"        {seen[f.stem]}")
+        qname = qualified_module_name(f, mains_dir)
+        if qname in seen:
+            print(f"[ERROR] Duplicate module name '{qname}':")
+            print(f"        {seen[qname]}")
             print(f"        {f}")
             print(f"        Rename one of them to avoid module name conflicts.")
             sys.exit(1)
-        seen[f.stem] = f
+        seen[qname] = f
 
     print(f"\n{'='*60}")
     print(f"[Nuitka] Shared-runtime mode: {len(mains)} main program(s)")
@@ -475,17 +492,20 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
     preprocessed = []
     skipped = 0
     for f in mains:
+        qname = qualified_module_name(f, mains_dir)
         changed, file_hash = needs_rebuild(f, output_dir, manifest)
         if not changed:
             # Check that the compiled output still exists
             ext = ".pyd" if sys.platform == "win32" else ".so"
-            compiled = list(shared_dist.glob(f"{f.stem}*{ext}"))
+            # Nuitka names output after the top-level package or module
+            search_stem = qname.split(".")[0]
+            compiled = list(shared_dist.glob(f"{search_stem}*{ext}"))
             if compiled:
                 skipped += 1
                 new_manifest[str(f)] = file_hash
                 continue
-        prep = preprocess_main_for_module(f, temp_dir)
-        preprocessed.append((prep, f, file_hash))
+        prep = preprocess_main_for_module(f, temp_dir, mains_dir)
+        preprocessed.append((prep, f, file_hash, qname))
 
     print(f"\n  Step 3/4: Compiling {len(preprocessed)} modules "
           f"({skipped} unchanged, skipped) ...")
@@ -499,7 +519,7 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
 
     if preprocessed:
         if parallel_procs <= 1:
-            for prep, orig, file_hash in preprocessed:
+            for prep, orig, file_hash, qname in preprocessed:
                 success, name = nuitka_compile_module(
                     prep, str(module_output), jobs=total_cores
                 )
@@ -512,7 +532,7 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
         else:
             with ProcessPoolExecutor(max_workers=parallel_procs) as pool:
                 futures = {}
-                for prep, orig, file_hash in preprocessed:
+                for prep, orig, file_hash, qname in preprocessed:
                     fut = pool.submit(
                         nuitka_compile_module, prep, str(module_output),
                         jobs=jobs_per_proc,
@@ -535,11 +555,14 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
     # --- Step 4: Assemble output ---
     print(f"\n  Step 4/4: Assembling output ...")
 
-    # Copy compiled modules (.so / .pyd) into shared_dist
+    # Copy compiled modules (.so / .pyd) into shared_dist, preserving structure
     copied = 0
     for ext in ("*.so", "*.pyd"):
         for f in module_output.rglob(ext):
-            shutil.copy2(f, shared_dist)
+            rel = f.relative_to(module_output)
+            dest = shared_dist / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dest)
             copied += 1
     print(f"           Copied {copied} compiled modules into shared_dist/")
 
@@ -548,22 +571,27 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
     os.makedirs(scripts_dir, exist_ok=True)
 
     for main_file in mains:
-        name = main_file.stem
+        qname = qualified_module_name(main_file, mains_dir)
+        # Use the relative path as wrapper name (e.g. pkg1/foo -> pkg1_foo)
+        wrapper_name = qname.replace(".", "_")
+        if wrapper_name.endswith("___init__"):
+            # pkg.__init__ -> just use pkg name
+            wrapper_name = wrapper_name[:-len("___init__")]
 
         # Unix wrapper
-        wrapper = scripts_dir / name
+        wrapper = scripts_dir / wrapper_name
         wrapper.write_text(
             f'#!/bin/sh\n'
             f'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
-            f'exec "$DIR/../shared_dist/_launcher" {name} "$@"\n'
+            f'exec "$DIR/../shared_dist/_launcher" {qname} "$@"\n'
         )
         wrapper.chmod(0o755)
 
         # Windows wrapper
-        wrapper_bat = scripts_dir / f"{name}.bat"
+        wrapper_bat = scripts_dir / f"{wrapper_name}.bat"
         wrapper_bat.write_text(
             f'@echo off\r\n'
-            f'"%~dp0\\..\\shared_dist\\_launcher.exe" {name} %*\r\n'
+            f'"%~dp0\\..\\shared_dist\\_launcher.exe" {qname} %*\r\n'
         )
 
     print(f"           Created {len(mains)} wrappers in bin/")
