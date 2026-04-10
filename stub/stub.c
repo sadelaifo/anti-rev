@@ -1499,8 +1499,20 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 size_t dirlen = slash ? (size_t)(slash - real_exe) : 1;
                 if (!slash) { daemon_path[0] = '.'; dirlen = 1; }
                 else memcpy(daemon_path, real_exe, dirlen);
+                /* Try arch-specific daemon first, then generic */
+#if defined(__x86_64__) || defined(__i386__)
+                snprintf(daemon_path + dirlen,
+                         sizeof(daemon_path) - dirlen, "/.antirev-libd-x86_64");
+#elif defined(__aarch64__)
+                snprintf(daemon_path + dirlen,
+                         sizeof(daemon_path) - dirlen, "/.antirev-libd-aarch64");
+#else
                 snprintf(daemon_path + dirlen,
                          sizeof(daemon_path) - dirlen, "/.antirev-libd");
+#endif
+                if (access(daemon_path, X_OK) != 0)
+                    snprintf(daemon_path + dirlen,
+                             sizeof(daemon_path) - dirlen, "/.antirev-libd");
                 if (access(daemon_path, X_OK) == 0) {
                     pid_t pid = fork();
                     if (pid == 0) {
@@ -1658,16 +1670,31 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
 
             /* First failure: try to auto-launch the daemon */
             if (!daemon_launched && retry == 0) {
-                /* Build path: dirname(real_exe) + "/.antirev-libd" */
+                /* Build path: dirname(real_exe) + "/.antirev-libd[-arch]" */
                 char daemon_path[4096];
                 {
                     char *slash = strrchr(real_exe, '/');
                     size_t dirlen = slash ? (size_t)(slash - real_exe) : 1;
                     if (!slash) { daemon_path[0] = '.'; dirlen = 1; }
                     else memcpy(daemon_path, real_exe, dirlen);
+                    /* Try arch-specific daemon first, then generic */
+#if defined(__x86_64__) || defined(__i386__)
+                    snprintf(daemon_path + dirlen,
+                             sizeof(daemon_path) - dirlen,
+                             "/.antirev-libd-x86_64");
+#elif defined(__aarch64__)
+                    snprintf(daemon_path + dirlen,
+                             sizeof(daemon_path) - dirlen,
+                             "/.antirev-libd-aarch64");
+#else
                     snprintf(daemon_path + dirlen,
                              sizeof(daemon_path) - dirlen,
                              "/.antirev-libd");
+#endif
+                    if (access(daemon_path, X_OK) != 0)
+                        snprintf(daemon_path + dirlen,
+                                 sizeof(daemon_path) - dirlen,
+                                 "/.antirev-libd");
                 }
 
                 if (access(daemon_path, X_OK) == 0) {

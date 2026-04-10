@@ -677,29 +677,31 @@ def main():
                 except Exception as e:
                     sys.exit(f"[error] encrypt lib failed for {futures[fut]}: {e}")
 
-        # Build lightweight daemon: stub + key only, no bundled libs
-        daemon_arch = next(iter(stubs))
-        daemon_stub = stubs[daemon_arch]
-        daemon_path = output_dir / '.antirev-libd'
-        stub_data = daemon_stub.read_bytes()
-        bundle = struct.pack("<IB", 0, 0)  # 0 files, no flags
-        bundle_offset = len(stub_data)
-        trailer = struct.pack("<Q", bundle_offset) + key + MAGIC
-        daemon_path.parent.mkdir(parents=True, exist_ok=True)
-        daemon_path.write_bytes(stub_data + bundle + trailer)
-        os.chmod(str(daemon_path), 0o755)
-        print(f"[pack] Daemon binary: {daemon_path.name}  "
-              f"({daemon_path.stat().st_size:,} bytes, reads libs from disk)")
+        # Build lightweight daemon and wrapper for each architecture
+        for arch, stub_path in stubs.items():
+            stub_data = stub_path.read_bytes()
+            suffix = f'-{arch}' if len(stubs) > 1 else ''
 
-        # Build wrapper binary: connects to daemon, sets up env, execs argv[1...]
-        wrapper_path = output_dir / '.antirev-wrap'
-        wrap_bundle = struct.pack("<IB", 0, BFLAG_WRAPPER)
-        wrap_offset = len(stub_data)
-        wrap_trailer = struct.pack("<Q", wrap_offset) + key + MAGIC
-        wrapper_path.write_bytes(stub_data + wrap_bundle + wrap_trailer)
-        os.chmod(str(wrapper_path), 0o755)
-        print(f"[pack] Wrapper binary: {wrapper_path.name}  "
-              f"(use: .antirev-wrap <command> [args...])")
+            # Daemon: stub + key only, no bundled libs
+            daemon_path = output_dir / f'.antirev-libd{suffix}'
+            bundle = struct.pack("<IB", 0, 0)  # 0 files, no flags
+            bundle_offset = len(stub_data)
+            trailer = struct.pack("<Q", bundle_offset) + key + MAGIC
+            daemon_path.parent.mkdir(parents=True, exist_ok=True)
+            daemon_path.write_bytes(stub_data + bundle + trailer)
+            os.chmod(str(daemon_path), 0o755)
+            print(f"[pack] Daemon binary: {daemon_path.name}  "
+                  f"({daemon_path.stat().st_size:,} bytes, {arch})")
+
+            # Wrapper: connects to daemon, sets up env, execs argv[1...]
+            wrapper_path = output_dir / f'.antirev-wrap{suffix}'
+            wrap_bundle = struct.pack("<IB", 0, BFLAG_WRAPPER)
+            wrap_offset = len(stub_data)
+            wrap_trailer = struct.pack("<Q", wrap_offset) + key + MAGIC
+            wrapper_path.write_bytes(stub_data + wrap_bundle + wrap_trailer)
+            os.chmod(str(wrapper_path), 0o755)
+            print(f"[pack] Wrapper binary: {wrapper_path.name}  "
+                  f"({arch}, use: {wrapper_path.name} <command> [args...])")
         print()
 
     if exe_files:
