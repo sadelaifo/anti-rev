@@ -2010,44 +2010,55 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         new_env[ei++] = symlink_dir_entry;
     new_env[ei]   = NULL;
 
-    /* Phase 6. Replace this process with the decrypted binary — no fork, same PID.
+    /* Phase 6. Replace this process with the decrypted binary — no fork, same PID. */
+#if !defined(__aarch64__)
+    /* QEMU user-mode (cross-arch host): try to directly exec the QEMU interpreter
+     * with the binary's real name as argv[0] so that "ps -ef" shows the binary
+     * name (e.g. "DophiServer") instead of "qemu-aarch64-static /proc/self/fd/N".
      *
-     * QEMU user-mode: directly exec the QEMU interpreter with the binary's real
-     * name as argv[0] so that "ps -ef" and process managers see the binary name
-     * (e.g. "DophiServer") instead of "qemu-aarch64-static /proc/self/fd/N".
-     * Fall back to fexecve (binfmt_misc) if no QEMU binary is found. */
+     * Fallback: fexecve via binfmt_misc. When the binfmt_misc entry is registered
+     * with the 'P' flag (preserve argv[0]), the binary name is preserved in cmdline.
+     *
+     * This block is compiled out on native aarch64 where QEMU is not needed. */
     {
-        static const char *qemu_candidates[] = {
-            "/usr/bin/qemu-aarch64-static",
-            "/usr/bin/qemu-aarch64",
-            NULL
-        };
         const char *binname = strrchr(real_exe, '/');
         binname = binname ? binname + 1 : real_exe;
-
-        char fd_path[32];
-        snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
 
         int orig_argc = 0;
         while (argv[orig_argc]) orig_argc++;
 
-        char **qargv = malloc((size_t)(orig_argc + 2) * sizeof(char *));
-        if (qargv) {
-            qargv[0] = (char *)binname;
-            qargv[1] = fd_path;
-            for (int i = 1; i < orig_argc; i++) qargv[i + 1] = argv[i];
-            qargv[orig_argc + 1] = NULL;
+        char **new_argv = malloc((size_t)(orig_argc + 2) * sizeof(char *));
+        if (new_argv) {
+            /* Direct QEMU exec: [binname, fd_path, argv[1..]] */
+            static const char *qemu_candidates[] = {
+                "/usr/bin/qemu-aarch64-static",
+                "/usr/bin/qemu-aarch64",
+                NULL
+            };
+            char fd_path[32];
+            snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
+
+            new_argv[0] = (char *)binname;
+            new_argv[1] = fd_path;
+            for (int i = 1; i < orig_argc; i++) new_argv[i + 1] = argv[i];
+            new_argv[orig_argc + 1] = NULL;
 
             for (int qi = 0; qemu_candidates[qi]; qi++) {
                 struct stat st;
                 if (stat(qemu_candidates[qi], &st) == 0) {
-                    execve(qemu_candidates[qi], qargv, new_env);
-                    /* execve only returns on failure — try next candidate */
+                    execve(qemu_candidates[qi], new_argv, new_env);
                 }
             }
-            free(qargv);
+
+            /* binfmt_misc fallback: [binname, argv[1..]]
+             * Works when binfmt_misc has 'P' flag (preserve argv[0]). */
+            for (int i = 1; i < orig_argc; i++) new_argv[i] = argv[i];
+            new_argv[orig_argc] = NULL;
+            fexecve(main_fd, new_argv, new_env);
+            free(new_argv);
         }
     }
+#endif /* !__aarch64__ */
     fexecve(main_fd, argv, new_env);
     perror("fexecve");
     return 1;
