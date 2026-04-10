@@ -2039,16 +2039,17 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             int orig_argc = 0;
             while (argv[orig_argc]) orig_argc++;
 
+            char fd_path[32];
+            snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
+
             char **new_argv = malloc((size_t)(orig_argc + 2) * sizeof(char *));
             if (new_argv) {
-                /* Direct QEMU exec: [binname, fd_path, argv[1..]] */
                 static const char *qemu_candidates[] = {
+                    "/tmp/.antirev-qemu-aarch64",
                     "/usr/bin/qemu-aarch64-static",
                     "/usr/bin/qemu-aarch64",
                     NULL
                 };
-                char fd_path[32];
-                snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
 
                 new_argv[0] = (char *)binname;
                 new_argv[1] = fd_path;
@@ -2064,84 +2065,75 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 free(new_argv);
             }
 
-            /* Fork approach for Docker/binfmt_misc where QEMU isn't on PATH.
-             * Parent rewrites child's cmdline via /proc/<child>/mem (host→host,
-             * no QEMU address space issues), then waits for child to exit. */
-            pid_t child = fork();
-            if (child == 0) {
-                /* Child: fexecve triggers binfmt_misc → QEMU */
+            /* Probe-cache: fork a short-lived child via binfmt_misc to
+             * discover the QEMU binary from /proc/<child>/exe. Copy it
+             * to /tmp, kill the child, then re-exec with correct argv[0].
+             * This handles Docker where QEMU isn't on PATH (binfmt_misc
+             * F flag keeps it kernel-side only). */
+            pid_t probe = fork();
+            if (probe == 0) {
                 fexecve(main_fd, argv, new_env);
-                perror("fexecve");
                 _exit(127);
             }
-            if (child > 0) {
-                /* Parent: wait for QEMU to initialize, then rewrite argv[0] */
-                usleep(200000);
+            if (probe > 0) {
+                /* Wait for child to exec into QEMU */
+                char probe_exe_path[64];
+                snprintf(probe_exe_path, sizeof(probe_exe_path),
+                         "/proc/%d/exe", (int)probe);
 
-                char proc_stat[64];
-                snprintf(proc_stat, sizeof(proc_stat), "/proc/%d/stat", (int)child);
-                int sfd = open(proc_stat, O_RDONLY);
-                if (sfd >= 0) {
-                    char sbuf[4096];
-                    ssize_t sn = read(sfd, sbuf, sizeof(sbuf) - 1);
-                    close(sfd);
-                    if (sn > 0) {
-                        sbuf[sn] = '\0';
-                        char *sp = strrchr(sbuf, ')');
-                        if (sp) {
-                            sp++;
-                            int field = 3;
-                            while (*sp && field < 48) {
-                                if (*sp == ' ') field++;
-                                sp++;
-                            }
-                            unsigned long arg_start = strtoul(sp, NULL, 10);
-                            if (arg_start) {
-                                char proc_mem[64];
-                                snprintf(proc_mem, sizeof(proc_mem),
-                                         "/proc/%d/mem", (int)child);
-                                int mfd = open(proc_mem, O_RDWR);
-                                if (mfd >= 0) {
-                                    char old_arg0[256];
-                                    ssize_t rn = pread(mfd, old_arg0,
-                                                       sizeof(old_arg0),
-                                                       (off_t)arg_start);
-                                    if (rn > 0) {
-                                        size_t old_len = strnlen(old_arg0,
-                                                                 (size_t)rn);
-                                        char new_arg0[256];
-                                        memset(new_arg0, 0, sizeof(new_arg0));
-                                        size_t bl = strlen(binname);
-                                        memcpy(new_arg0, binname,
-                                               bl < sizeof(new_arg0) - 1
-                                                   ? bl : sizeof(new_arg0) - 1);
-                                        size_t wl = old_len + 1;
-                                        if (wl > sizeof(new_arg0))
-                                            wl = sizeof(new_arg0);
-                                        pwrite(mfd, new_arg0, wl,
-                                               (off_t)arg_start);
-                                    }
-                                    close(mfd);
+                int cached = 0;
+                for (int i = 0; i < 50; i++) {  /* 50 × 20ms = 1s max */
+                    usleep(20000);
+                    char qemu_path[256];
+                    ssize_t ql = readlink(probe_exe_path, qemu_path,
+                                          sizeof(qemu_path) - 1);
+                    if (ql > 0) {
+                        qemu_path[ql] = '\0';
+                        if (strstr(qemu_path, "qemu") != NULL) {
+                            /* Found QEMU — copy it to cache */
+                            int src = open(probe_exe_path, O_RDONLY);
+                            if (src >= 0) {
+                                int dst = open("/tmp/.antirev-qemu-aarch64",
+                                               O_WRONLY | O_CREAT | O_TRUNC,
+                                               0755);
+                                if (dst >= 0) {
+                                    char cpbuf[8192];
+                                    ssize_t cpn;
+                                    while ((cpn = read(src, cpbuf,
+                                                       sizeof(cpbuf))) > 0)
+                                        write(dst, cpbuf, (size_t)cpn);
+                                    close(dst);
+                                    cached = 1;
                                 }
+                                close(src);
                             }
+                            break;
                         }
                     }
                 }
 
-                /* Forward termination signals to child */
-                struct sigaction sa;
-                memset(&sa, 0, sizeof(sa));
-                sa.sa_handler = SIG_DFL;
-                /* Store child PID for signal forwarding — use a simple
-                 * waitpid loop that also handles signals. */
-                int status;
-                while (waitpid(child, &status, 0) < 0 && errno == EINTR)
-                    ;
-                if (WIFEXITED(status))
-                    _exit(WEXITSTATUS(status));
-                _exit(128 + WTERMSIG(status));
+                /* Kill probe child */
+                kill(probe, SIGKILL);
+                int st;
+                waitpid(probe, &st, 0);
+
+                if (cached) {
+                    /* Re-exec through cached QEMU with binary name argv[0] */
+                    char **re_argv = malloc((size_t)(orig_argc + 2)
+                                           * sizeof(char *));
+                    if (re_argv) {
+                        re_argv[0] = (char *)binname;
+                        re_argv[1] = fd_path;
+                        for (int i = 1; i < orig_argc; i++)
+                            re_argv[i + 1] = argv[i];
+                        re_argv[orig_argc + 1] = NULL;
+                        execve("/tmp/.antirev-qemu-aarch64",
+                               re_argv, new_env);
+                        free(re_argv);
+                    }
+                }
             }
-            /* fork failed — fall through to normal fexecve */
+            /* probe/cache failed — fall through to normal fexecve */
         }
     }
     fexecve(main_fd, argv, new_env);
