@@ -118,6 +118,10 @@ def nuitka_compile_one(main_file, output_dir):
         "--standalone",
         "--follow-imports",
         f"--output-dir={output_dir}",
+        "--lto=no",
+        "--c-compilation-cache=auto",
+        "--assume-yes-for-downloads",
+        "--python-flag=no_docstrings",
     ]
     cmd.extend(NUITKA_EXTRA_FLAGS)
     cmd.append(str(main_file))

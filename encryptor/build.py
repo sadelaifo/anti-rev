@@ -20,6 +20,8 @@ Configure MAINS_DIR, LIBS_DIR, and other settings below.
 import argparse
 import ast
 import glob
+import hashlib
+import json
 import multiprocessing
 import os
 import re
@@ -153,6 +155,48 @@ def get_lib_module_names(libs_dir):
 
 
 # ============================================================
+# Incremental build support
+# ============================================================
+
+HASH_MANIFEST = ".nuitka_hashes.json"
+
+
+def _file_hash(path):
+    """Return SHA-256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_hash_manifest(output_dir):
+    """Load the previous build's file-hash manifest."""
+    manifest_path = Path(output_dir) / HASH_MANIFEST
+    if manifest_path.exists():
+        try:
+            return json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_hash_manifest(output_dir, manifest):
+    """Persist the current build's file-hash manifest."""
+    manifest_path = Path(output_dir) / HASH_MANIFEST
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+
+
+def needs_rebuild(source_path, output_dir, manifest):
+    """Check if a source file has changed since the last build."""
+    key = str(source_path)
+    current_hash = _file_hash(source_path)
+    return current_hash != manifest.get(key), current_hash
+
+
+# ============================================================
 # Nuitka compilation — per-script (legacy) strategy
 # ============================================================
 
@@ -167,6 +211,9 @@ def nuitka_compile_one(main_file, output_dir):
         "--follow-imports",
         f"--output-dir={output_dir}",
         "--lto=no",
+        "--c-compilation-cache=auto",
+        "--assume-yes-for-downloads",
+        "--python-flag=no_docstrings",
     ]
     cmd.extend(NUITKA_EXTRA_FLAGS)
     cmd.append(str(main_file))
@@ -264,7 +311,7 @@ def preprocess_main_for_module(source_path, temp_dir):
     return dest
 
 
-def nuitka_compile_module(main_file, output_dir):
+def nuitka_compile_module(main_file, output_dir, jobs=1):
     """Compile a single script as a Nuitka module (.so/.pyd)."""
     main_file = Path(main_file)
     name = main_file.stem
@@ -274,6 +321,11 @@ def nuitka_compile_module(main_file, output_dir):
         "--module",
         f"--output-dir={output_dir}",
         "--no-pyi-file",
+        "--lto=no",
+        f"--jobs={jobs}",
+        "--c-compilation-cache=auto",
+        "--assume-yes-for-downloads",
+        "--python-flag=no_docstrings",
     ]
     cmd.extend(NUITKA_EXTRA_FLAGS)
     cmd.append(str(main_file))
@@ -373,6 +425,9 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
         f"--output-dir={output_dir}",
         "--lto=no",
         f"--jobs={get_workers()}",
+        "--c-compilation-cache=auto",
+        "--assume-yes-for-downloads",
+        "--python-flag=no_docstrings",
     ]
     for lib_mod in lib_modules:
         cmd.append(f"--nofollow-import-to={lib_mod}")
@@ -407,48 +462,75 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
         shutil.rmtree(launcher_build)
     launcher_src.unlink(missing_ok=True)
 
-    # --- Step 3: Compile all mains as modules ---
-    print(f"\n  Step 3/4: Compiling {len(mains)} scripts as modules ...")
+    # --- Step 3: Compile all mains as modules (incremental) ---
+    manifest = load_hash_manifest(output_dir)
+    new_manifest = dict(manifest)
 
     temp_dir = Path(output_dir) / "_temp_preprocess"
     module_output = Path(output_dir) / "_modules"
     os.makedirs(temp_dir, exist_ok=True)
     os.makedirs(module_output, exist_ok=True)
 
-    # Preprocess: replace if __name__ == "__main__": with if True:
+    # Preprocess and filter unchanged modules
     preprocessed = []
+    skipped = 0
     for f in mains:
+        changed, file_hash = needs_rebuild(f, output_dir, manifest)
+        if not changed:
+            # Check that the compiled output still exists
+            ext = ".pyd" if sys.platform == "win32" else ".so"
+            compiled = list(shared_dist.glob(f"{f.stem}*{ext}"))
+            if compiled:
+                skipped += 1
+                new_manifest[str(f)] = file_hash
+                continue
         prep = preprocess_main_for_module(f, temp_dir)
-        preprocessed.append(prep)
+        preprocessed.append((prep, f, file_hash))
+
+    print(f"\n  Step 3/4: Compiling {len(preprocessed)} modules "
+          f"({skipped} unchanged, skipped) ...")
 
     ok_count = 0
     fail_count = 0
     failed = []
-    workers = get_workers()
+    total_cores = get_workers()
+    parallel_procs = max(1, min(total_cores // 2, 4))
+    jobs_per_proc = max(1, total_cores // parallel_procs)
 
-    if workers == 1:
-        for prep in preprocessed:
-            success, name = nuitka_compile_module(prep, str(module_output))
-            if success:
-                ok_count += 1
-            else:
-                fail_count += 1
-                failed.append(name)
-    else:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(nuitka_compile_module, prep, str(module_output)): prep
-                for prep in preprocessed
-            }
-            for fut in as_completed(futures):
-                success, name = fut.result()
+    if preprocessed:
+        if parallel_procs <= 1:
+            for prep, orig, file_hash in preprocessed:
+                success, name = nuitka_compile_module(
+                    prep, str(module_output), jobs=total_cores
+                )
                 if success:
                     ok_count += 1
+                    new_manifest[str(orig)] = file_hash
                 else:
                     fail_count += 1
                     failed.append(name)
+        else:
+            with ProcessPoolExecutor(max_workers=parallel_procs) as pool:
+                futures = {}
+                for prep, orig, file_hash in preprocessed:
+                    fut = pool.submit(
+                        nuitka_compile_module, prep, str(module_output),
+                        jobs=jobs_per_proc,
+                    )
+                    futures[fut] = (orig, file_hash)
+                for fut in as_completed(futures):
+                    orig, file_hash = futures[fut]
+                    success, name = fut.result()
+                    if success:
+                        ok_count += 1
+                        new_manifest[str(orig)] = file_hash
+                    else:
+                        fail_count += 1
+                        failed.append(name)
 
-    print(f"  [nuitka] Modules: {ok_count} OK, {fail_count} failed")
+    save_hash_manifest(output_dir, new_manifest)
+    print(f"  [nuitka] Modules: {ok_count} compiled, {skipped} skipped, "
+          f"{fail_count} failed")
 
     # --- Step 4: Assemble output ---
     print(f"\n  Step 4/4: Assembling output ...")
@@ -775,6 +857,11 @@ Examples:
         default=NUITKA_STRATEGY,
         help=f"Nuitka build strategy (default: {NUITKA_STRATEGY})",
     )
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Ignore incremental cache and rebuild all modules",
+    )
 
     args = parser.parse_args()
 
@@ -786,6 +873,13 @@ Examples:
         print("[Clean] Removing build artifacts ...")
         clean(args.output_dir)
         return
+
+    # Clear incremental cache if forced
+    if args.force_rebuild:
+        manifest_path = Path(args.output_dir) / HASH_MANIFEST
+        if manifest_path.exists():
+            manifest_path.unlink()
+            print("[Info] Cleared incremental build cache")
 
     # Validate directories exist
     if args.mode in ("nuitka", "all"):
