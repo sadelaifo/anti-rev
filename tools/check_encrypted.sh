@@ -13,10 +13,7 @@ total=0
 encrypted=0
 plain=0
 
-for f in $(find "$DIR" -type f); do
-    # Check if ELF: first 4 bytes = 7f 45 4c 46 (\x7fELF)
-    head -c 4 "$f" 2>/dev/null | grep -q "^.ELF" || continue
-
+find "$DIR" -type f -print0 2>/dev/null | xargs -0 file 2>/dev/null | grep "ELF" | cut -d: -f1 | while IFS= read -r f; do
     total=$((total + 1))
     magic=$(tail -c 8 "$f" 2>/dev/null)
     if [ "$magic" = "ANTREV01" ]; then
@@ -26,7 +23,14 @@ for f in $(find "$DIR" -type f); do
         plain=$((plain + 1))
         echo "[plain]     $f"
     fi
+    # Write counters to temp file (subshell workaround)
+    echo "$total $encrypted $plain" > /tmp/.antirev_check_count
 done
+
+if [ -f /tmp/.antirev_check_count ]; then
+    read total encrypted plain < /tmp/.antirev_check_count
+    rm -f /tmp/.antirev_check_count
+fi
 
 echo ""
 echo "Total ELF: $total  Encrypted: $encrypted  Plain: $plain"
