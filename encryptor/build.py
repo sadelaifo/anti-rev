@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-Build script to compile Python source files using Nuitka or Cython.
+Build script to compile/obfuscate Python source files.
 
 Usage:
-    python build.py nuitka              # compile main programs with Nuitka
-    python build.py cython              # compile libraries with Cython
-    python build.py all                 # Nuitka for mains + Cython for libs
+    python build.py cython              # compile with Cython (fast)
+    python build.py nuitka              # compile with Nuitka (slower, standalone)
+    python build.py pyarmor             # obfuscate with PyArmor (needs license)
     python build.py clean               # remove build artifacts
 
-Nuitka strategies:
-    shared      (default) One shared runtime + compiled modules.
-                          Output: ~300MB total instead of ~300GB.
-                          Build time: ~15-30 min instead of ~2 hours.
-    per-script  Legacy mode: standalone build per script (slow, large).
+Backends:
+    cython      Fast compilation to .so/.pyd via Cython.
+    nuitka      Compiles to C then native binary. Strategies:
+                  shared     (default) One shared runtime + compiled modules.
+                  per-script Legacy mode: standalone build per script (slow).
+    pyarmor     Obfuscates Python source with PyArmor.
 
 Configure MAINS_DIR, LIBS_DIR, and other settings below.
 """
@@ -20,6 +21,8 @@ Configure MAINS_DIR, LIBS_DIR, and other settings below.
 import argparse
 import ast
 import glob
+import hashlib
+import json
 import multiprocessing
 import os
 import re
@@ -111,6 +114,8 @@ def check_tool(name):
             print("    pip install nuitka")
         elif name == "cython" or name == "cythonize":
             print("    pip install cython")
+        elif name == "pyarmor":
+            print("    pip install pyarmor")
         sys.exit(1)
 
 
@@ -153,6 +158,48 @@ def get_lib_module_names(libs_dir):
 
 
 # ============================================================
+# Incremental build support
+# ============================================================
+
+HASH_MANIFEST = ".nuitka_hashes.json"
+
+
+def _file_hash(path):
+    """Return SHA-256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_hash_manifest(output_dir):
+    """Load the previous build's file-hash manifest."""
+    manifest_path = Path(output_dir) / HASH_MANIFEST
+    if manifest_path.exists():
+        try:
+            return json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_hash_manifest(output_dir, manifest):
+    """Persist the current build's file-hash manifest."""
+    manifest_path = Path(output_dir) / HASH_MANIFEST
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+
+
+def needs_rebuild(source_path, output_dir, manifest):
+    """Check if a source file has changed since the last build."""
+    key = str(source_path)
+    current_hash = _file_hash(source_path)
+    return current_hash != manifest.get(key), current_hash
+
+
+# ============================================================
 # Nuitka compilation — per-script (legacy) strategy
 # ============================================================
 
@@ -167,6 +214,9 @@ def nuitka_compile_one(main_file, output_dir):
         "--follow-imports",
         f"--output-dir={output_dir}",
         "--lto=no",
+
+        "--assume-yes-for-downloads",
+        "--python-flag=no_docstrings",
     ]
     cmd.extend(NUITKA_EXTRA_FLAGS)
     cmd.append(str(main_file))
@@ -245,11 +295,27 @@ def build_nuitka_per_script(mains_dir, output_dir):
 # Nuitka compilation — shared runtime strategy
 # ============================================================
 
-def preprocess_main_for_module(source_path, temp_dir):
+def qualified_module_name(source_path, mains_dir):
+    """Derive a dotted module name relative to mains_dir.
+
+    e.g. mains/pkg1/__init__.py -> pkg1.__init__
+         mains/foo.py           -> foo
+    """
+    rel = Path(source_path).relative_to(mains_dir)
+    parts = list(rel.parts)
+    if parts[-1].endswith(".py"):
+        parts[-1] = parts[-1][:-3]
+    return ".".join(parts)
+
+
+def preprocess_main_for_module(source_path, temp_dir, mains_dir):
     """Preprocess a main script for module compilation.
 
     Replaces ``if __name__ == "__main__":`` with ``if True:`` so that
     entry-point code executes when the launcher imports the module.
+
+    Preserves directory structure under temp_dir so that Nuitka sees the
+    correct package layout (avoids collisions between e.g. two __init__.py).
     """
     source = Path(source_path).read_text(encoding="utf-8", errors="replace")
     processed = re.sub(
@@ -257,9 +323,9 @@ def preprocess_main_for_module(source_path, temp_dir):
         "if True:",
         source,
     )
-    file_dir = Path(temp_dir) / Path(source_path).stem
-    file_dir.mkdir(parents=True, exist_ok=True)
-    dest = file_dir / Path(source_path).name
+    rel = Path(source_path).relative_to(mains_dir)
+    dest = Path(temp_dir) / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(processed, encoding="utf-8")
     return dest
 
@@ -274,6 +340,9 @@ def nuitka_compile_module(main_file, output_dir):
         "--module",
         f"--output-dir={output_dir}",
         "--no-pyi-file",
+        "--lto=no",
+        "--assume-yes-for-downloads",
+        "--python-flag=no_docstrings",
     ]
     cmd.extend(NUITKA_EXTRA_FLAGS)
     cmd.append(str(main_file))
@@ -314,16 +383,17 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
         print(f"[WARN] No .py files found in '{mains_dir}'")
         return
 
-    # Check for duplicate filenames
+    # Check for duplicate qualified module names
     seen = {}
     for f in mains:
-        if f.stem in seen:
-            print(f"[ERROR] Duplicate main script name '{f.stem}':")
-            print(f"        {seen[f.stem]}")
+        qname = qualified_module_name(f, mains_dir)
+        if qname in seen:
+            print(f"[ERROR] Duplicate module name '{qname}':")
+            print(f"        {seen[qname]}")
             print(f"        {f}")
             print(f"        Rename one of them to avoid module name conflicts.")
             sys.exit(1)
-        seen[f.stem] = f
+        seen[qname] = f
 
     print(f"\n{'='*60}")
     print(f"[Nuitka] Shared-runtime mode: {len(mains)} main program(s)")
@@ -373,6 +443,9 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
         f"--output-dir={output_dir}",
         "--lto=no",
         f"--jobs={get_workers()}",
+
+        "--assume-yes-for-downloads",
+        "--python-flag=no_docstrings",
     ]
     for lib_mod in lib_modules:
         cmd.append(f"--nofollow-import-to={lib_mod}")
@@ -407,57 +480,87 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
         shutil.rmtree(launcher_build)
     launcher_src.unlink(missing_ok=True)
 
-    # --- Step 3: Compile all mains as modules ---
-    print(f"\n  Step 3/4: Compiling {len(mains)} scripts as modules ...")
+    # --- Step 3: Compile all mains as modules (incremental) ---
+    manifest = load_hash_manifest(output_dir)
+    new_manifest = dict(manifest)
 
     temp_dir = Path(output_dir) / "_temp_preprocess"
     module_output = Path(output_dir) / "_modules"
     os.makedirs(temp_dir, exist_ok=True)
     os.makedirs(module_output, exist_ok=True)
 
-    # Preprocess: replace if __name__ == "__main__": with if True:
+    # Preprocess and filter unchanged modules
     preprocessed = []
+    skipped = 0
     for f in mains:
-        prep = preprocess_main_for_module(f, temp_dir)
-        preprocessed.append(prep)
+        qname = qualified_module_name(f, mains_dir)
+        changed, file_hash = needs_rebuild(f, output_dir, manifest)
+        if not changed:
+            # Check that the compiled output still exists
+            ext = ".pyd" if sys.platform == "win32" else ".so"
+            # Nuitka names output after the top-level package or module
+            search_stem = qname.split(".")[0]
+            compiled = list(shared_dist.glob(f"{search_stem}*{ext}"))
+            if compiled:
+                skipped += 1
+                new_manifest[str(f)] = file_hash
+                continue
+        prep = preprocess_main_for_module(f, temp_dir, mains_dir)
+        preprocessed.append((prep, f, file_hash, qname))
+
+    print(f"\n  Step 3/4: Compiling {len(preprocessed)} modules "
+          f"({skipped} unchanged, skipped) ...")
 
     ok_count = 0
     fail_count = 0
     failed = []
     workers = get_workers()
 
-    if workers == 1:
-        for prep in preprocessed:
-            success, name = nuitka_compile_module(prep, str(module_output))
-            if success:
-                ok_count += 1
-            else:
-                fail_count += 1
-                failed.append(name)
-    else:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(nuitka_compile_module, prep, str(module_output)): prep
-                for prep in preprocessed
-            }
-            for fut in as_completed(futures):
-                success, name = fut.result()
+    if preprocessed:
+        if workers <= 1:
+            for prep, orig, file_hash, qname in preprocessed:
+                success, name = nuitka_compile_module(
+                    prep, str(module_output),
+                )
                 if success:
                     ok_count += 1
+                    new_manifest[str(orig)] = file_hash
                 else:
                     fail_count += 1
                     failed.append(name)
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {}
+                for prep, orig, file_hash, qname in preprocessed:
+                    fut = pool.submit(
+                        nuitka_compile_module, prep, str(module_output),
+                    )
+                    futures[fut] = (orig, file_hash)
+                for fut in as_completed(futures):
+                    orig, file_hash = futures[fut]
+                    success, name = fut.result()
+                    if success:
+                        ok_count += 1
+                        new_manifest[str(orig)] = file_hash
+                    else:
+                        fail_count += 1
+                        failed.append(name)
 
-    print(f"  [nuitka] Modules: {ok_count} OK, {fail_count} failed")
+    save_hash_manifest(output_dir, new_manifest)
+    print(f"  [nuitka] Modules: {ok_count} compiled, {skipped} skipped, "
+          f"{fail_count} failed")
 
     # --- Step 4: Assemble output ---
     print(f"\n  Step 4/4: Assembling output ...")
 
-    # Copy compiled modules (.so / .pyd) into shared_dist
+    # Copy compiled modules (.so / .pyd) into shared_dist, preserving structure
     copied = 0
     for ext in ("*.so", "*.pyd"):
         for f in module_output.rglob(ext):
-            shutil.copy2(f, shared_dist)
+            rel = f.relative_to(module_output)
+            dest = shared_dist / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dest)
             copied += 1
     print(f"           Copied {copied} compiled modules into shared_dist/")
 
@@ -466,22 +569,27 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
     os.makedirs(scripts_dir, exist_ok=True)
 
     for main_file in mains:
-        name = main_file.stem
+        qname = qualified_module_name(main_file, mains_dir)
+        # Use the relative path as wrapper name (e.g. pkg1/foo -> pkg1_foo)
+        wrapper_name = qname.replace(".", "_")
+        if wrapper_name.endswith("___init__"):
+            # pkg.__init__ -> just use pkg name
+            wrapper_name = wrapper_name[:-len("___init__")]
 
         # Unix wrapper
-        wrapper = scripts_dir / name
+        wrapper = scripts_dir / wrapper_name
         wrapper.write_text(
             f'#!/bin/sh\n'
             f'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
-            f'exec "$DIR/../shared_dist/_launcher" {name} "$@"\n'
+            f'exec "$DIR/../shared_dist/_launcher" {qname} "$@"\n'
         )
         wrapper.chmod(0o755)
 
         # Windows wrapper
-        wrapper_bat = scripts_dir / f"{name}.bat"
+        wrapper_bat = scripts_dir / f"{wrapper_name}.bat"
         wrapper_bat.write_text(
             f'@echo off\r\n'
-            f'"%~dp0\\..\\shared_dist\\_launcher.exe" {name} %*\r\n'
+            f'"%~dp0\\..\\shared_dist\\_launcher.exe" {qname} %*\r\n'
         )
 
     print(f"           Created {len(mains)} wrappers in bin/")
@@ -658,8 +766,8 @@ def cleanup_cython_artifacts(libs_dir):
     return removed
 
 
-def build_cython(libs_dir, output_dir):
-    """Compile all library files with Cython."""
+def build_cython_libs(libs_dir, output_dir):
+    """Compile library files with Cython (used by nuitka 'all' mode)."""
     check_tool("cython")
 
     py_files = find_py_files(libs_dir)
@@ -686,6 +794,196 @@ def build_cython(libs_dir, output_dir):
     build_dir = Path(output_dir) / "_cython_build"
     if build_dir.exists():
         shutil.rmtree(build_dir)
+
+
+def build_cython_all(mains_dir, libs_dir, output_dir):
+    """Compile both mains and libs with Cython.
+
+    Produces .so/.pyd files for all sources and creates thin launcher
+    scripts for each main entry point.
+    """
+    check_tool("cython")
+
+    all_py = []
+    all_dirs = []
+
+    if Path(mains_dir).is_dir():
+        all_py.extend(find_py_files(mains_dir))
+        all_dirs.append(mains_dir)
+    if Path(libs_dir).is_dir():
+        all_py.extend(find_py_files(libs_dir))
+        all_dirs.append(libs_dir)
+
+    if not all_py:
+        print(f"[WARN] No .py files found in '{mains_dir}' or '{libs_dir}'")
+        return
+
+    mains = find_py_files(mains_dir) if Path(mains_dir).is_dir() else []
+    libs = find_py_files(libs_dir) if Path(libs_dir).is_dir() else []
+
+    print(f"\n{'='*60}")
+    print(f"[Cython] Compiling {len(mains)} main(s) + {len(libs)} lib(s)")
+    print(f"         Workers: {get_workers()}")
+    print(f"{'='*60}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    cython_dist = Path(output_dir) / "cython_dist"
+    cython_dist.mkdir(parents=True, exist_ok=True)
+
+    # --- Step 1: Compile all files with Cython ---
+    print(f"\n  Step 1/3: Compiling {len(all_py)} files with Cython ...")
+
+    for src_dir in all_dirs:
+        py_files = find_py_files(src_dir)
+        if not py_files:
+            continue
+        success = cython_compile_batch(py_files, src_dir, output_dir)
+        if not success:
+            print(f"  [cython] FAILED compiling {src_dir}")
+            for d in all_dirs:
+                cleanup_cython_artifacts(d)
+            return
+
+    # --- Step 2: Collect compiled outputs ---
+    print(f"\n  Step 2/3: Collecting compiled outputs ...")
+
+    copied = 0
+    for src_dir in all_dirs:
+        src_path = Path(src_dir)
+        for ext_pattern in ("*.so", "*.pyd"):
+            for f in src_path.rglob(ext_pattern):
+                rel = f.relative_to(src_path)
+                dest = cython_dist / src_dir / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, dest)
+                copied += 1
+
+        # Copy __init__.py and non-Python resource files
+        for f in src_path.rglob("*"):
+            if f.is_file():
+                rel = f.relative_to(src_path)
+                dest = cython_dist / src_dir / rel
+                if f.name == "__init__.py":
+                    if not dest.exists():
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(f, dest)
+                elif f.suffix not in (".py", ".pyc", ".c", ".so", ".pyd"):
+                    if not dest.exists():
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(f, dest)
+
+    print(f"           Collected {copied} compiled files")
+
+    # Clean source tree artifacts
+    for d in all_dirs:
+        cleanup_cython_artifacts(d)
+
+    # --- Step 3: Create launcher scripts ---
+    print(f"\n  Step 3/3: Creating launchers ...")
+
+    scripts_dir = Path(output_dir) / "bin"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    for main_file in mains:
+        rel = main_file.relative_to(mains_dir)
+        module_parts = list(rel.parts)
+        if module_parts[-1].endswith(".py"):
+            module_parts[-1] = module_parts[-1][:-3]
+        module_name = ".".join(module_parts)
+
+        # Wrapper name
+        wrapper_name = module_name.replace(".", "_")
+        if wrapper_name.endswith("___init__"):
+            wrapper_name = wrapper_name[:-len("___init__")]
+
+        # Unix launcher
+        launcher = scripts_dir / wrapper_name
+        launcher.write_text(
+            f'#!/bin/sh\n'
+            f'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+            f'PYTHONPATH="$DIR/../cython_dist/{mains_dir}:$DIR/../cython_dist/{libs_dir}:$PYTHONPATH" '
+            f'exec python3 -c "import {module_name}" "$@"\n'
+        )
+        launcher.chmod(0o755)
+
+        # Windows launcher
+        launcher_bat = scripts_dir / f"{wrapper_name}.bat"
+        launcher_bat.write_text(
+            f'@echo off\r\n'
+            f'set "PYTHONPATH=%~dp0\\..\\cython_dist\\{mains_dir};'
+            f'%~dp0\\..\\cython_dist\\{libs_dir};%PYTHONPATH%"\r\n'
+            f'python -c "import {module_name}" %*\r\n'
+        )
+
+    print(f"           Created {len(mains)} launchers in bin/")
+
+    # Clean up build dir
+    build_dir = Path(output_dir) / "_cython_build"
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+
+    print(f"\n[Cython] Done: {copied} compiled files")
+    print(f"         Output:   {cython_dist}/")
+    print(f"         Launchers: {scripts_dir}/")
+
+
+# ============================================================
+# PyArmor obfuscation
+# ============================================================
+
+def build_pyarmor(mains_dir, libs_dir, output_dir):
+    """Obfuscate mains and libs with PyArmor."""
+    check_tool("pyarmor")
+
+    mains = find_py_files(mains_dir) if Path(mains_dir).is_dir() else []
+    libs = find_py_files(libs_dir) if Path(libs_dir).is_dir() else []
+
+    if not mains and not libs:
+        print(f"[WARN] No .py files found in '{mains_dir}' or '{libs_dir}'")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"[PyArmor] Obfuscating {len(mains)} main(s) + {len(libs)} lib(s)")
+    print(f"{'='*60}")
+
+    pyarmor_dist = Path(output_dir) / "pyarmor_dist"
+    os.makedirs(pyarmor_dist, exist_ok=True)
+
+    # Obfuscate each source directory
+    for src_dir in [mains_dir, libs_dir]:
+        if not Path(src_dir).is_dir():
+            continue
+
+        print(f"\n  [pyarmor] Obfuscating {src_dir}/ ...")
+        t0 = time.time()
+        cmd = [
+            "pyarmor", "gen",
+            "-O", str(pyarmor_dist / src_dir),
+            "-r",  # recursive
+            str(src_dir),
+        ]
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        elapsed = time.time() - t0
+
+        if result.returncode != 0:
+            print(f"  [pyarmor] FAILED {src_dir} ({elapsed:.1f}s)")
+            log_path = Path(output_dir) / f"pyarmor_{Path(src_dir).name}.log"
+            log_path.write_text(result.stdout)
+            print(f"           Log: {log_path}")
+            print(f"           Last 20 lines:")
+            for line in result.stdout.strip().splitlines()[-20:]:
+                print(f"           {line}")
+            return
+
+        print(f"  [pyarmor] OK {src_dir} ({elapsed:.1f}s)")
+
+    print(f"\n[PyArmor] Done")
+    print(f"         Output: {pyarmor_dist}/")
 
 
 # ============================================================
@@ -730,23 +1028,22 @@ def clean(output_dir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compile Python source with Nuitka and/or Cython",
+        description="Compile/obfuscate Python source with Cython, Nuitka, or PyArmor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python build.py nuitka                # shared-runtime mode (fast, small)
-    python build.py nuitka -s per-script  # legacy standalone-per-script mode
-    python build.py cython                # compile libs/ with Cython
-    python build.py all                   # both (shared Nuitka + Cython)
+    python build.py cython                # compile all with Cython (fast)
+    python build.py nuitka                # compile all with Nuitka (shared-runtime)
+    python build.py nuitka -s per-script  # Nuitka standalone-per-script (slow)
+    python build.py pyarmor               # obfuscate with PyArmor
     python build.py clean                 # remove build artifacts
-    python build.py nuitka -m src/        # custom mains directory
-    python build.py cython -l pkg/        # custom libs directory
+    python build.py cython -m src/ -l pkg/  # custom directories
         """,
     )
     parser.add_argument(
         "mode",
-        choices=["nuitka", "cython", "all", "clean"],
-        help="Build mode",
+        choices=["cython", "nuitka", "pyarmor", "clean"],
+        help="Build mode: cython (fast), nuitka (standalone), pyarmor (obfuscate)",
     )
     parser.add_argument(
         "-m", "--mains-dir",
@@ -775,6 +1072,11 @@ Examples:
         default=NUITKA_STRATEGY,
         help=f"Nuitka build strategy (default: {NUITKA_STRATEGY})",
     )
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Ignore incremental cache and rebuild all modules",
+    )
 
     args = parser.parse_args()
 
@@ -787,33 +1089,42 @@ Examples:
         clean(args.output_dir)
         return
 
-    # Validate directories exist
-    if args.mode in ("nuitka", "all"):
-        if not Path(args.mains_dir).is_dir():
-            print(f"[ERROR] Mains directory not found: {args.mains_dir}")
-            print(f"        Create it or use -m to specify a different path")
-            sys.exit(1)
+    # Clear incremental cache if forced
+    if args.force_rebuild:
+        manifest_path = Path(args.output_dir) / HASH_MANIFEST
+        if manifest_path.exists():
+            manifest_path.unlink()
+            print("[Info] Cleared incremental build cache")
 
-    if args.mode in ("cython", "all"):
-        if not Path(args.libs_dir).is_dir():
-            print(f"[ERROR] Libs directory not found: {args.libs_dir}")
-            print(f"        Create it or use -l to specify a different path")
-            sys.exit(1)
+    # Validate that at least one source directory exists
+    has_mains = Path(args.mains_dir).is_dir()
+    has_libs = Path(args.libs_dir).is_dir()
+
+    if not has_mains and not has_libs:
+        print(f"[ERROR] No source directories found:")
+        print(f"        mains: {args.mains_dir} (not found)")
+        print(f"        libs:  {args.libs_dir} (not found)")
+        print(f"        Use -m and/or -l to specify paths")
+        sys.exit(1)
 
     t_start = time.time()
 
-    if args.mode in ("nuitka", "all"):
+    if args.mode == "cython":
+        build_cython_all(args.mains_dir, args.libs_dir, args.output_dir)
+
+    elif args.mode == "nuitka":
         if args.strategy == "shared":
             build_nuitka_shared(args.mains_dir, args.libs_dir, args.output_dir)
         else:
             build_nuitka_per_script(args.mains_dir, args.output_dir)
+        # Also compile libs with Cython if libs dir exists
+        if has_libs:
+            build_cython_libs(args.libs_dir, args.output_dir)
+            if args.strategy == "shared":
+                integrate_libs_to_shared(args.output_dir)
 
-    if args.mode in ("cython", "all"):
-        build_cython(args.libs_dir, args.output_dir)
-
-    # In 'all' + 'shared' mode, integrate Cython libs into shared_dist
-    if args.mode == "all" and args.strategy == "shared":
-        integrate_libs_to_shared(args.output_dir)
+    elif args.mode == "pyarmor":
+        build_pyarmor(args.mains_dir, args.libs_dir, args.output_dir)
 
     elapsed = time.time() - t_start
     print(f"\n{'='*60}")
