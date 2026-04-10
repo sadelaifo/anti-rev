@@ -327,7 +327,7 @@ def preprocess_main_for_module(source_path, temp_dir, mains_dir):
     return dest
 
 
-def nuitka_compile_module(main_file, output_dir, jobs=1):
+def nuitka_compile_module(main_file, output_dir):
     """Compile a single script as a Nuitka module (.so/.pyd)."""
     main_file = Path(main_file)
     name = main_file.stem
@@ -338,8 +338,6 @@ def nuitka_compile_module(main_file, output_dir, jobs=1):
         f"--output-dir={output_dir}",
         "--no-pyi-file",
         "--lto=no",
-        f"--jobs={jobs}",
-
         "--assume-yes-for-downloads",
         "--python-flag=no_docstrings",
     ]
@@ -513,15 +511,13 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
     ok_count = 0
     fail_count = 0
     failed = []
-    total_cores = get_workers()
-    parallel_procs = max(1, min(total_cores // 2, 4))
-    jobs_per_proc = max(1, total_cores // parallel_procs)
+    workers = get_workers()
 
     if preprocessed:
-        if parallel_procs <= 1:
+        if workers <= 1:
             for prep, orig, file_hash, qname in preprocessed:
                 success, name = nuitka_compile_module(
-                    prep, str(module_output), jobs=total_cores
+                    prep, str(module_output),
                 )
                 if success:
                     ok_count += 1
@@ -530,12 +526,11 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
                     fail_count += 1
                     failed.append(name)
         else:
-            with ProcessPoolExecutor(max_workers=parallel_procs) as pool:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
                 futures = {}
                 for prep, orig, file_hash, qname in preprocessed:
                     fut = pool.submit(
                         nuitka_compile_module, prep, str(module_output),
-                        jobs=jobs_per_proc,
                     )
                     futures[fut] = (orig, file_hash)
                 for fut in as_completed(futures):
