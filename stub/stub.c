@@ -2010,55 +2010,67 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         new_env[ei++] = symlink_dir_entry;
     new_env[ei]   = NULL;
 
-    /* Phase 6. Replace this process with the decrypted binary — no fork, same PID. */
-#if !defined(__aarch64__)
-    /* QEMU user-mode (cross-arch host): try to directly exec the QEMU interpreter
-     * with the binary's real name as argv[0] so that "ps -ef" shows the binary
-     * name (e.g. "DophiServer") instead of "qemu-aarch64-static /proc/self/fd/N".
+    /* Phase 6. Replace this process with the decrypted binary — no fork, same PID.
      *
-     * Fallback: fexecve via binfmt_misc. When the binfmt_misc entry is registered
-     * with the 'P' flag (preserve argv[0]), the binary name is preserved in cmdline.
+     * Runtime cross-architecture detection: read the ELF e_machine field from
+     * the decrypted binary. If it differs from the host architecture, QEMU
+     * user-mode is needed — try direct QEMU exec with the binary name as
+     * argv[0] so "ps -ef" shows it correctly. Otherwise fexecve directly.
      *
-     * This block is compiled out on native aarch64 where QEMU is not needed. */
+     * This avoids affecting native same-arch execution (x86→x86, aarch64→aarch64). */
     {
-        const char *binname = strrchr(real_exe, '/');
-        binname = binname ? binname + 1 : real_exe;
+        int needs_qemu = 0;
+        uint8_t elf_hdr[20];
+        if (pread(main_fd, elf_hdr, sizeof(elf_hdr), 0) == sizeof(elf_hdr)
+            && elf_hdr[0] == 0x7f && elf_hdr[1] == 'E'
+            && elf_hdr[2] == 'L' && elf_hdr[3] == 'F') {
+            uint16_t e_machine = elf_hdr[18] | ((uint16_t)elf_hdr[19] << 8);
+#if defined(__x86_64__) || defined(__i386__)
+            needs_qemu = (e_machine != 0x3E && e_machine != 0x03); /* not x86_64/x86 */
+#elif defined(__aarch64__)
+            needs_qemu = (e_machine != 0xB7); /* not aarch64 */
+#endif
+        }
 
-        int orig_argc = 0;
-        while (argv[orig_argc]) orig_argc++;
+        if (needs_qemu) {
+            const char *binname = strrchr(real_exe, '/');
+            binname = binname ? binname + 1 : real_exe;
 
-        char **new_argv = malloc((size_t)(orig_argc + 2) * sizeof(char *));
-        if (new_argv) {
-            /* Direct QEMU exec: [binname, fd_path, argv[1..]] */
-            static const char *qemu_candidates[] = {
-                "/usr/bin/qemu-aarch64-static",
-                "/usr/bin/qemu-aarch64",
-                NULL
-            };
-            char fd_path[32];
-            snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
+            int orig_argc = 0;
+            while (argv[orig_argc]) orig_argc++;
 
-            new_argv[0] = (char *)binname;
-            new_argv[1] = fd_path;
-            for (int i = 1; i < orig_argc; i++) new_argv[i + 1] = argv[i];
-            new_argv[orig_argc + 1] = NULL;
+            char **new_argv = malloc((size_t)(orig_argc + 2) * sizeof(char *));
+            if (new_argv) {
+                /* Direct QEMU exec: [binname, fd_path, argv[1..]] */
+                static const char *qemu_candidates[] = {
+                    "/usr/bin/qemu-aarch64-static",
+                    "/usr/bin/qemu-aarch64",
+                    NULL
+                };
+                char fd_path[32];
+                snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
 
-            for (int qi = 0; qemu_candidates[qi]; qi++) {
-                struct stat st;
-                if (stat(qemu_candidates[qi], &st) == 0) {
-                    execve(qemu_candidates[qi], new_argv, new_env);
+                new_argv[0] = (char *)binname;
+                new_argv[1] = fd_path;
+                for (int i = 1; i < orig_argc; i++) new_argv[i + 1] = argv[i];
+                new_argv[orig_argc + 1] = NULL;
+
+                for (int qi = 0; qemu_candidates[qi]; qi++) {
+                    struct stat st;
+                    if (stat(qemu_candidates[qi], &st) == 0) {
+                        execve(qemu_candidates[qi], new_argv, new_env);
+                    }
                 }
-            }
 
-            /* binfmt_misc fallback: [binname, argv[1..]]
-             * Works when binfmt_misc has 'P' flag (preserve argv[0]). */
-            for (int i = 1; i < orig_argc; i++) new_argv[i] = argv[i];
-            new_argv[orig_argc] = NULL;
-            fexecve(main_fd, new_argv, new_env);
-            free(new_argv);
+                /* binfmt_misc fallback: [binname, argv[1..]]
+                 * Works when binfmt_misc has 'P' flag (preserve argv[0]). */
+                for (int i = 1; i < orig_argc; i++) new_argv[i] = argv[i];
+                new_argv[orig_argc] = NULL;
+                fexecve(main_fd, new_argv, new_env);
+                free(new_argv);
+            }
         }
     }
-#endif /* !__aarch64__ */
     fexecve(main_fd, argv, new_env);
     perror("fexecve");
     return 1;
