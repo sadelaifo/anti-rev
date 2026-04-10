@@ -211,7 +211,7 @@ def nuitka_compile_one(main_file, output_dir):
         "--follow-imports",
         f"--output-dir={output_dir}",
         "--lto=no",
-        "--c-compilation-cache=auto",
+
         "--assume-yes-for-downloads",
         "--python-flag=no_docstrings",
     ]
@@ -323,7 +323,7 @@ def nuitka_compile_module(main_file, output_dir, jobs=1):
         "--no-pyi-file",
         "--lto=no",
         f"--jobs={jobs}",
-        "--c-compilation-cache=auto",
+
         "--assume-yes-for-downloads",
         "--python-flag=no_docstrings",
     ]
@@ -425,7 +425,7 @@ def build_nuitka_shared(mains_dir, libs_dir, output_dir):
         f"--output-dir={output_dir}",
         "--lto=no",
         f"--jobs={get_workers()}",
-        "--c-compilation-cache=auto",
+
         "--assume-yes-for-downloads",
         "--python-flag=no_docstrings",
     ]
