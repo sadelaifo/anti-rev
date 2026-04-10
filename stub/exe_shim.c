@@ -108,7 +108,6 @@ static void restore_identity(void)
      *   — covers QEMU user-mode where /proc/self/exe points to the QEMU
      *   binary instead of the guest memfd. */
     int is_owner = 0;
-    int qemu_mode = 0;  /* set when ownership detected via QEMU fallback */
     char exe_buf[256];
     ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
                                  "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
@@ -139,7 +138,6 @@ static void restore_identity(void)
             /* QEMU: readlinkat didn't confirm "memfd:" — trust presence alone */
             if (!is_owner)
                 is_owner = 1;
-            qemu_mode = 1;
         }
     }
 
@@ -182,63 +180,6 @@ static void restore_identity(void)
 
     /* Restore process comm (ps -o comm, /proc/pid/comm) */
     prctl(PR_SET_NAME, (unsigned long)base, 0, 0, 0);
-
-    /* Rewrite cmdline (ps -o cmd, /proc/pid/cmdline) for QEMU user-mode only.
-     * Under QEMU+binfmt_misc, cmdline shows "qemu-aarch64-static /proc/self/fd/N".
-     * Overwrite argv[0] with the binary name via /proc/self/mem so that
-     * "ps -o cmd" also shows the real binary name.
-     * Skipped on native aarch64 where the kernel sets argv correctly. */
-    if (qemu_mode) {
-        /* Read arg_start (field 48) from /proc/self/stat */
-        int sfd = (int)syscall(SYS_openat, AT_FDCWD,
-                               "/proc/self/stat", O_RDONLY);
-        if (sfd >= 0) {
-            char sbuf[4096];
-            ssize_t sn = (ssize_t)syscall(SYS_read, sfd, sbuf, sizeof(sbuf) - 1);
-            syscall(SYS_close, sfd);
-            if (sn > 0) {
-                sbuf[sn] = '\0';
-                /* Skip past "(comm)" — find last ')' to handle names with parens */
-                char *sp = strrchr(sbuf, ')');
-                if (sp) {
-                    sp++;
-                    int field = 3;
-                    while (*sp && field < 48) {
-                        if (*sp == ' ') field++;
-                        sp++;
-                    }
-                    unsigned long arg_start = 0;
-                    while (*sp >= '0' && *sp <= '9')
-                        arg_start = arg_start * 10 + (unsigned long)(*sp++ - '0');
-
-                    if (arg_start) {
-                        int mfd = (int)syscall(SYS_openat, AT_FDCWD,
-                                               "/proc/self/mem", O_RDWR);
-                        if (mfd >= 0) {
-                            /* Read old argv[0] to know its length */
-                            char old_arg0[256];
-                            ssize_t rn = pread(mfd, old_arg0, sizeof(old_arg0),
-                                               (off_t)arg_start);
-                            if (rn > 0) {
-                                size_t old_len = strnlen(old_arg0, (size_t)rn);
-                                size_t name_len = strlen(base);
-                                /* Overwrite with binary name + null padding */
-                                char new_arg0[256];
-                                memset(new_arg0, 0, sizeof(new_arg0));
-                                memcpy(new_arg0, base,
-                                       name_len < sizeof(new_arg0) - 1
-                                           ? name_len : sizeof(new_arg0) - 1);
-                                size_t wlen = old_len + 1;
-                                if (wlen > sizeof(new_arg0)) wlen = sizeof(new_arg0);
-                                pwrite(mfd, new_arg0, wlen, (off_t)arg_start);
-                            }
-                            syscall(SYS_close, mfd);
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     /* Restore program_invocation_name and program_invocation_short_name */
     strncpy(g_inv_name, real, sizeof(g_inv_name) - 1);

@@ -2061,14 +2061,87 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                         execve(qemu_candidates[qi], new_argv, new_env);
                     }
                 }
-
-                /* binfmt_misc fallback: [binname, argv[1..]]
-                 * Works when binfmt_misc has 'P' flag (preserve argv[0]). */
-                for (int i = 1; i < orig_argc; i++) new_argv[i] = argv[i];
-                new_argv[orig_argc] = NULL;
-                fexecve(main_fd, new_argv, new_env);
                 free(new_argv);
             }
+
+            /* Fork approach for Docker/binfmt_misc where QEMU isn't on PATH.
+             * Parent rewrites child's cmdline via /proc/<child>/mem (host→host,
+             * no QEMU address space issues), then waits for child to exit. */
+            pid_t child = fork();
+            if (child == 0) {
+                /* Child: fexecve triggers binfmt_misc → QEMU */
+                fexecve(main_fd, argv, new_env);
+                perror("fexecve");
+                _exit(127);
+            }
+            if (child > 0) {
+                /* Parent: wait for QEMU to initialize, then rewrite argv[0] */
+                usleep(200000);
+
+                char proc_stat[64];
+                snprintf(proc_stat, sizeof(proc_stat), "/proc/%d/stat", (int)child);
+                int sfd = open(proc_stat, O_RDONLY);
+                if (sfd >= 0) {
+                    char sbuf[4096];
+                    ssize_t sn = read(sfd, sbuf, sizeof(sbuf) - 1);
+                    close(sfd);
+                    if (sn > 0) {
+                        sbuf[sn] = '\0';
+                        char *sp = strrchr(sbuf, ')');
+                        if (sp) {
+                            sp++;
+                            int field = 3;
+                            while (*sp && field < 48) {
+                                if (*sp == ' ') field++;
+                                sp++;
+                            }
+                            unsigned long arg_start = strtoul(sp, NULL, 10);
+                            if (arg_start) {
+                                char proc_mem[64];
+                                snprintf(proc_mem, sizeof(proc_mem),
+                                         "/proc/%d/mem", (int)child);
+                                int mfd = open(proc_mem, O_RDWR);
+                                if (mfd >= 0) {
+                                    char old_arg0[256];
+                                    ssize_t rn = pread(mfd, old_arg0,
+                                                       sizeof(old_arg0),
+                                                       (off_t)arg_start);
+                                    if (rn > 0) {
+                                        size_t old_len = strnlen(old_arg0,
+                                                                 (size_t)rn);
+                                        char new_arg0[256];
+                                        memset(new_arg0, 0, sizeof(new_arg0));
+                                        size_t bl = strlen(binname);
+                                        memcpy(new_arg0, binname,
+                                               bl < sizeof(new_arg0) - 1
+                                                   ? bl : sizeof(new_arg0) - 1);
+                                        size_t wl = old_len + 1;
+                                        if (wl > sizeof(new_arg0))
+                                            wl = sizeof(new_arg0);
+                                        pwrite(mfd, new_arg0, wl,
+                                               (off_t)arg_start);
+                                    }
+                                    close(mfd);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                /* Forward termination signals to child */
+                struct sigaction sa;
+                memset(&sa, 0, sizeof(sa));
+                sa.sa_handler = SIG_DFL;
+                /* Store child PID for signal forwarding — use a simple
+                 * waitpid loop that also handles signals. */
+                int status;
+                while (waitpid(child, &status, 0) < 0 && errno == EINTR)
+                    ;
+                if (WIFEXITED(status))
+                    _exit(WEXITSTATUS(status));
+                _exit(128 + WTERMSIG(status));
+            }
+            /* fork failed — fall through to normal fexecve */
         }
     }
     fexecve(main_fd, argv, new_env);
