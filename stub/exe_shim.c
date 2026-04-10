@@ -48,10 +48,31 @@ extern char *program_invocation_short_name;
  * /proc/self/exe, realpath, etc. intercepted — they are different
  * binaries and ANTIREV_REAL_EXE refers to the parent. */
 static pid_t g_owner_pid = 0;
+static int g_owner_checked = 0;  /* 1 = constructor has determined ownership */
 
+/* Lazy ownership check — covers calls that arrive before the constructor
+ * (e.g. C++ global static initializers in DT_NEEDED libraries). */
 static int is_owner_process(void)
 {
-    return g_owner_pid != 0 && getpid() == g_owner_pid;
+    if (g_owner_checked)
+        return g_owner_pid != 0 && getpid() == g_owner_pid;
+
+    /* Constructor hasn't run yet.  Detect ownership on the fly by
+     * checking if /proc/self/exe points to a memfd. */
+    if (!getenv("ANTIREV_REAL_EXE"))
+        return 0;
+    char exe_buf[256];
+    ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
+                                 "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    if (n > 0) {
+        exe_buf[n] = '\0';
+        if (strstr(exe_buf, "memfd:") != NULL) {
+            g_owner_pid = getpid();
+            g_owner_checked = 1;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -135,13 +156,16 @@ static void restore_identity(void)
         }
     }
 
-    if (!is_owner)
+    if (!is_owner) {
+        g_owner_checked = 1;
         return;
+    }
 
     /* Consume the marker so forked children don't false-positive. */
     unsetenv("ANTIREV_MAIN_FD");
 
     g_owner_pid = getpid();
+    g_owner_checked = 1;
 
     const char *base = strrchr(real, '/');
     base = base ? base + 1 : real;
