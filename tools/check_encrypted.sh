@@ -1,7 +1,6 @@
 #!/bin/sh
 # Check which ELF files (exe/so) are encrypted by anti-rev.
 # Usage: ./check_encrypted.sh <directory>
-# Example: ./check_encrypted.sh /opt/myapp
 
 DIR="${1:-.}"
 
@@ -15,9 +14,8 @@ encrypted=0
 plain=0
 
 for f in $(find "$DIR" -type f); do
-    # Check if ELF (magic: 7f 45 4c 46)
-    header=$(head -c 4 "$f" 2>/dev/null | od -A n -t x1 2>/dev/null | tr -d ' ')
-    [ "$header" = "7f454c46" ] || continue
+    # Check if ELF: first 4 bytes = 7f 45 4c 46 (\x7fELF)
+    head -c 4 "$f" 2>/dev/null | grep -q "^.ELF" || continue
 
     total=$((total + 1))
     magic=$(tail -c 8 "$f" 2>/dev/null)
