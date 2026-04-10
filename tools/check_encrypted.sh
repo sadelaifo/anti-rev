@@ -14,7 +14,7 @@ total=0
 encrypted=0
 plain=0
 
-find "$DIR" -type f | while read -r f; do
+for f in $(find "$DIR" -type f); do
     # Check if ELF (magic: 7f 45 4c 46)
     header=$(head -c 4 "$f" 2>/dev/null | od -A n -t x1 2>/dev/null | tr -d ' ')
     [ "$header" = "7f454c46" ] || continue
