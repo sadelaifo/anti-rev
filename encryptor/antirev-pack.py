@@ -132,6 +132,10 @@ def is_blacklisted(rel_path: str, blacklist: list[tuple[str, str]]) -> bool:
             if rel_normalized.startswith(pattern) or \
                rel_normalized == pattern.rstrip('/'):
                 return True
+        elif kind == 'dir_any':
+            # Match directory name anywhere in path: /helf/ or starts with helf
+            if ('/' + pattern) in ('/' + rel_normalized + '/'):
+                return True
         elif kind == 'path':
             if rel_normalized == pattern or \
                rel_normalized.startswith(pattern + '/'):
@@ -144,13 +148,23 @@ def is_blacklisted(rel_path: str, blacklist: list[tuple[str, str]]) -> bool:
 
 
 def compile_blacklist(raw: list[str]) -> list[tuple[str, str]]:
-    """Pre-classify blacklist entries once instead of per-file."""
+    """Pre-classify blacklist entries once instead of per-file.
+
+    Entry types:
+      'dir'      — "bin/"        matches paths starting with bin/
+      'dir_any'  — "*helf/"      matches paths containing /helf/ anywhere
+      'path'     — "L3/bin/3rd"  matches exact path or children
+      'name'     — "libfoo.so*"  matches filename with glob
+    """
     compiled = []
     for entry in raw:
         if not entry:
             continue
         entry = entry.replace('\\', '/')
-        if entry.endswith('/'):
+        if entry.startswith('*') and entry.endswith('/'):
+            # *helf/ → match directory name anywhere in path
+            compiled.append((entry[1:], 'dir_any'))
+        elif entry.endswith('/'):
             compiled.append((entry, 'dir'))
         elif '/' in entry:
             compiled.append((entry, 'path'))
