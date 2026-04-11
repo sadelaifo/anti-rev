@@ -6,7 +6,10 @@ Binary protection system that encrypts executables and shared libraries, then ru
 - **exe_shim**: LD_PRELOAD shim that intercepts `readlink`, `realpath`, `getauxval` to hide memfd paths from the protected process
 - **dlopen_shim**: LD_PRELOAD shim that redirects `dlopen()` calls to decrypted memfd-backed libraries via `ANTIREV_FD_MAP`
 - **encryptor** (`protect.py`, `antirev-pack.py`): Python tools that encrypt and bundle binaries with AES-256-GCM
-- **daemon mode**: a lib-server process decrypts shared libraries once and serves them to client processes via SCM_RIGHTS
+- **daemon mode** (`.antirev-libd`): a lib-server process decrypts shared libraries once and serves them to client processes via SCM_RIGHTS
+- **wrapper mode** (`.antirev-wrap`): connects to daemon, receives lib fds, sets up `LD_PRELOAD` with dlopen_shim + `ANTIREV_FD_MAP`, then execs an arbitrary command (e.g. `python3`). Used for non-encrypted binaries that need to dlopen encrypted libs.
+- **antirev_client.py**: Python client that connects to the daemon, receives decrypted lib memfds via SCM_RIGHTS, and patches `import` + `ctypes.CDLL` to transparently load encrypted libs. Handles dependency ordering via `_ensure_loaded()` which recursively preloads transitive DT_NEEDED deps with `RTLD_GLOBAL`.
+- **build.py**: compiles/obfuscates Python source files via Cython, Nuitka, or PyArmor
 
 ## Target environment
 
@@ -14,6 +17,8 @@ This project protects a business software suite consisting of:
 - 100+ executables
 - 550+ shared libraries
 - 1000+ Python scripts (some of which dlopen encrypted .so files)
+
+The business software also uses third-party libraries (e.g. `libdopra.so`, `libprotobuf.so`, open62541, Boost) which are NOT encrypted but coexist in the same processes.
 
 ## Build
 
@@ -41,3 +46,15 @@ When adding or changing features, update this CLAUDE.md file to reflect the new 
 - The exe_shim constructor may run after C++ global static initializers in DT_NEEDED libraries. The `is_owner_process()` function handles this via lazy detection.
 - Child processes inherit `LD_PRELOAD` but the shims detect non-owner processes (by checking `/proc/self/exe` for memfd) and pass through to real libc functions.
 - The daemon mode splits libs into DT_NEEDED (on `LD_PRELOAD`) and dlopen'd (on `ANTIREV_FD_MAP`).
+
+### Python integration
+
+Python scripts load encrypted libs via two mechanisms:
+1. **Wrapper mode**: `.antirev-wrap python3 script.py` — the wrapper connects to the daemon, sets up dlopen_shim via LD_PRELOAD, then execs Python. The dlopen_shim intercepts C-level dlopen calls.
+2. **antirev_client.py**: called from within Python (`from antirev_client import activate`). Connects to the daemon, patches `ctypes.CDLL` and `sys.meta_path` to redirect to memfd-backed libs. Loads encrypted libs with `RTLD_GLOBAL` and creates soname symlinks in a temp dir prepended to `LD_LIBRARY_PATH`.
+
+### Known issues with memfd loading
+
+- Libraries loaded from memfd may have different symbol scoping (RTLD_LOCAL vs RTLD_GLOBAL) than disk-loaded equivalents, which can cause duplicate global instances when a library is both statically linked into one .so and dynamically loaded by another.
+- Each decrypted lib holds an open memfd, consuming file descriptors. Large deployments (550+ libs) may require raising `ulimit -n`.
+- The dynamic linker's path-based deduplication uses `l_name` from the load path. The same library accessed via memfd path (`/proc/self/fd/N`) vs disk path may be treated as different libraries.
