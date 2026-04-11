@@ -12,6 +12,7 @@ set(TESTS
     test_plain_so         # encrypted exe + plain (unencrypted) .so
     test_linked           # DT_NEEDED .so via bundled LD_PRELOAD memfd
     test_proc_self_exe    # /proc/self/exe returns real path (readlink)
+    test_ctor_readlink    # readlink in C++ global static init (before exe_shim ctor)
     test_realpath         # realpath/canonicalize_file_name on /proc/self/exe
     test_path_stress      # comprehensive path resolution test
     test_dlopen           # dlopen bundled .so by soname

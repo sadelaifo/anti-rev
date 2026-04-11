@@ -22,26 +22,8 @@ static void *(*real_dlopen_fn)(const char *, int) = NULL;
 
 static void *get_real_dlopen(void)
 {
-    if (!real_dlopen_fn) {
-        /* RTLD_NEXT may land on an intermediate wrapper (e.g. libdopra.so)
-         * instead of glibc.  Get that wrapper first, then use it to obtain
-         * a handle to libdl/libc so we can resolve glibc's real dlopen. */
-        void *(*next_fn)(const char *, int) = dlsym(RTLD_NEXT, "dlopen");
-        if (next_fn) {
-            /* glibc < 2.34: dlopen lives in libdl.so.2
-             * glibc >= 2.34: dlopen lives in libc.so.6 */
-            void *h = next_fn("libdl.so.2", RTLD_LAZY | RTLD_NOLOAD);
-            if (!h)
-                h = next_fn("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
-            if (h) {
-                void *fn = dlsym(h, "dlopen");
-                if (fn)
-                    real_dlopen_fn = fn;
-            }
-        }
-        if (!real_dlopen_fn)
-            real_dlopen_fn = next_fn;
-    }
+    if (!real_dlopen_fn)
+        real_dlopen_fn = dlsym(RTLD_NEXT, "dlopen");
     return real_dlopen_fn;
 }
 
