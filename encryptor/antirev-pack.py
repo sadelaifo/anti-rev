@@ -133,9 +133,12 @@ def is_blacklisted(rel_path: str, blacklist: list[tuple[str, str]]) -> bool:
                rel_normalized == pattern.rstrip('/'):
                 return True
         elif kind == 'dir_any':
-            # Match directory name anywhere in path: /helf/ or starts with helf
-            if ('/' + pattern) in ('/' + rel_normalized + '/'):
-                return True
+            # Match directory name anywhere in path using fnmatch.
+            # "*helf/" matches exact "helf", "*helf*/" matches "shelf", "myhelf" etc.
+            dir_pattern = pattern.rstrip('/')
+            for part in rel_normalized.split('/')[:-1]:  # check each dir component
+                if fnmatch.fnmatch(part, dir_pattern):
+                    return True
         elif kind == 'path':
             if rel_normalized == pattern or \
                rel_normalized.startswith(pattern + '/'):
