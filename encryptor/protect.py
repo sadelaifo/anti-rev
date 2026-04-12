@@ -153,13 +153,23 @@ def _build_ldconfig_cache() -> dict:
 
 
 def _get_transitive_needed(main_path: Path) -> list[str]:
-    """BFS through all DT_NEEDED deps, following unencrypted libs on disk.
+    """Find encrypted libs needed by main_path, in topological order.
 
-    Returns lib names NOT resolvable on disk (presumed encrypted) in
-    dependency-first order (deepest deps first) for LD_PRELOAD ordering.
+    Phase 1: BFS through DT_NEEDED, following unencrypted libs on disk.
+    Libs NOT resolvable on disk are presumed encrypted.
+
+    Phase 2: Topological sort (Kahn's algorithm) among the encrypted
+    libs so leaf dependencies come first in the LD_PRELOAD list.
+
+    Note: this function cannot follow DT_NEEDED of encrypted libs
+    (they're not on disk).  antirev-pack.py's get_transitive_needed()
+    handles this correctly using the plaintext originals.  This version
+    is only used for standalone protect-exe --daemon-libs invocations.
     """
+    from collections import deque
+
     ldcache = _build_ldconfig_cache()
-    needed = []
+    encrypted = set()
     visited = set()
     queue = _get_dt_needed(main_path)
 
@@ -171,16 +181,21 @@ def _get_transitive_needed(main_path: Path) -> list[str]:
 
         lib_path = ldcache.get(name)
         if lib_path:
-            # Found on disk — unencrypted system lib, follow its deps
             for dep in _get_dt_needed(Path(lib_path)):
                 if dep not in visited:
                     queue.append(dep)
         else:
-            # Not on disk — presumed encrypted, needs LD_PRELOAD
-            needed.append(name)
+            encrypted.add(name)
 
-    needed.reverse()
-    return needed
+    if not encrypted:
+        return []
+
+    # Build dependency edges among encrypted libs.
+    # Since encrypted libs aren't on disk, we can't read their DT_NEEDED
+    # here — each encrypted lib is treated as an independent node.
+    # antirev-pack.py's version does the full topo sort with access to
+    # plaintext originals.  Here we just sort by name for determinism.
+    return sorted(encrypted)
 
 
 def _build_protected(stub_path: Path, out_path: Path, key: bytes,

@@ -60,6 +60,7 @@ import subprocess
 import tempfile
 import sys
 import time
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -313,19 +314,24 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
                           ldcache: dict) -> list[str]:
     """Get transitive closure of encrypted libs needed by an ELF binary.
 
-    BFS from path's DT_NEEDED, following through ALL libs — including
-    unencrypted intermediaries on disk — to discover encrypted deps
-    behind them (e.g. exe -> libfoo.so [unencrypted] -> libbar.so [encrypted]).
+    Phase 1: BFS from path's DT_NEEDED, following through ALL libs —
+    including unencrypted intermediaries — to discover every encrypted
+    lib reachable from this exe.
 
-    Uses *cache* for encrypted libs (no subprocess calls) and falls back
-    to a single readelf for system libs not in the cache.
+    Phase 2: Build a dependency graph among those encrypted libs and
+    topologically sort (Kahn's algorithm) so leaf dependencies come
+    first.  This ensures correct LD_PRELOAD ordering: when glibc loads
+    each entry, its DT_NEEDED are already available.
 
-    Returns list of filenames (not sonames) in dependency-first order
-    (deepest deps first) for correct LD_PRELOAD loading.
+    Previous approach (BFS-reverse) failed for diamond dependencies:
+        exe -> A -> B, exe -> C -> D -> B
+    BFS-reverse gave D,B,C,A — D before its dep B.  Topo sort gives
+    B,D,A,C (or B,D,C,A) — B always before D and A.
     """
-    needed = []
+    # ── Phase 1: BFS discovery ───────────────────────────────────────
+    encrypted_needed = set()
     visited = set()
-    queue = cache.get_needed(path)
+    queue = list(cache.get_needed(path))
 
     while queue:
         name = queue.pop(0)
@@ -333,30 +339,73 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
             continue
         visited.add(name)
 
-        # Resolve: DT_NEEDED might be a soname, map to filename
         filename = soname_to_filename.get(name, name)
 
         if filename in encrypted_names:
-            needed.append(filename)
-            # Follow this encrypted lib's own DT_NEEDED (from cache)
+            encrypted_needed.add(filename)
             lib_path = lib_by_lookup.get(name) or lib_by_lookup.get(filename)
             if lib_path:
                 for dep in cache.get_needed(lib_path):
                     if dep not in visited:
                         queue.append(dep)
         else:
-            # Unencrypted lib — find on disk and follow its DT_NEEDED
-            # to discover encrypted deps behind it
             lib_path = ldcache.get(name)
             if lib_path:
                 for dep in cache.get_needed(lib_path):
                     if dep not in visited:
                         queue.append(dep)
 
-    # Reverse: BFS visits parents before children, but LD_PRELOAD needs
-    # dependencies loaded first (glibc resolves DT_NEEDED per entry).
-    needed.reverse()
-    return needed
+    if not encrypted_needed:
+        return []
+
+    # ── Phase 2: build edge graph among encrypted libs ───────────────
+    # edges[A] = [B, C] means A depends on encrypted libs B and C.
+    edges = {fn: [] for fn in encrypted_needed}
+
+    for filename in encrypted_needed:
+        lib_path = lib_by_lookup.get(filename)
+        if not lib_path:
+            for sn, fn in soname_to_filename.items():
+                if fn == filename:
+                    lib_path = lib_by_lookup.get(sn)
+                    break
+        if not lib_path:
+            continue
+        for dep_name in cache.get_needed(lib_path):
+            dep_filename = soname_to_filename.get(dep_name, dep_name)
+            if dep_filename in encrypted_needed and dep_filename != filename:
+                edges[filename].append(dep_filename)
+
+    # ── Phase 3: Kahn's topological sort ─────────────────────────────
+    all_nodes = set(edges.keys())
+    for children in edges.values():
+        all_nodes.update(children)
+
+    in_degree = {n: 0 for n in all_nodes}
+    for parent, children in edges.items():
+        for c in children:
+            in_degree[c] += 1
+
+    q = deque(n for n in sorted(all_nodes) if in_degree[n] == 0)
+    result = []
+    while q:
+        node = q.popleft()
+        result.append(node)
+        for child in edges.get(node, []):
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                q.append(child)
+
+    if len(result) < len(all_nodes):
+        cycle_nodes = all_nodes - set(result)
+        print("[pack] WARNING: dependency cycle among encrypted libs: "
+              "{}".format(', '.join(sorted(cycle_nodes))),
+              file=sys.stderr)
+        result.extend(sorted(cycle_nodes))
+
+    # Kahn's gives parents first → reverse for leaf-deps-first LD_PRELOAD order
+    result.reverse()
+    return [n for n in result if n in encrypted_needed]
 
 
 # ── Worker functions (run in child processes) ─────────────────────────
