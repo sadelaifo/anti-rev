@@ -45,7 +45,8 @@ When adding or changing features, update this CLAUDE.md file to reflect the new 
 - Protected binaries run from memfd via `fexecve`. `/proc/self/exe` points to `memfd:name (deleted)`.
 - The exe_shim constructor may run after C++ global static initializers in DT_NEEDED libraries. The `is_owner_process()` function handles this via lazy detection.
 - Child processes inherit `LD_PRELOAD` but the shims detect non-owner processes (by checking `/proc/self/exe` for memfd) and pass through to real libc functions.
-- The daemon mode splits libs into DT_NEEDED (on `LD_PRELOAD`) and dlopen'd (on `ANTIREV_FD_MAP`).
+- The daemon mode splits libs into DT_NEEDED (resolved via symlink dir on `LD_LIBRARY_PATH`) and dlopen'd (on `ANTIREV_FD_MAP`). DT_NEEDED libs are NOT on `LD_PRELOAD` — glibc's normal BFS resolves them through the symlink dir, preserving the original symbol lookup order. `LD_PRELOAD` contains only exe_shim + dlopen_shim.
+- `antirev-pack.py` computes per-exe transitive DT_NEEDED using topological sort (Kahn's algorithm) to embed the needed-libs section. The stub uses this to create symlinks for the correct set of libs.
 
 ### Python integration
 
@@ -55,7 +56,8 @@ Python scripts load encrypted libs via two mechanisms:
 
 ### Known issues with memfd loading
 
-- Libraries loaded from memfd may have different symbol scoping (RTLD_LOCAL vs RTLD_GLOBAL) than disk-loaded equivalents, which can cause duplicate global instances when a library is both statically linked into one .so and dynamically loaded by another.
 - Each decrypted lib holds an open memfd, consuming file descriptors. Large deployments (550+ libs) may require raising `ulimit -n`.
 - The dynamic linker's path-based deduplication uses `l_name` from the load path. The same library accessed via memfd path (`/proc/self/fd/N`) vs disk path may be treated as different libraries.
+- **Symbol collision detection**: `tools/symbol_collision.py` checks for LD_PRELOAD symbol interposition risks. Run it against plaintext originals before deployment to catch collisions between encrypted and unencrypted libs.
+- Legacy binaries without the needed-section (backward compat) still use LD_PRELOAD for encrypted libs, which changes symbol lookup order. Re-pack with `antirev-pack.py` to get the symlink-dir-only approach.
 - **Debug symbol files (.debug) affect runtime behavior**: exe_shim spoofs `readlink("/proc/self/exe")` to point to the encrypted stub on disk. Business software that scans for `.debug` files relative to the exe path (e.g., signal handlers, crash recovery) will find or miss them depending on deployment. Two encrypted processes (Foo, Bar) crash in open62541 `ua_client()` init when `.debug` files are absent, but work fine when present. A standalone demo (tests/opcua_enc/) confirmed encryption itself does NOT cause the crash — the issue is the business software's debug-file-dependent infrastructure. **Workaround**: always deploy `.debug` files alongside encrypted binaries. **Investigation pending**: strace to identify which library reads `.debug` at runtime.
