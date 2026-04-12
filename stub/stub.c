@@ -961,27 +961,31 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     if (write_chunk(dlopen_shim_fd, dlopen_shim_blob, dlopen_shim_blob_len) != 0) return 1;
     if (lseek(dlopen_shim_fd, 0, SEEK_SET) < 0) { perror("lseek dlopen_shim"); return 1; }
 
-    /* Phase 4b. Split libs into DT_NEEDED (LD_PRELOAD) and rest (ANTIREV_FD_MAP).
-     * DT_NEEDED libs are preloaded for fast startup.
-     * Remaining encrypted libs are available on-demand via dlopen_shim. */
-    int preload_fds[MAX_FILES];
-    char preload_names[MAX_FILES][MAX_NAME + 1];
-    int n_preload = 0;
+    /* Phase 4b. Split libs into DT_NEEDED (symlink dir) and rest (ANTIREV_FD_MAP).
+     *
+     * DT_NEEDED libs are resolved by glibc's normal BFS through the symlink
+     * dir on LD_LIBRARY_PATH — preserving the original symbol lookup order.
+     * They are NOT put on LD_PRELOAD (which would reorder them ahead of
+     * unencrypted libs and change symbol resolution).
+     *
+     * Remaining libs are available on-demand via dlopen_shim + ANTIREV_FD_MAP. */
+    int dt_needed_fds[MAX_FILES];
+    char dt_needed_names[MAX_FILES][MAX_NAME + 1];
+    int n_dt_needed = 0;
 
     int fdmap_fds[MAX_FILES];
     char fdmap_names[MAX_FILES][MAX_NAME + 1];
     int n_fdmap = 0;
 
     if (has_needed_section && nlibs > 0) {
-        /* Build preload list in needed_names order (dependency-first).
-         * The packer embeds needed_names with deepest deps first so that
-         * glibc can resolve each lib's DT_NEEDED from already-loaded libs. */
+        /* Identify which daemon libs are in the exe's DT_NEEDED chain.
+         * These go into the symlink dir only (not LD_PRELOAD). */
         for (int k = 0; k < n_needed; k++) {
             for (int j = 0; j < nlibs; j++) {
                 if (strcmp(lib_names[j], needed_names[k]) == 0) {
-                    preload_fds[n_preload] = lib_fds[j];
-                    memcpy(preload_names[n_preload], lib_names[j], MAX_NAME + 1);
-                    n_preload++;
+                    dt_needed_fds[n_dt_needed] = lib_fds[j];
+                    memcpy(dt_needed_names[n_dt_needed], lib_names[j], MAX_NAME + 1);
+                    n_dt_needed++;
                     break;
                 }
             }
@@ -1001,36 +1005,39 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 n_fdmap++;
             }
         }
-        fprintf(stderr, "[antirev] split: %d on LD_PRELOAD, %d on FD_MAP "
+        fprintf(stderr, "[antirev] split: %d via symlinks, %d on FD_MAP "
                 "(needed=%d, daemon=%d)\n",
-                n_preload, n_fdmap, n_needed, nlibs);
-        for (int k = 0; k < n_preload; k++)
-            fprintf(stderr, "[antirev]   PRELOAD: %s (fd %d)\n",
-                    preload_names[k], preload_fds[k]);
+                n_dt_needed, n_fdmap, n_needed, nlibs);
+        for (int k = 0; k < n_dt_needed; k++)
+            fprintf(stderr, "[antirev]   DT_NEEDED: %s (fd %d)\n",
+                    dt_needed_names[k], dt_needed_fds[k]);
     } else {
-        /* No needed list — all libs go on LD_PRELOAD (backward compat) */
-        memcpy(preload_fds, lib_fds, (size_t)nlibs * sizeof(int));
-        memcpy(preload_names, lib_names, (size_t)nlibs * (MAX_NAME + 1));
-        n_preload = nlibs;
+        /* No needed list — all libs go on LD_PRELOAD (backward compat).
+         * This path is used by old protected binaries without the needed
+         * section.  It does NOT preserve original symbol lookup order. */
+        n_dt_needed = nlibs;
+        memcpy(dt_needed_fds, lib_fds, (size_t)nlibs * sizeof(int));
+        memcpy(dt_needed_names, lib_names, (size_t)nlibs * (MAX_NAME + 1));
         fprintf(stderr, "[antirev] backward compat: all %d libs on LD_PRELOAD\n",
                 nlibs);
     }
 
-    /* Phase 4c. Create symlink dir so the dynamic linker can resolve
-     * DT_NEEDED references to encrypted libs.  For each lib (both
-     * LD_PRELOAD and FD_MAP), create a symlink:
+    /* Phase 4c. Create symlink dir for ALL encrypted libs (DT_NEEDED + FD_MAP):
      *   /tmp/antirev_XXXXXX/libfoo.so → /proc/self/fd/N
-     * Then prepend this dir to LD_LIBRARY_PATH.  This covers the case
-     * where a runtime-dlopen'd lib has an encrypted lib as DT_NEEDED —
-     * the linker finds the symlink, follows it to the decrypted memfd. */
+     *
+     * This dir is prepended to LD_LIBRARY_PATH.  For DT_NEEDED libs, this
+     * is the PRIMARY resolution mechanism — glibc's BFS finds them here,
+     * preserving the original symbol lookup order.  For FD_MAP (dlopen'd)
+     * libs, the symlinks serve as a fallback when the lib's own DT_NEEDED
+     * chain references other encrypted libs. */
     char link_dir[] = "/tmp/antirev_XXXXXX";
     char *link_dir_ptr = mkdtemp(link_dir);
     if (link_dir_ptr) {
-        for (int j = 0; j < n_preload; j++) {
+        for (int j = 0; j < n_dt_needed; j++) {
             char lpath[sizeof(link_dir) + MAX_NAME + 2];
             char target[64];
-            snprintf(lpath, sizeof(lpath), "%s/%s", link_dir, preload_names[j]);
-            snprintf(target, sizeof(target), "/proc/self/fd/%d", preload_fds[j]);
+            snprintf(lpath, sizeof(lpath), "%s/%s", link_dir, dt_needed_names[j]);
+            snprintf(target, sizeof(target), "/proc/self/fd/%d", dt_needed_fds[j]);
             if (symlink(target, lpath) < 0)
                 perror("[antirev] symlink");
         }
@@ -1043,7 +1050,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 perror("[antirev] symlink");
         }
         fprintf(stderr, "[antirev] symlink dir: %s (%d links)\n",
-                link_dir, n_preload + n_fdmap);
+                link_dir, n_dt_needed + n_fdmap);
     }
 
     /* Phase 5. Build new envp */
@@ -1113,9 +1120,18 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     snprintf(main_fd_entry, sizeof(main_fd_entry),
              "ANTIREV_MAIN_FD=%d", main_fd);
 
-    /* Build LD_PRELOAD: exe_shim + dlopen_shim + DT_NEEDED lib memfds.
-     * Each fd path is /proc/self/fd/NNN — at most ~20 chars each. */
-    size_t preload_len = 128 + (size_t)n_preload * 24
+    /* Build LD_PRELOAD: exe_shim + dlopen_shim only.
+     *
+     * Encrypted DT_NEEDED libs are NOT on LD_PRELOAD — they are resolved
+     * by glibc's normal DT_NEEDED BFS through the symlink dir on
+     * LD_LIBRARY_PATH.  This preserves the original symbol lookup order.
+     *
+     * Backward compat (no needed section): encrypted libs are added to
+     * LD_PRELOAD as before, since we can't rely on symlink-only resolution
+     * without knowing which libs are DT_NEEDED vs dlopen'd. */
+    int compat_preload = !has_needed_section && nlibs > 0;
+    size_t preload_len = 128
+                       + (compat_preload ? (size_t)n_dt_needed * 24 : 0)
                        + (existing_preload ? 1 + strlen(existing_preload) : 0);
     char *ld_preload_entry = malloc(preload_len);
     if (!ld_preload_entry) { perror("malloc ld_preload"); return 1; }
@@ -1123,9 +1139,11 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     int off = snprintf(ld_preload_entry, preload_len,
                        "LD_PRELOAD=/proc/self/fd/%d:/proc/self/fd/%d",
                        exe_shim_fd, dlopen_shim_fd);
-    for (int j = 0; j < n_preload; j++)
-        off += snprintf(ld_preload_entry + off, preload_len - (size_t)off,
-                        ":/proc/self/fd/%d", preload_fds[j]);
+    if (compat_preload) {
+        for (int j = 0; j < n_dt_needed; j++)
+            off += snprintf(ld_preload_entry + off, preload_len - (size_t)off,
+                            ":/proc/self/fd/%d", dt_needed_fds[j]);
+    }
     if (existing_preload)
         snprintf(ld_preload_entry + off, preload_len - (size_t)off,
                  ":%s", existing_preload);
