@@ -13,6 +13,7 @@
 #include "crypto.h"
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
 
 /* ================================================================== */
 /*  AES-NI + PCLMULQDQ (x86-64 only)                                  */
