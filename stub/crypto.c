@@ -341,10 +341,14 @@ static void _detect_hw_arm(void)
         if (type == 16) {      /* AT_HWCAP */
             hw_aes  = !!(val & (1UL << 3));   /* HWCAP_AES  */
             hw_pmull = !!(val & (1UL << 4));   /* HWCAP_PMULL */
+            fprintf(stderr, "[antirev] ARM CE detect: hwcap=0x%lx aes=%d pmull=%d\n",
+                    val, hw_aes, hw_pmull);
             break;
         }
     }
     close(fd);
+    if (!hw_aes)
+        fprintf(stderr, "[antirev] ARM CE: AT_HWCAP not found, using software AES\n");
 }
 
 /* Forward declaration of software key expansion (defined below) */
