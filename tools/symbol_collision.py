@@ -435,14 +435,16 @@ def main():
     if not enc_libs:
         sys.exit(f"[error] no .so files found in {enc_dir}")
 
-    print(f"[scan] {len(exes)} executable(s), {len(enc_libs)} encrypted lib(s)")
+    log = (lambda *a, **k: print(*a, **k, file=sys.stderr)) if args.json else print
+
+    log(f"[scan] {len(exes)} executable(s), {len(enc_libs)} encrypted lib(s)")
 
     # Build caches
     ldcache = build_ldconfig_cache()
     cache = ElfCache()
 
     all_paths = [str(p) for p in enc_libs] + [str(p) for p in exes]
-    print(f"[scan] Parsing {len(all_paths)} ELFs...")
+    log(f"[scan] Parsing {len(all_paths)} ELFs...")
     cache.bulk_parse(all_paths)
 
     # Build soname maps for encrypted libs
@@ -505,21 +507,21 @@ def main():
         print(json.dumps(all_results, indent=2))
 
     # Summary
-    print(f"{'='*70}")
-    print(f"  Summary: {len(exes)} exe(s) checked")
-    print(f"    Errors:   {total_errors} (GLOBAL symbol collisions)")
-    print(f"    Warnings: {total_warns} (WEAK symbol collisions)")
-    print(f"{'='*70}")
+    log(f"{'='*70}")
+    log(f"  Summary: {len(exes)} exe(s) checked")
+    log(f"    Errors:   {total_errors} (GLOBAL symbol collisions)")
+    log(f"    Warnings: {total_warns} (WEAK symbol collisions)")
+    log(f"{'='*70}")
 
     if total_errors > 0:
-        print("\nGLOBAL collisions found — these can cause silent misbehavior.")
-        print("The LD_PRELOAD'd encrypted lib's symbol will override the")
-        print("unencrypted lib's version in ALL code paths.\n")
-        print("Options:")
-        print("  1. Rename the colliding symbol in your business lib")
-        print("  2. Use symbol versioning to disambiguate")
-        print("  3. Move the colliding lib from LD_PRELOAD to ANTIREV_FD_MAP")
-        print("     (requires removing it from the exe's DT_NEEDED chain)")
+        log("\nGLOBAL collisions found — these can cause silent misbehavior.")
+        log("The LD_PRELOAD'd encrypted lib's symbol will override the")
+        log("unencrypted lib's version in ALL code paths.\n")
+        log("Options:")
+        log("  1. Rename the colliding symbol in your business lib")
+        log("  2. Use symbol versioning to disambiguate")
+        log("  3. Move the colliding lib from LD_PRELOAD to ANTIREV_FD_MAP")
+        log("     (requires removing it from the exe's DT_NEEDED chain)")
         return 1
 
     return 0
