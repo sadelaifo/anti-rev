@@ -145,8 +145,65 @@ static void restore_identity(void)
      * children never inherit it and false-positive as owner. */
     unsetenv("ANTIREV_MAIN_FD");
 
-    if (!is_owner)
+    if (!is_owner) {
+        /* Non-owner child process (e.g., WAE.elf loaded by helf loadpg).
+         * Clean up anti-rev env vars to prevent dlopen_shim from
+         * redirecting dlopen calls via ANTIREV_FD_MAP, and to prevent
+         * LD_LIBRARY_PATH from pointing to anti-rev's symlink dir. */
+        unsetenv("ANTIREV_FD_MAP");
+        unsetenv("ANTIREV_REAL_EXE");
+
+        /* Remove anti-rev /proc/self/fd/ entries from LD_PRELOAD,
+         * keeping any user-specified preloads intact. */
+        const char *preload = getenv("LD_PRELOAD");
+        if (preload && strstr(preload, "/proc/self/fd/") != NULL) {
+            char clean[4096];
+            int off = 0;
+            const char *p = preload;
+            while (*p) {
+                const char *end = p;
+                while (*end && *end != ':') end++;
+                size_t len = (size_t)(end - p);
+                if (len > 0 && strncmp(p, "/proc/self/fd/", 14) != 0) {
+                    if (off > 0) clean[off++] = ':';
+                    memcpy(clean + off, p, len);
+                    off += (int)len;
+                }
+                p = (*end == ':') ? end + 1 : end;
+            }
+            clean[off] = '\0';
+            if (off > 0)
+                setenv("LD_PRELOAD", clean, 1);
+            else
+                unsetenv("LD_PRELOAD");
+        }
+
+        /* Remove anti-rev /tmp/antirev_ dir from LD_LIBRARY_PATH */
+        const char *ldpath = getenv("LD_LIBRARY_PATH");
+        if (ldpath && strstr(ldpath, "/tmp/antirev_") != NULL) {
+            char clean_path[8192];
+            int poff = 0;
+            const char *lp = ldpath;
+            while (*lp) {
+                const char *lend = lp;
+                while (*lend && *lend != ':') lend++;
+                size_t llen = (size_t)(lend - lp);
+                if (llen > 0 && strncmp(lp, "/tmp/antirev_", 13) != 0) {
+                    if (poff > 0) clean_path[poff++] = ':';
+                    memcpy(clean_path + poff, lp, llen);
+                    poff += (int)llen;
+                }
+                lp = (*lend == ':') ? lend + 1 : lend;
+            }
+            clean_path[poff] = '\0';
+            if (poff > 0)
+                setenv("LD_LIBRARY_PATH", clean_path, 1);
+            else
+                unsetenv("LD_LIBRARY_PATH");
+        }
+
         return;
+    }
 
     g_owner_pid = getpid();
 
