@@ -62,6 +62,11 @@ function(build_stub OUTPUT COMPILER STRIPPER EXE_BLOB_DEP DLOPEN_BLOB_DEP)
         set(EXTRA_FLAGS "")
     else()
         set(EXTRA_FLAGS "-static")
+        # Enable ARM Crypto Extensions for aarch64 AES hardware acceleration
+        string(FIND "${COMPILER}" "aarch64" _is_aarch64)
+        if(NOT _is_aarch64 EQUAL -1)
+            set(EXTRA_FLAGS "${EXTRA_FLAGS} -march=armv8-a+crypto")
+        endif()
     endif()
     add_custom_command(
         OUTPUT  "${OUTPUT}"
