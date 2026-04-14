@@ -1,8 +1,0 @@
-.github
-.azure-pipelines
-.dockerignore
-.travis*
-appveyor.yml
-docker
-build
-TinyDockerfile
