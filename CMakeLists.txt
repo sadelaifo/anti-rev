@@ -31,10 +31,10 @@ endfunction()
 function(compile_dlopen_shim OUTPUT COMPILER)
     add_custom_command(
         OUTPUT  "${OUTPUT}"
-        COMMAND "${COMPILER}" -shared -fPIC -O2 -fvisibility=hidden
+        COMMAND "${COMPILER}" -shared -fPIC -O2 -fvisibility=hidden -pthread
                 -o "${OUTPUT}"
                 "${CMAKE_SOURCE_DIR}/stub/dlopen_shim.c"
-                -ldl
+                -ldl -lpthread
         DEPENDS "${CMAKE_SOURCE_DIR}/stub/dlopen_shim.c"
         COMMENT "Building dlopen shim: ${OUTPUT}"
     )
