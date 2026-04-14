@@ -468,3 +468,80 @@ unsigned long getauxval(unsigned long type)
     syscall(SYS_close, fd);
     return result;
 }
+
+/* ------------------------------------------------------------------ */
+/*  popen interception                                                  */
+/*                                                                      */
+/*  glibc popen uses vfork (CLONE_VM|CLONE_VFORK) which shares the     */
+/*  parent's address space. Under anti-rev with many memfds and         */
+/*  LD_PRELOAD shims, the vfork'd child can behave unexpectedly.        */
+/*  We intercept popen to use a clean fork+exec instead.                */
+/* ------------------------------------------------------------------ */
+
+static FILE *(*g_real_popen)(const char *, const char *) = NULL;
+
+static void resolve_real_popen(void)
+{
+    if (g_real_popen)
+        return;
+    void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
+    if (libc) {
+        g_real_popen = dlsym(libc, "popen");
+        dlclose(libc);
+        if (g_real_popen)
+            return;
+    }
+    g_real_popen = dlsym(RTLD_NEXT, "popen");
+}
+
+__attribute__((visibility("default")))
+FILE *popen(const char *command, const char *type)
+{
+    if (!is_owner_process()) {
+        if (!g_real_popen) resolve_real_popen();
+        if (g_real_popen) return g_real_popen(command, type);
+        return NULL;
+    }
+
+    /* Owner process: implement popen with fork (not vfork) and clean env.
+     * This avoids vfork issues with memfd-heavy processes. */
+    if (type[0] != 'r') {
+        /* Only intercept read-mode popen for now */
+        if (!g_real_popen) resolve_real_popen();
+        if (g_real_popen) return g_real_popen(command, type);
+        return NULL;
+    }
+
+    int pipefd[2];
+    if (pipe(pipefd) < 0)
+        return NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return NULL;
+    }
+
+    if (pid == 0) {
+        /* Child: redirect stdout to pipe, exec sh */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+
+        /* Clean anti-rev env vars for the child */
+        unsetenv("ANTIREV_FD_MAP");
+        unsetenv("ANTIREV_REAL_EXE");
+        unsetenv("LD_PRELOAD");
+
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+
+    /* Parent: return read end of pipe as FILE* */
+    close(pipefd[1]);
+    FILE *fp = fdopen(pipefd[0], "r");
+    if (!fp)
+        close(pipefd[0]);
+    return fp;
+}
