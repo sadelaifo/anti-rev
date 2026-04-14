@@ -232,6 +232,60 @@ static void restore_identity(void)
     }
     unsetenv("ANTIREV_CLOSE_FDS");
 
+    /* Clean up anti-rev entries from LD_PRELOAD and LD_LIBRARY_PATH even
+     * for the owner process. The shims are already loaded in memory —
+     * removing them from env prevents children (popen, system, etc.) from
+     * inheriting /proc/self/fd/N paths that may become invalid. */
+    {
+        const char *preload = getenv("LD_PRELOAD");
+        if (preload && strstr(preload, "/proc/self/fd/") != NULL) {
+            char clean[4096];
+            int coff = 0;
+            const char *p = preload;
+            while (*p) {
+                const char *end = p;
+                while (*end && *end != ':') end++;
+                size_t slen = (size_t)(end - p);
+                if (slen > 0 && strncmp(p, "/proc/self/fd/", 14) != 0) {
+                    if (coff > 0) clean[coff++] = ':';
+                    memcpy(clean + coff, p, slen);
+                    coff += (int)slen;
+                }
+                p = (*end == ':') ? end + 1 : end;
+            }
+            clean[coff] = '\0';
+            if (coff > 0)
+                setenv("LD_PRELOAD", clean, 1);
+            else
+                unsetenv("LD_PRELOAD");
+        }
+
+        const char *ldpath = getenv("LD_LIBRARY_PATH");
+        if (ldpath && strstr(ldpath, "/tmp/antirev_") != NULL) {
+            char clean_path[8192];
+            int poff = 0;
+            const char *lp = ldpath;
+            while (*lp) {
+                const char *lend = lp;
+                while (*lend && *lend != ':') lend++;
+                size_t llen = (size_t)(lend - lp);
+                if (llen > 0 && strncmp(lp, "/tmp/antirev_", 13) != 0) {
+                    if (poff > 0) clean_path[poff++] = ':';
+                    memcpy(clean_path + poff, lp, llen);
+                    poff += (int)llen;
+                }
+                lp = (*lend == ':') ? lend + 1 : lend;
+            }
+            clean_path[poff] = '\0';
+            if (poff > 0)
+                setenv("LD_LIBRARY_PATH", clean_path, 1);
+            else
+                unsetenv("LD_LIBRARY_PATH");
+        }
+
+        unsetenv("ANTIREV_FD_MAP");
+    }
+
     const char *base = strrchr(real, '/');
     base = base ? base + 1 : real;
 
