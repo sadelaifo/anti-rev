@@ -164,6 +164,7 @@ add_custom_target(run_test
             --output "${CMAKE_BINARY_DIR}/hello.protected"
     COMMAND ${CMAKE_COMMAND}
             "-DBINARY=${CMAKE_BINARY_DIR}/hello.protected"
+            "-DEXPECTED_EXIT=42"
             -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
     DEPENDS stub hello
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
@@ -182,6 +183,7 @@ if(AARCH64_GCC)
         COMMAND ${CMAKE_COMMAND}
                 "-DBINARY=${CMAKE_BINARY_DIR}/hello_aarch64.protected"
                 "-DQEMU_LD_PREFIX=/usr/aarch64-linux-gnu"
+                "-DEXPECTED_EXIT=42"
                 -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
         DEPENDS stub_aarch64 hello_aarch64
         WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
@@ -584,6 +586,28 @@ daemon_test(test_linked "${CMAKE_BINARY_DIR}/linked_main"
     "DT_NEEDED satisfied via daemon-served encrypted .so"
     "${CMAKE_BINARY_DIR}/liblinkedmath.so")
 add_dependencies(test_linked stub liblinkedmath linked_main)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_fd_reduction — exe_shim must close DT_NEEDED memfds after ctor
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/fd_reduction_main"
+    COMMAND gcc -O2
+            -I "${CMAKE_SOURCE_DIR}/tests"
+            -o "${CMAKE_BINARY_DIR}/fd_reduction_main"
+            "${CMAKE_SOURCE_DIR}/tests/fd_reduction/main.c"
+            -L "${CMAKE_BINARY_DIR}" -llinkedmath
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/fd_reduction/main.c"
+            "${CMAKE_BINARY_DIR}/liblinkedmath.so"
+    COMMENT "Building test binary: fd_reduction_main"
+)
+add_custom_target(fd_reduction_main DEPENDS "${CMAKE_BINARY_DIR}/fd_reduction_main")
+
+daemon_test(test_fd_reduction "${CMAKE_BINARY_DIR}/fd_reduction_main"
+    "DT_NEEDED memfds closed by exe_shim ctor (fd reduction)"
+    "${CMAKE_BINARY_DIR}/liblinkedmath.so")
+add_dependencies(test_fd_reduction stub liblinkedmath fd_reduction_main)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  test_fork_exec — child process spawned via fork()+exec() must be able

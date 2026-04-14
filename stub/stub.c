@@ -1452,8 +1452,9 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
     }
 
-    /* +7: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP, LD_LIBRARY_PATH, NULL + spare */
-    char **new_env = malloc((size_t)(envc + 7) * sizeof(char *));
+    /* +8: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP, LD_LIBRARY_PATH,
+     * ANTIREV_CLOSE_FDS, NULL + spare */
+    char **new_env = malloc((size_t)(envc + 8) * sizeof(char *));
     if (!new_env) { perror("malloc env"); return 1; }
 
     char real_exe_entry[4096 + 32];
@@ -1507,13 +1508,36 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
     }
 
+    /* Build ANTIREV_CLOSE_FDS: comma-separated DT_NEEDED fds that exe_shim
+     * should close in its constructor.  By that point glibc has already
+     * mmap'd every DT_NEEDED lib, so the fds are pure bookkeeping — closing
+     * them frees fd-table slots without affecting the running process.
+     *
+     * Only populated on the symlink-dir path (has_needed_section).  The
+     * backward-compat path still uses LD_PRELOAD for encrypted libs and we
+     * don't want to close those fds — ld.so may still reference them. */
+    char *close_fds_entry = NULL;
+    if (has_needed_section && n_dt_needed > 0) {
+        size_t cf_len = 20 + (size_t)n_dt_needed * 12;
+        close_fds_entry = malloc(cf_len);
+        if (close_fds_entry) {
+            int cfo = snprintf(close_fds_entry, cf_len, "ANTIREV_CLOSE_FDS=");
+            for (int j = 0; j < n_dt_needed; j++) {
+                if (j > 0) close_fds_entry[cfo++] = ',';
+                cfo += snprintf(close_fds_entry + cfo, cf_len - (size_t)cfo,
+                                "%d", dt_needed_fds[j]);
+            }
+        }
+    }
+
     int ei = 0;
     for (int j = 0; j < envc; j++) {
-        if (strncmp(envp[j], "LD_PRELOAD=",       11) == 0) continue;
-        if (strncmp(envp[j], "LD_LIBRARY_PATH=",  16) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_REAL_EXE=", 17) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_MAIN_FD=",  16) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_FD_MAP=",   15) == 0) continue;
+        if (strncmp(envp[j], "LD_PRELOAD=",         11) == 0) continue;
+        if (strncmp(envp[j], "LD_LIBRARY_PATH=",    16) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_REAL_EXE=",   17) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_MAIN_FD=",    16) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_FD_MAP=",     15) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_CLOSE_FDS=",  18) == 0) continue;
         new_env[ei++] = envp[j];
     }
     new_env[ei++] = real_exe_entry;
@@ -1523,6 +1547,8 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         new_env[ei++] = fd_map_entry;
     if (ld_libpath_entry)
         new_env[ei++] = ld_libpath_entry;
+    if (close_fds_entry)
+        new_env[ei++] = close_fds_entry;
     new_env[ei]   = NULL;
 
     /* Phase 6. Replace this process with the decrypted binary — no fork, same PID */

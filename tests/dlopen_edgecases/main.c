@@ -6,9 +6,14 @@
  *   2. dlclose + reopen         — re-dlopen after close still works
  *   3. Double dlopen            — same lib opened twice, both handles valid
  *   4. Unmapped fallthrough     — unknown lib falls through to real dlopen
- *   5. RTLD_LAZY                — lazy binding works with preloaded libs
- *   6. RTLD_NOLOAD              — query already-loaded lib without loading
- *   7. dlsym(RTLD_DEFAULT)      — find symbol across all loaded libs
+ *   5. RTLD_LAZY                — lazy binding works with dlopen_shim
+ *
+ * Note: RTLD_NOLOAD and dlsym(RTLD_DEFAULT, ...) cases were removed with
+ * the symlink-dir-only architecture shift.  Under the current design libs
+ * are loaded on-demand via dlopen_shim with RTLD_LOCAL, so they are not
+ * present in RTLD_DEFAULT after dlclose and RTLD_NOLOAD's "already loaded"
+ * semantics depend on link-map dedup by filename, which /proc/self/fd/N
+ * paths break.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -104,34 +109,6 @@ int main(void)
                       "greeting() returned empty/null with RTLD_LAZY");
             }
             dlclose(h);
-        }
-    }
-
-    /* 6. RTLD_NOLOAD — query without loading; lib already preloaded */
-    {
-        /* mylib.so is preloaded via LD_PRELOAD, so RTLD_NOLOAD should find it */
-        void *h = dlopen("mylib.so", RTLD_NOW | RTLD_NOLOAD);
-        CHECK(h != NULL,
-              "dlopen(mylib.so, RTLD_NOLOAD) returned NULL: %s", dlerror());
-        if (h) {
-            int (*add_fn)(int, int) = dlsym(h, "add");
-            CHECK(add_fn != NULL, "dlsym(add) via RTLD_NOLOAD: %s", dlerror());
-            if (add_fn) {
-                CHECK(add_fn(100, 200) == 300,
-                      "add(100,200) via RTLD_NOLOAD = %d", add_fn(100, 200));
-            }
-            dlclose(h);
-        }
-    }
-
-    /* 7. dlsym(RTLD_DEFAULT) — find symbol from preloaded lib */
-    {
-        int (*add_fn)(int, int) = dlsym(RTLD_DEFAULT, "add");
-        CHECK(add_fn != NULL,
-              "dlsym(RTLD_DEFAULT, add) returned NULL: %s", dlerror());
-        if (add_fn) {
-            CHECK(add_fn(7, 8) == 15,
-                  "add(7,8) via RTLD_DEFAULT = %d", add_fn(7, 8));
         }
     }
 
