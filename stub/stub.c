@@ -46,6 +46,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#include <sys/epoll.h>
 #include <dirent.h>
 #include <pthread.h>
 #include <time.h>
@@ -135,46 +136,336 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 #define BFLAG_DAEMON_LIBS  0x02  /* libs served by external daemon */
 #define BFLAG_WRAPPER      0x04  /* wrapper mode: exec argv[1...] with libs */
 
-/* Max size of the daemon protocol data payload (per batch):
- * 4 bytes (nlibs) + SCM_BATCH * (2 + MAX_NAME) */
-#define DAEMON_DATA_MAX  (4 + SCM_BATCH * (2 + MAX_NAME))
-
 /* ------------------------------------------------------------------ */
-/*  Daemon: serve lib memfds to sibling processes via SCM_RIGHTS       */
-/*                                                                     */
-/*  Protocol: data payload contains lib count + names, ancillary data  */
-/*  carries the fds via SCM_RIGHTS.                                    */
-/*                                                                     */
-/*  Data layout:                                                       */
-/*    [uint32_t nlibs]                                                 */
-/*    for each lib:                                                    */
-/*      [uint16_t name_len] [char name[name_len]]                     */
-/*                                                                     */
-/*  Ancillary: SCM_RIGHTS with nlibs file descriptors.                 */
+/*  Daemon protocol v2                                                  */
+/*                                                                      */
+/*  Wire format (per message):                                          */
+/*    [u32 op] [u32 payload_len] [payload bytes...]                    */
+/*  plus optional SCM_RIGHTS ancillary data (OP_BATCH / OP_LIB only).   */
+/*                                                                      */
+/*  Client → Daemon:                                                    */
+/*    OP_INIT     + [u32 nfilter] [(u16 nlen, bytes) * nfilter]        */
+/*                  nfilter=0 means "send all libs".                    */
+/*    OP_GET_LIB  + [u16 nlen] [name bytes]                            */
+/*    OP_BYE      + (no payload) — daemon closes connection.           */
+/*                                                                      */
+/*  Daemon → Client (in response to OP_INIT):                           */
+/*    Zero or more OP_BATCH messages, each with:                        */
+/*      [u32 nlibs] [(u16 nlen, bytes) * nlibs]                        */
+/*    and ancillary data: SCM_RIGHTS with nlibs fds.                    */
+/*    Followed by a single OP_END message (empty payload) to mark EOF. */
+/*                                                                      */
+/*  Daemon → Client (in response to OP_GET_LIB):                        */
+/*    OP_LIB + [u32 status]                                             */
+/*    If status==ST_OK, ancillary SCM_RIGHTS carries 1 fd.              */
+/*    If status!=ST_OK, no ancillary data.                              */
 /* ------------------------------------------------------------------ */
 
-/* Build the data payload (lib count + names). Returns payload size. */
-static size_t build_daemon_payload(uint8_t *buf, size_t buflen,
-                                   const char (*names)[MAX_NAME + 1],
-                                   int nlibs)
+#define OP_INIT     0x01u
+#define OP_GET_LIB  0x02u
+#define OP_BYE      0x03u
+
+#define OP_BATCH    0x81u
+#define OP_END      0x82u
+#define OP_LIB      0x83u
+
+#define ST_OK        0u
+#define ST_NOT_FOUND 1u
+#define ST_ERROR     2u
+
+/* Max payload bytes we will accept or send in one message.
+ * Worst case: an OP_BATCH with SCM_BATCH entries, each up to MAX_NAME+2 bytes. */
+#define MAX_PAYLOAD  (4u + SCM_BATCH * (2u + MAX_NAME))
+
+static inline void put_u32le(uint8_t *p, uint32_t v)
 {
-    size_t off = 0;
-    uint32_t nl = (uint32_t)nlibs;
-    if (off + 4 > buflen) return 0;
-    memcpy(buf + off, &nl, 4);
-    off += 4;
+    p[0] = (uint8_t)(v & 0xff);
+    p[1] = (uint8_t)((v >> 8) & 0xff);
+    p[2] = (uint8_t)((v >> 16) & 0xff);
+    p[3] = (uint8_t)((v >> 24) & 0xff);
+}
 
-    for (int i = 0; i < nlibs; i++) {
-        uint16_t nlen = (uint16_t)strlen(names[i]);
+static inline void put_u16le(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xff);
+    p[1] = (uint8_t)((v >> 8) & 0xff);
+}
+
+/* Blocking recv of exactly len bytes. Returns 0 on success, -1 on error/EOF. */
+static int recv_full(int sock, void *buf, size_t len)
+{
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = recv(sock, (uint8_t *)buf + got, len - got, 0);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            return -1;
+        }
+        got += (size_t)n;
+    }
+    return 0;
+}
+
+/* Send one v2 message with optional ancillary fds.
+ * Writes [u32 op | u32 plen | payload bytes] and, if nfds > 0,
+ * attaches SCM_RIGHTS on the first sendmsg.
+ * Returns 0 on success, -1 on failure. */
+static int send_msg(int sock, uint32_t op, const void *payload, uint32_t plen,
+                    const int *fds, int nfds)
+{
+    uint8_t hdr[8];
+    put_u32le(hdr, op);
+    put_u32le(hdr + 4, plen);
+
+    struct iovec iov[2];
+    iov[0].iov_base = hdr;
+    iov[0].iov_len  = sizeof(hdr);
+    iov[1].iov_base = (void *)payload;
+    iov[1].iov_len  = plen;
+
+    struct msghdr msg = {0};
+    msg.msg_iov    = iov;
+    msg.msg_iovlen = (plen > 0) ? 2 : 1;
+
+    char cmsg_buf[CMSG_SPACE(SCM_BATCH * sizeof(int))];
+    if (nfds > 0) {
+        memset(cmsg_buf, 0, sizeof(cmsg_buf));
+        msg.msg_control    = cmsg_buf;
+        msg.msg_controllen = CMSG_SPACE((size_t)nfds * sizeof(int));
+        struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type  = SCM_RIGHTS;
+        cm->cmsg_len   = CMSG_LEN((size_t)nfds * sizeof(int));
+        memcpy(CMSG_DATA(cm), fds, (size_t)nfds * sizeof(int));
+    }
+
+    size_t total = (size_t)8 + (size_t)plen;
+    ssize_t n = sendmsg(sock, &msg, 0);
+    if (n < 0) return -1;
+    if ((size_t)n == total) return 0;
+
+    /* Partial write after the first sendmsg: ancillary is already
+     * delivered, finish the remaining bytes with plain send(). */
+    size_t sent = (size_t)n;
+    if (sent < 8) {
+        size_t hrem = 8 - sent;
+        ssize_t m = send(sock, hdr + sent, hrem, 0);
+        if (m < 0 || (size_t)m != hrem) return -1;
+        sent = 8;
+    }
+    size_t prem = total - sent;
+    if (prem > 0) {
+        ssize_t m = send(sock, (const uint8_t *)payload + (sent - 8), prem, 0);
+        if (m < 0 || (size_t)m != prem) return -1;
+    }
+    return 0;
+}
+
+/* Receive one v2 message. On success sets *op and *plen, writes up to
+ * *plen bytes into payload, and up to max_fds ancillary fds into fds[]
+ * (setting *nfds). Returns 0 on success, -1 on error/EOF. */
+static int recv_msg(int sock, uint32_t *op,
+                    uint8_t *payload, uint32_t *plen, uint32_t max_payload,
+                    int *fds, int *nfds, int max_fds)
+{
+    *nfds = 0;
+
+    /* First recvmsg: 8-byte header + ancillary (if any). */
+    uint8_t hdr[8];
+    struct iovec iov = { .iov_base = hdr, .iov_len = sizeof(hdr) };
+
+    char cmsg_buf[CMSG_SPACE(SCM_BATCH * sizeof(int))];
+    memset(cmsg_buf, 0, sizeof(cmsg_buf));
+
+    struct msghdr msg = {0};
+    msg.msg_iov        = &iov;
+    msg.msg_iovlen     = 1;
+    msg.msg_control    = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+
+    ssize_t got = recvmsg(sock, &msg, 0);
+    if (got <= 0) return -1;
+
+    /* Extract any SCM_RIGHTS fds (attached to first byte of message). */
+    for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm)) {
+        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+            int n = (int)((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+            if (n > max_fds) {
+                int *src = (int *)CMSG_DATA(cm);
+                for (int k = 0; k < n; k++) close(src[k]);
+                return -1;
+            }
+            memcpy(fds, CMSG_DATA(cm), (size_t)n * sizeof(int));
+            *nfds = n;
+        }
+    }
+
+    /* Finish reading the header if we got fewer than 8 bytes. */
+    if (got < (ssize_t)sizeof(hdr)) {
+        if (recv_full(sock, hdr + got, sizeof(hdr) - (size_t)got) < 0)
+            return -1;
+    }
+
+    *op = u32le(hdr);
+    uint32_t p = u32le(hdr + 4);
+    if (p > max_payload) return -1;
+    *plen = p;
+
+    if (p > 0) {
+        if (recv_full(sock, payload, p) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Build an OP_BATCH payload (u32 nlibs + per-lib u16 nlen + name bytes). */
+static size_t build_batch_payload(uint8_t *buf, size_t buflen,
+                                  const char (*names)[MAX_NAME + 1],
+                                  int start, int count)
+{
+    if ((size_t)4 > buflen) return 0;
+    put_u32le(buf, (uint32_t)count);
+    size_t off = 4;
+    for (int i = 0; i < count; i++) {
+        uint16_t nlen = (uint16_t)strlen(names[start + i]);
         if (off + 2 + nlen > buflen) return 0;
-        memcpy(buf + off, &nlen, 2);
+        put_u16le(buf + off, nlen);
         off += 2;
-        memcpy(buf + off, names[i], nlen);
+        memcpy(buf + off, names[start + i], nlen);
         off += nlen;
     }
     return off;
 }
 
+/* Send the initial batch (filtered by `filter_names` if nfilter > 0, else all)
+ * followed by OP_END. Returns 0 on success, -1 on failure. */
+static int send_init_batch(int client, const int *lib_fds,
+                           const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                           const char (*filter_names)[MAX_NAME + 1], int nfilter)
+{
+    /* Resolve selection: either the filter list, or the full lib list. */
+    int   sel_fds[MAX_FILES];
+    int   sel_count = 0;
+    char  sel_names[MAX_FILES][MAX_NAME + 1];
+
+    if (nfilter > 0) {
+        for (int k = 0; k < nfilter; k++) {
+            for (int j = 0; j < nlibs; j++) {
+                if (strcmp(filter_names[k], lib_names[j]) == 0) {
+                    sel_fds[sel_count] = lib_fds[j];
+                    memcpy(sel_names[sel_count], lib_names[j], MAX_NAME + 1);
+                    sel_count++;
+                    break;
+                }
+            }
+        }
+    } else {
+        sel_count = nlibs;
+        memcpy(sel_fds, lib_fds, (size_t)nlibs * sizeof(int));
+        memcpy(sel_names, lib_names, (size_t)nlibs * (MAX_NAME + 1));
+    }
+
+    /* Send in SCM_BATCH-sized chunks. */
+    for (int off = 0; off < sel_count; off += SCM_BATCH) {
+        int batch = sel_count - off;
+        if (batch > SCM_BATCH) batch = SCM_BATCH;
+
+        uint8_t payload[MAX_PAYLOAD];
+        size_t plen = build_batch_payload(payload, sizeof(payload),
+                                          sel_names, off, batch);
+        if (plen == 0) return -1;
+        if (send_msg(client, OP_BATCH, payload, (uint32_t)plen,
+                     sel_fds + off, batch) < 0)
+            return -1;
+    }
+    return send_msg(client, OP_END, NULL, 0, NULL, 0);
+}
+
+/* Handle OP_GET_LIB: look up `name` in the daemon's lib table and reply
+ * with OP_LIB + status + (optionally) one fd. */
+static int handle_get_lib(int client, const int *lib_fds,
+                          const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                          const uint8_t *payload, uint32_t plen)
+{
+    uint8_t resp[4];
+    if (plen < 2) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    uint16_t nlen;
+    memcpy(&nlen, payload, 2);
+    if ((uint32_t)nlen + 2u > plen || nlen > MAX_NAME) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    char name[MAX_NAME + 1];
+    memcpy(name, payload + 2, nlen);
+    name[nlen] = '\0';
+
+    for (int j = 0; j < nlibs; j++) {
+        if (strcmp(lib_names[j], name) == 0) {
+            put_u32le(resp, ST_OK);
+            int fd = lib_fds[j];
+            return send_msg(client, OP_LIB, resp, 4, &fd, 1);
+        }
+    }
+    put_u32le(resp, ST_NOT_FOUND);
+    return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+}
+
+/* Parse an OP_INIT payload into a filter list. Returns number of names,
+ * or -1 on parse error. */
+static int parse_init_filter(const uint8_t *payload, uint32_t plen,
+                             char (*out_names)[MAX_NAME + 1])
+{
+    if (plen < 4) return -1;
+    uint32_t nfilter = u32le(payload);
+    if (nfilter > MAX_FILES) return -1;
+    size_t off = 4;
+    for (uint32_t i = 0; i < nfilter; i++) {
+        if (off + 2 > plen) return -1;
+        uint16_t nlen;
+        memcpy(&nlen, payload + off, 2);
+        off += 2;
+        if (nlen > MAX_NAME || off + nlen > plen) return -1;
+        memcpy(out_names[i], payload + off, nlen);
+        out_names[i][nlen] = '\0';
+        off += nlen;
+    }
+    return (int)nfilter;
+}
+
+/* Process a single inbound request from a connected client.
+ * Returns 0 to keep the connection alive, -1 to close it. */
+static int daemon_handle_request(int client, const int *lib_fds,
+                                 const char (*lib_names)[MAX_NAME + 1], int nlibs)
+{
+    uint32_t op, plen;
+    uint8_t  payload[MAX_PAYLOAD];
+    int      dummy_fds[1];
+    int      dummy_nfds = 0;
+
+    if (recv_msg(client, &op, payload, &plen, MAX_PAYLOAD,
+                 dummy_fds, &dummy_nfds, 0) < 0)
+        return -1;
+
+    if (op == OP_INIT) {
+        char filter[MAX_FILES][MAX_NAME + 1];
+        int  nfilter = parse_init_filter(payload, plen, filter);
+        if (nfilter < 0) return -1;
+        return send_init_batch(client, lib_fds, lib_names, nlibs,
+                               filter, nfilter);
+    }
+    if (op == OP_GET_LIB) {
+        return handle_get_lib(client, lib_fds, lib_names, nlibs, payload, plen);
+    }
+    if (op == OP_BYE) {
+        return -1;
+    }
+    return -1;
+}
+
+/* Single-threaded epoll-based daemon. Keeps per-client sockets alive
+ * for as long as the client wants; same-uid check enforced at accept. */
 static void daemon_serve(int listen_fd, const int *lib_fds,
                          const char (*lib_names)[MAX_NAME + 1], int nlibs)
 {
@@ -184,113 +475,166 @@ static void daemon_serve(int listen_fd, const int *lib_fds,
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
 
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    if (ep < 0) return;
+
+    struct epoll_event lev;
+    lev.events  = EPOLLIN;
+    lev.data.fd = listen_fd;
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, listen_fd, &lev) < 0) return;
+
+    struct epoll_event evs[32];
     for (;;) {
-        int client = accept(listen_fd, NULL, NULL);
-        if (client < 0) continue;
-
-        /* Only serve same uid */
-        struct ucred cred;
-        socklen_t clen = sizeof(cred);
-        if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0
-            || cred.uid != my_uid) {
-            close(client);
-            continue;
+        int n = epoll_wait(ep, evs, 32, -1);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
         }
 
-        /* Send libs in batches of SCM_BATCH (kernel limit: 253 fds) */
-        int ok = 1;
-        for (int off = 0; off < nlibs && ok; off += SCM_BATCH) {
-            int batch = nlibs - off;
-            if (batch > SCM_BATCH) batch = SCM_BATCH;
+        for (int i = 0; i < n; i++) {
+            int fd = evs[i].data.fd;
 
-            uint8_t payload[DAEMON_DATA_MAX];
-            size_t payload_len = build_daemon_payload(
-                payload, sizeof(payload), lib_names + off, batch);
+            if (fd == listen_fd) {
+                int client = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+                if (client < 0) continue;
 
-            struct iovec iov = { .iov_base = payload, .iov_len = payload_len };
+                struct ucred cred;
+                socklen_t clen = sizeof(cred);
+                if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0
+                    || cred.uid != my_uid) {
+                    close(client);
+                    continue;
+                }
 
-            char cmsg_buf[CMSG_SPACE(SCM_BATCH * sizeof(int))];
-            memset(cmsg_buf, 0, sizeof(cmsg_buf));
+                struct epoll_event cev;
+                cev.events  = EPOLLIN | EPOLLRDHUP;
+                cev.data.fd = client;
+                if (epoll_ctl(ep, EPOLL_CTL_ADD, client, &cev) < 0) {
+                    close(client);
+                }
+                continue;
+            }
 
-            struct msghdr msg = {0};
-            msg.msg_iov        = &iov;
-            msg.msg_iovlen     = 1;
-            msg.msg_control    = cmsg_buf;
-            msg.msg_controllen = CMSG_SPACE((size_t)batch * sizeof(int));
+            if (evs[i].events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR)) {
+                epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
+                close(fd);
+                continue;
+            }
 
-            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-            cmsg->cmsg_level = SOL_SOCKET;
-            cmsg->cmsg_type  = SCM_RIGHTS;
-            cmsg->cmsg_len   = CMSG_LEN((size_t)batch * sizeof(int));
-            memcpy(CMSG_DATA(cmsg), lib_fds + off, (size_t)batch * sizeof(int));
-
-            if (sendmsg(client, &msg, 0) < 0) ok = 0;
+            if (evs[i].events & EPOLLIN) {
+                if (daemon_handle_request(fd, lib_fds, lib_names, nlibs) < 0) {
+                    epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
+                    close(fd);
+                }
+            }
         }
-
-        /* Sentinel: nlibs=0 signals end of batches */
-        uint32_t sentinel = 0;
-        (void)send(client, &sentinel, sizeof(sentinel), 0);
-
-        close(client);
     }
 }
 
-/* Receive lib fds + names from the daemon (batched protocol).
- * Daemon sends batches of up to SCM_BATCH fds, terminated by a
- * sentinel message (nlibs=0).
+/* Client-side helper: send OP_INIT (optionally with a filter list),
+ * collect all OP_BATCH messages until OP_END, return fds + names.
+ * If nfilter == 0, requests the full lib set.
  * Returns 0 on success, -1 on failure. */
+static int daemon_request_libs(int sd,
+                               const char (*filter_names)[MAX_NAME + 1],
+                               int nfilter,
+                               int *out_fds,
+                               char (*out_names)[MAX_NAME + 1],
+                               int *out_nlibs)
+{
+    /* Build OP_INIT payload: [u32 nfilter] [(u16 nlen, bytes) * nfilter] */
+    uint8_t init_payload[MAX_PAYLOAD];
+    put_u32le(init_payload, (uint32_t)nfilter);
+    size_t off = 4;
+    for (int i = 0; i < nfilter; i++) {
+        uint16_t nlen = (uint16_t)strlen(filter_names[i]);
+        if (off + 2 + nlen > sizeof(init_payload)) return -1;
+        put_u16le(init_payload + off, nlen);
+        off += 2;
+        memcpy(init_payload + off, filter_names[i], nlen);
+        off += nlen;
+    }
+    if (send_msg(sd, OP_INIT, init_payload, (uint32_t)off, NULL, 0) < 0)
+        return -1;
+
+    *out_nlibs = 0;
+    for (;;) {
+        uint32_t op, plen;
+        uint8_t  payload[MAX_PAYLOAD];
+        int      recvd_fds[SCM_BATCH];
+        int      nrecvd = 0;
+
+        if (recv_msg(sd, &op, payload, &plen, MAX_PAYLOAD,
+                     recvd_fds, &nrecvd, SCM_BATCH) < 0)
+            return -1;
+
+        if (op == OP_END) break;
+        if (op != OP_BATCH) return -1;
+        if (plen < 4) return -1;
+
+        uint32_t nl = u32le(payload);
+        if ((int)nl != nrecvd) return -1;
+        if (*out_nlibs + (int)nl > MAX_FILES) return -1;
+
+        memcpy(out_fds + *out_nlibs, recvd_fds, (size_t)nl * sizeof(int));
+
+        size_t poff = 4;
+        for (uint32_t i = 0; i < nl; i++) {
+            if (poff + 2 > plen) return -1;
+            uint16_t nlen;
+            memcpy(&nlen, payload + poff, 2);
+            poff += 2;
+            if (nlen > MAX_NAME || poff + nlen > plen) return -1;
+            memcpy(out_names[*out_nlibs + (int)i], payload + poff, nlen);
+            out_names[*out_nlibs + (int)i][nlen] = '\0';
+            poff += nlen;
+        }
+        *out_nlibs += (int)nl;
+    }
+    return (*out_nlibs > 0) ? 0 : -1;
+}
+
+/* Send OP_GET_LIB and receive one OP_LIB response with a single fd.
+ * Returns the fd on success, -1 on error. Used by lazy-fetch in dlopen_shim. */
+__attribute__((unused))
+static int daemon_request_one(int sd, const char *name)
+{
+    uint16_t nlen = (uint16_t)strlen(name);
+    if (nlen > MAX_NAME) return -1;
+
+    uint8_t req[2 + MAX_NAME];
+    put_u16le(req, nlen);
+    memcpy(req + 2, name, nlen);
+    if (send_msg(sd, OP_GET_LIB, req, (uint32_t)(2 + nlen), NULL, 0) < 0)
+        return -1;
+
+    uint32_t op, plen;
+    uint8_t  payload[16];
+    int      recvd_fds[1];
+    int      nrecvd = 0;
+    if (recv_msg(sd, &op, payload, &plen, sizeof(payload),
+                 recvd_fds, &nrecvd, 1) < 0)
+        return -1;
+    if (op != OP_LIB || plen < 4) return -1;
+    uint32_t status = u32le(payload);
+    if (status != ST_OK || nrecvd != 1) return -1;
+    return recvd_fds[0];
+}
+
+/* Send OP_BYE to cleanly close the daemon socket. Best-effort. */
+static void daemon_send_bye(int sd)
+{
+    (void)send_msg(sd, OP_BYE, NULL, 0, NULL, 0);
+}
+
+/* Back-compat shim for existing call sites that still want the
+ * "send empty filter, receive all libs, close" flow. */
 static int receive_lib_fds(int sd, int *out_fds,
                            char (*out_names)[MAX_NAME + 1], int *out_nlibs)
 {
-    *out_nlibs = 0;
-
-    for (;;) {
-        uint8_t payload[DAEMON_DATA_MAX];
-        struct iovec iov = { .iov_base = payload, .iov_len = sizeof(payload) };
-
-        char cmsg_buf[CMSG_SPACE(SCM_BATCH * sizeof(int))];
-        memset(cmsg_buf, 0, sizeof(cmsg_buf));
-
-        struct msghdr msg = {0};
-        msg.msg_iov        = &iov;
-        msg.msg_iovlen     = 1;
-        msg.msg_control    = cmsg_buf;
-        msg.msg_controllen = sizeof(cmsg_buf);
-
-        ssize_t got = recvmsg(sd, &msg, 0);
-        if (got < 4) return -1;
-
-        uint32_t nl;
-        memcpy(&nl, payload, 4);
-        if (nl == 0) break;  /* sentinel — no more batches */
-        if (*out_nlibs + (int)nl > MAX_FILES) return -1;
-
-        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-        if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) return -1;
-
-        int nfds = (int)((cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int));
-        if (nfds != (int)nl) return -1;
-
-        memcpy(out_fds + *out_nlibs, CMSG_DATA(cmsg),
-               (size_t)nfds * sizeof(int));
-
-        /* Parse lib names for this batch */
-        size_t off = 4;
-        for (int i = 0; i < (int)nl; i++) {
-            if (off + 2 > (size_t)got) return -1;
-            uint16_t nlen;
-            memcpy(&nlen, payload + off, 2);
-            off += 2;
-            if (nlen > MAX_NAME || off + nlen > (size_t)got) return -1;
-            memcpy(out_names[*out_nlibs + i], payload + off, nlen);
-            out_names[*out_nlibs + i][nlen] = '\0';
-            off += nlen;
-        }
-
-        *out_nlibs += (int)nl;
-    }
-
-    return (*out_nlibs > 0) ? 0 : -1;
+    int rc = daemon_request_libs(sd, NULL, 0, out_fds, out_names, out_nlibs);
+    daemon_send_bye(sd);
+    return rc;
 }
 
 /* Build abstract socket address from key hash.
