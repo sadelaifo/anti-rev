@@ -164,12 +164,10 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 #define OP_INIT     0x01u
 #define OP_GET_LIB  0x02u
 #define OP_BYE      0x03u
-#define OP_LIST     0x04u  /* client → daemon: return full name list, no fds */
 
 #define OP_BATCH    0x81u
 #define OP_END      0x82u
 #define OP_LIB      0x83u
-#define OP_NAMES    0x84u  /* daemon → client: full name list, no fds */
 
 #define ST_OK        0u
 #define ST_NOT_FOUND 1u
@@ -382,19 +380,6 @@ static int send_init_batch(int client, const int *lib_fds,
     return send_msg(client, OP_END, NULL, 0, NULL, 0);
 }
 
-/* Handle OP_LIST: reply with OP_NAMES carrying the full lib name list
- * (no SCM_RIGHTS fds).  Used by wrapper mode to populate
- * ANTIREV_FD_MAP_LIBS for dlopen_shim's lazy-fetch matching. */
-static int handle_list(int client, const char (*lib_names)[MAX_NAME + 1],
-                       int nlibs)
-{
-    uint8_t payload[MAX_PAYLOAD];
-    size_t plen = build_batch_payload(payload, sizeof(payload),
-                                      lib_names, 0, nlibs);
-    if (plen == 0) return -1;
-    return send_msg(client, OP_NAMES, payload, (uint32_t)plen, NULL, 0);
-}
-
 /* Handle OP_GET_LIB: look up `name` in the daemon's lib table and reply
  * with OP_LIB + status + (optionally) one fd. */
 static int handle_get_lib(int client, const int *lib_fds,
@@ -469,9 +454,6 @@ static int daemon_handle_request(int client, const int *lib_fds,
         if (nfilter < 0) return -1;
         return send_init_batch(client, lib_fds, lib_names, nlibs,
                                filter, nfilter);
-    }
-    if (op == OP_LIST) {
-        return handle_list(client, lib_names, nlibs);
     }
     if (op == OP_GET_LIB) {
         return handle_get_lib(client, lib_fds, lib_names, nlibs, payload, plen);
@@ -609,44 +591,7 @@ static int daemon_request_libs(int sd,
         }
         *out_nlibs += (int)nl;
     }
-    /* Zero libs is a valid response under lazy fetch — e.g. the filter
-     * named only unencrypted libs that the daemon doesn't hold. */
-    return 0;
-}
-
-/* Client-side helper: send OP_LIST, receive OP_NAMES, fill out_names.
- * Returns 0 on success, -1 on failure. */
-static int daemon_request_names(int sd,
-                                char (*out_names)[MAX_NAME + 1],
-                                int *out_nlibs)
-{
-    if (send_msg(sd, OP_LIST, NULL, 0, NULL, 0) < 0) return -1;
-
-    uint32_t op, plen;
-    uint8_t  payload[MAX_PAYLOAD];
-    int      dummy_fds[1];
-    int      nrecvd = 0;
-    if (recv_msg(sd, &op, payload, &plen, MAX_PAYLOAD,
-                 dummy_fds, &nrecvd, 0) < 0)
-        return -1;
-    if (op != OP_NAMES || plen < 4) return -1;
-
-    uint32_t nl = u32le(payload);
-    if (nl > MAX_FILES) return -1;
-
-    size_t off = 4;
-    for (uint32_t i = 0; i < nl; i++) {
-        if (off + 2 > plen) return -1;
-        uint16_t nlen;
-        memcpy(&nlen, payload + off, 2);
-        off += 2;
-        if (nlen > MAX_NAME || off + nlen > plen) return -1;
-        memcpy(out_names[i], payload + off, nlen);
-        out_names[i][nlen] = '\0';
-        off += nlen;
-    }
-    *out_nlibs = (int)nl;
-    return 0;
+    return (*out_nlibs > 0) ? 0 : -1;
 }
 
 /* Send OP_GET_LIB and receive one OP_LIB response with a single fd.
@@ -676,13 +621,20 @@ static int daemon_request_one(int sd, const char *name)
     return recvd_fds[0];
 }
 
-/* Send OP_BYE to cleanly close the daemon socket. Used by dlopen_shim on
- * process exit. Marked unused in stub.c itself since dlopen_shim has its
- * own duplicate. */
-__attribute__((unused))
+/* Send OP_BYE to cleanly close the daemon socket. Best-effort. */
 static void daemon_send_bye(int sd)
 {
     (void)send_msg(sd, OP_BYE, NULL, 0, NULL, 0);
+}
+
+/* Back-compat shim for existing call sites that still want the
+ * "send empty filter, receive all libs, close" flow. */
+static int receive_lib_fds(int sd, int *out_fds,
+                           char (*out_names)[MAX_NAME + 1], int *out_nlibs)
+{
+    int rc = daemon_request_libs(sd, NULL, 0, out_fds, out_names, out_nlibs);
+    daemon_send_bye(sd);
+    return rc;
 }
 
 /* Build abstract socket address from key hash.
@@ -1153,11 +1105,10 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
 
     /* ----------------------------------------------------------------
      * Mode D: Wrapper (BFLAG_WRAPPER).
-     * No main binary — connect to daemon, fetch just the lib NAME list
-     * (no fds), keep the socket open, set up LD_PRELOAD (dlopen_shim) +
-     * ANTIREV_FD_MAP_LIBS (names) + ANTIREV_LIBD_SOCK (daemon fd), then
-     * exec argv[1...].  dlopen_shim fetches each matching lib on demand
-     * via the inherited daemon socket.
+     * No main binary — connect to daemon, receive lib fds, set up
+     * LD_PRELOAD (dlopen_shim) + ANTIREV_FD_MAP (all libs), then
+     * exec argv[1...].  The dlopen_shim constructor eagerly preloads
+     * all ANTIREV_FD_MAP libs via retry loop.
      * ---------------------------------------------------------------- */
     if (bundle_flags & BFLAG_WRAPPER) {
         if (argc < 2) {
@@ -1165,29 +1116,32 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             return 1;
         }
 
+        /* Raise fd limit: we'll receive ~nlibs fds via SCM_RIGHTS */
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+
         /* Connect to daemon */
         struct sockaddr_un addr;
         socklen_t addr_len = make_sock_addr(&addr, key);
         explicit_bzero(key, sizeof(key));
 
-        int sd = -1;
-        int daemon_launched = 0;
+        int connected = 0, daemon_launched = 0;
         for (int retry = 0; retry < 50; retry++) {
-            sd = socket(AF_UNIX, SOCK_STREAM, 0);
+            int sd = socket(AF_UNIX, SOCK_STREAM, 0);
             if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
                 char recv_names[MAX_FILES][MAX_NAME + 1];
-                int  n_recv = 0;
-                if (daemon_request_names(sd, recv_names, &n_recv) == 0
-                    && n_recv > 0) {
+                if (receive_lib_fds(sd, lib_fds, recv_names, &nlibs) == 0
+                    && nlibs > 0) {
                     memcpy(lib_names, recv_names, sizeof(recv_names));
-                    nlibs = n_recv;
-                    break;  /* sd stays open */
+                    connected = 1;
                 }
                 close(sd);
-                sd = -1;
                 break;
             }
-            if (sd >= 0) { close(sd); sd = -1; }
+            if (sd >= 0) close(sd);
 
             if (!daemon_launched && retry == 0) {
                 char daemon_path[4096];
@@ -1210,11 +1164,11 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             usleep(100000);
         }
 
-        if (sd < 0 || nlibs == 0) {
-            fprintf(stderr, "[antirev] wrapper: could not get lib names from daemon\n");
+        if (!connected || nlibs == 0) {
+            fprintf(stderr, "[antirev] wrapper: could not get libs from daemon\n");
             return 1;
         }
-        fprintf(stderr, "[antirev] wrapper: %d libs available lazily\n", nlibs);
+        fprintf(stderr, "[antirev] wrapper: received %d libs\n", nlibs);
 
         /* Create dlopen_shim memfd */
         int dlopen_shim_fd = make_memfd("antirev_dlopen_shim.so");
@@ -1222,20 +1176,16 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         if (write_chunk(dlopen_shim_fd, dlopen_shim_blob, dlopen_shim_blob_len) != 0) return 1;
         if (lseek(dlopen_shim_fd, 0, SEEK_SET) < 0) { perror("lseek"); return 1; }
 
-        /* Build ANTIREV_FD_MAP_LIBS with all lib names (no fds) */
-        size_t map_len = 32 + (size_t)nlibs * (MAX_NAME + 4);
+        /* Build ANTIREV_FD_MAP with ALL libs */
+        size_t map_len = 16 + (size_t)nlibs * (MAX_NAME + 16);
         char *fd_map = malloc(map_len);
         if (!fd_map) { perror("malloc"); return 1; }
-        int moff = snprintf(fd_map, map_len, "ANTIREV_FD_MAP_LIBS=");
+        int moff = snprintf(fd_map, map_len, "ANTIREV_FD_MAP=");
         for (int j = 0; j < nlibs; j++) {
             if (j > 0) fd_map[moff++] = ',';
             moff += snprintf(fd_map + moff, map_len - (size_t)moff,
-                             "%s", lib_names[j]);
+                             "%s=%d", lib_names[j], lib_fds[j]);
         }
-
-        /* Daemon socket fd passed to the wrapped command */
-        char libd_sock[48];
-        snprintf(libd_sock, sizeof(libd_sock), "ANTIREV_LIBD_SOCK=%d", sd);
 
         /* Build LD_PRELOAD with only dlopen_shim */
         char ld_preload[128];
@@ -1245,19 +1195,16 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         /* Build new environment */
         int envc = 0;
         while (envp[envc]) envc++;
-        char **new_env = malloc((size_t)(envc + 4) * sizeof(char *));
+        char **new_env = malloc((size_t)(envc + 3) * sizeof(char *));
         if (!new_env) { perror("malloc"); return 1; }
         int ei = 0;
         for (int j = 0; j < envc; j++) {
-            if (strncmp(envp[j], "LD_PRELOAD=",          11) == 0) continue;
-            if (strncmp(envp[j], "ANTIREV_FD_MAP=",      15) == 0) continue;
-            if (strncmp(envp[j], "ANTIREV_FD_MAP_LIBS=", 20) == 0) continue;
-            if (strncmp(envp[j], "ANTIREV_LIBD_SOCK=",   18) == 0) continue;
+            if (strncmp(envp[j], "LD_PRELOAD=",   11) == 0) continue;
+            if (strncmp(envp[j], "ANTIREV_FD_MAP=", 15) == 0) continue;
             new_env[ei++] = envp[j];
         }
         new_env[ei++] = ld_preload;
         new_env[ei++] = fd_map;
-        new_env[ei++] = libd_sock;
         new_env[ei]   = NULL;
 
         /* Exec the wrapped command */
@@ -1272,19 +1219,13 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * Phase 3: lib fd acquisition.
      *
      * Mode C (daemon libs): no libs bundled, must receive from daemon.
-     *
-     * Lazy fetch: on the symlink-dir path (has_needed_section) we only
-     * pull the transitive DT_NEEDED set from the daemon and keep the
-     * socket open so dlopen_shim can request additional libs on demand.
-     * On the backward-compat path (no needed section) we fall back to
-     * requesting all libs up front to match old stub behavior.
      * ---------------------------------------------------------------- */
-    int daemon_sd = -1;
-    char fdmap_names_only[MAX_FILES][MAX_NAME + 1];
-    int n_fdmap_names = 0;
     if ((bundle_flags & BFLAG_DAEMON_LIBS) && nlibs == 0) {
-        /* Raise fd limit just in case (batches of DT_NEEDED fds still
-         * arrive via SCM_RIGHTS). */
+        /* Mode C: client-only — receive libs from daemon.
+         * If no daemon is running, auto-launch .antirev-libd from the
+         * same directory as our binary (first process bootstraps it). */
+
+        /* Raise fd limit: we'll receive ~nlibs fds via SCM_RIGHTS */
         struct rlimit rl;
         if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
             rl.rlim_cur = rl.rlim_max;
@@ -1301,60 +1242,12 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             int sd = socket(AF_UNIX, SOCK_STREAM, 0);
             if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
                 char recv_names[MAX_FILES][MAX_NAME + 1];
-                int rc = 0;
-
-                if (has_needed_section) {
-                    /* Lazy-fetch path:
-                     *   1. Pull the DT_NEEDED subset only (might be empty).
-                     *   2. Ask the daemon for the full name list.
-                     *   3. Anything not in the DT_NEEDED set is lazy fdmap. */
-                    if (n_needed > 0) {
-                        rc = daemon_request_libs(sd, needed_names, n_needed,
-                                                 lib_fds, recv_names, &nlibs);
-                    } else {
-                        nlibs = 0;
-                    }
-                    if (rc == 0) {
-                        if (nlibs > 0)
-                            memcpy(lib_names, recv_names, sizeof(recv_names));
-
-                        char all_names[MAX_FILES][MAX_NAME + 1];
-                        int  n_all = 0;
-                        if (daemon_request_names(sd, all_names, &n_all) == 0) {
-                            for (int a = 0; a < n_all; a++) {
-                                int is_needed = 0;
-                                for (int b = 0; b < nlibs; b++) {
-                                    if (strcmp(all_names[a], lib_names[b]) == 0) {
-                                        is_needed = 1;
-                                        break;
-                                    }
-                                }
-                                if (!is_needed) {
-                                    memcpy(fdmap_names_only[n_fdmap_names],
-                                           all_names[a], MAX_NAME + 1);
-                                    n_fdmap_names++;
-                                }
-                            }
-                        }
-                        connected = 1;
-                        daemon_sd = sd;
-                    } else {
-                        close(sd);
-                    }
-                } else {
-                    /* Legacy backward-compat: fetch everything up front,
-                     * will all go into symlink dir + LD_PRELOAD. */
-                    rc = daemon_request_libs(sd, NULL, 0,
-                                             lib_fds, recv_names, &nlibs);
-                    if (rc == 0 && nlibs > 0) {
-                        memcpy(lib_names, recv_names, sizeof(recv_names));
-                        connected = 1;
-                    } else if (rc == 0 && nlibs == 0) {
-                        /* Daemon reachable but no libs — treat as failure
-                         * for the legacy path (nothing to load). */
-                    }
-                    close(sd);
+                if (receive_lib_fds(sd, lib_fds, recv_names, &nlibs) == 0
+                    && nlibs > 0) {
+                    memcpy(lib_names, recv_names, sizeof(recv_names));
+                    connected = 1;
                 }
+                close(sd);
                 break;
             }
             if (sd >= 0) close(sd);
@@ -1412,22 +1305,14 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     if (write_chunk(dlopen_shim_fd, dlopen_shim_blob, dlopen_shim_blob_len) != 0) return 1;
     if (lseek(dlopen_shim_fd, 0, SEEK_SET) < 0) { perror("lseek dlopen_shim"); return 1; }
 
-    /* Phase 4b. Split libs into DT_NEEDED (symlink dir) and rest (dlopen_shim).
+    /* Phase 4b. Split libs into DT_NEEDED (symlink dir) and rest (ANTIREV_FD_MAP).
      *
-     * DT_NEEDED libs go into the symlink dir on LD_LIBRARY_PATH — glibc's
-     * normal BFS resolves them there, preserving the original symbol
-     * lookup order.  They are NOT put on LD_PRELOAD (which would reorder
-     * them ahead of unencrypted libs and change symbol resolution).
+     * DT_NEEDED libs are resolved by glibc's normal BFS through the symlink
+     * dir on LD_LIBRARY_PATH — preserving the original symbol lookup order.
+     * They are NOT put on LD_PRELOAD (which would reorder them ahead of
+     * unencrypted libs and change symbol resolution).
      *
-     * Remaining libs are fetched on demand by dlopen_shim:
-     *   - Mode C + has_needed_section: lazy fetch from the daemon socket.
-     *     lib_fds[] already contains only the DT_NEEDED subset (filtered
-     *     at daemon_request_libs time).  The fdmap set is a list of
-     *     *names* (no fds) collected from daemon_request_names.
-     *   - Mode A (libs bundled in exe): lib_fds[] contains everything and
-     *     we split by inspecting needed_names.  fdmap fds are held in
-     *     process for the lifetime of dlopen_shim.
-     */
+     * Remaining libs are available on-demand via dlopen_shim + ANTIREV_FD_MAP. */
     int dt_needed_fds[MAX_FILES];
     char dt_needed_names[MAX_FILES][MAX_NAME + 1];
     int n_dt_needed = 0;
@@ -1435,40 +1320,21 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     int fdmap_fds[MAX_FILES];
     char fdmap_names[MAX_FILES][MAX_NAME + 1];
     int n_fdmap = 0;
-    int fdmap_is_lazy = 0;   /* 1 = fdmap entries are names only, no fds */
 
-    if (has_needed_section && daemon_sd >= 0) {
-        /* Mode C lazy-fetch: lib_fds[] already filtered to DT_NEEDED only. */
-        n_dt_needed = nlibs;
-        memcpy(dt_needed_fds, lib_fds, (size_t)nlibs * sizeof(int));
-        memcpy(dt_needed_names, lib_names,
-               (size_t)nlibs * (MAX_NAME + 1));
-
-        n_fdmap = n_fdmap_names;
-        memcpy(fdmap_names, fdmap_names_only,
-               (size_t)n_fdmap * (MAX_NAME + 1));
-        fdmap_is_lazy = 1;
-
-        fprintf(stderr,
-                "[antirev] split: %d via symlinks, %d lazy "
-                "(needed=%d, daemon=%d)\n",
-                n_dt_needed, n_fdmap, n_needed, nlibs + n_fdmap);
-        for (int k = 0; k < n_dt_needed; k++)
-            fprintf(stderr, "[antirev]   DT_NEEDED: %s (fd %d)\n",
-                    dt_needed_names[k], dt_needed_fds[k]);
-    } else if (has_needed_section && nlibs > 0) {
-        /* Mode A with needed section: split by name. */
+    if (has_needed_section && nlibs > 0) {
+        /* Identify which daemon libs are in the exe's DT_NEEDED chain.
+         * These go into the symlink dir only (not LD_PRELOAD). */
         for (int k = 0; k < n_needed; k++) {
             for (int j = 0; j < nlibs; j++) {
                 if (strcmp(lib_names[j], needed_names[k]) == 0) {
                     dt_needed_fds[n_dt_needed] = lib_fds[j];
-                    memcpy(dt_needed_names[n_dt_needed], lib_names[j],
-                           MAX_NAME + 1);
+                    memcpy(dt_needed_names[n_dt_needed], lib_names[j], MAX_NAME + 1);
                     n_dt_needed++;
                     break;
                 }
             }
         }
+        /* Remaining libs go to ANTIREV_FD_MAP for on-demand dlopen */
         for (int j = 0; j < nlibs; j++) {
             int is_needed = 0;
             for (int k = 0; k < n_needed; k++) {
@@ -1511,29 +1377,24 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     char link_dir[] = "/tmp/antirev_XXXXXX";
     char *link_dir_ptr = mkdtemp(link_dir);
     if (link_dir_ptr) {
-        int linked = 0;
         for (int j = 0; j < n_dt_needed; j++) {
             char lpath[sizeof(link_dir) + MAX_NAME + 2];
             char target[64];
             snprintf(lpath, sizeof(lpath), "%s/%s", link_dir, dt_needed_names[j]);
             snprintf(target, sizeof(target), "/proc/self/fd/%d", dt_needed_fds[j]);
-            if (symlink(target, lpath) == 0) linked++;
-            else perror("[antirev] symlink");
+            if (symlink(target, lpath) < 0)
+                perror("[antirev] symlink");
         }
-        /* fdmap fds only exist on the non-lazy path (Mode A); lazy fetch
-         * resolves via the daemon socket inside dlopen_shim instead. */
-        if (!fdmap_is_lazy) {
-            for (int j = 0; j < n_fdmap; j++) {
-                char lpath[sizeof(link_dir) + MAX_NAME + 2];
-                char target[64];
-                snprintf(lpath, sizeof(lpath), "%s/%s", link_dir, fdmap_names[j]);
-                snprintf(target, sizeof(target), "/proc/self/fd/%d", fdmap_fds[j]);
-                if (symlink(target, lpath) == 0) linked++;
-                else perror("[antirev] symlink");
-            }
+        for (int j = 0; j < n_fdmap; j++) {
+            char lpath[sizeof(link_dir) + MAX_NAME + 2];
+            char target[64];
+            snprintf(lpath, sizeof(lpath), "%s/%s", link_dir, fdmap_names[j]);
+            snprintf(target, sizeof(target), "/proc/self/fd/%d", fdmap_fds[j]);
+            if (symlink(target, lpath) < 0)
+                perror("[antirev] symlink");
         }
         fprintf(stderr, "[antirev] symlink dir: %s (%d links)\n",
-                link_dir, linked);
+                link_dir, n_dt_needed + n_fdmap);
     }
 
     /* Phase 5. Build new envp */
@@ -1591,9 +1452,9 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
     }
 
-    /* +9: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP[_LIBS],
-     * ANTIREV_LIBD_SOCK, LD_LIBRARY_PATH, ANTIREV_CLOSE_FDS, NULL + spare */
-    char **new_env = malloc((size_t)(envc + 9) * sizeof(char *));
+    /* +8: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP, LD_LIBRARY_PATH,
+     * ANTIREV_CLOSE_FDS, NULL + spare */
+    char **new_env = malloc((size_t)(envc + 8) * sizeof(char *));
     if (!new_env) { perror("malloc env"); return 1; }
 
     char real_exe_entry[4096 + 32];
@@ -1632,44 +1493,19 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         snprintf(ld_preload_entry + off, preload_len - (size_t)off,
                  ":%s", existing_preload);
 
-    /* Build fdmap env entry.
-     *   - Lazy path (Mode C daemon + has_needed_section):
-     *       ANTIREV_FD_MAP_LIBS=libfoo.so,libbar.so,...
-     *       — names only.  dlopen_shim fetches each via daemon_sd on demand.
-     *   - Eager path (Mode A bundled libs):
-     *       ANTIREV_FD_MAP=libfoo.so=fd,libbar.so=fd,...
-     *       — preallocated fds, same as before. */
+    /* Build ANTIREV_FD_MAP: name=fd,name=fd,... for dlopen'd libs */
     char *fd_map_entry = NULL;
     if (n_fdmap > 0) {
-        size_t map_len = 32 + (size_t)n_fdmap * (MAX_NAME + 16);
+        size_t map_len = 16 + (size_t)n_fdmap * (MAX_NAME + 16);
         fd_map_entry = malloc(map_len);
         if (fd_map_entry) {
-            int moff;
-            if (fdmap_is_lazy) {
-                moff = snprintf(fd_map_entry, map_len, "ANTIREV_FD_MAP_LIBS=");
-                for (int j = 0; j < n_fdmap; j++) {
-                    if (j > 0) fd_map_entry[moff++] = ',';
-                    moff += snprintf(fd_map_entry + moff, map_len - (size_t)moff,
-                                     "%s", fdmap_names[j]);
-                }
-            } else {
-                moff = snprintf(fd_map_entry, map_len, "ANTIREV_FD_MAP=");
-                for (int j = 0; j < n_fdmap; j++) {
-                    if (j > 0) fd_map_entry[moff++] = ',';
-                    moff += snprintf(fd_map_entry + moff, map_len - (size_t)moff,
-                                     "%s=%d", fdmap_names[j], fdmap_fds[j]);
-                }
+            int moff = snprintf(fd_map_entry, map_len, "ANTIREV_FD_MAP=");
+            for (int j = 0; j < n_fdmap; j++) {
+                if (j > 0) fd_map_entry[moff++] = ',';
+                moff += snprintf(fd_map_entry + moff, map_len - (size_t)moff,
+                                 "%s=%d", fdmap_names[j], fdmap_fds[j]);
             }
         }
-    }
-
-    /* Build ANTIREV_LIBD_SOCK: daemon socket fd, inherited across fexecve.
-     * dlopen_shim reads it and uses daemon_request_one() to fetch libs. */
-    char libd_sock_entry[48];
-    libd_sock_entry[0] = '\0';
-    if (daemon_sd >= 0) {
-        snprintf(libd_sock_entry, sizeof(libd_sock_entry),
-                 "ANTIREV_LIBD_SOCK=%d", daemon_sd);
     }
 
     /* Build ANTIREV_CLOSE_FDS: comma-separated DT_NEEDED fds that exe_shim
@@ -1696,14 +1532,12 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
 
     int ei = 0;
     for (int j = 0; j < envc; j++) {
-        if (strncmp(envp[j], "LD_PRELOAD=",           11) == 0) continue;
-        if (strncmp(envp[j], "LD_LIBRARY_PATH=",      16) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_REAL_EXE=",     17) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_MAIN_FD=",      16) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_FD_MAP=",       15) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_FD_MAP_LIBS=",  20) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_LIBD_SOCK=",    18) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_CLOSE_FDS=",    18) == 0) continue;
+        if (strncmp(envp[j], "LD_PRELOAD=",         11) == 0) continue;
+        if (strncmp(envp[j], "LD_LIBRARY_PATH=",    16) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_REAL_EXE=",   17) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_MAIN_FD=",    16) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_FD_MAP=",     15) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_CLOSE_FDS=",  18) == 0) continue;
         new_env[ei++] = envp[j];
     }
     new_env[ei++] = real_exe_entry;
@@ -1711,8 +1545,6 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     new_env[ei++] = ld_preload_entry;
     if (fd_map_entry)
         new_env[ei++] = fd_map_entry;
-    if (libd_sock_entry[0])
-        new_env[ei++] = libd_sock_entry;
     if (ld_libpath_entry)
         new_env[ei++] = ld_libpath_entry;
     if (close_fds_entry)
