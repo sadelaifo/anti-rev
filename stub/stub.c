@@ -174,7 +174,13 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 #define OP_LIB      0x83u
 #define OP_NAMES    0x84u  /* response to OP_LIST: batched name list */
 
-#define MAX_DEPS_PER_LIB 32
+/* Per-lib adjacency cap.  Real business libs can DT_NEED 30+ entries
+ * (system + Qt + boost + app libs) and anything beyond this cap gets
+ * dropped from the deps graph, which then causes lazy fetch to miss
+ * transitive encrypted deps and glibc to fall back to disk (hitting
+ * ciphertext and aborting with "invalid elf header").  Keep this
+ * well above the largest plausible DT_NEEDED list. */
+#define MAX_DEPS_PER_LIB 128
 
 /* Forward decl — defined with the other daemon helpers further below. */
 static int compute_closure(const char *start,
@@ -857,9 +863,12 @@ static int parse_dt_needed(int fd,
     size_t      strtab_max = (size_t)(st.st_size - strtab_off);
 
     int n = 0;
-    for (int i = 0; i < ndyn && n < max_out; i++) {
+    int total = 0;   /* total DT_NEEDED entries observed, capped or not */
+    for (int i = 0; i < ndyn; i++) {
         if (dyn[i].d_tag == DT_NULL) break;
         if (dyn[i].d_tag != DT_NEEDED) continue;
+        total++;
+        if (n >= max_out) continue;   /* cap reached — keep counting */
         uint64_t off = dyn[i].d_un.d_val;
         if (off >= strtab_max) continue;
         size_t len = strnlen(strtab + off, strtab_max - off);
@@ -868,7 +877,10 @@ static int parse_dt_needed(int fd,
         out_names[n][len] = '\0';
         n++;
     }
-    found = n;
+    /* Signal truncation by returning a negative of (actual total)
+     * so the caller knows the stored list is incomplete.  Positive
+     * return = full list fits in the output buffer. */
+    found = (total > max_out) ? -(total) : n;
 
 out:
     munmap(map, (size_t)st.st_size);
@@ -885,7 +897,20 @@ static void build_deps_graph(const int *lib_fds,
     for (int i = 0; i < nlibs; i++) {
         g_deps_count[i] = 0;
         int n_dt = parse_dt_needed(lib_fds[i], dt_names, MAX_DEPS_PER_LIB);
-        if (n_dt <= 0) continue;
+        if (n_dt < 0) {
+            /* Parser signaled truncation — some DT_NEEDED entries
+             * didn't fit.  This is very bad for lazy closure fetch:
+             * any dropped encrypted dep will send glibc to disk at
+             * load time and abort with "invalid elf header".  Bump
+             * MAX_DEPS_PER_LIB above the real count and rebuild. */
+            fprintf(stderr, "[antirev] WARNING: %s has %d DT_NEEDED "
+                    "entries, only %d captured (MAX_DEPS_PER_LIB=%d). "
+                    "Increase the cap.\n",
+                    lib_names[i], -n_dt, MAX_DEPS_PER_LIB,
+                    MAX_DEPS_PER_LIB);
+            n_dt = MAX_DEPS_PER_LIB;  /* use what we got */
+        }
+        if (n_dt == 0) continue;
         for (int k = 0; k < n_dt; k++) {
             for (int j = 0; j < nlibs; j++) {
                 if (j == i) continue;
