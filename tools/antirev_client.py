@@ -46,6 +46,14 @@ from pathlib import Path
 KEY_SIZE = 32
 SCM_BATCH = 250
 
+# Daemon protocol v2 (matches stub/stub.c OP_*)
+OP_INIT    = 0x01
+OP_GET_LIB = 0x02
+OP_BYE     = 0x03
+OP_BATCH   = 0x81
+OP_END     = 0x82
+OP_LIB     = 0x83
+
 
 # ── ELF DT_NEEDED parser (pure Python, no external tools) ──────────
 
@@ -225,6 +233,69 @@ def _load_key(path):
     return key
 
 
+# ── Daemon protocol v2 framing ──────────────────────────────────────
+#
+# Every message on the wire is:
+#   [u32 op][u32 plen][payload bytes] (+ optional SCM_RIGHTS ancillary)
+#
+# Ancillary fds are attached to the first byte of the sendmsg, so a
+# single recvmsg for the header picks them up alongside bytes 0..7.
+
+_FD_SIZE = array.array('i').itemsize
+
+
+def _recv_exact(sd, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sd.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("antirev daemon closed connection")
+        buf += chunk
+    return bytes(buf)
+
+
+def _send_msg(sd, op, payload=b""):
+    """Send one framed v2 message (no ancillary fds from the client)."""
+    hdr = struct.pack('<II', op, len(payload))
+    sd.sendall(hdr + payload)
+
+
+def _recv_msg(sd):
+    """Receive one v2 message. Returns (op, payload, fds)."""
+    cmsg_len = socket.CMSG_SPACE(SCM_BATCH * _FD_SIZE)
+    msg, ancdata, _flags, _addr = sd.recvmsg(8, cmsg_len)
+    if not msg:
+        raise ConnectionError("antirev daemon closed connection")
+
+    # Ancillary fds ride with the first byte of the message — collect
+    # them before doing any follow-up recv() calls.
+    fds = []
+    for level, type_, cmsg_data in ancdata:
+        if level == socket.SOL_SOCKET and type_ == socket.SCM_RIGHTS:
+            arr = array.array('i')
+            usable = len(cmsg_data) - (len(cmsg_data) % _FD_SIZE)
+            arr.frombytes(cmsg_data[:usable])
+            fds.extend(arr.tolist())
+
+    # Stream sockets can short-read; finish the header if needed.
+    if len(msg) < 8:
+        msg += _recv_exact(sd, 8 - len(msg))
+
+    op, plen = struct.unpack_from('<II', msg, 0)
+    payload = _recv_exact(sd, plen) if plen else b""
+    return op, payload, fds
+
+
+def _build_init_payload(filter_names):
+    """OP_INIT payload: [u32 nfilter] [(u16 nlen, bytes) * nfilter]."""
+    parts = [struct.pack('<I', len(filter_names))]
+    for name in filter_names:
+        nb = name.encode() if isinstance(name, str) else name
+        parts.append(struct.pack('<H', len(nb)))
+        parts.append(nb)
+    return b"".join(parts)
+
+
 # ── Client ──────────────────────────────────────────────────────────
 
 class AntirevClient:
@@ -254,43 +325,45 @@ class AntirevClient:
         try:
             sd.connect(b'\x00' + sock_name.encode())
             self._receive_libs(sd)
+            try:
+                _send_msg(sd, OP_BYE)
+            except OSError:
+                pass
         finally:
             sd.close()
 
     def _receive_libs(self, sd: socket.socket):
-        """Receive batched lib fds via SCM_RIGHTS."""
+        """v2 handshake: send OP_INIT (empty filter = full set), then
+        read OP_BATCH messages until OP_END, populating self._libs."""
+        _send_msg(sd, OP_INIT, _build_init_payload(()))
+
         while True:
-            fds = array.array('i')
-            msg, ancdata, _, _ = sd.recvmsg(
-                65536, socket.CMSG_SPACE(SCM_BATCH * fds.itemsize))
-
-            if len(msg) < 4:
+            op, payload, fds = _recv_msg(sd)
+            if op == OP_END:
                 break
+            if op != OP_BATCH:
+                raise RuntimeError(
+                    f"antirev daemon: unexpected op {op:#x} (expected OP_BATCH)")
+            if len(payload) < 4:
+                raise RuntimeError("antirev daemon: short OP_BATCH payload")
 
-            nlibs = struct.unpack_from('<I', msg, 0)[0]
-            if nlibs == 0:
-                break
+            nlibs = struct.unpack_from('<I', payload, 0)[0]
+            if nlibs != len(fds):
+                raise RuntimeError(
+                    f"antirev daemon: OP_BATCH lib count {nlibs} "
+                    f"!= received fds {len(fds)}")
 
-            # Extract fds
-            received_fds = []
-            for cmsg_level, cmsg_type, cmsg_data in ancdata:
-                if (cmsg_level == socket.SOL_SOCKET
-                        and cmsg_type == socket.SCM_RIGHTS):
-                    batch_fds = array.array('i')
-                    batch_fds.frombytes(cmsg_data[:nlibs * batch_fds.itemsize])
-                    received_fds = list(batch_fds)
-
-            # Parse names
             off = 4
             for i in range(nlibs):
-                if off + 2 > len(msg):
-                    break
-                nlen = struct.unpack_from('<H', msg, off)[0]
+                if off + 2 > len(payload):
+                    raise RuntimeError("antirev daemon: truncated OP_BATCH name")
+                nlen = struct.unpack_from('<H', payload, off)[0]
                 off += 2
-                name = msg[off:off + nlen].decode()
+                if off + nlen > len(payload):
+                    raise RuntimeError("antirev daemon: truncated OP_BATCH name")
+                name = payload[off:off + nlen].decode()
                 off += nlen
-                if i < len(received_fds):
-                    self._libs[name] = received_fds[i]
+                self._libs[name] = fds[i]
 
     def _build_soname_map(self):
         """Map DT_SONAME → fd_map key for each encrypted lib.

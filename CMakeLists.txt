@@ -1183,6 +1183,22 @@ add_custom_target(test_lib_daemon
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_python_client_daemon — antirev_client.py speaks daemon protocol v2
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_target(test_python_client_daemon
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_python_client_daemon ==="
+    COMMAND bash "${CMAKE_SOURCE_DIR}/tests/python_client_daemon/run_test.sh"
+            "${CMAKE_BINARY_DIR}/stub"
+            "${CMAKE_BINARY_DIR}/mylib.so"
+            "${CMAKE_BINARY_DIR}/liblinkedmath.so"
+    DEPENDS stub mylib liblinkedmath
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "Python antirev_client v2 protocol handshake test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  run_tests — runs all tests and prints a summary
 # ═══════════════════════════════════════════════════════════════════════
 

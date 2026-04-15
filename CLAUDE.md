@@ -53,7 +53,7 @@ When adding or changing features, update this CLAUDE.md file to reflect the new 
 
 Python scripts load encrypted libs via two mechanisms:
 1. **Wrapper mode**: `.antirev-wrap python3 script.py` — the wrapper connects to the daemon, sets up dlopen_shim via LD_PRELOAD, then execs Python. The dlopen_shim intercepts C-level dlopen calls.
-2. **antirev_client.py**: called from within Python (`from antirev_client import activate`). Connects to the daemon, patches `ctypes.CDLL` and `sys.meta_path` to redirect to memfd-backed libs. Loads encrypted libs with `RTLD_GLOBAL` and creates soname symlinks in a temp dir prepended to `LD_LIBRARY_PATH`.
+2. **antirev_client.py**: called from within Python (`from antirev_client import activate`). Connects to the daemon, patches `ctypes.CDLL` and `sys.meta_path` to redirect to memfd-backed libs. Loads encrypted libs with `RTLD_GLOBAL` and creates soname symlinks in a temp dir prepended to `LD_LIBRARY_PATH`. Speaks daemon protocol v2 — sends `OP_INIT` on connect and collects `OP_BATCH`/`OP_END` framed replies. Covered by `test_python_client_daemon`.
 
 ### Known issues with memfd loading
 
