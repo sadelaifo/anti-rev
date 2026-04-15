@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package diag;
+
+message Inner {
+  string name = 1;
+  int32  count = 2;
+  repeated int32 vals = 3;
+}
+
+message Config {
+  string id = 1;
+  Inner  meta = 2;               // nested message
+  map<string, Inner> items = 3;  // map<string, nested>
+  repeated int32 tags = 4;
+  map<int32, string> labels = 5; // map with non-string key
+}
