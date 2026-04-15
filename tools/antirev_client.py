@@ -420,6 +420,11 @@ class AntirevClient:
         Unencrypted libs are followed (to discover encrypted deps behind
         them) and pre-loaded with RTLD_GLOBAL so $ORIGIN RPATH deps
         resolve correctly when consumers load from memfd.
+
+        Used by preload_all() when the caller has explicitly opted in
+        to upfront loading of every daemon lib.  For on-demand paths
+        (patch_ctypes / patch_import), call _ensure_deps() instead so
+        the caller retains its single refcount on the root lib.
         """
         # Resolve soname → filename (DT_NEEDED uses sonames like
         # "libB.so.1", but fd_map is keyed by filename "libB.so.1.2.3").
@@ -457,6 +462,39 @@ class AntirevClient:
                 _Real(disk_path or name, mode=ct.RTLD_GLOBAL)
             except OSError:
                 pass  # system lib already loaded, or linker will find it
+
+    def _ensure_deps(self, name):
+        """Preload `name`'s transitive dependency chain — but NOT `name`
+        itself — and materialize the soname symlink for `name` so the
+        caller can reference it by path.
+
+        Used from patch_ctypes / patch_import for on-demand loading: we
+        prep the DT_NEEDED closure so the caller's own dlopen (Python
+        import or ctypes.CDLL) finds every dep in glibc's link map,
+        but we leave the root lib's refcount to the caller.  That way
+        dropping the CDLL handle (or unloading the extension) actually
+        brings the root's refcount to zero — which is required for
+        plugin systems that cycle plugins carrying overlapping static
+        state (e.g. libprotobuf descriptor_pool collisions when two
+        plugins have shared .proto files compiled in).
+        """
+        name = self._soname_to_key.get(name, name)
+        if name in self._libs:
+            fd = self._libs[name]
+            for dep in _get_needed(fd):
+                self._ensure_loaded(dep)
+            # Ensure the soname symlink exists even though we're not
+            # pre-loading the root ourselves — the caller opens it by
+            # this path.
+            soname = _get_soname(fd) or name
+            link = os.path.join(self._link_dir, soname)
+            if not os.path.exists(link):
+                os.symlink("/proc/self/fd/{}".format(fd), link)
+        else:
+            disk_path = self._resolve_disk(name)
+            if disk_path:
+                for dep in _get_needed_from_path(disk_path):
+                    self._ensure_loaded(dep)
 
     def preload_all(self):
         """Load ALL daemon libs with RTLD_GLOBAL in dependency order.
@@ -513,12 +551,15 @@ class AntirevClient:
                             continue
 
                         if hdr == MAGIC:
-                            # Encrypted extension — redirect to memfd
+                            # Encrypted extension — redirect to memfd.
+                            # Preload deps only; Python's import will be
+                            # the single owner of the root's refcount so
+                            # module unload semantics stay intact.
                             base = os.path.basename(fpath)
                             key = client._soname_to_key.get(base, base)
                             if key not in client._libs:
                                 return None
-                            client._ensure_loaded(key)
+                            client._ensure_deps(key)
                             fd = client._libs[key]
                             memfd = "/proc/self/fd/{}".format(fd)
                             loader = importlib.machinery.ExtensionFileLoader(
@@ -560,7 +601,11 @@ class AntirevClient:
                     # Resolve soname → filename if needed
                     key = soname_map.get(base, base)
                     if key in fd_map:
-                        client._ensure_loaded(key)
+                        # Preload the DT_NEEDED closure only; let
+                        # super().__init__ below take the single
+                        # refcount on the root lib so dlclose can
+                        # actually unload it.
+                        client._ensure_deps(key)
                         soname = _get_soname(fd_map[key]) or key
                         name = os.path.join(client._link_dir, soname)
                 super().__init__(name, *args, **kwargs)

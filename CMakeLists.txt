@@ -1240,6 +1240,25 @@ add_custom_target(test_python_client_daemon
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_python_reload — antirev_client.py must not pin the root lib's
+#  refcount on on-demand ctypes loads.  Loads libreload.so twice via
+#  ctypes.CDLL with an explicit dlclose in between and counts ctor
+#  runs; guards the libprotobuf "File already exists in database"
+#  class of failures that triggered the fix.
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_target(test_python_reload
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_python_reload ==="
+    COMMAND bash "${CMAKE_SOURCE_DIR}/tests/python_reload/run_test.sh"
+            "${CMAKE_BINARY_DIR}/stub"
+            "${CMAKE_BINARY_DIR}/libreload.so"
+    DEPENDS stub libreload
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "antirev_client ctypes reload test (don't pin the root lib)"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  run_tests — runs all tests and prints a summary
 # ═══════════════════════════════════════════════════════════════════════
 
