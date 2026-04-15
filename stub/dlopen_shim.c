@@ -68,6 +68,23 @@ static int  g_cache_count = 0;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Escape hatch: if ANTIREV_NO_PRELOAD is set in the environment, skip
+ * the per-dep preload loop in fetch_closure and rely on glibc's normal
+ * recursive DT_NEEDED walk (triggered by the caller's real_dlopen of
+ * the root lib) to load the whole dependency tree in one atomic go.
+ *
+ * Why this matters: the per-dep preload loop dlopens each dep
+ * individually, which runs each dep's ctors in isolation with an
+ * incomplete link-map state.  Business software whose libs carry
+ * implicit symbol dependencies (a dep references a symbol provided by
+ * a sibling dep with no DT_NEEDED edge between them) then hits lazy
+ * binding failures mid-ctor.  Plaintext glibc loads avoid this by
+ * mapping everything before running any ctor.  Setting this env var
+ * reproduces that plaintext-equivalent load pattern, at the cost of
+ * losing the DT_RPATH-hits-ciphertext protection for libs that set
+ * DT_RPATH to the encrypted on-disk dir. */
+static int g_no_preload = 0;
+
 /* Diagnostic log file opened at ctor time if ANTIREV_DLOPEN_LOG is set
  * in the environment.  Records every dlopen decision and fetch outcome
  * so we can diagnose "dlopen(enc A) -> DT_NEEDED(enc B)" failures in
@@ -320,6 +337,14 @@ static void fetch_closure(const char *base)
     }
     LOG("  closure for %s: %d libs total\n", base, n_received);
 
+    /* Escape hatch — see the comment on g_no_preload.  Skip the loop
+     * entirely when the user wants plaintext-equivalent natural-load
+     * semantics instead of per-dep preloading. */
+    if (g_no_preload) {
+        LOG("  preload skipped (ANTIREV_NO_PRELOAD=1)\n");
+        return;
+    }
+
     /* Pre-load each DEPENDENCY via its symlink path, in the order the
      * daemon returned them (topological: leaves first).  Each load
      * registers the dep's SONAME in glibc's link map so the final
@@ -421,9 +446,14 @@ static void init_shim(void)
         }
     }
 
-    LOG("[dlopen_shim] sock=%d dir=%s enc_count=%d fd_map=%s\n",
+    const char *npe = getenv("ANTIREV_NO_PRELOAD");
+    if (npe && *npe && strcmp(npe, "0") != 0) {
+        g_no_preload = 1;
+    }
+
+    LOG("[dlopen_shim] sock=%d dir=%s enc_count=%d fd_map=%s no_preload=%d\n",
         g_sock, g_symlink_dir, g_enc_count,
-        g_fd_map ? "yes" : "no");
+        g_fd_map ? "yes" : "no", g_no_preload);
 }
 
 /* ------------------------------------------------------------------ */
