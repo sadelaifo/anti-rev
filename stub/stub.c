@@ -47,6 +47,8 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
+#include <elf.h>
 #include <dirent.h>
 #include <pthread.h>
 #include <time.h>
@@ -161,13 +163,23 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 /*    If status!=ST_OK, no ancillary data.                              */
 /* ------------------------------------------------------------------ */
 
-#define OP_INIT     0x01u
-#define OP_GET_LIB  0x02u
-#define OP_BYE      0x03u
+#define OP_INIT         0x01u
+#define OP_GET_LIB      0x02u
+#define OP_BYE          0x03u
+#define OP_LIST         0x04u  /* request: all lib names (no fds) */
+#define OP_GET_CLOSURE  0x05u  /* request: lib + transitive encrypted deps */
 
 #define OP_BATCH    0x81u
 #define OP_END      0x82u
 #define OP_LIB      0x83u
+#define OP_NAMES    0x84u  /* response to OP_LIST: batched name list */
+
+#define MAX_DEPS_PER_LIB 32
+
+/* Forward decl — defined with the other daemon helpers further below. */
+static int compute_closure(const char *start,
+                           const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                           int *out_idx, int max_out);
 
 #define ST_OK        0u
 #define ST_NOT_FOUND 1u
@@ -412,6 +424,69 @@ static int handle_get_lib(int client, const int *lib_fds,
     return send_msg(client, OP_LIB, resp, 4, NULL, 0);
 }
 
+/* Handle OP_LIST: reply with all lib names in SCM_BATCH-sized OP_NAMES
+ * messages, terminated by OP_END. No fds attached. */
+static int handle_list(int client,
+                       const char (*lib_names)[MAX_NAME + 1], int nlibs)
+{
+    for (int off = 0; off < nlibs; off += SCM_BATCH) {
+        int batch = nlibs - off;
+        if (batch > SCM_BATCH) batch = SCM_BATCH;
+        uint8_t payload[MAX_PAYLOAD];
+        size_t plen = build_batch_payload(payload, sizeof(payload),
+                                          lib_names, off, batch);
+        if (plen == 0) return -1;
+        if (send_msg(client, OP_NAMES, payload, (uint32_t)plen, NULL, 0) < 0)
+            return -1;
+    }
+    return send_msg(client, OP_END, NULL, 0, NULL, 0);
+}
+
+/* Handle OP_GET_CLOSURE: compute transitive encrypted closure of the
+ * requested lib (via build_deps_graph'd adjacency), then reply with
+ * OP_BATCH(es) carrying (fd, name) for every lib in the closure,
+ * terminated by OP_END.  If the name is not in the daemon's lib set,
+ * replies with a single OP_END (empty closure). */
+static int handle_get_closure(int client, const int *lib_fds,
+                              const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                              const uint8_t *payload, uint32_t plen)
+{
+    if (plen < 2)
+        return send_msg(client, OP_END, NULL, 0, NULL, 0);
+    uint16_t nlen;
+    memcpy(&nlen, payload, 2);
+    if ((uint32_t)nlen + 2u > plen || nlen > MAX_NAME)
+        return send_msg(client, OP_END, NULL, 0, NULL, 0);
+    char name[MAX_NAME + 1];
+    memcpy(name, payload + 2, nlen);
+    name[nlen] = '\0';
+
+    int closure[MAX_FILES];
+    int n = compute_closure(name, lib_names, nlibs, closure, MAX_FILES);
+    if (n <= 0)
+        return send_msg(client, OP_END, NULL, 0, NULL, 0);
+
+    /* Materialize ordered fds/names for the batch sender. */
+    int  sel_fds[MAX_FILES];
+    char sel_names[MAX_FILES][MAX_NAME + 1];
+    for (int i = 0; i < n; i++) {
+        sel_fds[i] = lib_fds[closure[i]];
+        memcpy(sel_names[i], lib_names[closure[i]], MAX_NAME + 1);
+    }
+
+    for (int off = 0; off < n; off += SCM_BATCH) {
+        int batch = n - off;
+        if (batch > SCM_BATCH) batch = SCM_BATCH;
+        uint8_t pay[MAX_PAYLOAD];
+        size_t pl = build_batch_payload(pay, sizeof(pay), sel_names, off, batch);
+        if (pl == 0) return -1;
+        if (send_msg(client, OP_BATCH, pay, (uint32_t)pl,
+                     sel_fds + off, batch) < 0)
+            return -1;
+    }
+    return send_msg(client, OP_END, NULL, 0, NULL, 0);
+}
+
 /* Parse an OP_INIT payload into a filter list. Returns number of names,
  * or -1 on parse error. */
 static int parse_init_filter(const uint8_t *payload, uint32_t plen,
@@ -457,6 +532,13 @@ static int daemon_handle_request(int client, const int *lib_fds,
     }
     if (op == OP_GET_LIB) {
         return handle_get_lib(client, lib_fds, lib_names, nlibs, payload, plen);
+    }
+    if (op == OP_LIST) {
+        return handle_list(client, lib_names, nlibs);
+    }
+    if (op == OP_GET_CLOSURE) {
+        return handle_get_closure(client, lib_fds, lib_names, nlibs,
+                                  payload, plen);
     }
     if (op == OP_BYE) {
         return -1;
@@ -594,6 +676,44 @@ static int daemon_request_libs(int sd,
     return (*out_nlibs > 0) ? 0 : -1;
 }
 
+/* Client-side helper: send OP_LIST and collect OP_NAMES/OP_END to recover
+ * the full set of encrypted lib names the daemon manages. No fds.
+ * Returns 0 on success, -1 on error. */
+static int daemon_request_names(int sd,
+                                char (*out_names)[MAX_NAME + 1],
+                                int *out_nlibs)
+{
+    if (send_msg(sd, OP_LIST, NULL, 0, NULL, 0) < 0) return -1;
+    *out_nlibs = 0;
+    for (;;) {
+        uint32_t op, plen;
+        uint8_t  payload[MAX_PAYLOAD];
+        int      dummy_fds[1];
+        int      nrecvd = 0;
+        if (recv_msg(sd, &op, payload, &plen, MAX_PAYLOAD,
+                     dummy_fds, &nrecvd, 0) < 0)
+            return -1;
+        if (op == OP_END) break;
+        if (op != OP_NAMES) return -1;
+        if (plen < 4) return -1;
+        uint32_t nl = u32le(payload);
+        size_t poff = 4;
+        for (uint32_t i = 0; i < nl; i++) {
+            if (poff + 2 > plen) return -1;
+            uint16_t nlen;
+            memcpy(&nlen, payload + poff, 2);
+            poff += 2;
+            if (nlen > MAX_NAME || poff + nlen > plen) return -1;
+            if (*out_nlibs >= MAX_FILES) return -1;
+            memcpy(out_names[*out_nlibs], payload + poff, nlen);
+            out_names[*out_nlibs][nlen] = '\0';
+            (*out_nlibs)++;
+            poff += nlen;
+        }
+    }
+    return 0;
+}
+
 /* Send OP_GET_LIB and receive one OP_LIB response with a single fd.
  * Returns the fd on success, -1 on error. Used by lazy-fetch in dlopen_shim. */
 __attribute__((unused))
@@ -663,6 +783,163 @@ static socklen_t make_sock_addr(struct sockaddr_un *addr,
 
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path)
                        + 1 + strlen(addr->sun_path + 1));
+}
+
+/* ------------------------------------------------------------------ */
+/*  ELF DT_NEEDED parser + per-lib dependency graph (daemon-side)     */
+/*                                                                      */
+/*  At daemon startup we mmap each decrypted lib memfd, parse its      */
+/*  PT_DYNAMIC segment, extract DT_NEEDED names, and filter them to    */
+/*  the set of encrypted libs the daemon manages.  The resulting       */
+/*  adjacency list is later used by compute_closure() to answer        */
+/*  OP_GET_CLOSURE requests — so dlopen_shim can fetch a lib and its   */
+/*  transitive encrypted deps in a single round-trip.                  */
+/* ------------------------------------------------------------------ */
+
+static int  g_deps_count[MAX_FILES];
+static int  g_deps_idx[MAX_FILES][MAX_DEPS_PER_LIB];
+
+static int parse_dt_needed(int fd,
+                           char (*out_names)[MAX_NAME + 1],
+                           int max_out)
+{
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size < (off_t)sizeof(Elf64_Ehdr))
+        return -1;
+
+    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) return -1;
+
+    int found = -1;
+    const uint8_t  *base = (const uint8_t *)map;
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)base;
+
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) goto out;
+    if (eh->e_ident[EI_CLASS] != ELFCLASS64) goto out;
+    if (eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > (uint64_t)st.st_size)
+        goto out;
+
+    const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(base + eh->e_phoff);
+    const Elf64_Phdr *dyn_ph = NULL;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (phdrs[i].p_type == PT_DYNAMIC) { dyn_ph = &phdrs[i]; break; }
+    }
+    if (!dyn_ph) goto out;
+
+    /* Translate vaddr → file offset using a PT_LOAD segment */
+    off_t dyn_off = -1;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (phdrs[i].p_type != PT_LOAD) continue;
+        if (dyn_ph->p_vaddr >= phdrs[i].p_vaddr
+            && dyn_ph->p_vaddr < phdrs[i].p_vaddr + phdrs[i].p_memsz) {
+            dyn_off = (off_t)(dyn_ph->p_vaddr - phdrs[i].p_vaddr
+                              + phdrs[i].p_offset);
+            break;
+        }
+    }
+    if (dyn_off < 0 || dyn_off + (off_t)dyn_ph->p_filesz > st.st_size) goto out;
+
+    const Elf64_Dyn *dyn = (const Elf64_Dyn *)(base + dyn_off);
+    int ndyn = (int)(dyn_ph->p_filesz / sizeof(Elf64_Dyn));
+
+    uint64_t strtab_vaddr = 0;
+    for (int i = 0; i < ndyn; i++) {
+        if (dyn[i].d_tag == DT_NULL) break;
+        if (dyn[i].d_tag == DT_STRTAB) { strtab_vaddr = dyn[i].d_un.d_ptr; break; }
+    }
+    if (!strtab_vaddr) goto out;
+
+    off_t strtab_off = -1;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (phdrs[i].p_type != PT_LOAD) continue;
+        if (strtab_vaddr >= phdrs[i].p_vaddr
+            && strtab_vaddr < phdrs[i].p_vaddr + phdrs[i].p_memsz) {
+            strtab_off = (off_t)(strtab_vaddr - phdrs[i].p_vaddr
+                                 + phdrs[i].p_offset);
+            break;
+        }
+    }
+    if (strtab_off < 0 || strtab_off >= st.st_size) goto out;
+
+    const char *strtab     = (const char *)(base + strtab_off);
+    size_t      strtab_max = (size_t)(st.st_size - strtab_off);
+
+    int n = 0;
+    for (int i = 0; i < ndyn && n < max_out; i++) {
+        if (dyn[i].d_tag == DT_NULL) break;
+        if (dyn[i].d_tag != DT_NEEDED) continue;
+        uint64_t off = dyn[i].d_un.d_val;
+        if (off >= strtab_max) continue;
+        size_t len = strnlen(strtab + off, strtab_max - off);
+        if (len == 0 || len > MAX_NAME) continue;
+        memcpy(out_names[n], strtab + off, len);
+        out_names[n][len] = '\0';
+        n++;
+    }
+    found = n;
+
+out:
+    munmap(map, (size_t)st.st_size);
+    return found;
+}
+
+/* Build per-lib adjacency list: for each lib, record indices of its
+ * direct DT_NEEDED deps that are also in the daemon's lib table.
+ * Libs whose deps can't be parsed (stripped, etc.) get deps_count = 0. */
+static void build_deps_graph(const int *lib_fds,
+                             const char (*lib_names)[MAX_NAME + 1], int nlibs)
+{
+    char dt_names[MAX_DEPS_PER_LIB][MAX_NAME + 1];
+    for (int i = 0; i < nlibs; i++) {
+        g_deps_count[i] = 0;
+        int n_dt = parse_dt_needed(lib_fds[i], dt_names, MAX_DEPS_PER_LIB);
+        if (n_dt <= 0) continue;
+        for (int k = 0; k < n_dt; k++) {
+            for (int j = 0; j < nlibs; j++) {
+                if (j == i) continue;
+                if (strcmp(lib_names[j], dt_names[k]) == 0) {
+                    if (g_deps_count[i] < MAX_DEPS_PER_LIB)
+                        g_deps_idx[i][g_deps_count[i]++] = j;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/* BFS closure from a lib name through the encrypted-deps graph.
+ * Writes reachable lib indices into out_idx[], returns count or -1. */
+static int compute_closure(const char *start,
+                           const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                           int *out_idx, int max_out)
+{
+    int start_idx = -1;
+    for (int i = 0; i < nlibs; i++) {
+        if (strcmp(lib_names[i], start) == 0) { start_idx = i; break; }
+    }
+    if (start_idx < 0) return -1;
+
+    static uint8_t visited[MAX_FILES];  /* static: avoid 1 KiB stack */
+    memset(visited, 0, sizeof(visited));
+    int queue[MAX_FILES];
+    int qhead = 0, qtail = 0;
+    int n_out = 0;
+
+    visited[start_idx] = 1;
+    queue[qtail++] = start_idx;
+
+    while (qhead < qtail) {
+        int cur = queue[qhead++];
+        if (n_out < max_out) out_idx[n_out++] = cur;
+        for (int k = 0; k < g_deps_count[cur]; k++) {
+            int dep = g_deps_idx[cur][k];
+            if (!visited[dep]) {
+                visited[dep] = 1;
+                if (qtail < MAX_FILES) queue[qtail++] = dep;
+            }
+        }
+    }
+    return n_out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1076,6 +1353,11 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         fprintf(stderr, "[antirev] decrypted %d libs in %.1fs\n",
                 nlibs, elapsed);
 
+        /* Build per-lib DT_NEEDED adjacency so OP_GET_CLOSURE can return
+         * a lib + its transitive encrypted deps in one round trip. */
+        build_deps_graph(lib_fds, lib_names, nlibs);
+        fprintf(stderr, "[antirev] built deps graph for %d libs\n", nlibs);
+
         struct sockaddr_un addr;
         socklen_t addr_len = make_sock_addr(&addr, key);
         explicit_bzero(key, sizeof(key));
@@ -1219,11 +1501,20 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * Phase 3: lib fd acquisition.
      *
      * Mode C (daemon libs): no libs bundled, must receive from daemon.
+     *
+     * Lazy-fetch flow:
+     *   1. OP_LIST            → full encrypted lib name list (no fds)
+     *   2. OP_INIT(DT_NEEDED) → fds for libs linked directly by the exe,
+     *                          so glibc can resolve them at startup.
+     *   3. Keep the socket open and pass its fd to the child so that
+     *      dlopen_shim can request lazy closures on-demand via
+     *      OP_GET_CLOSURE.
      * ---------------------------------------------------------------- */
+    int  daemon_sd = -1;
+    char all_enc_names[MAX_FILES][MAX_NAME + 1];
+    int  n_all_enc = 0;
+
     if ((bundle_flags & BFLAG_DAEMON_LIBS) && nlibs == 0) {
-        /* Mode C: client-only — receive libs from daemon.
-         * If no daemon is running, auto-launch .antirev-libd from the
-         * same directory as our binary (first process bootstraps it). */
 
         /* Raise fd limit: we'll receive ~nlibs fds via SCM_RIGHTS */
         struct rlimit rl;
@@ -1241,13 +1532,58 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         for (int retry = 0; retry < 50; retry++) {
             int sd = socket(AF_UNIX, SOCK_STREAM, 0);
             if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
-                char recv_names[MAX_FILES][MAX_NAME + 1];
-                if (receive_lib_fds(sd, lib_fds, recv_names, &nlibs) == 0
-                    && nlibs > 0) {
-                    memcpy(lib_names, recv_names, sizeof(recv_names));
-                    connected = 1;
+                /* Step 1: full name list, no fds. */
+                if (daemon_request_names(sd, all_enc_names, &n_all_enc) < 0
+                    || n_all_enc == 0) {
+                    close(sd);
+                    break;
                 }
-                close(sd);
+
+                if (has_needed_section) {
+                    /* needed_names is the exe's direct DT_NEEDED list
+                     * (encrypted + unencrypted).  Intersect with the
+                     * encrypted set so we only eagerly fetch libs that
+                     * actually live in the daemon. */
+                    char   enc_needed[MAX_FILES][MAX_NAME + 1];
+                    int    n_enc_needed = 0;
+                    for (int k = 0; k < n_needed; k++) {
+                        for (int j = 0; j < n_all_enc; j++) {
+                            if (strcmp(needed_names[k], all_enc_names[j]) == 0) {
+                                memcpy(enc_needed[n_enc_needed],
+                                       needed_names[k], MAX_NAME + 1);
+                                n_enc_needed++;
+                                break;
+                            }
+                        }
+                    }
+                    if (n_enc_needed > 0) {
+                        if (daemon_request_libs(sd, enc_needed, n_enc_needed,
+                                                lib_fds, lib_names, &nlibs) < 0
+                            || nlibs == 0) {
+                            close(sd);
+                            break;
+                        }
+                    } else {
+                        /* No encrypted DT_NEEDED — nothing to eager-fetch.
+                         * dlopen_shim handles everything lazily. */
+                        nlibs = 0;
+                    }
+                    /* Keep socket open for lazy OP_GET_CLOSURE requests. */
+                    daemon_sd = sd;
+                } else {
+                    /* Legacy bundle (no needed-libs section): fetch
+                     * everything eagerly, drop the socket. */
+                    if (daemon_request_libs(sd, NULL, 0,
+                                            lib_fds, lib_names, &nlibs) < 0
+                        || nlibs == 0) {
+                        close(sd);
+                        break;
+                    }
+                    daemon_send_bye(sd);
+                    close(sd);
+                    n_all_enc = 0;  /* no lazy mode */
+                }
+                connected = 1;
                 break;
             }
             if (sd >= 0) close(sd);
@@ -1289,6 +1625,9 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             fprintf(stderr, "[antirev] failed to connect to lib daemon\n");
             return 1;
         }
+        fprintf(stderr, "[antirev] daemon: %d enc libs total, "
+                "%d eagerly fetched (DT_NEEDED)\n",
+                n_all_enc, nlibs);
     }
 
     /* Wipe key (after daemon socket name derivation) */
@@ -1452,9 +1791,10 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
     }
 
-    /* +8: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP, LD_LIBRARY_PATH,
-     * ANTIREV_CLOSE_FDS, NULL + spare */
-    char **new_env = malloc((size_t)(envc + 8) * sizeof(char *));
+    /* +11: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP, LD_LIBRARY_PATH,
+     * ANTIREV_CLOSE_FDS, ANTIREV_LIBD_SOCK, ANTIREV_ENC_LIBS,
+     * ANTIREV_SYMLINK_DIR, NULL + spare */
+    char **new_env = malloc((size_t)(envc + 11) * sizeof(char *));
     if (!new_env) { perror("malloc env"); return 1; }
 
     char real_exe_entry[4096 + 32];
@@ -1508,6 +1848,48 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
     }
 
+    /* Lazy-fetch env vars (dlopen_shim side).
+     *
+     *   ANTIREV_LIBD_SOCK   — fd number of the open daemon socket,
+     *                         inherited through fexecve.
+     *   ANTIREV_SYMLINK_DIR — directory where dlopen_shim writes its
+     *                         per-lib symlinks (same dir stub uses).
+     *   ANTIREV_ENC_LIBS    — comma-separated list of every encrypted
+     *                         lib name the daemon manages.  dlopen_shim
+     *                         checks incoming dlopen basenames against
+     *                         this set before talking to the daemon.
+     *
+     * Only populated when Mode C is in lazy mode (daemon_sd >= 0). */
+    int lazy_mode = (daemon_sd >= 0 && n_all_enc > 0);
+
+    char *libd_sock_entry = NULL;
+    char *enc_libs_entry  = NULL;
+    char *symlink_dir_entry = NULL;
+
+    if (lazy_mode) {
+        libd_sock_entry = malloc(48);
+        if (libd_sock_entry)
+            snprintf(libd_sock_entry, 48, "ANTIREV_LIBD_SOCK=%d", daemon_sd);
+
+        if (link_dir_ptr) {
+            symlink_dir_entry = malloc(64);
+            if (symlink_dir_entry)
+                snprintf(symlink_dir_entry, 64,
+                         "ANTIREV_SYMLINK_DIR=%s", link_dir);
+        }
+
+        size_t enc_len = 20 + (size_t)n_all_enc * (MAX_NAME + 2);
+        enc_libs_entry = malloc(enc_len);
+        if (enc_libs_entry) {
+            int eo = snprintf(enc_libs_entry, enc_len, "ANTIREV_ENC_LIBS=");
+            for (int j = 0; j < n_all_enc; j++) {
+                if (j > 0) enc_libs_entry[eo++] = ',';
+                eo += snprintf(enc_libs_entry + eo, enc_len - (size_t)eo,
+                               "%s", all_enc_names[j]);
+            }
+        }
+    }
+
     /* Build ANTIREV_CLOSE_FDS: comma-separated DT_NEEDED fds that exe_shim
      * should close in its constructor.  By that point glibc has already
      * mmap'd every DT_NEEDED lib, so the fds are pure bookkeeping — closing
@@ -1532,12 +1914,15 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
 
     int ei = 0;
     for (int j = 0; j < envc; j++) {
-        if (strncmp(envp[j], "LD_PRELOAD=",         11) == 0) continue;
-        if (strncmp(envp[j], "LD_LIBRARY_PATH=",    16) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_REAL_EXE=",   17) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_MAIN_FD=",    16) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_FD_MAP=",     15) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_CLOSE_FDS=",  18) == 0) continue;
+        if (strncmp(envp[j], "LD_PRELOAD=",            11) == 0) continue;
+        if (strncmp(envp[j], "LD_LIBRARY_PATH=",       16) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_REAL_EXE=",      17) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_MAIN_FD=",       16) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_FD_MAP=",        15) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_CLOSE_FDS=",     18) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_LIBD_SOCK=",     18) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_ENC_LIBS=",      17) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_SYMLINK_DIR=",   20) == 0) continue;
         new_env[ei++] = envp[j];
     }
     new_env[ei++] = real_exe_entry;
@@ -1549,6 +1934,12 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         new_env[ei++] = ld_libpath_entry;
     if (close_fds_entry)
         new_env[ei++] = close_fds_entry;
+    if (libd_sock_entry)
+        new_env[ei++] = libd_sock_entry;
+    if (enc_libs_entry)
+        new_env[ei++] = enc_libs_entry;
+    if (symlink_dir_entry)
+        new_env[ei++] = symlink_dir_entry;
     new_env[ei]   = NULL;
 
     /* Phase 6. Replace this process with the decrypted binary — no fork, same PID */

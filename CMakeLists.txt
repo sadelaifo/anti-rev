@@ -34,7 +34,7 @@ function(compile_dlopen_shim OUTPUT COMPILER)
         COMMAND "${COMPILER}" -shared -fPIC -O2 -fvisibility=hidden
                 -o "${OUTPUT}"
                 "${CMAKE_SOURCE_DIR}/stub/dlopen_shim.c"
-                -ldl
+                -ldl -pthread
         DEPENDS "${CMAKE_SOURCE_DIR}/stub/dlopen_shim.c"
         COMMENT "Building dlopen shim: ${OUTPUT}"
     )
