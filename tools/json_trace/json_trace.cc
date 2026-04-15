@@ -58,11 +58,16 @@ namespace {
 // This avoids hardcoding any mangled name — the compiler produces
 // whatever mangling matches the installed protobuf headers, and
 // libprotobuf.so.* exports the same one.
-using Fn2 = gpu::Status (*)(gpb::StringPiece, gpb::Message *);
+//
+// NOTE: we only override the 3-arg overload. In protobuf >= ~3.21
+// the 2-arg JsonStringToMessage is an inline wrapper in the header
+// that forwards to the 3-arg, so redefining it here triggers an
+// "inline function redefined" error. All call sites that use the
+// 2-arg form get inlined to 3-arg at the caller's compile time, so
+// the 3-arg interceptor catches them anyway.
 using Fn3 = gpu::Status (*)(gpb::StringPiece, gpb::Message *,
                             const gpu::JsonParseOptions &);
 
-static Fn2 real2 = nullptr;
 static Fn3 real3 = nullptr;
 
 static void *resolve_next(void *self_fn_addr) {
@@ -101,20 +106,9 @@ namespace google {
 namespace protobuf {
 namespace util {
 
-Status JsonStringToMessage(StringPiece input, Message *message) {
-    if (!real2) real2 = (Fn2)resolve_next((void *)&JsonStringToMessage);
-    print_diag(message, "2arg");
-    if (!real2) {
-        fprintf(stderr, "[json_trace] FATAL: no real JsonStringToMessage/2\n");
-        abort();
-    }
-    return real2(input, message);
-}
-
 Status JsonStringToMessage(StringPiece input, Message *message,
                            const JsonParseOptions &options) {
     if (!real3) {
-        // Take address of the 3-arg overload explicitly.
         Status (*self)(StringPiece, Message *, const JsonParseOptions &) =
             &JsonStringToMessage;
         real3 = (Fn3)resolve_next((void *)self);
