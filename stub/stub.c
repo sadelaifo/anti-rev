@@ -826,18 +826,10 @@ static int parse_dt_needed(int fd,
     }
     if (!dyn_ph) goto out;
 
-    /* Translate vaddr → file offset using a PT_LOAD segment */
-    off_t dyn_off = -1;
-    for (int i = 0; i < eh->e_phnum; i++) {
-        if (phdrs[i].p_type != PT_LOAD) continue;
-        if (dyn_ph->p_vaddr >= phdrs[i].p_vaddr
-            && dyn_ph->p_vaddr < phdrs[i].p_vaddr + phdrs[i].p_memsz) {
-            dyn_off = (off_t)(dyn_ph->p_vaddr - phdrs[i].p_vaddr
-                              + phdrs[i].p_offset);
-            break;
-        }
-    }
-    if (dyn_off < 0 || dyn_off + (off_t)dyn_ph->p_filesz > st.st_size) goto out;
+    /* PT_DYNAMIC's own p_offset is the file offset of .dynamic —
+     * more reliable than deriving it from a containing PT_LOAD. */
+    off_t dyn_off = (off_t)dyn_ph->p_offset;
+    if (dyn_off + (off_t)dyn_ph->p_filesz > st.st_size) goto out;
 
     const Elf64_Dyn *dyn = (const Elf64_Dyn *)(base + dyn_off);
     int ndyn = (int)(dyn_ph->p_filesz / sizeof(Elf64_Dyn));
@@ -1356,7 +1348,31 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         /* Build per-lib DT_NEEDED adjacency so OP_GET_CLOSURE can return
          * a lib + its transitive encrypted deps in one round trip. */
         build_deps_graph(lib_fds, lib_names, nlibs);
-        fprintf(stderr, "[antirev] built deps graph for %d libs\n", nlibs);
+        {
+            int total_edges = 0, zero = 0;
+            for (int i = 0; i < nlibs; i++) {
+                total_edges += g_deps_count[i];
+                if (g_deps_count[i] == 0) zero++;
+            }
+            fprintf(stderr, "[antirev] deps graph: %d libs, %d edges, "
+                    "%d libs with 0 deps\n", nlibs, total_edges, zero);
+
+            /* Dump the full graph to /tmp/antirev-deps.log so it is
+             * reachable even when the daemon's stderr is closed (e.g.
+             * launched from sysmgr).  This is a one-shot diagnostic
+             * file; safe to delete after debugging. */
+            FILE *lf = fopen("/tmp/antirev-deps.log", "w");
+            if (lf) {
+                fprintf(lf, "# antirev deps graph (%d libs)\n", nlibs);
+                for (int i = 0; i < nlibs; i++) {
+                    fprintf(lf, "%s %d", lib_names[i], g_deps_count[i]);
+                    for (int k = 0; k < g_deps_count[i]; k++)
+                        fprintf(lf, " %s", lib_names[g_deps_idx[i][k]]);
+                    fprintf(lf, "\n");
+                }
+                fclose(lf);
+            }
+        }
 
         struct sockaddr_un addr;
         socklen_t addr_len = make_sock_addr(&addr, key);

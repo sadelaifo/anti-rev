@@ -68,6 +68,13 @@ static int  g_cache_count = 0;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Diagnostic log file opened at ctor time if ANTIREV_DLOPEN_LOG is set
+ * in the environment.  Records every dlopen decision and fetch outcome
+ * so we can diagnose "dlopen(enc A) -> DT_NEEDED(enc B)" failures in
+ * production binaries without needing stderr. */
+static FILE *g_log = NULL;
+#define LOG(...) do { if (g_log) { fprintf(g_log, __VA_ARGS__); fflush(g_log); } } while (0)
+
 /* ------------------------------------------------------------------ */
 /*  Little-endian helpers                                              */
 /* ------------------------------------------------------------------ */
@@ -209,8 +216,11 @@ static int cache_find(const char *base)
  * Caller must hold g_lock. */
 static void fetch_closure(const char *base)
 {
-    if (cache_find(base) >= 0) return;
-    if (g_sock < 0 || !g_symlink_dir[0]) return;
+    if (cache_find(base) >= 0) { LOG("  cache-hit %s\n", base); return; }
+    if (g_sock < 0 || !g_symlink_dir[0]) {
+        LOG("  no-sock (sock=%d dir='%s')\n", g_sock, g_symlink_dir);
+        return;
+    }
 
     uint16_t nlen = (uint16_t)strlen(base);
     if (nlen == 0 || nlen > MAX_NAME) return;
@@ -218,8 +228,12 @@ static void fetch_closure(const char *base)
     uint8_t req[2 + MAX_NAME];
     put_u16le(req, nlen);
     memcpy(req + 2, base, nlen);
-    if (send_msg(g_sock, OP_GET_CLOSURE, req, (uint32_t)(2 + nlen)) < 0)
+    if (send_msg(g_sock, OP_GET_CLOSURE, req, (uint32_t)(2 + nlen)) < 0) {
+        LOG("  send OP_GET_CLOSURE failed\n");
         return;
+    }
+
+    int n_received = 0;
 
     for (;;) {
         uint32_t op, plen;
@@ -257,10 +271,12 @@ static void fetch_closure(const char *base)
             name[l] = '\0';
             poff += l;
 
+            n_received++;
             if (cache_find(name) >= 0) {
                 /* Already have it — close the fresh duplicate fd.
                  * This does not break path dedup because we keep our
                  * own cached fd (with a different number) pinned. */
+                LOG("    dup %s (closed fresh fd)\n", name);
                 close(fds[i]);
                 continue;
             }
@@ -277,14 +293,18 @@ static void fetch_closure(const char *base)
              * exe_shim).  The in-memory mapping stays live regardless. */
             unlink(lpath);
             if (symlink(target, lpath) < 0) {
+                LOG("    symlink %s -> %s FAILED errno=%d\n",
+                    lpath, target, errno);
                 close(fds[i]);
                 continue;
             }
+            LOG("    new  %s (fd=%d)\n", name, fds[i]);
             memcpy(g_cache_names[g_cache_count], name, (size_t)l + 1);
             g_cache_fds[g_cache_count] = fds[i];
             g_cache_count++;
         }
     }
+    LOG("  closure for %s: %d libs total\n", base, n_received);
 }
 
 /* ------------------------------------------------------------------ */
@@ -294,6 +314,15 @@ static void fetch_closure(const char *base)
 __attribute__((constructor))
 static void init_shim(void)
 {
+    const char *logpath = getenv("ANTIREV_DLOPEN_LOG");
+    if (logpath && *logpath) {
+        g_log = fopen(logpath, "w");
+        if (g_log) {
+            setvbuf(g_log, NULL, _IOLBF, 0);
+            LOG("[dlopen_shim] ctor pid=%d\n", getpid());
+        }
+    }
+
     g_fd_map = getenv("ANTIREV_FD_MAP");
 
     const char *sock_str = getenv("ANTIREV_LIBD_SOCK");
@@ -323,6 +352,10 @@ static void init_shim(void)
             free(buf);
         }
     }
+
+    LOG("[dlopen_shim] sock=%d dir=%s enc_count=%d fd_map=%s\n",
+        g_sock, g_symlink_dir, g_enc_count,
+        g_fd_map ? "yes" : "no");
 }
 
 /* ------------------------------------------------------------------ */
@@ -374,8 +407,14 @@ void *dlopen(const char *filename, int flags)
     }
 
     /* Lazy path. */
-    if (g_sock < 0 || g_enc_count == 0 || !is_encrypted(base))
+    if (g_sock < 0 || g_enc_count == 0 || !is_encrypted(base)) {
+        LOG("dlopen(%s) flags=0x%x -> passthrough (enc=%d)\n",
+            filename, flags, is_encrypted(base));
         return real_dlopen_fn(filename, flags);
+    }
+
+    LOG("dlopen(%s) flags=0x%x -> fetch_closure(%s)\n",
+        filename, flags, base);
 
     pthread_mutex_lock(&g_lock);
     fetch_closure(base);
@@ -387,9 +426,17 @@ void *dlopen(const char *filename, int flags)
     snprintf(spath, sizeof(spath), "%s/%s", g_symlink_dir, base);
     void *h = real_dlopen_fn(spath, flags);
     if (!h) {
+        const char *err = dlerror();
+        LOG("  real_dlopen(%s) FAILED: %s\n", spath, err ? err : "(null)");
         /* If the symlink path didn't work (e.g., lib wasn't in our set),
          * fall through to the original request. */
         h = real_dlopen_fn(filename, flags);
+        if (!h) {
+            const char *e2 = dlerror();
+            LOG("  real_dlopen(%s) also failed: %s\n", filename, e2 ? e2 : "(null)");
+        }
+    } else {
+        LOG("  real_dlopen(%s) OK\n", spath);
     }
     return h;
 }
