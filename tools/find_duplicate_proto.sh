@@ -42,11 +42,13 @@ echo "Searching under: $ROOT"
 echo "Looking for type: $TYPE"
 echo
 
+total=0
 hits=0
 find "$ROOT" -type f \( -name '*.so' -o -name '*.so.*' -o -executable \) 2>/dev/null \
   | while read -r f; do
-    # Skip non-ELF quickly
-    head -c 4 "$f" 2>/dev/null | grep -q $'\x7fELF' || continue
+    total=$((total+1))
+    # Robust ELF check via readelf. Skip anything that isn't an ELF object.
+    readelf -h "$f" >/dev/null 2>&1 || continue
 
     if strings -a "$f" 2>/dev/null | grep -qF "$TYPE"; then
         # Does this file also contain a protobuf descriptor-registration
@@ -58,6 +60,7 @@ find "$ROOT" -type f \( -name '*.so' -o -name '*.so.*' -o -executable \) 2>/dev/
         hits=$((hits+1))
     fi
 done
+echo "  (scanned $total files under $ROOT)"
 
 echo
 cat <<'EOF'
