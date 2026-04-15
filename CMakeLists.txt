@@ -34,7 +34,7 @@ function(compile_dlopen_shim OUTPUT COMPILER)
         COMMAND "${COMPILER}" -shared -fPIC -O2 -fvisibility=hidden
                 -o "${OUTPUT}"
                 "${CMAKE_SOURCE_DIR}/stub/dlopen_shim.c"
-                -ldl
+                -ldl -pthread
         DEPENDS "${CMAKE_SOURCE_DIR}/stub/dlopen_shim.c"
         COMMENT "Building dlopen shim: ${OUTPUT}"
     )
@@ -164,6 +164,7 @@ add_custom_target(run_test
             --output "${CMAKE_BINARY_DIR}/hello.protected"
     COMMAND ${CMAKE_COMMAND}
             "-DBINARY=${CMAKE_BINARY_DIR}/hello.protected"
+            "-DEXPECTED_EXIT=42"
             -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
     DEPENDS stub hello
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
@@ -182,6 +183,7 @@ if(AARCH64_GCC)
         COMMAND ${CMAKE_COMMAND}
                 "-DBINARY=${CMAKE_BINARY_DIR}/hello_aarch64.protected"
                 "-DQEMU_LD_PREFIX=/usr/aarch64-linux-gnu"
+                "-DEXPECTED_EXIT=42"
                 -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
         DEPENDS stub_aarch64 hello_aarch64
         WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
@@ -454,6 +456,135 @@ add_custom_target(test_dlopen_dt_needed
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_dlopen_reload — verify that plugin libs unload on dlclose and
+#  re-run their constructors on the next dlopen.  Guards the lazy-fetch
+#  "don't pin the root lib" rule — a regression would cause the
+#  libprotobuf "File already exists in database" class of failures when
+#  business software cycles plugins that share static state.
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_lib("${CMAKE_BINARY_DIR}/libreload.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_reload/libreload.c")
+add_custom_target(libreload DEPENDS "${CMAKE_BINARY_DIR}/libreload.so")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/dlopen_reload"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_reload/main.c")
+add_custom_target(dlopen_reload_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_reload")
+
+set(_TD_RELOAD "${CMAKE_BINARY_DIR}/daemon_test_dlopen_reload")
+add_custom_target(test_dlopen_reload
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_reload ==="
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_RELOAD}"
+    COMMAND ${CMAKE_COMMAND} -E remove -f /tmp/test_dlopen_reload.log
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_RELOAD}/test.key"
+            --libs   "${CMAKE_BINARY_DIR}/libreload.so"
+            --output "${_TD_RELOAD}/.antirev-libd"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/dlopen_reload"
+            --key    "${_TD_RELOAD}/test.key"
+            --daemon-libs
+            --output "${_TD_RELOAD}/test.protected"
+    COMMAND ${CMAKE_COMMAND}
+            "-DBINARY=${_TD_RELOAD}/test.protected"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
+    DEPENDS stub libreload dlopen_reload_bin
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "dlopen reload: dlopen/dlclose/dlopen must re-run ctor"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_dlopen_interpose — dlopen_shim must preload closure deps with
+#  RTLD_GLOBAL so DSOs carrying overlapping static initializers (the
+#  libprotobuf "File already exists in database" scenario) dedup via
+#  symbol interposition the way the plaintext loader does.
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_lib("${CMAKE_BINARY_DIR}/libregistrar.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libregistrar.c")
+add_custom_target(libregistrar
+    DEPENDS "${CMAKE_BINARY_DIR}/libregistrar.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libinterpose_dup1.so"
+    COMMAND gcc -shared -fPIC -O2
+            -Wl,-soname,libinterpose_dup1.so
+            -o "${CMAKE_BINARY_DIR}/libinterpose_dup1.so"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libdup1.c"
+            -L "${CMAKE_BINARY_DIR}" -lregistrar -Wl,--no-as-needed
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libdup1.c"
+            "${CMAKE_BINARY_DIR}/libregistrar.so"
+    COMMENT "Building libinterpose_dup1.so"
+)
+add_custom_target(libinterpose_dup1
+    DEPENDS "${CMAKE_BINARY_DIR}/libinterpose_dup1.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libinterpose_dup2.so"
+    COMMAND gcc -shared -fPIC -O2
+            -Wl,-soname,libinterpose_dup2.so
+            -o "${CMAKE_BINARY_DIR}/libinterpose_dup2.so"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libdup2.c"
+            -L "${CMAKE_BINARY_DIR}" -lregistrar -Wl,--no-as-needed
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libdup2.c"
+            "${CMAKE_BINARY_DIR}/libregistrar.so"
+    COMMENT "Building libinterpose_dup2.so"
+)
+add_custom_target(libinterpose_dup2
+    DEPENDS "${CMAKE_BINARY_DIR}/libinterpose_dup2.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libroot.so"
+    COMMAND gcc -shared -fPIC -O2
+            -Wl,-soname,libroot.so
+            -o "${CMAKE_BINARY_DIR}/libroot.so"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libroot.c"
+            -L "${CMAKE_BINARY_DIR}"
+            -linterpose_dup1 -linterpose_dup2
+            -Wl,--no-as-needed
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libroot.c"
+            "${CMAKE_BINARY_DIR}/libinterpose_dup1.so"
+            "${CMAKE_BINARY_DIR}/libinterpose_dup2.so"
+    COMMENT "Building libroot.so (dlopen_interpose test)"
+)
+add_custom_target(libroot_interpose DEPENDS "${CMAKE_BINARY_DIR}/libroot.so")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/dlopen_interpose"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/main.c")
+add_custom_target(dlopen_interpose_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_interpose")
+
+set(_TD_INTER "${CMAKE_BINARY_DIR}/daemon_test_dlopen_interpose")
+add_custom_target(test_dlopen_interpose
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_interpose ==="
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_INTER}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_INTER}/test.key"
+            --libs   "${CMAKE_BINARY_DIR}/libregistrar.so"
+                     "${CMAKE_BINARY_DIR}/libinterpose_dup1.so"
+                     "${CMAKE_BINARY_DIR}/libinterpose_dup2.so"
+                     "${CMAKE_BINARY_DIR}/libroot.so"
+            --output "${_TD_INTER}/.antirev-libd"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/dlopen_interpose"
+            --key    "${_TD_INTER}/test.key"
+            --daemon-libs
+            --output "${_TD_INTER}/test.protected"
+    COMMAND ${CMAKE_COMMAND}
+            "-DBINARY=${_TD_INTER}/test.protected"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
+    DEPENDS stub libregistrar libinterpose_dup1 libinterpose_dup2
+            libroot_interpose dlopen_interpose_bin
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "dlopen interpose: RTLD_GLOBAL preload dedups overlapping static state"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_preload_memfd — smoke test: DT_NEEDED satisfied via LD_PRELOAD
 #  from a memfd (no .so on disk, no LD_AUDIT)
 # ═══════════════════════════════════════════════════════════════════════
@@ -584,6 +715,28 @@ daemon_test(test_linked "${CMAKE_BINARY_DIR}/linked_main"
     "DT_NEEDED satisfied via daemon-served encrypted .so"
     "${CMAKE_BINARY_DIR}/liblinkedmath.so")
 add_dependencies(test_linked stub liblinkedmath linked_main)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_fd_reduction — exe_shim must close DT_NEEDED memfds after ctor
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/fd_reduction_main"
+    COMMAND gcc -O2
+            -I "${CMAKE_SOURCE_DIR}/tests"
+            -o "${CMAKE_BINARY_DIR}/fd_reduction_main"
+            "${CMAKE_SOURCE_DIR}/tests/fd_reduction/main.c"
+            -L "${CMAKE_BINARY_DIR}" -llinkedmath
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/fd_reduction/main.c"
+            "${CMAKE_BINARY_DIR}/liblinkedmath.so"
+    COMMENT "Building test binary: fd_reduction_main"
+)
+add_custom_target(fd_reduction_main DEPENDS "${CMAKE_BINARY_DIR}/fd_reduction_main")
+
+daemon_test(test_fd_reduction "${CMAKE_BINARY_DIR}/fd_reduction_main"
+    "DT_NEEDED memfds closed by exe_shim ctor (fd reduction)"
+    "${CMAKE_BINARY_DIR}/liblinkedmath.so")
+add_dependencies(test_fd_reduction stub liblinkedmath fd_reduction_main)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  test_fork_exec — child process spawned via fork()+exec() must be able
@@ -1155,6 +1308,41 @@ add_custom_target(test_lib_daemon
     DEPENDS stub mylib liblinkedmath dlopen_main linked_main
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
     COMMENT "lib daemon mode test (dlopen + DT_NEEDED via daemon)"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_python_client_daemon — antirev_client.py speaks daemon protocol v2
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_target(test_python_client_daemon
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_python_client_daemon ==="
+    COMMAND bash "${CMAKE_SOURCE_DIR}/tests/python_client_daemon/run_test.sh"
+            "${CMAKE_BINARY_DIR}/stub"
+            "${CMAKE_BINARY_DIR}/mylib.so"
+            "${CMAKE_BINARY_DIR}/liblinkedmath.so"
+    DEPENDS stub mylib liblinkedmath
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "Python antirev_client v2 protocol handshake test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_python_reload — antirev_client.py must not pin the root lib's
+#  refcount on on-demand ctypes loads.  Loads libreload.so twice via
+#  ctypes.CDLL with an explicit dlclose in between and counts ctor
+#  runs; guards the libprotobuf "File already exists in database"
+#  class of failures that triggered the fix.
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_target(test_python_reload
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_python_reload ==="
+    COMMAND bash "${CMAKE_SOURCE_DIR}/tests/python_reload/run_test.sh"
+            "${CMAKE_BINARY_DIR}/stub"
+            "${CMAKE_BINARY_DIR}/libreload.so"
+    DEPENDS stub libreload
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "antirev_client ctypes reload test (don't pin the root lib)"
     USES_TERMINAL
 )
 

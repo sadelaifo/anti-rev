@@ -167,6 +167,31 @@ static void restore_identity(void)
     g_owner_pid = getpid();
     g_owner_checked = 1;
 
+    /* Close DT_NEEDED memfds now that glibc's dynamic linker has finished
+     * mapping them.  The fds are pure bookkeeping at this point — the
+     * libraries stay live via their mmap references — but closing them
+     * frees fd-table slots so that later socket()/open()/memfd_create()
+     * calls land at low fd numbers.  This matters for code that still
+     * uses select() (FD_SETSIZE=1024).
+     *
+     * Set by stub.c only on the symlink-dir code path (has_needed_section).
+     * Unset immediately so fork()ed children don't misinterpret stale fds. */
+    const char *close_list = getenv("ANTIREV_CLOSE_FDS");
+    if (close_list && *close_list) {
+        const char *p = close_list;
+        while (*p) {
+            char *end = NULL;
+            long fd = strtol(p, &end, 10);
+            if (end == p) break;
+            if (fd > 2) {
+                (void)syscall(SYS_close, (int)fd);
+            }
+            if (*end != ',') break;
+            p = end + 1;
+        }
+    }
+    unsetenv("ANTIREV_CLOSE_FDS");
+
     const char *base = strrchr(real, '/');
     base = base ? base + 1 : real;
 

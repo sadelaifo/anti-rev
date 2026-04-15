@@ -19,10 +19,16 @@ set(TESTS
     test_dlopen_edgecases # dlopen edge cases (paths, flags, reopen, fallthrough)
     test_dlopen_nested    # nested dlopen from within a protected .so
     test_dlopen_transitive # encrypted lib behind unencrypted intermediary
+    test_dlopen_dt_needed # dlopen(enc A) -> A DT_NEEDs enc B via symlink dir
+    test_dlopen_reload    # dlopen/dlclose/dlopen re-runs ctor (no root pin)
+    test_dlopen_interpose # RTLD_GLOBAL preload dedups overlapping static state
     test_fork_same_lib    # fork+exec child inherits same lib via LD_PRELOAD
     test_fork_diff_lib    # parent and child use different libs independently
     test_script_multi_bin # script invokes A and B with shared + unique libs
     test_lib_daemon       # centralized lib daemon serves libs to client exes
+    test_python_client_daemon  # antirev_client.py speaks daemon v2 protocol
+    test_python_reload    # antirev_client ctypes reload re-runs ctor
+    test_fd_reduction     # exe_shim ctor closes DT_NEEDED memfds
     test_wrong_key        # wrong key -> clean failure
     test_tamper           # bit-flipped ciphertext -> clean failure
 )

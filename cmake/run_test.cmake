@@ -20,8 +20,15 @@ else()
     set(RUN_CMD "${BINARY}" test_arg)
 endif()
 
+if(NOT DEFINED EXPECTED_EXIT)
+    set(EXPECTED_EXIT 0)
+endif()
+
 execute_process(
     COMMAND ${RUN_CMD}
     RESULT_VARIABLE RET
 )
-message(STATUS "Exit code: ${RET}")
+message(STATUS "Exit code: ${RET} (expected ${EXPECTED_EXIT})")
+if(NOT RET EQUAL EXPECTED_EXIT)
+    message(FATAL_ERROR "Test binary ${BINARY} exited with ${RET}, expected ${EXPECTED_EXIT}")
+endif()

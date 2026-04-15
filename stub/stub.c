@@ -46,6 +46,9 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#include <sys/epoll.h>
+#include <sys/mman.h>
+#include <elf.h>
 #include <dirent.h>
 #include <pthread.h>
 #include <time.h>
@@ -135,46 +138,422 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 #define BFLAG_DAEMON_LIBS  0x02  /* libs served by external daemon */
 #define BFLAG_WRAPPER      0x04  /* wrapper mode: exec argv[1...] with libs */
 
-/* Max size of the daemon protocol data payload (per batch):
- * 4 bytes (nlibs) + SCM_BATCH * (2 + MAX_NAME) */
-#define DAEMON_DATA_MAX  (4 + SCM_BATCH * (2 + MAX_NAME))
-
 /* ------------------------------------------------------------------ */
-/*  Daemon: serve lib memfds to sibling processes via SCM_RIGHTS       */
-/*                                                                     */
-/*  Protocol: data payload contains lib count + names, ancillary data  */
-/*  carries the fds via SCM_RIGHTS.                                    */
-/*                                                                     */
-/*  Data layout:                                                       */
-/*    [uint32_t nlibs]                                                 */
-/*    for each lib:                                                    */
-/*      [uint16_t name_len] [char name[name_len]]                     */
-/*                                                                     */
-/*  Ancillary: SCM_RIGHTS with nlibs file descriptors.                 */
+/*  Daemon protocol v2                                                  */
+/*                                                                      */
+/*  Wire format (per message):                                          */
+/*    [u32 op] [u32 payload_len] [payload bytes...]                    */
+/*  plus optional SCM_RIGHTS ancillary data (OP_BATCH / OP_LIB only).   */
+/*                                                                      */
+/*  Client → Daemon:                                                    */
+/*    OP_INIT     + [u32 nfilter] [(u16 nlen, bytes) * nfilter]        */
+/*                  nfilter=0 means "send all libs".                    */
+/*    OP_GET_LIB  + [u16 nlen] [name bytes]                            */
+/*    OP_BYE      + (no payload) — daemon closes connection.           */
+/*                                                                      */
+/*  Daemon → Client (in response to OP_INIT):                           */
+/*    Zero or more OP_BATCH messages, each with:                        */
+/*      [u32 nlibs] [(u16 nlen, bytes) * nlibs]                        */
+/*    and ancillary data: SCM_RIGHTS with nlibs fds.                    */
+/*    Followed by a single OP_END message (empty payload) to mark EOF. */
+/*                                                                      */
+/*  Daemon → Client (in response to OP_GET_LIB):                        */
+/*    OP_LIB + [u32 status]                                             */
+/*    If status==ST_OK, ancillary SCM_RIGHTS carries 1 fd.              */
+/*    If status!=ST_OK, no ancillary data.                              */
 /* ------------------------------------------------------------------ */
 
-/* Build the data payload (lib count + names). Returns payload size. */
-static size_t build_daemon_payload(uint8_t *buf, size_t buflen,
-                                   const char (*names)[MAX_NAME + 1],
-                                   int nlibs)
+#define OP_INIT         0x01u
+#define OP_GET_LIB      0x02u
+#define OP_BYE          0x03u
+#define OP_LIST         0x04u  /* request: all lib names (no fds) */
+#define OP_GET_CLOSURE  0x05u  /* request: lib + transitive encrypted deps */
+
+#define OP_BATCH    0x81u
+#define OP_END      0x82u
+#define OP_LIB      0x83u
+#define OP_NAMES    0x84u  /* response to OP_LIST: batched name list */
+
+/* Per-lib adjacency cap.  Real business libs can DT_NEED 30+ entries
+ * (system + Qt + boost + app libs) and anything beyond this cap gets
+ * dropped from the deps graph, which then causes lazy fetch to miss
+ * transitive encrypted deps and glibc to fall back to disk (hitting
+ * ciphertext and aborting with "invalid elf header").  Keep this
+ * well above the largest plausible DT_NEEDED list. */
+#define MAX_DEPS_PER_LIB 128
+
+/* Forward decl — defined with the other daemon helpers further below. */
+static int compute_closure(const char *start,
+                           const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                           int *out_idx, int max_out);
+
+#define ST_OK        0u
+#define ST_NOT_FOUND 1u
+#define ST_ERROR     2u
+
+/* Max payload bytes we will accept or send in one message.
+ * Worst case: an OP_BATCH with SCM_BATCH entries, each up to MAX_NAME+2 bytes. */
+#define MAX_PAYLOAD  (4u + SCM_BATCH * (2u + MAX_NAME))
+
+static inline void put_u32le(uint8_t *p, uint32_t v)
 {
-    size_t off = 0;
-    uint32_t nl = (uint32_t)nlibs;
-    if (off + 4 > buflen) return 0;
-    memcpy(buf + off, &nl, 4);
-    off += 4;
+    p[0] = (uint8_t)(v & 0xff);
+    p[1] = (uint8_t)((v >> 8) & 0xff);
+    p[2] = (uint8_t)((v >> 16) & 0xff);
+    p[3] = (uint8_t)((v >> 24) & 0xff);
+}
 
-    for (int i = 0; i < nlibs; i++) {
-        uint16_t nlen = (uint16_t)strlen(names[i]);
+static inline void put_u16le(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xff);
+    p[1] = (uint8_t)((v >> 8) & 0xff);
+}
+
+/* Blocking recv of exactly len bytes. Returns 0 on success, -1 on error/EOF. */
+static int recv_full(int sock, void *buf, size_t len)
+{
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = recv(sock, (uint8_t *)buf + got, len - got, 0);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            return -1;
+        }
+        got += (size_t)n;
+    }
+    return 0;
+}
+
+/* Send one v2 message with optional ancillary fds.
+ * Writes [u32 op | u32 plen | payload bytes] and, if nfds > 0,
+ * attaches SCM_RIGHTS on the first sendmsg.
+ * Returns 0 on success, -1 on failure. */
+static int send_msg(int sock, uint32_t op, const void *payload, uint32_t plen,
+                    const int *fds, int nfds)
+{
+    uint8_t hdr[8];
+    put_u32le(hdr, op);
+    put_u32le(hdr + 4, plen);
+
+    struct iovec iov[2];
+    iov[0].iov_base = hdr;
+    iov[0].iov_len  = sizeof(hdr);
+    iov[1].iov_base = (void *)payload;
+    iov[1].iov_len  = plen;
+
+    struct msghdr msg = {0};
+    msg.msg_iov    = iov;
+    msg.msg_iovlen = (plen > 0) ? 2 : 1;
+
+    char cmsg_buf[CMSG_SPACE(SCM_BATCH * sizeof(int))];
+    if (nfds > 0) {
+        memset(cmsg_buf, 0, sizeof(cmsg_buf));
+        msg.msg_control    = cmsg_buf;
+        msg.msg_controllen = CMSG_SPACE((size_t)nfds * sizeof(int));
+        struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type  = SCM_RIGHTS;
+        cm->cmsg_len   = CMSG_LEN((size_t)nfds * sizeof(int));
+        memcpy(CMSG_DATA(cm), fds, (size_t)nfds * sizeof(int));
+    }
+
+    size_t total = (size_t)8 + (size_t)plen;
+    ssize_t n = sendmsg(sock, &msg, 0);
+    if (n < 0) return -1;
+    if ((size_t)n == total) return 0;
+
+    /* Partial write after the first sendmsg: ancillary is already
+     * delivered, finish the remaining bytes with plain send(). */
+    size_t sent = (size_t)n;
+    if (sent < 8) {
+        size_t hrem = 8 - sent;
+        ssize_t m = send(sock, hdr + sent, hrem, 0);
+        if (m < 0 || (size_t)m != hrem) return -1;
+        sent = 8;
+    }
+    size_t prem = total - sent;
+    if (prem > 0) {
+        ssize_t m = send(sock, (const uint8_t *)payload + (sent - 8), prem, 0);
+        if (m < 0 || (size_t)m != prem) return -1;
+    }
+    return 0;
+}
+
+/* Receive one v2 message. On success sets *op and *plen, writes up to
+ * *plen bytes into payload, and up to max_fds ancillary fds into fds[]
+ * (setting *nfds). Returns 0 on success, -1 on error/EOF. */
+static int recv_msg(int sock, uint32_t *op,
+                    uint8_t *payload, uint32_t *plen, uint32_t max_payload,
+                    int *fds, int *nfds, int max_fds)
+{
+    *nfds = 0;
+
+    /* First recvmsg: 8-byte header + ancillary (if any). */
+    uint8_t hdr[8];
+    struct iovec iov = { .iov_base = hdr, .iov_len = sizeof(hdr) };
+
+    char cmsg_buf[CMSG_SPACE(SCM_BATCH * sizeof(int))];
+    memset(cmsg_buf, 0, sizeof(cmsg_buf));
+
+    struct msghdr msg = {0};
+    msg.msg_iov        = &iov;
+    msg.msg_iovlen     = 1;
+    msg.msg_control    = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+
+    ssize_t got = recvmsg(sock, &msg, 0);
+    if (got <= 0) return -1;
+
+    /* Extract any SCM_RIGHTS fds (attached to first byte of message). */
+    for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm)) {
+        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+            int n = (int)((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+            if (n > max_fds) {
+                int *src = (int *)CMSG_DATA(cm);
+                for (int k = 0; k < n; k++) close(src[k]);
+                return -1;
+            }
+            memcpy(fds, CMSG_DATA(cm), (size_t)n * sizeof(int));
+            *nfds = n;
+        }
+    }
+
+    /* Finish reading the header if we got fewer than 8 bytes. */
+    if (got < (ssize_t)sizeof(hdr)) {
+        if (recv_full(sock, hdr + got, sizeof(hdr) - (size_t)got) < 0)
+            return -1;
+    }
+
+    *op = u32le(hdr);
+    uint32_t p = u32le(hdr + 4);
+    if (p > max_payload) return -1;
+    *plen = p;
+
+    if (p > 0) {
+        if (recv_full(sock, payload, p) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Build an OP_BATCH payload (u32 nlibs + per-lib u16 nlen + name bytes). */
+static size_t build_batch_payload(uint8_t *buf, size_t buflen,
+                                  const char (*names)[MAX_NAME + 1],
+                                  int start, int count)
+{
+    if ((size_t)4 > buflen) return 0;
+    put_u32le(buf, (uint32_t)count);
+    size_t off = 4;
+    for (int i = 0; i < count; i++) {
+        uint16_t nlen = (uint16_t)strlen(names[start + i]);
         if (off + 2 + nlen > buflen) return 0;
-        memcpy(buf + off, &nlen, 2);
+        put_u16le(buf + off, nlen);
         off += 2;
-        memcpy(buf + off, names[i], nlen);
+        memcpy(buf + off, names[start + i], nlen);
         off += nlen;
     }
     return off;
 }
 
+/* Send the initial batch (filtered by `filter_names` if nfilter > 0, else all)
+ * followed by OP_END. Returns 0 on success, -1 on failure. */
+static int send_init_batch(int client, const int *lib_fds,
+                           const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                           const char (*filter_names)[MAX_NAME + 1], int nfilter)
+{
+    /* Resolve selection: either the filter list, or the full lib list. */
+    int   sel_fds[MAX_FILES];
+    int   sel_count = 0;
+    char  sel_names[MAX_FILES][MAX_NAME + 1];
+
+    if (nfilter > 0) {
+        for (int k = 0; k < nfilter; k++) {
+            for (int j = 0; j < nlibs; j++) {
+                if (strcmp(filter_names[k], lib_names[j]) == 0) {
+                    sel_fds[sel_count] = lib_fds[j];
+                    memcpy(sel_names[sel_count], lib_names[j], MAX_NAME + 1);
+                    sel_count++;
+                    break;
+                }
+            }
+        }
+    } else {
+        sel_count = nlibs;
+        memcpy(sel_fds, lib_fds, (size_t)nlibs * sizeof(int));
+        memcpy(sel_names, lib_names, (size_t)nlibs * (MAX_NAME + 1));
+    }
+
+    /* Send in SCM_BATCH-sized chunks. */
+    for (int off = 0; off < sel_count; off += SCM_BATCH) {
+        int batch = sel_count - off;
+        if (batch > SCM_BATCH) batch = SCM_BATCH;
+
+        uint8_t payload[MAX_PAYLOAD];
+        size_t plen = build_batch_payload(payload, sizeof(payload),
+                                          sel_names, off, batch);
+        if (plen == 0) return -1;
+        if (send_msg(client, OP_BATCH, payload, (uint32_t)plen,
+                     sel_fds + off, batch) < 0)
+            return -1;
+    }
+    return send_msg(client, OP_END, NULL, 0, NULL, 0);
+}
+
+/* Handle OP_GET_LIB: look up `name` in the daemon's lib table and reply
+ * with OP_LIB + status + (optionally) one fd. */
+static int handle_get_lib(int client, const int *lib_fds,
+                          const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                          const uint8_t *payload, uint32_t plen)
+{
+    uint8_t resp[4];
+    if (plen < 2) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    uint16_t nlen;
+    memcpy(&nlen, payload, 2);
+    if ((uint32_t)nlen + 2u > plen || nlen > MAX_NAME) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    char name[MAX_NAME + 1];
+    memcpy(name, payload + 2, nlen);
+    name[nlen] = '\0';
+
+    for (int j = 0; j < nlibs; j++) {
+        if (strcmp(lib_names[j], name) == 0) {
+            put_u32le(resp, ST_OK);
+            int fd = lib_fds[j];
+            return send_msg(client, OP_LIB, resp, 4, &fd, 1);
+        }
+    }
+    put_u32le(resp, ST_NOT_FOUND);
+    return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+}
+
+/* Handle OP_LIST: reply with all lib names in SCM_BATCH-sized OP_NAMES
+ * messages, terminated by OP_END. No fds attached. */
+static int handle_list(int client,
+                       const char (*lib_names)[MAX_NAME + 1], int nlibs)
+{
+    for (int off = 0; off < nlibs; off += SCM_BATCH) {
+        int batch = nlibs - off;
+        if (batch > SCM_BATCH) batch = SCM_BATCH;
+        uint8_t payload[MAX_PAYLOAD];
+        size_t plen = build_batch_payload(payload, sizeof(payload),
+                                          lib_names, off, batch);
+        if (plen == 0) return -1;
+        if (send_msg(client, OP_NAMES, payload, (uint32_t)plen, NULL, 0) < 0)
+            return -1;
+    }
+    return send_msg(client, OP_END, NULL, 0, NULL, 0);
+}
+
+/* Handle OP_GET_CLOSURE: compute transitive encrypted closure of the
+ * requested lib (via build_deps_graph'd adjacency), then reply with
+ * OP_BATCH(es) carrying (fd, name) for every lib in the closure,
+ * terminated by OP_END.  If the name is not in the daemon's lib set,
+ * replies with a single OP_END (empty closure). */
+static int handle_get_closure(int client, const int *lib_fds,
+                              const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                              const uint8_t *payload, uint32_t plen)
+{
+    if (plen < 2)
+        return send_msg(client, OP_END, NULL, 0, NULL, 0);
+    uint16_t nlen;
+    memcpy(&nlen, payload, 2);
+    if ((uint32_t)nlen + 2u > plen || nlen > MAX_NAME)
+        return send_msg(client, OP_END, NULL, 0, NULL, 0);
+    char name[MAX_NAME + 1];
+    memcpy(name, payload + 2, nlen);
+    name[nlen] = '\0';
+
+    int closure[MAX_FILES];
+    int n = compute_closure(name, lib_names, nlibs, closure, MAX_FILES);
+    if (n <= 0)
+        return send_msg(client, OP_END, NULL, 0, NULL, 0);
+
+    /* Materialize ordered fds/names for the batch sender. */
+    int  sel_fds[MAX_FILES];
+    char sel_names[MAX_FILES][MAX_NAME + 1];
+    for (int i = 0; i < n; i++) {
+        sel_fds[i] = lib_fds[closure[i]];
+        memcpy(sel_names[i], lib_names[closure[i]], MAX_NAME + 1);
+    }
+
+    for (int off = 0; off < n; off += SCM_BATCH) {
+        int batch = n - off;
+        if (batch > SCM_BATCH) batch = SCM_BATCH;
+        uint8_t pay[MAX_PAYLOAD];
+        size_t pl = build_batch_payload(pay, sizeof(pay), sel_names, off, batch);
+        if (pl == 0) return -1;
+        if (send_msg(client, OP_BATCH, pay, (uint32_t)pl,
+                     sel_fds + off, batch) < 0)
+            return -1;
+    }
+    return send_msg(client, OP_END, NULL, 0, NULL, 0);
+}
+
+/* Parse an OP_INIT payload into a filter list. Returns number of names,
+ * or -1 on parse error. */
+static int parse_init_filter(const uint8_t *payload, uint32_t plen,
+                             char (*out_names)[MAX_NAME + 1])
+{
+    if (plen < 4) return -1;
+    uint32_t nfilter = u32le(payload);
+    if (nfilter > MAX_FILES) return -1;
+    size_t off = 4;
+    for (uint32_t i = 0; i < nfilter; i++) {
+        if (off + 2 > plen) return -1;
+        uint16_t nlen;
+        memcpy(&nlen, payload + off, 2);
+        off += 2;
+        if (nlen > MAX_NAME || off + nlen > plen) return -1;
+        memcpy(out_names[i], payload + off, nlen);
+        out_names[i][nlen] = '\0';
+        off += nlen;
+    }
+    return (int)nfilter;
+}
+
+/* Process a single inbound request from a connected client.
+ * Returns 0 to keep the connection alive, -1 to close it. */
+static int daemon_handle_request(int client, const int *lib_fds,
+                                 const char (*lib_names)[MAX_NAME + 1], int nlibs)
+{
+    uint32_t op, plen;
+    uint8_t  payload[MAX_PAYLOAD];
+    int      dummy_fds[1];
+    int      dummy_nfds = 0;
+
+    if (recv_msg(client, &op, payload, &plen, MAX_PAYLOAD,
+                 dummy_fds, &dummy_nfds, 0) < 0)
+        return -1;
+
+    if (op == OP_INIT) {
+        char filter[MAX_FILES][MAX_NAME + 1];
+        int  nfilter = parse_init_filter(payload, plen, filter);
+        if (nfilter < 0) return -1;
+        return send_init_batch(client, lib_fds, lib_names, nlibs,
+                               filter, nfilter);
+    }
+    if (op == OP_GET_LIB) {
+        return handle_get_lib(client, lib_fds, lib_names, nlibs, payload, plen);
+    }
+    if (op == OP_LIST) {
+        return handle_list(client, lib_names, nlibs);
+    }
+    if (op == OP_GET_CLOSURE) {
+        return handle_get_closure(client, lib_fds, lib_names, nlibs,
+                                  payload, plen);
+    }
+    if (op == OP_BYE) {
+        return -1;
+    }
+    return -1;
+}
+
+/* Single-threaded epoll-based daemon. Keeps per-client sockets alive
+ * for as long as the client wants; same-uid check enforced at accept. */
 static void daemon_serve(int listen_fd, const int *lib_fds,
                          const char (*lib_names)[MAX_NAME + 1], int nlibs)
 {
@@ -184,113 +563,204 @@ static void daemon_serve(int listen_fd, const int *lib_fds,
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
 
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    if (ep < 0) return;
+
+    struct epoll_event lev;
+    lev.events  = EPOLLIN;
+    lev.data.fd = listen_fd;
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, listen_fd, &lev) < 0) return;
+
+    struct epoll_event evs[32];
     for (;;) {
-        int client = accept(listen_fd, NULL, NULL);
-        if (client < 0) continue;
-
-        /* Only serve same uid */
-        struct ucred cred;
-        socklen_t clen = sizeof(cred);
-        if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0
-            || cred.uid != my_uid) {
-            close(client);
-            continue;
+        int n = epoll_wait(ep, evs, 32, -1);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
         }
 
-        /* Send libs in batches of SCM_BATCH (kernel limit: 253 fds) */
-        int ok = 1;
-        for (int off = 0; off < nlibs && ok; off += SCM_BATCH) {
-            int batch = nlibs - off;
-            if (batch > SCM_BATCH) batch = SCM_BATCH;
+        for (int i = 0; i < n; i++) {
+            int fd = evs[i].data.fd;
 
-            uint8_t payload[DAEMON_DATA_MAX];
-            size_t payload_len = build_daemon_payload(
-                payload, sizeof(payload), lib_names + off, batch);
+            if (fd == listen_fd) {
+                int client = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+                if (client < 0) continue;
 
-            struct iovec iov = { .iov_base = payload, .iov_len = payload_len };
+                struct ucred cred;
+                socklen_t clen = sizeof(cred);
+                if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0
+                    || cred.uid != my_uid) {
+                    close(client);
+                    continue;
+                }
 
-            char cmsg_buf[CMSG_SPACE(SCM_BATCH * sizeof(int))];
-            memset(cmsg_buf, 0, sizeof(cmsg_buf));
+                struct epoll_event cev;
+                cev.events  = EPOLLIN | EPOLLRDHUP;
+                cev.data.fd = client;
+                if (epoll_ctl(ep, EPOLL_CTL_ADD, client, &cev) < 0) {
+                    close(client);
+                }
+                continue;
+            }
 
-            struct msghdr msg = {0};
-            msg.msg_iov        = &iov;
-            msg.msg_iovlen     = 1;
-            msg.msg_control    = cmsg_buf;
-            msg.msg_controllen = CMSG_SPACE((size_t)batch * sizeof(int));
+            if (evs[i].events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR)) {
+                epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
+                close(fd);
+                continue;
+            }
 
-            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-            cmsg->cmsg_level = SOL_SOCKET;
-            cmsg->cmsg_type  = SCM_RIGHTS;
-            cmsg->cmsg_len   = CMSG_LEN((size_t)batch * sizeof(int));
-            memcpy(CMSG_DATA(cmsg), lib_fds + off, (size_t)batch * sizeof(int));
-
-            if (sendmsg(client, &msg, 0) < 0) ok = 0;
+            if (evs[i].events & EPOLLIN) {
+                if (daemon_handle_request(fd, lib_fds, lib_names, nlibs) < 0) {
+                    epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
+                    close(fd);
+                }
+            }
         }
-
-        /* Sentinel: nlibs=0 signals end of batches */
-        uint32_t sentinel = 0;
-        (void)send(client, &sentinel, sizeof(sentinel), 0);
-
-        close(client);
     }
 }
 
-/* Receive lib fds + names from the daemon (batched protocol).
- * Daemon sends batches of up to SCM_BATCH fds, terminated by a
- * sentinel message (nlibs=0).
+/* Client-side helper: send OP_INIT (optionally with a filter list),
+ * collect all OP_BATCH messages until OP_END, return fds + names.
+ * If nfilter == 0, requests the full lib set.
  * Returns 0 on success, -1 on failure. */
+static int daemon_request_libs(int sd,
+                               const char (*filter_names)[MAX_NAME + 1],
+                               int nfilter,
+                               int *out_fds,
+                               char (*out_names)[MAX_NAME + 1],
+                               int *out_nlibs)
+{
+    /* Build OP_INIT payload: [u32 nfilter] [(u16 nlen, bytes) * nfilter] */
+    uint8_t init_payload[MAX_PAYLOAD];
+    put_u32le(init_payload, (uint32_t)nfilter);
+    size_t off = 4;
+    for (int i = 0; i < nfilter; i++) {
+        uint16_t nlen = (uint16_t)strlen(filter_names[i]);
+        if (off + 2 + nlen > sizeof(init_payload)) return -1;
+        put_u16le(init_payload + off, nlen);
+        off += 2;
+        memcpy(init_payload + off, filter_names[i], nlen);
+        off += nlen;
+    }
+    if (send_msg(sd, OP_INIT, init_payload, (uint32_t)off, NULL, 0) < 0)
+        return -1;
+
+    *out_nlibs = 0;
+    for (;;) {
+        uint32_t op, plen;
+        uint8_t  payload[MAX_PAYLOAD];
+        int      recvd_fds[SCM_BATCH];
+        int      nrecvd = 0;
+
+        if (recv_msg(sd, &op, payload, &plen, MAX_PAYLOAD,
+                     recvd_fds, &nrecvd, SCM_BATCH) < 0)
+            return -1;
+
+        if (op == OP_END) break;
+        if (op != OP_BATCH) return -1;
+        if (plen < 4) return -1;
+
+        uint32_t nl = u32le(payload);
+        if ((int)nl != nrecvd) return -1;
+        if (*out_nlibs + (int)nl > MAX_FILES) return -1;
+
+        memcpy(out_fds + *out_nlibs, recvd_fds, (size_t)nl * sizeof(int));
+
+        size_t poff = 4;
+        for (uint32_t i = 0; i < nl; i++) {
+            if (poff + 2 > plen) return -1;
+            uint16_t nlen;
+            memcpy(&nlen, payload + poff, 2);
+            poff += 2;
+            if (nlen > MAX_NAME || poff + nlen > plen) return -1;
+            memcpy(out_names[*out_nlibs + (int)i], payload + poff, nlen);
+            out_names[*out_nlibs + (int)i][nlen] = '\0';
+            poff += nlen;
+        }
+        *out_nlibs += (int)nl;
+    }
+    return (*out_nlibs > 0) ? 0 : -1;
+}
+
+/* Client-side helper: send OP_LIST and collect OP_NAMES/OP_END to recover
+ * the full set of encrypted lib names the daemon manages. No fds.
+ * Returns 0 on success, -1 on error. */
+static int daemon_request_names(int sd,
+                                char (*out_names)[MAX_NAME + 1],
+                                int *out_nlibs)
+{
+    if (send_msg(sd, OP_LIST, NULL, 0, NULL, 0) < 0) return -1;
+    *out_nlibs = 0;
+    for (;;) {
+        uint32_t op, plen;
+        uint8_t  payload[MAX_PAYLOAD];
+        int      dummy_fds[1];
+        int      nrecvd = 0;
+        if (recv_msg(sd, &op, payload, &plen, MAX_PAYLOAD,
+                     dummy_fds, &nrecvd, 0) < 0)
+            return -1;
+        if (op == OP_END) break;
+        if (op != OP_NAMES) return -1;
+        if (plen < 4) return -1;
+        uint32_t nl = u32le(payload);
+        size_t poff = 4;
+        for (uint32_t i = 0; i < nl; i++) {
+            if (poff + 2 > plen) return -1;
+            uint16_t nlen;
+            memcpy(&nlen, payload + poff, 2);
+            poff += 2;
+            if (nlen > MAX_NAME || poff + nlen > plen) return -1;
+            if (*out_nlibs >= MAX_FILES) return -1;
+            memcpy(out_names[*out_nlibs], payload + poff, nlen);
+            out_names[*out_nlibs][nlen] = '\0';
+            (*out_nlibs)++;
+            poff += nlen;
+        }
+    }
+    return 0;
+}
+
+/* Send OP_GET_LIB and receive one OP_LIB response with a single fd.
+ * Returns the fd on success, -1 on error. Used by lazy-fetch in dlopen_shim. */
+__attribute__((unused))
+static int daemon_request_one(int sd, const char *name)
+{
+    uint16_t nlen = (uint16_t)strlen(name);
+    if (nlen > MAX_NAME) return -1;
+
+    uint8_t req[2 + MAX_NAME];
+    put_u16le(req, nlen);
+    memcpy(req + 2, name, nlen);
+    if (send_msg(sd, OP_GET_LIB, req, (uint32_t)(2 + nlen), NULL, 0) < 0)
+        return -1;
+
+    uint32_t op, plen;
+    uint8_t  payload[16];
+    int      recvd_fds[1];
+    int      nrecvd = 0;
+    if (recv_msg(sd, &op, payload, &plen, sizeof(payload),
+                 recvd_fds, &nrecvd, 1) < 0)
+        return -1;
+    if (op != OP_LIB || plen < 4) return -1;
+    uint32_t status = u32le(payload);
+    if (status != ST_OK || nrecvd != 1) return -1;
+    return recvd_fds[0];
+}
+
+/* Send OP_BYE to cleanly close the daemon socket. Best-effort. */
+static void daemon_send_bye(int sd)
+{
+    (void)send_msg(sd, OP_BYE, NULL, 0, NULL, 0);
+}
+
+/* Back-compat shim for existing call sites that still want the
+ * "send empty filter, receive all libs, close" flow. */
 static int receive_lib_fds(int sd, int *out_fds,
                            char (*out_names)[MAX_NAME + 1], int *out_nlibs)
 {
-    *out_nlibs = 0;
-
-    for (;;) {
-        uint8_t payload[DAEMON_DATA_MAX];
-        struct iovec iov = { .iov_base = payload, .iov_len = sizeof(payload) };
-
-        char cmsg_buf[CMSG_SPACE(SCM_BATCH * sizeof(int))];
-        memset(cmsg_buf, 0, sizeof(cmsg_buf));
-
-        struct msghdr msg = {0};
-        msg.msg_iov        = &iov;
-        msg.msg_iovlen     = 1;
-        msg.msg_control    = cmsg_buf;
-        msg.msg_controllen = sizeof(cmsg_buf);
-
-        ssize_t got = recvmsg(sd, &msg, 0);
-        if (got < 4) return -1;
-
-        uint32_t nl;
-        memcpy(&nl, payload, 4);
-        if (nl == 0) break;  /* sentinel — no more batches */
-        if (*out_nlibs + (int)nl > MAX_FILES) return -1;
-
-        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-        if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) return -1;
-
-        int nfds = (int)((cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int));
-        if (nfds != (int)nl) return -1;
-
-        memcpy(out_fds + *out_nlibs, CMSG_DATA(cmsg),
-               (size_t)nfds * sizeof(int));
-
-        /* Parse lib names for this batch */
-        size_t off = 4;
-        for (int i = 0; i < (int)nl; i++) {
-            if (off + 2 > (size_t)got) return -1;
-            uint16_t nlen;
-            memcpy(&nlen, payload + off, 2);
-            off += 2;
-            if (nlen > MAX_NAME || off + nlen > (size_t)got) return -1;
-            memcpy(out_names[*out_nlibs + i], payload + off, nlen);
-            out_names[*out_nlibs + i][nlen] = '\0';
-            off += nlen;
-        }
-
-        *out_nlibs += (int)nl;
-    }
-
-    return (*out_nlibs > 0) ? 0 : -1;
+    int rc = daemon_request_libs(sd, NULL, 0, out_fds, out_names, out_nlibs);
+    daemon_send_bye(sd);
+    return rc;
 }
 
 /* Build abstract socket address from key hash.
@@ -319,6 +789,201 @@ static socklen_t make_sock_addr(struct sockaddr_un *addr,
 
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path)
                        + 1 + strlen(addr->sun_path + 1));
+}
+
+/* ------------------------------------------------------------------ */
+/*  ELF DT_NEEDED parser + per-lib dependency graph (daemon-side)     */
+/*                                                                      */
+/*  At daemon startup we mmap each decrypted lib memfd, parse its      */
+/*  PT_DYNAMIC segment, extract DT_NEEDED names, and filter them to    */
+/*  the set of encrypted libs the daemon manages.  The resulting       */
+/*  adjacency list is later used by compute_closure() to answer        */
+/*  OP_GET_CLOSURE requests — so dlopen_shim can fetch a lib and its   */
+/*  transitive encrypted deps in a single round-trip.                  */
+/* ------------------------------------------------------------------ */
+
+static int  g_deps_count[MAX_FILES];
+static int  g_deps_idx[MAX_FILES][MAX_DEPS_PER_LIB];
+
+static int parse_dt_needed(int fd,
+                           char (*out_names)[MAX_NAME + 1],
+                           int max_out)
+{
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size < (off_t)sizeof(Elf64_Ehdr))
+        return -1;
+
+    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) return -1;
+
+    int found = -1;
+    const uint8_t  *base = (const uint8_t *)map;
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)base;
+
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) goto out;
+    if (eh->e_ident[EI_CLASS] != ELFCLASS64) goto out;
+    if (eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > (uint64_t)st.st_size)
+        goto out;
+
+    const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(base + eh->e_phoff);
+    const Elf64_Phdr *dyn_ph = NULL;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (phdrs[i].p_type == PT_DYNAMIC) { dyn_ph = &phdrs[i]; break; }
+    }
+    if (!dyn_ph) goto out;
+
+    /* PT_DYNAMIC's own p_offset is the file offset of .dynamic —
+     * more reliable than deriving it from a containing PT_LOAD. */
+    off_t dyn_off = (off_t)dyn_ph->p_offset;
+    if (dyn_off + (off_t)dyn_ph->p_filesz > st.st_size) goto out;
+
+    const Elf64_Dyn *dyn = (const Elf64_Dyn *)(base + dyn_off);
+    int ndyn = (int)(dyn_ph->p_filesz / sizeof(Elf64_Dyn));
+
+    uint64_t strtab_vaddr = 0;
+    for (int i = 0; i < ndyn; i++) {
+        if (dyn[i].d_tag == DT_NULL) break;
+        if (dyn[i].d_tag == DT_STRTAB) { strtab_vaddr = dyn[i].d_un.d_ptr; break; }
+    }
+    if (!strtab_vaddr) goto out;
+
+    off_t strtab_off = -1;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (phdrs[i].p_type != PT_LOAD) continue;
+        if (strtab_vaddr >= phdrs[i].p_vaddr
+            && strtab_vaddr < phdrs[i].p_vaddr + phdrs[i].p_memsz) {
+            strtab_off = (off_t)(strtab_vaddr - phdrs[i].p_vaddr
+                                 + phdrs[i].p_offset);
+            break;
+        }
+    }
+    if (strtab_off < 0 || strtab_off >= st.st_size) goto out;
+
+    const char *strtab     = (const char *)(base + strtab_off);
+    size_t      strtab_max = (size_t)(st.st_size - strtab_off);
+
+    int n = 0;
+    int total = 0;   /* total DT_NEEDED entries observed, capped or not */
+    for (int i = 0; i < ndyn; i++) {
+        if (dyn[i].d_tag == DT_NULL) break;
+        if (dyn[i].d_tag != DT_NEEDED) continue;
+        total++;
+        if (n >= max_out) continue;   /* cap reached — keep counting */
+        uint64_t off = dyn[i].d_un.d_val;
+        if (off >= strtab_max) continue;
+        size_t len = strnlen(strtab + off, strtab_max - off);
+        if (len == 0 || len > MAX_NAME) continue;
+        memcpy(out_names[n], strtab + off, len);
+        out_names[n][len] = '\0';
+        n++;
+    }
+    /* Signal truncation by returning a negative of (actual total)
+     * so the caller knows the stored list is incomplete.  Positive
+     * return = full list fits in the output buffer. */
+    found = (total > max_out) ? -(total) : n;
+
+out:
+    munmap(map, (size_t)st.st_size);
+    return found;
+}
+
+/* Build per-lib adjacency list: for each lib, record indices of its
+ * direct DT_NEEDED deps that are also in the daemon's lib table.
+ * Libs whose deps can't be parsed (stripped, etc.) get deps_count = 0. */
+static void build_deps_graph(const int *lib_fds,
+                             const char (*lib_names)[MAX_NAME + 1], int nlibs)
+{
+    char dt_names[MAX_DEPS_PER_LIB][MAX_NAME + 1];
+    for (int i = 0; i < nlibs; i++) {
+        g_deps_count[i] = 0;
+        int n_dt = parse_dt_needed(lib_fds[i], dt_names, MAX_DEPS_PER_LIB);
+        if (n_dt < 0) {
+            /* Parser signaled truncation — some DT_NEEDED entries
+             * didn't fit.  This is very bad for lazy closure fetch:
+             * any dropped encrypted dep will send glibc to disk at
+             * load time and abort with "invalid elf header".  Bump
+             * MAX_DEPS_PER_LIB above the real count and rebuild. */
+            fprintf(stderr, "[antirev] WARNING: %s has %d DT_NEEDED "
+                    "entries, only %d captured (MAX_DEPS_PER_LIB=%d). "
+                    "Increase the cap.\n",
+                    lib_names[i], -n_dt, MAX_DEPS_PER_LIB,
+                    MAX_DEPS_PER_LIB);
+            n_dt = MAX_DEPS_PER_LIB;  /* use what we got */
+        }
+        if (n_dt == 0) continue;
+        for (int k = 0; k < n_dt; k++) {
+            for (int j = 0; j < nlibs; j++) {
+                if (j == i) continue;
+                if (strcmp(lib_names[j], dt_names[k]) == 0) {
+                    if (g_deps_count[i] < MAX_DEPS_PER_LIB)
+                        g_deps_idx[i][g_deps_count[i]++] = j;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/* Iterative DFS post-order from `node` through the encrypted-deps graph.
+ * Emits each lib AFTER all its transitive deps — giving the client a
+ * topological ordering (leaves first, root last) it can replay via
+ * real_dlopen() so each lib finds its already-loaded deps in glibc's
+ * link map and skips DT_RPATH / DT_RUNPATH search on disk. */
+static void dfs_postorder(int start_idx, uint8_t *visited,
+                          int *out_idx, int *n_out, int max_out)
+{
+    /* Stack frame: (node, next-child-index-to-visit).  We push the node
+     * when first encountered, keep visiting its unexplored deps, and
+     * emit it once the child index runs off the end. */
+    int stack_node[MAX_FILES];
+    int stack_next[MAX_FILES];
+    int top = 0;
+
+    if (visited[start_idx]) return;
+    visited[start_idx] = 1;
+    stack_node[top] = start_idx;
+    stack_next[top] = 0;
+    top++;
+
+    while (top > 0) {
+        int node = stack_node[top - 1];
+        int next = stack_next[top - 1];
+
+        if (next >= g_deps_count[node]) {
+            /* All children visited: emit this node and pop. */
+            if (*n_out < max_out) out_idx[(*n_out)++] = node;
+            top--;
+            continue;
+        }
+        stack_next[top - 1] = next + 1;
+        int dep = g_deps_idx[node][next];
+        if (!visited[dep] && top < MAX_FILES) {
+            visited[dep] = 1;
+            stack_node[top] = dep;
+            stack_next[top] = 0;
+            top++;
+        }
+    }
+}
+
+/* Topological closure from a lib name through the encrypted-deps graph.
+ * Writes indices into out_idx[] in deps-first order, returns count
+ * (>= 1 on success) or -1 if `start` is not in the lib table. */
+static int compute_closure(const char *start,
+                           const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                           int *out_idx, int max_out)
+{
+    int start_idx = -1;
+    for (int i = 0; i < nlibs; i++) {
+        if (strcmp(lib_names[i], start) == 0) { start_idx = i; break; }
+    }
+    if (start_idx < 0) return -1;
+
+    static uint8_t visited[MAX_FILES];
+    memset(visited, 0, sizeof(visited));
+    int n_out = 0;
+    dfs_postorder(start_idx, visited, out_idx, &n_out, max_out);
+    return n_out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -732,6 +1397,35 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         fprintf(stderr, "[antirev] decrypted %d libs in %.1fs\n",
                 nlibs, elapsed);
 
+        /* Build per-lib DT_NEEDED adjacency so OP_GET_CLOSURE can return
+         * a lib + its transitive encrypted deps in one round trip. */
+        build_deps_graph(lib_fds, lib_names, nlibs);
+        {
+            int total_edges = 0, zero = 0;
+            for (int i = 0; i < nlibs; i++) {
+                total_edges += g_deps_count[i];
+                if (g_deps_count[i] == 0) zero++;
+            }
+            fprintf(stderr, "[antirev] deps graph: %d libs, %d edges, "
+                    "%d libs with 0 deps\n", nlibs, total_edges, zero);
+
+            /* Dump the full graph to /tmp/antirev-deps.log so it is
+             * reachable even when the daemon's stderr is closed (e.g.
+             * launched from sysmgr).  This is a one-shot diagnostic
+             * file; safe to delete after debugging. */
+            FILE *lf = fopen("/tmp/antirev-deps.log", "w");
+            if (lf) {
+                fprintf(lf, "# antirev deps graph (%d libs)\n", nlibs);
+                for (int i = 0; i < nlibs; i++) {
+                    fprintf(lf, "%s %d", lib_names[i], g_deps_count[i]);
+                    for (int k = 0; k < g_deps_count[i]; k++)
+                        fprintf(lf, " %s", lib_names[g_deps_idx[i][k]]);
+                    fprintf(lf, "\n");
+                }
+                fclose(lf);
+            }
+        }
+
         struct sockaddr_un addr;
         socklen_t addr_len = make_sock_addr(&addr, key);
         explicit_bzero(key, sizeof(key));
@@ -875,11 +1569,20 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * Phase 3: lib fd acquisition.
      *
      * Mode C (daemon libs): no libs bundled, must receive from daemon.
+     *
+     * Lazy-fetch flow:
+     *   1. OP_LIST            → full encrypted lib name list (no fds)
+     *   2. OP_INIT(DT_NEEDED) → fds for libs linked directly by the exe,
+     *                          so glibc can resolve them at startup.
+     *   3. Keep the socket open and pass its fd to the child so that
+     *      dlopen_shim can request lazy closures on-demand via
+     *      OP_GET_CLOSURE.
      * ---------------------------------------------------------------- */
+    int  daemon_sd = -1;
+    char all_enc_names[MAX_FILES][MAX_NAME + 1];
+    int  n_all_enc = 0;
+
     if ((bundle_flags & BFLAG_DAEMON_LIBS) && nlibs == 0) {
-        /* Mode C: client-only — receive libs from daemon.
-         * If no daemon is running, auto-launch .antirev-libd from the
-         * same directory as our binary (first process bootstraps it). */
 
         /* Raise fd limit: we'll receive ~nlibs fds via SCM_RIGHTS */
         struct rlimit rl;
@@ -897,13 +1600,58 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         for (int retry = 0; retry < 50; retry++) {
             int sd = socket(AF_UNIX, SOCK_STREAM, 0);
             if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
-                char recv_names[MAX_FILES][MAX_NAME + 1];
-                if (receive_lib_fds(sd, lib_fds, recv_names, &nlibs) == 0
-                    && nlibs > 0) {
-                    memcpy(lib_names, recv_names, sizeof(recv_names));
-                    connected = 1;
+                /* Step 1: full name list, no fds. */
+                if (daemon_request_names(sd, all_enc_names, &n_all_enc) < 0
+                    || n_all_enc == 0) {
+                    close(sd);
+                    break;
                 }
-                close(sd);
+
+                if (has_needed_section) {
+                    /* needed_names is the exe's direct DT_NEEDED list
+                     * (encrypted + unencrypted).  Intersect with the
+                     * encrypted set so we only eagerly fetch libs that
+                     * actually live in the daemon. */
+                    char   enc_needed[MAX_FILES][MAX_NAME + 1];
+                    int    n_enc_needed = 0;
+                    for (int k = 0; k < n_needed; k++) {
+                        for (int j = 0; j < n_all_enc; j++) {
+                            if (strcmp(needed_names[k], all_enc_names[j]) == 0) {
+                                memcpy(enc_needed[n_enc_needed],
+                                       needed_names[k], MAX_NAME + 1);
+                                n_enc_needed++;
+                                break;
+                            }
+                        }
+                    }
+                    if (n_enc_needed > 0) {
+                        if (daemon_request_libs(sd, enc_needed, n_enc_needed,
+                                                lib_fds, lib_names, &nlibs) < 0
+                            || nlibs == 0) {
+                            close(sd);
+                            break;
+                        }
+                    } else {
+                        /* No encrypted DT_NEEDED — nothing to eager-fetch.
+                         * dlopen_shim handles everything lazily. */
+                        nlibs = 0;
+                    }
+                    /* Keep socket open for lazy OP_GET_CLOSURE requests. */
+                    daemon_sd = sd;
+                } else {
+                    /* Legacy bundle (no needed-libs section): fetch
+                     * everything eagerly, drop the socket. */
+                    if (daemon_request_libs(sd, NULL, 0,
+                                            lib_fds, lib_names, &nlibs) < 0
+                        || nlibs == 0) {
+                        close(sd);
+                        break;
+                    }
+                    daemon_send_bye(sd);
+                    close(sd);
+                    n_all_enc = 0;  /* no lazy mode */
+                }
+                connected = 1;
                 break;
             }
             if (sd >= 0) close(sd);
@@ -945,6 +1693,9 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             fprintf(stderr, "[antirev] failed to connect to lib daemon\n");
             return 1;
         }
+        fprintf(stderr, "[antirev] daemon: %d enc libs total, "
+                "%d eagerly fetched (DT_NEEDED)\n",
+                n_all_enc, nlibs);
     }
 
     /* Wipe key (after daemon socket name derivation) */
@@ -961,27 +1712,31 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     if (write_chunk(dlopen_shim_fd, dlopen_shim_blob, dlopen_shim_blob_len) != 0) return 1;
     if (lseek(dlopen_shim_fd, 0, SEEK_SET) < 0) { perror("lseek dlopen_shim"); return 1; }
 
-    /* Phase 4b. Split libs into DT_NEEDED (LD_PRELOAD) and rest (ANTIREV_FD_MAP).
-     * DT_NEEDED libs are preloaded for fast startup.
-     * Remaining encrypted libs are available on-demand via dlopen_shim. */
-    int preload_fds[MAX_FILES];
-    char preload_names[MAX_FILES][MAX_NAME + 1];
-    int n_preload = 0;
+    /* Phase 4b. Split libs into DT_NEEDED (symlink dir) and rest (ANTIREV_FD_MAP).
+     *
+     * DT_NEEDED libs are resolved by glibc's normal BFS through the symlink
+     * dir on LD_LIBRARY_PATH — preserving the original symbol lookup order.
+     * They are NOT put on LD_PRELOAD (which would reorder them ahead of
+     * unencrypted libs and change symbol resolution).
+     *
+     * Remaining libs are available on-demand via dlopen_shim + ANTIREV_FD_MAP. */
+    int dt_needed_fds[MAX_FILES];
+    char dt_needed_names[MAX_FILES][MAX_NAME + 1];
+    int n_dt_needed = 0;
 
     int fdmap_fds[MAX_FILES];
     char fdmap_names[MAX_FILES][MAX_NAME + 1];
     int n_fdmap = 0;
 
     if (has_needed_section && nlibs > 0) {
-        /* Build preload list in needed_names order (dependency-first).
-         * The packer embeds needed_names with deepest deps first so that
-         * glibc can resolve each lib's DT_NEEDED from already-loaded libs. */
+        /* Identify which daemon libs are in the exe's DT_NEEDED chain.
+         * These go into the symlink dir only (not LD_PRELOAD). */
         for (int k = 0; k < n_needed; k++) {
             for (int j = 0; j < nlibs; j++) {
                 if (strcmp(lib_names[j], needed_names[k]) == 0) {
-                    preload_fds[n_preload] = lib_fds[j];
-                    memcpy(preload_names[n_preload], lib_names[j], MAX_NAME + 1);
-                    n_preload++;
+                    dt_needed_fds[n_dt_needed] = lib_fds[j];
+                    memcpy(dt_needed_names[n_dt_needed], lib_names[j], MAX_NAME + 1);
+                    n_dt_needed++;
                     break;
                 }
             }
@@ -1001,36 +1756,39 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 n_fdmap++;
             }
         }
-        fprintf(stderr, "[antirev] split: %d on LD_PRELOAD, %d on FD_MAP "
+        fprintf(stderr, "[antirev] split: %d via symlinks, %d on FD_MAP "
                 "(needed=%d, daemon=%d)\n",
-                n_preload, n_fdmap, n_needed, nlibs);
-        for (int k = 0; k < n_preload; k++)
-            fprintf(stderr, "[antirev]   PRELOAD: %s (fd %d)\n",
-                    preload_names[k], preload_fds[k]);
+                n_dt_needed, n_fdmap, n_needed, nlibs);
+        for (int k = 0; k < n_dt_needed; k++)
+            fprintf(stderr, "[antirev]   DT_NEEDED: %s (fd %d)\n",
+                    dt_needed_names[k], dt_needed_fds[k]);
     } else {
-        /* No needed list — all libs go on LD_PRELOAD (backward compat) */
-        memcpy(preload_fds, lib_fds, (size_t)nlibs * sizeof(int));
-        memcpy(preload_names, lib_names, (size_t)nlibs * (MAX_NAME + 1));
-        n_preload = nlibs;
+        /* No needed list — all libs go on LD_PRELOAD (backward compat).
+         * This path is used by old protected binaries without the needed
+         * section.  It does NOT preserve original symbol lookup order. */
+        n_dt_needed = nlibs;
+        memcpy(dt_needed_fds, lib_fds, (size_t)nlibs * sizeof(int));
+        memcpy(dt_needed_names, lib_names, (size_t)nlibs * (MAX_NAME + 1));
         fprintf(stderr, "[antirev] backward compat: all %d libs on LD_PRELOAD\n",
                 nlibs);
     }
 
-    /* Phase 4c. Create symlink dir so the dynamic linker can resolve
-     * DT_NEEDED references to encrypted libs.  For each lib (both
-     * LD_PRELOAD and FD_MAP), create a symlink:
+    /* Phase 4c. Create symlink dir for ALL encrypted libs (DT_NEEDED + FD_MAP):
      *   /tmp/antirev_XXXXXX/libfoo.so → /proc/self/fd/N
-     * Then prepend this dir to LD_LIBRARY_PATH.  This covers the case
-     * where a runtime-dlopen'd lib has an encrypted lib as DT_NEEDED —
-     * the linker finds the symlink, follows it to the decrypted memfd. */
+     *
+     * This dir is prepended to LD_LIBRARY_PATH.  For DT_NEEDED libs, this
+     * is the PRIMARY resolution mechanism — glibc's BFS finds them here,
+     * preserving the original symbol lookup order.  For FD_MAP (dlopen'd)
+     * libs, the symlinks serve as a fallback when the lib's own DT_NEEDED
+     * chain references other encrypted libs. */
     char link_dir[] = "/tmp/antirev_XXXXXX";
     char *link_dir_ptr = mkdtemp(link_dir);
     if (link_dir_ptr) {
-        for (int j = 0; j < n_preload; j++) {
+        for (int j = 0; j < n_dt_needed; j++) {
             char lpath[sizeof(link_dir) + MAX_NAME + 2];
             char target[64];
-            snprintf(lpath, sizeof(lpath), "%s/%s", link_dir, preload_names[j]);
-            snprintf(target, sizeof(target), "/proc/self/fd/%d", preload_fds[j]);
+            snprintf(lpath, sizeof(lpath), "%s/%s", link_dir, dt_needed_names[j]);
+            snprintf(target, sizeof(target), "/proc/self/fd/%d", dt_needed_fds[j]);
             if (symlink(target, lpath) < 0)
                 perror("[antirev] symlink");
         }
@@ -1043,7 +1801,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 perror("[antirev] symlink");
         }
         fprintf(stderr, "[antirev] symlink dir: %s (%d links)\n",
-                link_dir, n_preload + n_fdmap);
+                link_dir, n_dt_needed + n_fdmap);
     }
 
     /* Phase 5. Build new envp */
@@ -1101,8 +1859,10 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
     }
 
-    /* +7: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP, LD_LIBRARY_PATH, NULL + spare */
-    char **new_env = malloc((size_t)(envc + 7) * sizeof(char *));
+    /* +11: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP, LD_LIBRARY_PATH,
+     * ANTIREV_CLOSE_FDS, ANTIREV_LIBD_SOCK, ANTIREV_ENC_LIBS,
+     * ANTIREV_SYMLINK_DIR, NULL + spare */
+    char **new_env = malloc((size_t)(envc + 11) * sizeof(char *));
     if (!new_env) { perror("malloc env"); return 1; }
 
     char real_exe_entry[4096 + 32];
@@ -1113,9 +1873,18 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     snprintf(main_fd_entry, sizeof(main_fd_entry),
              "ANTIREV_MAIN_FD=%d", main_fd);
 
-    /* Build LD_PRELOAD: exe_shim + dlopen_shim + DT_NEEDED lib memfds.
-     * Each fd path is /proc/self/fd/NNN — at most ~20 chars each. */
-    size_t preload_len = 128 + (size_t)n_preload * 24
+    /* Build LD_PRELOAD: exe_shim + dlopen_shim only.
+     *
+     * Encrypted DT_NEEDED libs are NOT on LD_PRELOAD — they are resolved
+     * by glibc's normal DT_NEEDED BFS through the symlink dir on
+     * LD_LIBRARY_PATH.  This preserves the original symbol lookup order.
+     *
+     * Backward compat (no needed section): encrypted libs are added to
+     * LD_PRELOAD as before, since we can't rely on symlink-only resolution
+     * without knowing which libs are DT_NEEDED vs dlopen'd. */
+    int compat_preload = !has_needed_section && nlibs > 0;
+    size_t preload_len = 128
+                       + (compat_preload ? (size_t)n_dt_needed * 24 : 0)
                        + (existing_preload ? 1 + strlen(existing_preload) : 0);
     char *ld_preload_entry = malloc(preload_len);
     if (!ld_preload_entry) { perror("malloc ld_preload"); return 1; }
@@ -1123,9 +1892,11 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     int off = snprintf(ld_preload_entry, preload_len,
                        "LD_PRELOAD=/proc/self/fd/%d:/proc/self/fd/%d",
                        exe_shim_fd, dlopen_shim_fd);
-    for (int j = 0; j < n_preload; j++)
-        off += snprintf(ld_preload_entry + off, preload_len - (size_t)off,
-                        ":/proc/self/fd/%d", preload_fds[j]);
+    if (compat_preload) {
+        for (int j = 0; j < n_dt_needed; j++)
+            off += snprintf(ld_preload_entry + off, preload_len - (size_t)off,
+                            ":/proc/self/fd/%d", dt_needed_fds[j]);
+    }
     if (existing_preload)
         snprintf(ld_preload_entry + off, preload_len - (size_t)off,
                  ":%s", existing_preload);
@@ -1145,13 +1916,81 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
     }
 
+    /* Lazy-fetch env vars (dlopen_shim side).
+     *
+     *   ANTIREV_LIBD_SOCK   — fd number of the open daemon socket,
+     *                         inherited through fexecve.
+     *   ANTIREV_SYMLINK_DIR — directory where dlopen_shim writes its
+     *                         per-lib symlinks (same dir stub uses).
+     *   ANTIREV_ENC_LIBS    — comma-separated list of every encrypted
+     *                         lib name the daemon manages.  dlopen_shim
+     *                         checks incoming dlopen basenames against
+     *                         this set before talking to the daemon.
+     *
+     * Only populated when Mode C is in lazy mode (daemon_sd >= 0). */
+    int lazy_mode = (daemon_sd >= 0 && n_all_enc > 0);
+
+    char *libd_sock_entry = NULL;
+    char *enc_libs_entry  = NULL;
+    char *symlink_dir_entry = NULL;
+
+    if (lazy_mode) {
+        libd_sock_entry = malloc(48);
+        if (libd_sock_entry)
+            snprintf(libd_sock_entry, 48, "ANTIREV_LIBD_SOCK=%d", daemon_sd);
+
+        if (link_dir_ptr) {
+            symlink_dir_entry = malloc(64);
+            if (symlink_dir_entry)
+                snprintf(symlink_dir_entry, 64,
+                         "ANTIREV_SYMLINK_DIR=%s", link_dir);
+        }
+
+        size_t enc_len = 20 + (size_t)n_all_enc * (MAX_NAME + 2);
+        enc_libs_entry = malloc(enc_len);
+        if (enc_libs_entry) {
+            int eo = snprintf(enc_libs_entry, enc_len, "ANTIREV_ENC_LIBS=");
+            for (int j = 0; j < n_all_enc; j++) {
+                if (j > 0) enc_libs_entry[eo++] = ',';
+                eo += snprintf(enc_libs_entry + eo, enc_len - (size_t)eo,
+                               "%s", all_enc_names[j]);
+            }
+        }
+    }
+
+    /* Build ANTIREV_CLOSE_FDS: comma-separated DT_NEEDED fds that exe_shim
+     * should close in its constructor.  By that point glibc has already
+     * mmap'd every DT_NEEDED lib, so the fds are pure bookkeeping — closing
+     * them frees fd-table slots without affecting the running process.
+     *
+     * Only populated on the symlink-dir path (has_needed_section).  The
+     * backward-compat path still uses LD_PRELOAD for encrypted libs and we
+     * don't want to close those fds — ld.so may still reference them. */
+    char *close_fds_entry = NULL;
+    if (has_needed_section && n_dt_needed > 0) {
+        size_t cf_len = 20 + (size_t)n_dt_needed * 12;
+        close_fds_entry = malloc(cf_len);
+        if (close_fds_entry) {
+            int cfo = snprintf(close_fds_entry, cf_len, "ANTIREV_CLOSE_FDS=");
+            for (int j = 0; j < n_dt_needed; j++) {
+                if (j > 0) close_fds_entry[cfo++] = ',';
+                cfo += snprintf(close_fds_entry + cfo, cf_len - (size_t)cfo,
+                                "%d", dt_needed_fds[j]);
+            }
+        }
+    }
+
     int ei = 0;
     for (int j = 0; j < envc; j++) {
-        if (strncmp(envp[j], "LD_PRELOAD=",       11) == 0) continue;
-        if (strncmp(envp[j], "LD_LIBRARY_PATH=",  16) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_REAL_EXE=", 17) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_MAIN_FD=",  16) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_FD_MAP=",   15) == 0) continue;
+        if (strncmp(envp[j], "LD_PRELOAD=",            11) == 0) continue;
+        if (strncmp(envp[j], "LD_LIBRARY_PATH=",       16) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_REAL_EXE=",      17) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_MAIN_FD=",       16) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_FD_MAP=",        15) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_CLOSE_FDS=",     18) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_LIBD_SOCK=",     18) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_ENC_LIBS=",      17) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_SYMLINK_DIR=",   20) == 0) continue;
         new_env[ei++] = envp[j];
     }
     new_env[ei++] = real_exe_entry;
@@ -1161,6 +2000,14 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         new_env[ei++] = fd_map_entry;
     if (ld_libpath_entry)
         new_env[ei++] = ld_libpath_entry;
+    if (close_fds_entry)
+        new_env[ei++] = close_fds_entry;
+    if (libd_sock_entry)
+        new_env[ei++] = libd_sock_entry;
+    if (enc_libs_entry)
+        new_env[ei++] = enc_libs_entry;
+    if (symlink_dir_entry)
+        new_env[ei++] = symlink_dir_entry;
     new_env[ei]   = NULL;
 
     /* Phase 6. Replace this process with the decrypted binary — no fork, same PID */
