@@ -20,6 +20,7 @@ set(TESTS
     test_dlopen_nested    # nested dlopen from within a protected .so
     test_dlopen_transitive # encrypted lib behind unencrypted intermediary
     test_dlopen_dt_needed # dlopen(enc A) -> A DT_NEEDs enc B via symlink dir
+    test_dlopen_reload    # dlopen/dlclose/dlopen re-runs ctor (no root pin)
     test_fork_same_lib    # fork+exec child inherits same lib via LD_PRELOAD
     test_fork_diff_lib    # parent and child use different libs independently
     test_script_multi_bin # script invokes A and B with shared + unique libs

@@ -456,6 +456,47 @@ add_custom_target(test_dlopen_dt_needed
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_dlopen_reload — verify that plugin libs unload on dlclose and
+#  re-run their constructors on the next dlopen.  Guards the lazy-fetch
+#  "don't pin the root lib" rule — a regression would cause the
+#  libprotobuf "File already exists in database" class of failures when
+#  business software cycles plugins that share static state.
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_lib("${CMAKE_BINARY_DIR}/libreload.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_reload/libreload.c")
+add_custom_target(libreload DEPENDS "${CMAKE_BINARY_DIR}/libreload.so")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/dlopen_reload"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_reload/main.c")
+add_custom_target(dlopen_reload_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_reload")
+
+set(_TD_RELOAD "${CMAKE_BINARY_DIR}/daemon_test_dlopen_reload")
+add_custom_target(test_dlopen_reload
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_reload ==="
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_RELOAD}"
+    COMMAND ${CMAKE_COMMAND} -E remove -f /tmp/test_dlopen_reload.log
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_RELOAD}/test.key"
+            --libs   "${CMAKE_BINARY_DIR}/libreload.so"
+            --output "${_TD_RELOAD}/.antirev-libd"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/dlopen_reload"
+            --key    "${_TD_RELOAD}/test.key"
+            --daemon-libs
+            --output "${_TD_RELOAD}/test.protected"
+    COMMAND ${CMAKE_COMMAND}
+            "-DBINARY=${_TD_RELOAD}/test.protected"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
+    DEPENDS stub libreload dlopen_reload_bin
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "dlopen reload: dlopen/dlclose/dlopen must re-run ctor"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_preload_memfd — smoke test: DT_NEEDED satisfied via LD_PRELOAD
 #  from a memfd (no .so on disk, no LD_AUDIT)
 # ═══════════════════════════════════════════════════════════════════════
