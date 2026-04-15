@@ -320,11 +320,25 @@ static void fetch_closure(const char *base)
     }
     LOG("  closure for %s: %d libs total\n", base, n_received);
 
-    /* Pre-load each new lib via its symlink path, in the order the
+    /* Pre-load each DEPENDENCY via its symlink path, in the order the
      * daemon returned them (topological: leaves first).  Each load
-     * registers the lib's SONAME in glibc's link map so subsequent
-     * libs' DT_NEEDED lookups hit the link map and skip disk search. */
+     * registers the dep's SONAME in glibc's link map so the final
+     * real_dlopen() of `base` finds its DT_NEEDED chain in the link
+     * map instead of falling back to DT_RPATH / DT_RUNPATH on disk.
+     *
+     * Explicitly skip `base` itself: pinning the root's refcount here
+     * prevents the caller from ever fully dlclose()ing it, which
+     * breaks plugin systems that unload one plugin before loading the
+     * next — notably the libprotobuf "File already exists in database"
+     * conflict seen when two plugins carry overlapping descriptors.
+     * The caller's own real_dlopen() in the outer dlopen() handler
+     * takes the single reference that the user is entitled to
+     * manage. */
     for (int i = 0; i < new_count; i++) {
+        if (strcmp(new_names[i], base) == 0) {
+            LOG("    skip-root %s\n", new_names[i]);
+            continue;
+        }
         char spath[512];
         snprintf(spath, sizeof(spath), "%s/%s", g_symlink_dir, new_names[i]);
         void *h = real_dlopen_fn(spath, RTLD_LAZY);
@@ -335,8 +349,10 @@ static void fetch_closure(const char *base)
         } else {
             LOG("    preload(%s) OK handle=%p\n", new_names[i], h);
         }
-        /* Don't dlclose — we want the refcount to stay up so the lib
-         * remains in the link map for subsequent loads. */
+        /* Deps are pinned intentionally — they're typically shared
+         * across plugins (libc++, libprotobuf, libQtCore, etc.) and
+         * must stay resident so repeated plugin loads don't drop and
+         * re-register them. */
     }
 }
 
