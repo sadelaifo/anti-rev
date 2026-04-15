@@ -341,7 +341,26 @@ static void fetch_closure(const char *base)
         }
         char spath[512];
         snprintf(spath, sizeof(spath), "%s/%s", g_symlink_dir, new_names[i]);
-        void *h = real_dlopen_fn(spath, RTLD_LAZY);
+        /* RTLD_GLOBAL is mandatory here, not decorative.
+         *
+         * Generated .pb.cc code exports `descriptor_table_<file>_2eproto`
+         * with default visibility and registers it via a std::call_once
+         * hanging off the table's own `once_flag*`.  If two DSOs in the
+         * closure each statically link the same .pb.o, an RTLD_LOCAL
+         * preload leaves their tables in separate symbol scopes: each
+         * DSO's ctor reads its *own* `once_flag`, both run, libprotobuf
+         * sees two different-pointer-but-same-filename DescriptorTable
+         * registrations, and the process aborts with "File already
+         * exists in database".
+         *
+         * With RTLD_GLOBAL the first-loaded DSO's copy interposes every
+         * subsequent reference to the same symbol, the second ctor's
+         * `call_once` finds the already-ran flag on the interposed
+         * pointer and short-circuits, and libprotobuf never sees the
+         * duplicate.  This matches the plaintext load-time behavior
+         * where glibc places DT_NEEDED libs into the global scope
+         * automatically. */
+        void *h = real_dlopen_fn(spath, RTLD_LAZY | RTLD_GLOBAL);
         if (!h) {
             const char *err = dlerror();
             LOG("    preload(%s) FAILED: %s\n", new_names[i],

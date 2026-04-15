@@ -497,6 +497,94 @@ add_custom_target(test_dlopen_reload
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_dlopen_interpose — dlopen_shim must preload closure deps with
+#  RTLD_GLOBAL so DSOs carrying overlapping static initializers (the
+#  libprotobuf "File already exists in database" scenario) dedup via
+#  symbol interposition the way the plaintext loader does.
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_lib("${CMAKE_BINARY_DIR}/libregistrar.so"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libregistrar.c")
+add_custom_target(libregistrar
+    DEPENDS "${CMAKE_BINARY_DIR}/libregistrar.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libinterpose_dup1.so"
+    COMMAND gcc -shared -fPIC -O2
+            -Wl,-soname,libinterpose_dup1.so
+            -o "${CMAKE_BINARY_DIR}/libinterpose_dup1.so"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libdup1.c"
+            -L "${CMAKE_BINARY_DIR}" -lregistrar -Wl,--no-as-needed
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libdup1.c"
+            "${CMAKE_BINARY_DIR}/libregistrar.so"
+    COMMENT "Building libinterpose_dup1.so"
+)
+add_custom_target(libinterpose_dup1
+    DEPENDS "${CMAKE_BINARY_DIR}/libinterpose_dup1.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libinterpose_dup2.so"
+    COMMAND gcc -shared -fPIC -O2
+            -Wl,-soname,libinterpose_dup2.so
+            -o "${CMAKE_BINARY_DIR}/libinterpose_dup2.so"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libdup2.c"
+            -L "${CMAKE_BINARY_DIR}" -lregistrar -Wl,--no-as-needed
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libdup2.c"
+            "${CMAKE_BINARY_DIR}/libregistrar.so"
+    COMMENT "Building libinterpose_dup2.so"
+)
+add_custom_target(libinterpose_dup2
+    DEPENDS "${CMAKE_BINARY_DIR}/libinterpose_dup2.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libroot.so"
+    COMMAND gcc -shared -fPIC -O2
+            -Wl,-soname,libroot.so
+            -o "${CMAKE_BINARY_DIR}/libroot.so"
+            "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libroot.c"
+            -L "${CMAKE_BINARY_DIR}"
+            -linterpose_dup1 -linterpose_dup2
+            -Wl,--no-as-needed
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/libroot.c"
+            "${CMAKE_BINARY_DIR}/libinterpose_dup1.so"
+            "${CMAKE_BINARY_DIR}/libinterpose_dup2.so"
+    COMMENT "Building libroot.so (dlopen_interpose test)"
+)
+add_custom_target(libroot_interpose DEPENDS "${CMAKE_BINARY_DIR}/libroot.so")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/dlopen_interpose"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/main.c")
+add_custom_target(dlopen_interpose_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_interpose")
+
+set(_TD_INTER "${CMAKE_BINARY_DIR}/daemon_test_dlopen_interpose")
+add_custom_target(test_dlopen_interpose
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_interpose ==="
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_INTER}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_INTER}/test.key"
+            --libs   "${CMAKE_BINARY_DIR}/libregistrar.so"
+                     "${CMAKE_BINARY_DIR}/libinterpose_dup1.so"
+                     "${CMAKE_BINARY_DIR}/libinterpose_dup2.so"
+                     "${CMAKE_BINARY_DIR}/libroot.so"
+            --output "${_TD_INTER}/.antirev-libd"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/dlopen_interpose"
+            --key    "${_TD_INTER}/test.key"
+            --daemon-libs
+            --output "${_TD_INTER}/test.protected"
+    COMMAND ${CMAKE_COMMAND}
+            "-DBINARY=${_TD_INTER}/test.protected"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
+    DEPENDS stub libregistrar libinterpose_dup1 libinterpose_dup2
+            libroot_interpose dlopen_interpose_bin
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "dlopen interpose: RTLD_GLOBAL preload dedups overlapping static state"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_preload_memfd — smoke test: DT_NEEDED satisfied via LD_PRELOAD
 #  from a memfd (no .so on disk, no LD_AUDIT)
 # ═══════════════════════════════════════════════════════════════════════
