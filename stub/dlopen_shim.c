@@ -210,8 +210,13 @@ static int cache_find(const char *base)
 /* ------------------------------------------------------------------ */
 
 /* Request `base` and its transitive encrypted closure from the daemon,
- * materialize symlinks for any names we don't already have cached, and
- * keep the fds open for the process lifetime.
+ * materialize symlinks for any names we don't already have cached,
+ * keep the fds open for the process lifetime, and then real_dlopen()
+ * each fetched lib by its symlink path in the daemon's (topological)
+ * return order — so leaves land in glibc's link map before their
+ * dependents start loading.  That way a plugin whose DT_RPATH points
+ * at the on-disk encrypted directory still satisfies its DT_NEEDED
+ * chain via the link map instead of trying to mmap ciphertext.
  *
  * Caller must hold g_lock. */
 static void fetch_closure(const char *base)
@@ -221,6 +226,11 @@ static void fetch_closure(const char *base)
         LOG("  no-sock (sock=%d dir='%s')\n", g_sock, g_symlink_dir);
         return;
     }
+
+    /* Collect newly-created lib names so we can pre-load them after
+     * all symlinks are in place. */
+    char new_names[MAX_FILES][MAX_NAME + 1];
+    int  new_count = 0;
 
     uint16_t nlen = (uint16_t)strlen(base);
     if (nlen == 0 || nlen > MAX_NAME) return;
@@ -302,9 +312,32 @@ static void fetch_closure(const char *base)
             memcpy(g_cache_names[g_cache_count], name, (size_t)l + 1);
             g_cache_fds[g_cache_count] = fds[i];
             g_cache_count++;
+            if (new_count < MAX_FILES) {
+                memcpy(new_names[new_count], name, (size_t)l + 1);
+                new_count++;
+            }
         }
     }
     LOG("  closure for %s: %d libs total\n", base, n_received);
+
+    /* Pre-load each new lib via its symlink path, in the order the
+     * daemon returned them (topological: leaves first).  Each load
+     * registers the lib's SONAME in glibc's link map so subsequent
+     * libs' DT_NEEDED lookups hit the link map and skip disk search. */
+    for (int i = 0; i < new_count; i++) {
+        char spath[512];
+        snprintf(spath, sizeof(spath), "%s/%s", g_symlink_dir, new_names[i]);
+        void *h = real_dlopen_fn(spath, RTLD_LAZY);
+        if (!h) {
+            const char *err = dlerror();
+            LOG("    preload(%s) FAILED: %s\n", new_names[i],
+                err ? err : "(null)");
+        } else {
+            LOG("    preload(%s) OK handle=%p\n", new_names[i], h);
+        }
+        /* Don't dlclose — we want the refcount to stay up so the lib
+         * remains in the link map for subsequent loads. */
+    }
 }
 
 /* ------------------------------------------------------------------ */

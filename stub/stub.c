@@ -899,8 +899,51 @@ static void build_deps_graph(const int *lib_fds,
     }
 }
 
-/* BFS closure from a lib name through the encrypted-deps graph.
- * Writes reachable lib indices into out_idx[], returns count or -1. */
+/* Iterative DFS post-order from `node` through the encrypted-deps graph.
+ * Emits each lib AFTER all its transitive deps — giving the client a
+ * topological ordering (leaves first, root last) it can replay via
+ * real_dlopen() so each lib finds its already-loaded deps in glibc's
+ * link map and skips DT_RPATH / DT_RUNPATH search on disk. */
+static void dfs_postorder(int start_idx, uint8_t *visited,
+                          int *out_idx, int *n_out, int max_out)
+{
+    /* Stack frame: (node, next-child-index-to-visit).  We push the node
+     * when first encountered, keep visiting its unexplored deps, and
+     * emit it once the child index runs off the end. */
+    int stack_node[MAX_FILES];
+    int stack_next[MAX_FILES];
+    int top = 0;
+
+    if (visited[start_idx]) return;
+    visited[start_idx] = 1;
+    stack_node[top] = start_idx;
+    stack_next[top] = 0;
+    top++;
+
+    while (top > 0) {
+        int node = stack_node[top - 1];
+        int next = stack_next[top - 1];
+
+        if (next >= g_deps_count[node]) {
+            /* All children visited: emit this node and pop. */
+            if (*n_out < max_out) out_idx[(*n_out)++] = node;
+            top--;
+            continue;
+        }
+        stack_next[top - 1] = next + 1;
+        int dep = g_deps_idx[node][next];
+        if (!visited[dep] && top < MAX_FILES) {
+            visited[dep] = 1;
+            stack_node[top] = dep;
+            stack_next[top] = 0;
+            top++;
+        }
+    }
+}
+
+/* Topological closure from a lib name through the encrypted-deps graph.
+ * Writes indices into out_idx[] in deps-first order, returns count
+ * (>= 1 on success) or -1 if `start` is not in the lib table. */
 static int compute_closure(const char *start,
                            const char (*lib_names)[MAX_NAME + 1], int nlibs,
                            int *out_idx, int max_out)
@@ -911,26 +954,10 @@ static int compute_closure(const char *start,
     }
     if (start_idx < 0) return -1;
 
-    static uint8_t visited[MAX_FILES];  /* static: avoid 1 KiB stack */
+    static uint8_t visited[MAX_FILES];
     memset(visited, 0, sizeof(visited));
-    int queue[MAX_FILES];
-    int qhead = 0, qtail = 0;
     int n_out = 0;
-
-    visited[start_idx] = 1;
-    queue[qtail++] = start_idx;
-
-    while (qhead < qtail) {
-        int cur = queue[qhead++];
-        if (n_out < max_out) out_idx[n_out++] = cur;
-        for (int k = 0; k < g_deps_count[cur]; k++) {
-            int dep = g_deps_idx[cur][k];
-            if (!visited[dep]) {
-                visited[dep] = 1;
-                if (qtail < MAX_FILES) queue[qtail++] = dep;
-            }
-        }
-    }
+    dfs_postorder(start_idx, visited, out_idx, &n_out, max_out);
     return n_out;
 }
 
