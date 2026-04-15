@@ -311,6 +311,21 @@ class AntirevClient:
         self._libs = {}
         self._loaded = set()   # tracks libs processed by _ensure_loaded
         self._link_dir = tempfile.mkdtemp(prefix="antirev_")
+        # Escape hatch, same semantics as dlopen_shim's ANTIREV_NO_PRELOAD:
+        # when set, _ensure_loaded / _ensure_deps still materialize the
+        # soname symlinks and recurse through the DT_NEEDED chain, but
+        # they do NOT call _Real(link, RTLD_GLOBAL) on each dep.  The
+        # caller's own ctypes.CDLL() (or Python import) then triggers
+        # glibc's normal recursive DT_NEEDED walk against the symlink
+        # dir, mapping every dep first and running all ctors together
+        # at the end.  Matches plaintext semantics and fixes business
+        # libs with implicit inter-lib symbol dependencies (where one
+        # lib references a symbol provided by a sibling lib with no
+        # DT_NEEDED edge between them — the per-dep RTLD_GLOBAL preload
+        # runs each dep's ctors in isolation and crashes on lazy binds
+        # across the implicit boundary).
+        npe = os.environ.get('ANTIREV_NO_PRELOAD', '')
+        self._no_preload = bool(npe) and npe != '0'
         # Prepend symlink dir to LD_LIBRARY_PATH so glibc's DT_NEEDED
         # resolution finds our soname symlinks (→ memfd) before any
         # encrypted copies on disk.
@@ -446,11 +461,12 @@ class AntirevClient:
             link = os.path.join(self._link_dir, soname)
             if not os.path.exists(link):
                 os.symlink("/proc/self/fd/{}".format(fd), link)
-            try:
-                _Real(link, mode=ct.RTLD_GLOBAL)
-            except OSError as e:
-                print("[antirev] warning: failed to preload {}: {}".format(
-                    name, e), file=sys.stderr)
+            if not self._no_preload:
+                try:
+                    _Real(link, mode=ct.RTLD_GLOBAL)
+                except OSError as e:
+                    print("[antirev] warning: failed to preload {}: {}".format(
+                        name, e), file=sys.stderr)
         else:
             # Unencrypted dep — follow DT_NEEDED to discover encrypted
             # deps behind it, then pre-load with RTLD_GLOBAL.
@@ -458,10 +474,11 @@ class AntirevClient:
             if disk_path:
                 for dep in _get_needed_from_path(disk_path):
                     self._ensure_loaded(dep)
-            try:
-                _Real(disk_path or name, mode=ct.RTLD_GLOBAL)
-            except OSError:
-                pass  # system lib already loaded, or linker will find it
+            if not self._no_preload:
+                try:
+                    _Real(disk_path or name, mode=ct.RTLD_GLOBAL)
+                except OSError:
+                    pass  # system lib already loaded, or linker will find it
 
     def _ensure_deps(self, name):
         """Preload `name`'s transitive dependency chain — but NOT `name`
@@ -659,6 +676,22 @@ def activate(key_source=None, preload='on_demand'):
                      when encrypted libs have C constructors that
                      dlopen other encrypted libs at init time.
 
+    Environment:
+        ANTIREV_NO_PRELOAD=1 — escape hatch.  When set, disables the
+            per-dep RTLD_GLOBAL preload that _ensure_loaded /
+            _ensure_deps normally does; soname symlinks are still
+            materialized and the DT_NEEDED chain is still walked, but
+            no _Real(link, RTLD_GLOBAL) call is issued per dep.  The
+            caller's own ctypes.CDLL() / Python import then triggers
+            glibc's natural recursive DT_NEEDED load, matching
+            plaintext semantics.  Required for business libs with
+            implicit inter-lib symbol dependencies (one lib references
+            a symbol provided by a sibling lib with no DT_NEEDED edge
+            between them).  See stub/dlopen_shim.c for the C-side
+            equivalent; the env var is the same name and has the same
+            semantics.  The correct long-term fix is to add the
+            missing DT_NEEDED edge to the business build.
+
     Returns:
         The AntirevClient instance (for introspection / manual use).
     """
@@ -670,7 +703,12 @@ def activate(key_source=None, preload='on_demand'):
     client.patch_import()
     client.patch_ctypes()
     n = len(client._loaded & set(client._libs)) if client._loaded else 0
-    mode = "preloaded {}".format(n) if preload == 'all' else "on-demand"
+    if client._no_preload:
+        mode = "no-preload (natural load)"
+    elif preload == 'all':
+        mode = "preloaded {}".format(n)
+    else:
+        mode = "on-demand"
     print("[antirev] {} libs available ({}), "
           "import + ctypes.CDLL patched".format(len(client._libs), mode),
           file=sys.stderr)
