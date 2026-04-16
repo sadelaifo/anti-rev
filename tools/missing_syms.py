@@ -174,7 +174,11 @@ def build_ldconfig_cache():
     for line in out.splitlines():
         m = re.match(r'\s+(\S+)\s+\(.*\)\s+=>\s+(\S+)', line)
         if m:
-            cache[m.group(1)] = m.group(2)
+            # Keep the first entry per soname — ldconfig lists the
+            # native architecture (x86-64) before compat (i386), so
+            # first-wins picks the right one for the host binaries.
+            if m.group(1) not in cache:
+                cache[m.group(1)] = m.group(2)
     return cache
 
 
