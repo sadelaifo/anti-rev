@@ -214,6 +214,36 @@ class LibResolver:
         return result
 
 
+# -- Deduplication -----------------------------------------------------------
+
+def dedup_versioned(elfs, all_parsed):
+    # type: (list[str], dict) -> list[str]
+    """Collapse versioned copies to one representative per (dir, soname).
+
+    Installations often ship ``libfoo.so``, ``libfoo.so.1``, and
+    ``libfoo.so.1.2.3`` as real files (not symlinks).  They share the
+    same DT_SONAME and identical symbols, so scanning all of them is
+    redundant.  This keeps the shortest filename per group (typically
+    the base ``.so``).  Files without a DT_SONAME are kept as-is.
+    """
+    groups = {}   # type: dict[tuple[str,str], str]
+    no_soname = []  # type: list[str]
+
+    for p in elfs:
+        parsed = all_parsed.get(p)
+        soname = parsed[0] if parsed else ''
+        if not soname:
+            no_soname.append(p)
+            continue
+        d = os.path.dirname(p)
+        key = (d, soname)
+        if key not in groups or \
+                len(os.path.basename(p)) < len(os.path.basename(groups[key])):
+            groups[key] = p
+
+    return sorted(set(no_soname) | set(groups.values()))
+
+
 # -- Blacklist ---------------------------------------------------------------
 
 def parse_blacklist(path, proj_dir):
@@ -872,30 +902,18 @@ def main():
 
     # -- Discover ELFs -------------------------------------------------------
     log('[scan] Scanning %s ...' % proj_dir)
-    proj_elfs = scan_proj_dir(proj_dir)
-    if not proj_elfs:
+    all_proj_elfs = scan_proj_dir(proj_dir)
+    if not all_proj_elfs:
         sys.exit('[error] no ELF files found in %s' % proj_dir)
 
-    # Split: scan_elfs are checked for issues; blacklisted are providers only
-    if blacklist:
-        scan_elfs = [p for p in proj_elfs
-                     if not is_blacklisted(p, blacklist)]
-        n_bl = len(proj_elfs) - len(scan_elfs)
-        log('[blacklist] %d ELF(s) blacklisted (providers only)' % n_bl)
-    else:
-        scan_elfs = proj_elfs
-
-    n_exe = sum(1 for p in scan_elfs if classify_elf(p) == 'exe')
-    n_lib = len(scan_elfs) - n_exe
-    log('[scan] Scanning: %d executable(s), %d shared lib(s)' %
-        (n_exe, n_lib))
+    log('[scan] Found %d ELF file(s) in project' % len(all_proj_elfs))
 
     # Scan LD_LIBRARY_PATH for external libs (symbol provider search)
-    proj_set = set(proj_elfs)
-    ext_libs = scan_search_dirs(search_dirs, proj_set)
+    all_proj_set = set(all_proj_elfs)
+    ext_libs = scan_search_dirs(search_dirs, all_proj_set)
     log('[scan] External: %d lib(s) on LD_LIBRARY_PATH' % len(ext_libs))
 
-    all_elfs = proj_elfs + ext_libs
+    all_elfs = all_proj_elfs + ext_libs
 
     # -- Parallel parse ------------------------------------------------------
     log('[parse] Parsing %d ELF files ...' % len(all_elfs))
@@ -914,7 +932,7 @@ def main():
 
     log('[parse] Done.')
 
-    # -- Build resolution map ------------------------------------------------
+    # -- Build resolution map (uses ALL files for soname lookup) -------------
     local_map = {}  # type: dict[str, str]
     for p in all_elfs:
         parsed = all_parsed[p]
@@ -926,6 +944,32 @@ def main():
             local_map[soname] = p
 
     resolver = LibResolver(search_dirs, ldcache, local_map)
+
+    # -- Deduplicate versioned copies ----------------------------------------
+    proj_elfs = dedup_versioned(all_proj_elfs, all_parsed)
+    n_deduped = len(all_proj_elfs) - len(proj_elfs)
+    if n_deduped:
+        log('[dedup] %d -> %d unique ELFs '
+            '(%d versioned copies collapsed)' %
+            (len(all_proj_elfs), len(proj_elfs), n_deduped))
+
+    # -- Blacklist: split into scan vs provider-only -------------------------
+    if blacklist:
+        scan_elfs = [p for p in proj_elfs
+                     if not is_blacklisted(p, blacklist)]
+        n_bl = len(proj_elfs) - len(scan_elfs)
+        log('[blacklist] %d ELF(s) blacklisted (providers only)' % n_bl)
+    else:
+        scan_elfs = proj_elfs
+
+    n_exe = sum(1 for p in scan_elfs if classify_elf(p) == 'exe')
+    n_lib = len(scan_elfs) - n_exe
+    log('[scan] Scanning: %d executable(s), %d shared lib(s)' %
+        (n_exe, n_lib))
+
+    # proj_set includes ALL project files (even deduped-out and blacklisted)
+    # so provider-preference in match_providers works correctly.
+    proj_set = set(all_proj_elfs)
 
     # -- Cycle detection (always computed) -----------------------------------
     log('[cycles] Building DT_NEEDED graph ...')

@@ -125,9 +125,13 @@ SRC
 gcc -shared -fPIC -o "$WORKDIR/libclean.so" "$WORKDIR/clean.c" \
     -Wl,-soname,libclean.so
 
+# Create versioned copies of libclean.so to test dedup
+cp "$WORKDIR/libclean.so" "$WORKDIR/libclean.so.1"
+cp "$WORKDIR/libclean.so" "$WORKDIR/libclean.so.1.2.3"
+
 echo
 echo "=== Built test binaries ==="
-file "$WORKDIR"/test_main "$WORKDIR"/lib*.so
+file "$WORKDIR"/test_main "$WORKDIR"/lib*.so*
 echo
 
 # ── Run the tool ───────────────────────────────────────────────────
@@ -140,6 +144,14 @@ FAIL=0
 # --- Text mode ---
 TEXT_OUT=$("$TOOL" "$WORKDIR" --demangle 2>&1) || true
 echo "$TEXT_OUT"
+
+# Check: versioned copies should be deduped
+if echo "$TEXT_OUT" | grep -q "versioned copies collapsed"; then
+    echo "PASS: versioned copies deduped"
+else
+    echo "FAIL: did not dedup versioned copies"
+    FAIL=1
+fi
 
 # Check: libconsumer.so should report provider_func as missing
 if echo "$TEXT_OUT" | grep -q "provider_func"; then
