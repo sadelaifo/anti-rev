@@ -27,18 +27,12 @@ util::Status JsonStringToMessage(StringPiece input,
         }
     }
 
-    TypeResolver* resolver = NewTypeResolverForDescriptorPool(
-        "type.googleapis.com", pool);
     std::string binary;
-    util::Status st = BinaryFromJsonString(
-        resolver,
-        "type.googleapis.com/" + desc->full_name(),
-        input, &binary);
+    util::Status st = JsonToBinaryString(
+        pool, desc->full_name(), input, &binary);
 
     fprintf(stderr, "[proto-diag] JsonToBinaryString: ok=%d err=%s binary_size=%zu\n",
             st.ok(), st.ToString().c_str(), binary.size());
-
-    delete resolver;
 
     if (!st.ok()) return st;
 
@@ -49,8 +43,7 @@ util::Status JsonStringToMessage(StringPiece input,
             fprintf(stderr, "%02x ", (unsigned char)binary[i]);
         fprintf(stderr, "\n");
 
-        // Try to decode what ParseFromString sees
-        const Reflection* ref = output->GetReflection();
+        // Compare descriptors
         const Descriptor* d2 = output->GetDescriptor();
         fprintf(stderr, "[proto-diag] Message descriptor: %s pool=%p\n",
                 d2->full_name().c_str(), (void*)d2->file()->pool());
@@ -67,8 +60,7 @@ util::Status JsonStringToMessage(StringPiece input,
 
 ================================================================================
 
-NOTE: You also need to add this include at the top of json_util.cc if not present:
-
-#include <google/protobuf/util/type_resolver_util.h>
+No extra includes needed. The patch uses only functions already available
+in json_util.cc (JsonToBinaryString is declared in the same header).
 
 The 2-arg overload calls the 3-arg, so no need to patch it separately.
