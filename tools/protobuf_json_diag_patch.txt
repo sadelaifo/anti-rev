@@ -1,66 +1,46 @@
 Patch for protobuf 3.13.0: src/google/protobuf/util/json_util.cc
 
-Find the JsonStringToMessage 3-arg overload and replace it with:
+DO NOT replace the function. Only INSERT the fprintf lines marked with "// +++ ADD"
+below. Keep all original code exactly as-is.
 
 ================================================================================
 
-util::Status JsonStringToMessage(StringPiece input,
-                                 const JsonParseOptions& options,
-                                 Message* output) {
-    const DescriptorPool* pool = output->GetDescriptor()->file()->pool();
-    const Descriptor* desc = output->GetDescriptor();
+Find the 3-arg JsonStringToMessage function. It looks like:
 
-    fprintf(stderr, "[proto-diag] JsonStringToMessage: type=%s pool=%p gen_pool=%p same=%s\n",
-            desc->full_name().c_str(), (void*)pool,
-            (void*)DescriptorPool::generated_pool(),
-            pool == DescriptorPool::generated_pool() ? "YES" : "NO");
+  util::Status JsonStringToMessage(StringPiece input,
+                                   const JsonParseOptions& options,
+                                   Message* output) {
 
-    // Print nested message field descriptors
-    for (int i = 0; i < desc->field_count(); i++) {
-        const FieldDescriptor* f = desc->field(i);
-        if (f->message_type()) {
-            const Descriptor* nested = f->message_type();
-            fprintf(stderr, "[proto-diag]   field[%d]=%s type=%s pool=%p\n",
-                    f->number(), f->name().c_str(),
-                    nested->full_name().c_str(),
-                    (void*)nested->file()->pool());
-        }
-    }
+Right after the opening brace, INSERT:
 
-    std::string binary;
-    util::Status st = JsonToBinaryString(
-        pool, desc->full_name(), input, &binary);
+  // +++ ADD: diagnostic prints
+  fprintf(stderr, "[proto-diag] JsonStringToMessage: type=%s pool=%p gen_pool=%p same=%s\n",
+          output->GetDescriptor()->full_name().c_str(),
+          (void*)output->GetDescriptor()->file()->pool(),
+          (void*)google::protobuf::DescriptorPool::generated_pool(),
+          output->GetDescriptor()->file()->pool() == google::protobuf::DescriptorPool::generated_pool() ? "YES" : "NO");
+  for (int _i = 0; _i < output->GetDescriptor()->field_count(); _i++) {
+      const google::protobuf::FieldDescriptor* _f = output->GetDescriptor()->field(_i);
+      if (_f->message_type()) {
+          fprintf(stderr, "[proto-diag]   field[%d]=%s type=%s pool=%p\n",
+                  _f->number(), _f->name().c_str(),
+                  _f->message_type()->full_name().c_str(),
+                  (void*)_f->message_type()->file()->pool());
+      }
+  }
 
-    fprintf(stderr, "[proto-diag] JsonToBinaryString: ok=%d err=%s binary_size=%zu\n",
-            st.ok(), st.ToString().c_str(), binary.size());
+Then find the line that says something like:
+  "json decoder produced invalid protobuf output"
 
-    if (!st.ok()) return st;
+Right BEFORE that error return, INSERT:
 
-    if (!output->ParseFromString(binary)) {
-        fprintf(stderr, "[proto-diag] ParseFromString FAILED! binary hex (%zu bytes):\n",
-                binary.size());
-        for (size_t i = 0; i < binary.size() && i < 512; i++)
-            fprintf(stderr, "%02x ", (unsigned char)binary[i]);
-        fprintf(stderr, "\n");
-
-        // Compare descriptors
-        const Descriptor* d2 = output->GetDescriptor();
-        fprintf(stderr, "[proto-diag] Message descriptor: %s pool=%p\n",
-                d2->full_name().c_str(), (void*)d2->file()->pool());
-        fprintf(stderr, "[proto-diag] Same descriptor? %s\n",
-                desc == d2 ? "YES" : "NO");
-
-        return util::Status(util::error::INVALID_ARGUMENT,
-                           "json decoder produced invalid protobuf output");
-    }
-
-    fprintf(stderr, "[proto-diag] ParseFromString OK\n");
-    return util::Status();
-}
+  // +++ ADD: dump wire format on failure
+  fprintf(stderr, "[proto-diag] ParseFromString FAILED! binary size=%zu hex:\n", binary.size());
+  for (size_t _j = 0; _j < binary.size() && _j < 512; _j++)
+      fprintf(stderr, "%02x ", (unsigned char)binary[_j]);
+  fprintf(stderr, "\n");
 
 ================================================================================
 
-No extra includes needed. The patch uses only functions already available
-in json_util.cc (JsonToBinaryString is declared in the same header).
-
-The 2-arg overload calls the 3-arg, so no need to patch it separately.
+That's it. Two insertions, zero changes to existing code.
+Add #include <stdio.h> at the top if fprintf is not already available.
