@@ -320,8 +320,8 @@ def scan_search_dirs(search_dirs, exclude_realpaths):
 
 # -- Analysis: missing symbols -----------------------------------------------
 
-def compute_available_syms(target, all_parsed, resolver):
-    # type: (str, dict, LibResolver) -> set[str]
+def compute_available_syms(target, all_parsed, resolver, verbose=False):
+    # type: (str, dict, LibResolver, bool) -> set[str]
     """Collect all symbols available to *target* via transitive DT_NEEDED.
 
     Parses system libs on demand and adds them to *all_parsed*.
@@ -337,12 +337,17 @@ def compute_available_syms(target, all_parsed, resolver):
     while queue:
         name = queue.popleft()
         resolved = resolver.resolve(name)
-        if not resolved or resolved in visited:
+        if not resolved:
+            if verbose:
+                print('  [resolve] UNRESOLVED: %s (needed by %s)' %
+                      (name, os.path.basename(target)), file=sys.stderr)
+            continue
+        if resolved in visited:
             continue
         visited.add(resolved)
 
         dep_parsed = all_parsed.get(resolved)
-        if not dep_parsed:
+        if dep_parsed is None:
             # System lib not in initial parallel parse -- parse now
             dep_parsed = parse_elf(resolved)
             all_parsed[resolved] = dep_parsed
@@ -354,6 +359,10 @@ def compute_available_syms(target, all_parsed, resolver):
             if dep_soname and dep_soname not in resolver.local_map:
                 resolver.local_map[dep_soname] = resolved
 
+        if verbose and not dep_parsed[2]:
+            print('  [resolve] EMPTY parse: %s -> %s (0 defined syms)' %
+                  (name, resolved), file=sys.stderr)
+
         available |= dep_parsed[2]      # defined syms
 
         for dep_name in dep_parsed[1]:   # DT_NEEDED
@@ -362,8 +371,8 @@ def compute_available_syms(target, all_parsed, resolver):
     return available
 
 
-def find_missing_symbols(proj_elfs, all_parsed, resolver):
-    # type: (list[str], dict, LibResolver) -> list[tuple[str, set[str]]]
+def find_missing_symbols(proj_elfs, all_parsed, resolver, verbose=False):
+    # type: (list[str], dict, LibResolver, bool) -> list[tuple[str, set[str]]]
     """For each proj ELF, find undefined syms not in transitive DT_NEEDED.
 
     Returns list of ``(target_path, missing_syms_set)``.
@@ -377,7 +386,8 @@ def find_missing_symbols(proj_elfs, all_parsed, resolver):
         undef = parsed[3]
         if not undef:
             continue
-        available = compute_available_syms(target, all_parsed, resolver)
+        available = compute_available_syms(
+            target, all_parsed, resolver, verbose=verbose)
         missing = undef - available
         if missing:
             results.append((target, missing))
@@ -986,7 +996,8 @@ def main():
 
     # -- Missing symbol analysis ---------------------------------------------
     log('[analyze] Checking symbol resolution ...')
-    missing_results = find_missing_symbols(scan_elfs, all_parsed, resolver)
+    missing_results = find_missing_symbols(
+        scan_elfs, all_parsed, resolver, verbose=args.verbose)
 
     # Build sym index AFTER analysis (includes on-demand parsed system libs)
     sym_index = build_sym_index(all_parsed)
