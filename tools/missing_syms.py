@@ -624,7 +624,7 @@ def print_missing_report(results, proj_dir, do_demangle=False):
 
     total_missing = 0
     total_no_provider = 0
-    total_latent = 0
+    total_latent_links = 0
 
     for r in results:
         consumer = r['consumer']
@@ -632,37 +632,48 @@ def print_missing_report(results, proj_dir, do_demangle=False):
         ctype = r['consumer_type']
         n = len(r['missing'])
         total_missing += n
+        consumer_basename = os.path.basename(consumer)
+
+        # Group missing symbols by provider soname (None = not found)
+        by_provider = defaultdict(list)  # provider_soname -> [entry, ...]
+        for entry in r['missing']:
+            by_provider[entry['provider_soname']].append(entry)
 
         print('\n  %s  (%s, %d missing symbol%s):' %
               (rel, ctype, n, 's' if n != 1 else ''))
 
-        for entry in r['missing']:
-            sym = entry['symbol']
-            provider = entry['provider']
-            provider_soname = entry['provider_soname']
-            latent = entry.get('latent_cycle')
-
-            if do_demangle and demangled.get(sym, sym) != sym:
-                label = '%s  [%s]' % (demangled[sym], sym)
-            else:
-                label = sym
-
-            consumer_basename = os.path.basename(consumer)
-
-            if provider:
-                print('    %s' % label)
-                print('      -> %s needs to link to %s  '
-                      '(patchelf --add-needed %s %s)' %
-                      (consumer_basename, provider_soname,
-                       provider_soname, consumer_basename))
-                if latent:
-                    total_latent += 1
-                    print('      !! WARN: creates cycle: %s' %
-                          ' -> '.join(latent))
-            else:
-                total_no_provider += 1
-                print('    %s' % label)
+        for provider_soname, entries in by_provider.items():
+            if provider_soname is None:
+                # Symbols with no provider
+                total_no_provider += len(entries)
+                for entry in entries:
+                    sym = entry['symbol']
+                    if do_demangle and demangled.get(sym, sym) != sym:
+                        print('    %s  [%s]' % (demangled[sym], sym))
+                    else:
+                        print('    %s' % sym)
                 print('      -> NOT FOUND in any scanned library')
+                continue
+
+            # Print provider header with patchelf hint
+            print('    from %s  '
+                  '(patchelf --add-needed %s %s):' %
+                  (provider_soname, provider_soname, consumer_basename))
+
+            # Check if this provider link would create a latent cycle
+            latent = entries[0].get('latent_cycle')
+            if latent:
+                total_latent_links += 1
+                print('      !! WARN: creates cycle: %s' %
+                      ' -> '.join(latent))
+
+            # List symbols
+            for entry in entries:
+                sym = entry['symbol']
+                if do_demangle and demangled.get(sym, sym) != sym:
+                    print('      %s  [%s]' % (demangled[sym], sym))
+                else:
+                    print('      %s' % sym)
 
     print()
     print('-' * 60)
@@ -672,9 +683,9 @@ def print_missing_report(results, proj_dir, do_demangle=False):
     if total_no_provider:
         print('  %d symbol%s not found anywhere -- check LD_LIBRARY_PATH' %
               (total_no_provider, 's' if total_no_provider != 1 else ''))
-    if total_latent:
+    if total_latent_links:
         print('  %d link%s would create circular dependencies' %
-              (total_latent, 's' if total_latent != 1 else ''))
+              (total_latent_links, 's' if total_latent_links != 1 else ''))
     print()
 
 
