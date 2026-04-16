@@ -91,6 +91,32 @@ gcc -shared -fPIC -o "$WORKDIR/liblatent_a.so" "$WORKDIR/latent_a.c" \
     -Wl,-soname,liblatent_a.so \
     -L"$WORKDIR" -llatent_b -Wl,-rpath,"$WORKDIR"
 
+# Third-party lib in a subdirectory (will be blacklisted).
+# libtp.so: defines tp_func, but also has its own missing symbol (tp_missing)
+# that should NOT be reported when blacklisted.
+mkdir -p "$WORKDIR/third_party"
+cat > "$WORKDIR/third_party/tp.c" << 'SRC'
+extern int tp_missing(void);
+int tp_func(int x) { return x + 100; }
+int tp_wrapper(void) { return tp_missing(); }
+SRC
+gcc -shared -fPIC -o "$WORKDIR/third_party/libtp.so" \
+    "$WORKDIR/third_party/tp.c" -Wl,-soname,libtp.so
+
+# libapp.so: business lib that calls tp_func without linking to libtp
+cat > "$WORKDIR/app.c" << 'SRC'
+extern int tp_func(int);
+int app_func(int x) { return tp_func(x) + 1; }
+SRC
+gcc -shared -fPIC -o "$WORKDIR/libapp.so" "$WORKDIR/app.c" \
+    -Wl,-soname,libapp.so
+
+# Write blacklist file
+cat > "$WORKDIR/blacklist.txt" << 'SRC'
+# Third-party libraries -- provider-only, not scanned
+third_party/
+SRC
+
 # Also build a "clean" lib with no issues (should NOT appear in report)
 cat > "$WORKDIR/clean.c" << 'SRC'
 #include <string.h>
@@ -174,6 +200,33 @@ if echo "$TEXT_OUT" | grep -q "Latent circular dependencies"; then
 else
     echo "FAIL: no latent circular dependency section"
     FAIL=1
+fi
+
+echo
+
+# --- Blacklist mode ---
+BL_OUT=$("$TOOL" "$WORKDIR" --blacklist "$WORKDIR/blacklist.txt" --demangle 2>&1) || true
+echo "$BL_OUT"
+
+# Check: libapp.so should report tp_func as missing, with libtp.so as provider
+if echo "$BL_OUT" | grep -q "tp_func"; then
+    if echo "$BL_OUT" | grep -q "libtp.so"; then
+        echo "PASS: blacklisted lib used as provider for business lib"
+    else
+        echo "FAIL: blacklisted libtp.so not suggested as provider"
+        FAIL=1
+    fi
+else
+    echo "FAIL: tp_func not detected as missing in libapp.so"
+    FAIL=1
+fi
+
+# Check: libtp.so's own missing symbol (tp_missing) should NOT be reported
+if echo "$BL_OUT" | grep -q "tp_missing"; then
+    echo "FAIL: blacklisted lib's own missing symbol was reported"
+    FAIL=1
+else
+    echo "PASS: blacklisted lib not scanned for its own missing symbols"
 fi
 
 echo

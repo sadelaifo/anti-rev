@@ -214,6 +214,35 @@ class LibResolver:
         return result
 
 
+# -- Blacklist ---------------------------------------------------------------
+
+def parse_blacklist(path, proj_dir):
+    # type: (str, str) -> list[str]
+    """Parse a blacklist file and return a list of absolute directory/file paths.
+
+    The file format is one path per line (relative to *proj_dir*).
+    Blank lines and ``#`` comments are ignored.
+    """
+    entries = []  # type: list[str]
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            resolved = os.path.realpath(os.path.join(proj_dir, line))
+            entries.append(resolved)
+    return entries
+
+
+def is_blacklisted(path, blacklist):
+    # type: (str, list[str]) -> bool
+    """Check if *path* is under (or equal to) any blacklisted entry."""
+    for bl in blacklist:
+        if path == bl or path.startswith(bl + '/'):
+            return True
+    return False
+
+
 # -- Scanning ----------------------------------------------------------------
 
 def scan_proj_dir(proj_dir):
@@ -805,6 +834,11 @@ def main():
                     help='Only report circular dependencies')
     ap.add_argument('--demangle', action='store_true',
                     help='Demangle C++ symbols via c++filt')
+    ap.add_argument('--blacklist', metavar='FILE',
+                    help='File listing paths (relative to proj_dir) whose '
+                         'ELFs are indexed as symbol providers but not '
+                         'scanned for missing symbols or cycles.  '
+                         'One path per line, # comments.')
     ap.add_argument('-v', '--verbose', action='store_true',
                     help='Show progress details')
     args = ap.parse_args()
@@ -827,15 +861,33 @@ def main():
 
     ldcache = build_ldconfig_cache()
 
+    # -- Blacklist (if any) ---------------------------------------------------
+    blacklist = []  # type: list[str]
+    if args.blacklist:
+        if not os.path.isfile(args.blacklist):
+            sys.exit('[error] blacklist file not found: %s' % args.blacklist)
+        blacklist = parse_blacklist(args.blacklist, proj_dir)
+        log('[blacklist] %d path(s) loaded from %s' %
+            (len(blacklist), args.blacklist))
+
     # -- Discover ELFs -------------------------------------------------------
     log('[scan] Scanning %s ...' % proj_dir)
     proj_elfs = scan_proj_dir(proj_dir)
     if not proj_elfs:
         sys.exit('[error] no ELF files found in %s' % proj_dir)
 
-    n_exe = sum(1 for p in proj_elfs if classify_elf(p) == 'exe')
-    n_lib = len(proj_elfs) - n_exe
-    log('[scan] Project: %d executable(s), %d shared lib(s)' %
+    # Split: scan_elfs are checked for issues; blacklisted are providers only
+    if blacklist:
+        scan_elfs = [p for p in proj_elfs
+                     if not is_blacklisted(p, blacklist)]
+        n_bl = len(proj_elfs) - len(scan_elfs)
+        log('[blacklist] %d ELF(s) blacklisted (providers only)' % n_bl)
+    else:
+        scan_elfs = proj_elfs
+
+    n_exe = sum(1 for p in scan_elfs if classify_elf(p) == 'exe')
+    n_lib = len(scan_elfs) - n_exe
+    log('[scan] Scanning: %d executable(s), %d shared lib(s)' %
         (n_exe, n_lib))
 
     # Scan LD_LIBRARY_PATH for external libs (symbol provider search)
@@ -878,7 +930,7 @@ def main():
     # -- Cycle detection (always computed) -----------------------------------
     log('[cycles] Building DT_NEEDED graph ...')
     proj_edges, path_to_name = build_proj_edges(
-        proj_elfs, all_parsed, resolver)
+        scan_elfs, all_parsed, resolver)
     sccs = find_cycles_tarjan(proj_edges)
 
     if args.cycles_only:
@@ -890,7 +942,7 @@ def main():
 
     # -- Missing symbol analysis ---------------------------------------------
     log('[analyze] Checking symbol resolution ...')
-    missing_results = find_missing_symbols(proj_elfs, all_parsed, resolver)
+    missing_results = find_missing_symbols(scan_elfs, all_parsed, resolver)
 
     # Build sym index AFTER analysis (includes on-demand parsed system libs)
     sym_index = build_sym_index(all_parsed)
