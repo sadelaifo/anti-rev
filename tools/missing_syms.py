@@ -812,45 +812,93 @@ def print_latent_cycle_report(latent_cycles):
     print()
 
 
-def print_patchelf_commands(results):
-    # type: (list[dict]) -> None
-    """Print ready-to-run patchelf commands and cycle warnings."""
-    safe = []     # type: list[tuple[str, str]]  # (provider_soname, consumer_path)
-    unsafe = []   # type: list[tuple[str, str, list[str]]]  # (provider, consumer, cycle)
+def print_patchelf_commands(results, proj_edges, path_to_name):
+    # type: (list[dict], dict[str, list[str]], dict[str, str]) -> None
+    """Print safe patchelf commands and warn about unsafe ones.
+
+    Builds a combined graph (existing edges + ALL suggested edges at once)
+    and runs Tarjan's SCC to find which suggested edges participate in
+    cycles.  This catches transitive cycles where no single edge alone
+    creates a cycle but the combination does.
+    """
+    # Collect unique patchelf commands, mapping to graph edge names
+    cmds = []   # type: list[tuple[str, str, str | None, str | None]]
     seen = set()  # type: set[tuple[str, str]]
 
     for r in results:
-        consumer = r['consumer']
+        consumer_path = r['consumer']
+        consumer_name = path_to_name.get(consumer_path)
         for entry in r['missing']:
             provider_soname = entry['provider_soname']
             if not provider_soname:
                 continue
-            pair = (provider_soname, consumer)
-            if pair in seen:
+            cmd_key = (provider_soname, consumer_path)
+            if cmd_key in seen:
                 continue
-            seen.add(pair)
+            seen.add(cmd_key)
 
-            latent = entry.get('latent_cycle')
-            if latent:
-                unsafe.append((provider_soname, consumer, latent))
-            else:
-                safe.append((provider_soname, consumer))
+            provider_path = entry['provider']
+            provider_name = path_to_name.get(provider_path) \
+                if provider_path else None
 
+            cmds.append((provider_soname, consumer_path,
+                         consumer_name, provider_name))
+
+    # Build combined graph: existing DT_NEEDED + all suggested edges
+    combined = defaultdict(list)  # type: defaultdict[str, list[str]]
+    for src, dsts in proj_edges.items():
+        combined[src] = list(dsts)
+
+    suggested_edges = set()  # type: set[tuple[str, str]]
+    for _, _, cname, pname in cmds:
+        if cname and pname:
+            edge = (cname, pname)
+            if edge not in suggested_edges:
+                suggested_edges.add(edge)
+                combined[cname].append(pname)
+
+    # Find SCCs in the combined graph
+    sccs = find_cycles_tarjan(dict(combined))
+
+    # Any suggested edge with both endpoints in the same SCC is unsafe
+    unsafe_edges = set()  # type: set[tuple[str, str]]
+    edge_to_cycle = {}    # type: dict[tuple[str, str], list[str]]
+    for scc in sccs:
+        scc_set = set(scc)
+        cycle_path = find_cycle_path(dict(combined), scc)
+        for edge in suggested_edges:
+            if edge[0] in scc_set and edge[1] in scc_set:
+                unsafe_edges.add(edge)
+                edge_to_cycle[edge] = cycle_path
+
+    # Classify commands
+    safe = []     # type: list[tuple[str, str]]
+    unsafe = []   # type: list[tuple[str, str, list[str]]]
+
+    for provider_soname, consumer_path, cname, pname in cmds:
+        edge = (cname, pname) if cname and pname else None
+        if edge and edge in unsafe_edges:
+            unsafe.append((provider_soname, consumer_path,
+                           edge_to_cycle[edge]))
+        else:
+            safe.append((provider_soname, consumer_path))
+
+    # Print
     print('=' * 60)
     print('  Patchelf commands')
     print('=' * 60)
 
     if safe:
         print('\n  # Safe — run these:\n')
-        for provider_soname, consumer in safe:
+        for provider_soname, consumer_path in safe:
             print('  patchelf --add-needed %s %s' %
-                  (provider_soname, consumer))
+                  (provider_soname, consumer_path))
 
     if unsafe:
         print('\n  # WARNING — these would create circular dependencies:\n')
-        for provider_soname, consumer, cycle in unsafe:
+        for provider_soname, consumer_path, cycle in unsafe:
             print('  # patchelf --add-needed %s %s' %
-                  (provider_soname, consumer))
+                  (provider_soname, consumer_path))
             print('  #   cycle: %s' % ' -> '.join(cycle))
 
     if not safe and not unsafe:
@@ -1073,7 +1121,7 @@ def main():
         print_missing_report(results, proj_dir, do_demangle=args.demangle)
         print_cycle_report(sccs, proj_edges)
         print_latent_cycle_report(latent_cycles)
-        print_patchelf_commands(results)
+        print_patchelf_commands(results, proj_edges, path_to_name)
 
     has_issues = bool(results) or bool(sccs)
     sys.exit(1 if has_issues else 0)

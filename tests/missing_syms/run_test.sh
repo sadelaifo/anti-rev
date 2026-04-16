@@ -117,6 +117,45 @@ cat > "$WORKDIR/blacklist.txt" << 'SRC'
 third_party/
 SRC
 
+# Transitive cycle test: libX -> libY -> libZ (DT_NEEDED)
+# libZ uses a symbol from libX (without linking).
+# libX uses a symbol from libZ (without linking).
+# Neither missing edge alone creates a cycle, but BOTH together do:
+#   libX -> libY -> libZ -> libX
+cat > "$WORKDIR/trans_x.c" << 'SRC'
+extern int trans_y_func(int);
+extern int trans_z_func(int);
+int trans_x_func(int x) { return trans_y_func(x) + 1; }
+int trans_x_for_z(int x) { return x * 3; }
+SRC
+cat > "$WORKDIR/trans_y.c" << 'SRC'
+extern int trans_z_func(int);
+int trans_y_func(int x) { return trans_z_func(x) + 2; }
+SRC
+cat > "$WORKDIR/trans_z.c" << 'SRC'
+extern int trans_x_for_z(int);
+int trans_z_func(int x) { return x > 0 ? trans_x_for_z(x - 1) : 0; }
+SRC
+# Build: X -> Y -> Z (DT_NEEDED chain)
+gcc -shared -fPIC -o "$WORKDIR/libtrans_z.so" "$WORKDIR/trans_z.c" \
+    -Wl,-soname,libtrans_z.so
+gcc -shared -fPIC -o "$WORKDIR/libtrans_y.so" "$WORKDIR/trans_y.c" \
+    -Wl,-soname,libtrans_y.so \
+    -L"$WORKDIR" -ltrans_z -Wl,-rpath,"$WORKDIR"
+gcc -shared -fPIC -o "$WORKDIR/libtrans_x.so" "$WORKDIR/trans_x.c" \
+    -Wl,-soname,libtrans_x.so \
+    -L"$WORKDIR" -ltrans_y -Wl,-rpath,"$WORKDIR"
+# Now: X DT_NEEDs Y, Y DT_NEEDs Z.
+# Missing: Z uses trans_x_for_z (from X, no link) — tool suggests Z -> X
+# Missing: X uses trans_z_func (from Z, no link via Y) — wait, X -> Y -> Z
+# Actually X already reaches Z transitively through Y. So trans_z_func IS available.
+# Let me fix: X should NOT DT_NEED Y. Instead, X just uses symbols from Y and Z
+# without linking to either. And Y DT_NEEDs Z.
+
+# Rebuild: only Y -> Z as DT_NEEDED. X has no DT_NEEDED to Y or Z.
+gcc -shared -fPIC -o "$WORKDIR/libtrans_x.so" "$WORKDIR/trans_x.c" \
+    -Wl,-soname,libtrans_x.so
+
 # Also build a "clean" lib with no issues (should NOT appear in report)
 cat > "$WORKDIR/clean.c" << 'SRC'
 #include <string.h>
@@ -223,11 +262,24 @@ if echo "$TEXT_OUT" | grep -q "Patchelf commands"; then
         echo "FAIL: safe patchelf command not found"
         FAIL=1
     fi
-    # Unsafe command for liblatent_b should be commented out
+    # Unsafe command for liblatent_b should be commented out (direct cycle)
     if echo "$TEXT_OUT" | grep -q "# patchelf --add-needed liblatent_a.so"; then
         echo "PASS: unsafe patchelf command commented with warning"
     else
         echo "FAIL: unsafe patchelf command not commented"
+        FAIL=1
+    fi
+    # Transitive cycle: X->Y and Z->X are each safe alone but unsafe together
+    # Both should be commented out in the patchelf section
+    if echo "$TEXT_OUT" | grep -q "# patchelf --add-needed libtrans_y.so"; then
+        if echo "$TEXT_OUT" | grep -q "# patchelf --add-needed libtrans_x.so"; then
+            echo "PASS: transitive cycle commands both commented out"
+        else
+            echo "FAIL: Z->X not flagged as part of transitive cycle"
+            FAIL=1
+        fi
+    else
+        echo "FAIL: X->Y not flagged as part of transitive cycle"
         FAIL=1
     fi
 else
