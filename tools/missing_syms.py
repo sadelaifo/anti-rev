@@ -812,6 +812,53 @@ def print_latent_cycle_report(latent_cycles):
     print()
 
 
+def print_patchelf_commands(results):
+    # type: (list[dict]) -> None
+    """Print ready-to-run patchelf commands and cycle warnings."""
+    safe = []     # type: list[tuple[str, str]]  # (provider_soname, consumer_path)
+    unsafe = []   # type: list[tuple[str, str, list[str]]]  # (provider, consumer, cycle)
+    seen = set()  # type: set[tuple[str, str]]
+
+    for r in results:
+        consumer = r['consumer']
+        for entry in r['missing']:
+            provider_soname = entry['provider_soname']
+            if not provider_soname:
+                continue
+            pair = (provider_soname, consumer)
+            if pair in seen:
+                continue
+            seen.add(pair)
+
+            latent = entry.get('latent_cycle')
+            if latent:
+                unsafe.append((provider_soname, consumer, latent))
+            else:
+                safe.append((provider_soname, consumer))
+
+    print('=' * 60)
+    print('  Patchelf commands')
+    print('=' * 60)
+
+    if safe:
+        print('\n  # Safe — run these:\n')
+        for provider_soname, consumer in safe:
+            print('  patchelf --add-needed %s %s' %
+                  (provider_soname, consumer))
+
+    if unsafe:
+        print('\n  # WARNING — these would create circular dependencies:\n')
+        for provider_soname, consumer, cycle in unsafe:
+            print('  # patchelf --add-needed %s %s' %
+                  (provider_soname, consumer))
+            print('  #   cycle: %s' % ' -> '.join(cycle))
+
+    if not safe and not unsafe:
+        print('\n  No patchelf commands needed.\n')
+    else:
+        print()
+
+
 def print_json_output(results, sccs, edges, proj_dir, latent_cycles=None):
     # type: (list[dict], list[list[str]], dict[str, list[str]], str) -> None
     cycles = []  # type: list[dict]
@@ -1026,6 +1073,7 @@ def main():
         print_missing_report(results, proj_dir, do_demangle=args.demangle)
         print_cycle_report(sccs, proj_edges)
         print_latent_cycle_report(latent_cycles)
+        print_patchelf_commands(results)
 
     has_issues = bool(results) or bool(sccs)
     sys.exit(1 if has_issues else 0)

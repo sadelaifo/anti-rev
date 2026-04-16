@@ -214,6 +214,27 @@ else
     FAIL=1
 fi
 
+# Check: patchelf commands section — safe commands printed, unsafe commented out
+if echo "$TEXT_OUT" | grep -q "Patchelf commands"; then
+    # Safe command for libconsumer (provider_func from libprovider)
+    if echo "$TEXT_OUT" | grep "patchelf --add-needed libprovider.so" | grep -qv "^  #"; then
+        echo "PASS: safe patchelf command printed"
+    else
+        echo "FAIL: safe patchelf command not found"
+        FAIL=1
+    fi
+    # Unsafe command for liblatent_b should be commented out
+    if echo "$TEXT_OUT" | grep -q "# patchelf --add-needed liblatent_a.so"; then
+        echo "PASS: unsafe patchelf command commented with warning"
+    else
+        echo "FAIL: unsafe patchelf command not commented"
+        FAIL=1
+    fi
+else
+    echo "FAIL: no patchelf commands section"
+    FAIL=1
+fi
+
 echo
 
 # --- Blacklist mode ---
