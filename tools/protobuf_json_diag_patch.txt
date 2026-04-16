@@ -1,0 +1,74 @@
+Patch for protobuf 3.13.0: src/google/protobuf/util/json_util.cc
+
+Find the JsonStringToMessage 3-arg overload and replace it with:
+
+================================================================================
+
+util::Status JsonStringToMessage(StringPiece input,
+                                 const JsonParseOptions& options,
+                                 Message* output) {
+    const DescriptorPool* pool = output->GetDescriptor()->file()->pool();
+    const Descriptor* desc = output->GetDescriptor();
+
+    fprintf(stderr, "[proto-diag] JsonStringToMessage: type=%s pool=%p gen_pool=%p same=%s\n",
+            desc->full_name().c_str(), (void*)pool,
+            (void*)DescriptorPool::generated_pool(),
+            pool == DescriptorPool::generated_pool() ? "YES" : "NO");
+
+    // Print nested message field descriptors
+    for (int i = 0; i < desc->field_count(); i++) {
+        const FieldDescriptor* f = desc->field(i);
+        if (f->message_type()) {
+            const Descriptor* nested = f->message_type();
+            fprintf(stderr, "[proto-diag]   field[%d]=%s type=%s pool=%p\n",
+                    f->number(), f->name().c_str(),
+                    nested->full_name().c_str(),
+                    (void*)nested->file()->pool());
+        }
+    }
+
+    TypeResolver* resolver = NewTypeResolverForDescriptorPool(
+        "type.googleapis.com", pool);
+    std::string binary;
+    util::Status st = BinaryFromJsonString(
+        resolver,
+        "type.googleapis.com/" + desc->full_name(),
+        input, &binary);
+
+    fprintf(stderr, "[proto-diag] JsonToBinaryString: ok=%d err=%s binary_size=%zu\n",
+            st.ok(), st.ToString().c_str(), binary.size());
+
+    delete resolver;
+
+    if (!st.ok()) return st;
+
+    if (!output->ParseFromString(binary)) {
+        fprintf(stderr, "[proto-diag] ParseFromString FAILED! binary hex (%zu bytes):\n",
+                binary.size());
+        for (size_t i = 0; i < binary.size() && i < 512; i++)
+            fprintf(stderr, "%02x ", (unsigned char)binary[i]);
+        fprintf(stderr, "\n");
+
+        // Try to decode what ParseFromString sees
+        const Reflection* ref = output->GetReflection();
+        const Descriptor* d2 = output->GetDescriptor();
+        fprintf(stderr, "[proto-diag] Message descriptor: %s pool=%p\n",
+                d2->full_name().c_str(), (void*)d2->file()->pool());
+        fprintf(stderr, "[proto-diag] Same descriptor? %s\n",
+                desc == d2 ? "YES" : "NO");
+
+        return util::Status(util::error::INVALID_ARGUMENT,
+                           "json decoder produced invalid protobuf output");
+    }
+
+    fprintf(stderr, "[proto-diag] ParseFromString OK\n");
+    return util::Status();
+}
+
+================================================================================
+
+NOTE: You also need to add this include at the top of json_util.cc if not present:
+
+#include <google/protobuf/util/type_resolver_util.h>
+
+The 2-arg overload calls the 3-arg, so no need to patch it separately.
