@@ -36,11 +36,13 @@ Then find the line that says something like:
 
 Right BEFORE that error return, INSERT:
 
-  // +++ ADD: dump wire format on failure
+  // +++ ADD: dump wire format and exact failure reason
   fprintf(stderr, "[proto-diag] ParseFromString FAILED! binary size=%zu hex:\n", binary.size());
   for (size_t _j = 0; _j < binary.size() && _j < 512; _j++)
       fprintf(stderr, "%02x ", (unsigned char)binary[_j]);
   fprintf(stderr, "\n");
+  fprintf(stderr, "[proto-diag] InitializationError: %s\n",
+          output->InitializationErrorString().c_str());
 
 ================================================================================
 
