@@ -52,6 +52,22 @@ Right after the opening brace, INSERT:
                   _mf ? (void*)_mf->pool() : (void*)0);
       }
   }
+  // +++ ADD: dump all sub-fields of pMap to check if checkereEnum is registered
+  for (int _i = 0; _i < output->GetDescriptor()->field_count(); _i++) {
+      const google::protobuf::FieldDescriptor* _f = output->GetDescriptor()->field(_i);
+      if (_f->message_type() && strcmp(_f->name().c_str(), "pMap") == 0) {
+          const google::protobuf::Descriptor* _mt = _f->message_type();
+          fprintf(stderr, "[proto-diag] PTMap (%s) has %d fields:\n",
+                  _mt->full_name().c_str(), _mt->field_count());
+          for (int _k = 0; _k < _mt->field_count(); _k++) {
+              const google::protobuf::FieldDescriptor* _sf = _mt->field(_k);
+              fprintf(stderr, "[proto-diag]   [%d] %s json_name=%s type=%d\n",
+                      _sf->number(), _sf->name().c_str(),
+                      _sf->json_name().c_str(), _sf->type());
+          }
+          break;
+      }
+  }
 
 Then find the line that says something like:
   "json decoder produced invalid protobuf output"
