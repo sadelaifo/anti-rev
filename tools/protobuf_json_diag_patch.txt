@@ -13,10 +13,23 @@ Find the 3-arg JsonStringToMessage function. It looks like:
 
 Right after the opening brace, INSERT:
 
-  // +++ ADD: dump JSON input and type info
+  // +++ ADD: dump JSON input, type info, and field lookup
   fprintf(stderr, "[proto-diag] JsonStringToMessage: type=%s input(%zu)=%.512s\n",
           output->GetDescriptor()->full_name().c_str(),
           input.size(), input.data());
+  {
+      const google::protobuf::Descriptor* _pmap_desc = nullptr;
+      const google::protobuf::FieldDescriptor* _pf = output->GetDescriptor()->FindFieldByName("pMap");
+      if (_pf && _pf->message_type()) _pmap_desc = _pf->message_type();
+      if (_pmap_desc) {
+          fprintf(stderr, "[proto-diag] PTMap fields=%d byName(checkerEnum)=%p byName(checker_enum)=%p\n",
+                  _pmap_desc->field_count(),
+                  (void*)_pmap_desc->FindFieldByName("checkerEnum"),
+                  (void*)_pmap_desc->FindFieldByName("checker_enum"));
+      } else {
+          fprintf(stderr, "[proto-diag] pMap field not found in descriptor\n");
+      }
+  }
 
 Then find the line that says something like:
   "json decoder produced invalid protobuf output"
