@@ -13,34 +13,14 @@ Find the 3-arg JsonStringToMessage function. It looks like:
 
 Right after the opening brace, INSERT:
 
-  // +++ ADD: diagnostic — test generated_pool() with signal-safe crash guard
+  // +++ ADD: diagnostic prints
   {
       const google::protobuf::Descriptor* _desc = output->GetDescriptor();
       const google::protobuf::FileDescriptor* _fd = _desc ? _desc->file() : nullptr;
-      fprintf(stderr, "[proto-diag] JsonStringToMessage: type=%s desc=%p file=%p pool=%p\n",
+      fprintf(stderr, "[proto-diag] JsonStringToMessage: type=%s file=%p pool=%p\n",
               _desc ? _desc->full_name().c_str() : "(null)",
-              (void*)_desc, (void*)_fd,
+              (void*)_fd,
               _fd ? (void*)_fd->pool() : (void*)0);
-      fflush(stderr);
-      // safe probe of generated_pool() — catch SIGSEGV/SIGBUS without crashing
-      static sigjmp_buf _jmpbuf;
-      struct sigaction _sa_new, _sa_old_segv, _sa_old_bus;
-      memset(&_sa_new, 0, sizeof(_sa_new));
-      _sa_new.sa_handler = [](int) { siglongjmp(_jmpbuf, 1); };
-      sigemptyset(&_sa_new.sa_mask);
-      _sa_new.sa_flags = 0;
-      sigaction(SIGSEGV, &_sa_new, &_sa_old_segv);
-      sigaction(SIGBUS,  &_sa_new, &_sa_old_bus);
-      if (sigsetjmp(_jmpbuf, 1) == 0) {
-          const void* _gp = (void*)google::protobuf::DescriptorPool::generated_pool();
-          fprintf(stderr, "[proto-diag] generated_pool=%p same=%s\n",
-                  _gp, (_fd && (void*)_fd->pool() == _gp) ? "YES" : "NO");
-      } else {
-          fprintf(stderr, "[proto-diag] generated_pool() CRASHED (signal caught)\n");
-      }
-      sigaction(SIGSEGV, &_sa_old_segv, nullptr);
-      sigaction(SIGBUS,  &_sa_old_bus,  nullptr);
-      fflush(stderr);
   }
   for (int _i = 0; _i < output->GetDescriptor()->field_count(); _i++) {
       const google::protobuf::FieldDescriptor* _f = output->GetDescriptor()->field(_i);
@@ -52,33 +32,12 @@ Right after the opening brace, INSERT:
                   _mf ? (void*)_mf->pool() : (void*)0);
       }
   }
-  // +++ ADD: dump PTMap sub-fields (crash-guarded)
+  // +++ ADD: probe PTMap field count only
   for (int _i = 0; _i < output->GetDescriptor()->field_count(); _i++) {
       const google::protobuf::FieldDescriptor* _f = output->GetDescriptor()->field(_i);
       if (_f->message_type() && strcmp(_f->name().c_str(), "pMap") == 0) {
           const google::protobuf::Descriptor* _mt = _f->message_type();
-          static sigjmp_buf _jb2;
-          struct sigaction _sn2, _so2_segv, _so2_bus;
-          memset(&_sn2, 0, sizeof(_sn2));
-          _sn2.sa_handler = [](int) { siglongjmp(_jb2, 1); };
-          sigemptyset(&_sn2.sa_mask);
-          sigaction(SIGSEGV, &_sn2, &_so2_segv);
-          sigaction(SIGBUS,  &_sn2, &_so2_bus);
-          if (sigsetjmp(_jb2, 1) == 0) {
-              fprintf(stderr, "[proto-diag] PTMap (%s) has %d fields:\n",
-                      _mt->full_name().c_str(), _mt->field_count());
-              fflush(stderr);
-              for (int _k = 0; _k < _mt->field_count(); _k++) {
-                  const google::protobuf::FieldDescriptor* _sf = _mt->field(_k);
-                  fprintf(stderr, "[proto-diag]   [%d] %s type=%d\n",
-                          _sf->number(), _sf->name().c_str(), _sf->type());
-                  fflush(stderr);
-              }
-          } else {
-              fprintf(stderr, "[proto-diag] PTMap field iteration CRASHED\n");
-          }
-          sigaction(SIGSEGV, &_so2_segv, nullptr);
-          sigaction(SIGBUS,  &_so2_bus,  nullptr);
+          fprintf(stderr, "[proto-diag] PTMap field_count=%d\n", _mt->field_count());
           fflush(stderr);
           break;
       }
@@ -98,7 +57,4 @@ Right BEFORE that error return, INSERT:
 ================================================================================
 
 That's it. Two insertions, zero changes to existing code.
-Add these includes at the top if not already available:
-  #include <stdio.h>
-  #include <signal.h>
-  #include <setjmp.h>
+Add #include <stdio.h> at the top if fprintf is not already available.
