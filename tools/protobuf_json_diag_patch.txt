@@ -13,7 +13,7 @@ Find the 3-arg JsonStringToMessage function. It looks like:
 
 Right after the opening brace, INSERT:
 
-  // +++ ADD: diagnostic — test generated_pool() via fork to isolate crash
+  // +++ ADD: diagnostic — test generated_pool() with signal-safe crash guard
   {
       const google::protobuf::Descriptor* _desc = output->GetDescriptor();
       const google::protobuf::FileDescriptor* _fd = _desc ? _desc->file() : nullptr;
@@ -22,18 +22,25 @@ Right after the opening brace, INSERT:
               (void*)_desc, (void*)_fd,
               _fd ? (void*)_fd->pool() : (void*)0);
       fflush(stderr);
-      pid_t _pid = fork();
-      if (_pid == 0) {
+      // safe probe of generated_pool() — catch SIGSEGV/SIGBUS without crashing
+      static sigjmp_buf _jmpbuf;
+      struct sigaction _sa_new, _sa_old_segv, _sa_old_bus;
+      memset(&_sa_new, 0, sizeof(_sa_new));
+      _sa_new.sa_handler = [](int) { siglongjmp(_jmpbuf, 1); };
+      sigemptyset(&_sa_new.sa_mask);
+      _sa_new.sa_flags = 0;
+      sigaction(SIGSEGV, &_sa_new, &_sa_old_segv);
+      sigaction(SIGBUS,  &_sa_new, &_sa_old_bus);
+      if (sigsetjmp(_jmpbuf, 1) == 0) {
           const void* _gp = (void*)google::protobuf::DescriptorPool::generated_pool();
-          fprintf(stderr, "[proto-diag] generated_pool=%p OK\n", _gp);
-          _exit(0);
+          fprintf(stderr, "[proto-diag] generated_pool=%p same=%s\n",
+                  _gp, (_fd && (void*)_fd->pool() == _gp) ? "YES" : "NO");
+      } else {
+          fprintf(stderr, "[proto-diag] generated_pool() CRASHED (signal caught)\n");
       }
-      if (_pid > 0) {
-          int _st;
-          waitpid(_pid, &_st, 0);
-          if (WIFSIGNALED(_st))
-              fprintf(stderr, "[proto-diag] generated_pool() CRASHED signal=%d\n", WTERMSIG(_st));
-      }
+      sigaction(SIGSEGV, &_sa_old_segv, nullptr);
+      sigaction(SIGBUS,  &_sa_old_bus,  nullptr);
+      fflush(stderr);
   }
   for (int _i = 0; _i < output->GetDescriptor()->field_count(); _i++) {
       const google::protobuf::FieldDescriptor* _f = output->GetDescriptor()->field(_i);
@@ -60,4 +67,7 @@ Right BEFORE that error return, INSERT:
 ================================================================================
 
 That's it. Two insertions, zero changes to existing code.
-Add #include <stdio.h> at the top if fprintf is not already available.
+Add these includes at the top if not already available:
+  #include <stdio.h>
+  #include <signal.h>
+  #include <setjmp.h>
