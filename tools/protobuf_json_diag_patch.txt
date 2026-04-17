@@ -52,19 +52,34 @@ Right after the opening brace, INSERT:
                   _mf ? (void*)_mf->pool() : (void*)0);
       }
   }
-  // +++ ADD: dump all sub-fields of pMap to check if checkereEnum is registered
+  // +++ ADD: dump PTMap sub-fields (crash-guarded)
   for (int _i = 0; _i < output->GetDescriptor()->field_count(); _i++) {
       const google::protobuf::FieldDescriptor* _f = output->GetDescriptor()->field(_i);
       if (_f->message_type() && strcmp(_f->name().c_str(), "pMap") == 0) {
           const google::protobuf::Descriptor* _mt = _f->message_type();
-          fprintf(stderr, "[proto-diag] PTMap (%s) has %d fields:\n",
-                  _mt->full_name().c_str(), _mt->field_count());
-          for (int _k = 0; _k < _mt->field_count(); _k++) {
-              const google::protobuf::FieldDescriptor* _sf = _mt->field(_k);
-              fprintf(stderr, "[proto-diag]   [%d] %s json_name=%s type=%d\n",
-                      _sf->number(), _sf->name().c_str(),
-                      _sf->json_name().c_str(), _sf->type());
+          static sigjmp_buf _jb2;
+          struct sigaction _sn2, _so2_segv, _so2_bus;
+          memset(&_sn2, 0, sizeof(_sn2));
+          _sn2.sa_handler = [](int) { siglongjmp(_jb2, 1); };
+          sigemptyset(&_sn2.sa_mask);
+          sigaction(SIGSEGV, &_sn2, &_so2_segv);
+          sigaction(SIGBUS,  &_sn2, &_so2_bus);
+          if (sigsetjmp(_jb2, 1) == 0) {
+              fprintf(stderr, "[proto-diag] PTMap (%s) has %d fields:\n",
+                      _mt->full_name().c_str(), _mt->field_count());
+              fflush(stderr);
+              for (int _k = 0; _k < _mt->field_count(); _k++) {
+                  const google::protobuf::FieldDescriptor* _sf = _mt->field(_k);
+                  fprintf(stderr, "[proto-diag]   [%d] %s type=%d\n",
+                          _sf->number(), _sf->name().c_str(), _sf->type());
+                  fflush(stderr);
+              }
+          } else {
+              fprintf(stderr, "[proto-diag] PTMap field iteration CRASHED\n");
           }
+          sigaction(SIGSEGV, &_so2_segv, nullptr);
+          sigaction(SIGBUS,  &_so2_bus,  nullptr);
+          fflush(stderr);
           break;
       }
   }
