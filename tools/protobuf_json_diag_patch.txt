@@ -22,10 +22,11 @@ Right after the opening brace, INSERT:
   for (int _i = 0; _i < output->GetDescriptor()->field_count(); _i++) {
       const google::protobuf::FieldDescriptor* _f = output->GetDescriptor()->field(_i);
       if (_f->message_type()) {
+          const google::protobuf::FileDescriptor* _mf = _f->message_type()->file();
           fprintf(stderr, "[proto-diag]   field[%d]=%s type=%s pool=%p\n",
                   _f->number(), _f->name().c_str(),
                   _f->message_type()->full_name().c_str(),
-                  (void*)_f->message_type()->file()->pool());
+                  _mf ? (void*)_mf->pool() : (void*)0);
       }
   }
 
