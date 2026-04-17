@@ -13,12 +13,28 @@ Find the 3-arg JsonStringToMessage function. It looks like:
 
 Right after the opening brace, INSERT:
 
-  // +++ ADD: diagnostic prints
-  fprintf(stderr, "[proto-diag] JsonStringToMessage: type=%s pool=%p gen_pool=%p same=%s\n",
-          output->GetDescriptor()->full_name().c_str(),
-          (void*)output->GetDescriptor()->file()->pool(),
-          (void*)google::protobuf::DescriptorPool::generated_pool(),
-          output->GetDescriptor()->file()->pool() == google::protobuf::DescriptorPool::generated_pool() ? "YES" : "NO");
+  // +++ ADD: diagnostic — test generated_pool() via fork to isolate crash
+  {
+      const google::protobuf::Descriptor* _desc = output->GetDescriptor();
+      const google::protobuf::FileDescriptor* _fd = _desc ? _desc->file() : nullptr;
+      fprintf(stderr, "[proto-diag] JsonStringToMessage: type=%s desc=%p file=%p pool=%p\n",
+              _desc ? _desc->full_name().c_str() : "(null)",
+              (void*)_desc, (void*)_fd,
+              _fd ? (void*)_fd->pool() : (void*)0);
+      fflush(stderr);
+      pid_t _pid = fork();
+      if (_pid == 0) {
+          const void* _gp = (void*)google::protobuf::DescriptorPool::generated_pool();
+          fprintf(stderr, "[proto-diag] generated_pool=%p OK\n", _gp);
+          _exit(0);
+      }
+      if (_pid > 0) {
+          int _st;
+          waitpid(_pid, &_st, 0);
+          if (WIFSIGNALED(_st))
+              fprintf(stderr, "[proto-diag] generated_pool() CRASHED signal=%d\n", WTERMSIG(_st));
+      }
+  }
   for (int _i = 0; _i < output->GetDescriptor()->field_count(); _i++) {
       const google::protobuf::FieldDescriptor* _f = output->GetDescriptor()->field(_i);
       if (_f->message_type()) {
