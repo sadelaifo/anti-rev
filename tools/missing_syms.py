@@ -979,8 +979,9 @@ def _bind_label(bind):
     return 'WEAK' if bind == 'WEAK' else 'STRONG'
 
 
-def print_duplicate_report(dup_results, proj_dir, do_demangle=False):
-    # type: (list[dict], str, bool) -> None
+def print_duplicate_report(dup_results, proj_dir, do_demangle=False,
+                           errors_only=False):
+    # type: (list[dict], str, bool, bool) -> None
     print('=' * 60)
     print('  Duplicate symbols in per-target DT_NEEDED closures')
     print('=' * 60)
@@ -1008,6 +1009,9 @@ def print_duplicate_report(dup_results, proj_dir, do_demangle=False):
         total_err += len(errors)
         total_warn += len(warns)
 
+        if errors_only and not errors:
+            continue
+
         print('\n  %s  (%s, %d error%s, %d warning%s):' %
               (rel, ctype,
                len(errors), 's' if len(errors) != 1 else '',
@@ -1029,7 +1033,7 @@ def print_duplicate_report(dup_results, proj_dir, do_demangle=False):
             print('    ERRORS (STRONG x STRONG):')
             for d in errors:
                 _fmt_dup(d)
-        if warns:
+        if warns and not errors_only:
             print('    WARNINGS (WEAK or mixed):')
             for d in warns:
                 _fmt_dup(d)
@@ -1241,6 +1245,10 @@ def main():
                          'libs (e.g. libc vs ld-linux).  By default only '
                          'duplicates touching at least one project ELF are '
                          'reported.')
+    ap.add_argument('--dups-errors-only', action='store_true',
+                    help='Suppress WEAK / mixed-binding duplicate warnings '
+                         'from the text report; only print STRONG x STRONG '
+                         'errors.  JSON output is unchanged.')
     ap.add_argument('--blacklist', metavar='FILE',
                     help='File listing paths (relative to proj_dir) whose '
                          'ELFs are indexed as symbol providers but not '
@@ -1406,7 +1414,8 @@ def main():
         print_latent_cycle_report(latent_cycles)
         if not args.no_duplicates:
             print_duplicate_report(
-                dup_results, proj_dir, do_demangle=args.demangle)
+                dup_results, proj_dir, do_demangle=args.demangle,
+                errors_only=args.dups_errors_only)
         print_patchelf_commands(results, proj_edges, path_to_name)
 
     has_issues = bool(results) or bool(sccs) or dup_errors > 0
