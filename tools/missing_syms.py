@@ -479,105 +479,136 @@ def is_cxx_vague(sym):
     return sym.startswith(CXX_VAGUE_PREFIXES)
 
 
-def find_duplicate_symbols_for_target(target, all_parsed, resolver,
-                                      filter_cxx_vague=True,
-                                      proj_set=None):
-    # type: (str, dict, LibResolver, bool, set[str] | None) -> list[dict]
-    """Find symbols defined by more than one DSO in target's load image.
+def _compute_closure(target, all_parsed, resolver):
+    # type: (str, dict, LibResolver) -> set[str]
+    """Transitive DT_NEEDED closure of *target* (inclusive).
 
-    Walks target's transitive DT_NEEDED closure (including target itself),
-    collects every defined symbol with its originating (dso_path, bind),
-    and returns entries where multiple DSOs define the same symbol.
-
-    Severity:
-      * STRONG x STRONG (any non-WEAK binds) -> 'error'
-      * WEAK x WEAK                          -> 'warn'
-      * STRONG x WEAK                        -> 'warn'
-
-    If *proj_set* is provided, only duplicates with at least one provider
-    inside the project are kept — system-lib-only duplicates (e.g. libc
-    vs ld-linux) are filtered out as non-actionable noise.
+    Lazy-parses any resolved dep missing from *all_parsed* and inserts
+    it, so the caller's global map stays complete.
     """
     parsed = all_parsed.get(target)
     if not parsed:
-        return []
-
-    providers = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
-
-    def _collect(path, defined):
-        # type: (str, dict[str, str]) -> None
-        for sym, bind in defined.items():
-            if sym in IGNORE_SYMS:
-                continue
-            if filter_cxx_vague and is_cxx_vague(sym):
-                continue
-            providers[sym].append((path, bind))
-
-    _collect(target, parsed[2])
-
-    # Seed visited with target so a DT_NEEDED cycle back to target doesn't
-    # double-count its symbols.
-    visited = {target}  # type: set[str]
+        return set()
+    visited = {target}
     queue = deque(parsed[1])
-
     while queue:
         name = queue.popleft()
         resolved = resolver.resolve(name)
         if not resolved or resolved in visited:
             continue
         visited.add(resolved)
-
         dep_parsed = all_parsed.get(resolved)
         if dep_parsed is None:
             dep_parsed = parse_elf(resolved)
             all_parsed[resolved] = dep_parsed
-
-        _collect(resolved, dep_parsed[2])
-
-        for dep_name in dep_parsed[1]:
-            queue.append(dep_name)
-
-    dups = []  # type: list[dict]
-    for sym, provs in providers.items():
-        if len(provs) < 2:
-            continue
-        if proj_set is not None and not any(p in proj_set for p, _ in provs):
-            continue
-        binds = {b for _, b in provs}
-        if 'WEAK' in binds and len(binds) == 1:
-            severity = 'warn'          # all weak
-        elif 'WEAK' in binds:
-            severity = 'warn'          # mixed strong + weak
-        else:
-            severity = 'error'         # all strong
-        dups.append({
-            'symbol': sym,
-            'providers': provs,
-            'severity': severity,
-        })
-
-    dups.sort(key=lambda d: (d['severity'] != 'error', d['symbol']))
-    return dups
+        queue.extend(dep_parsed[1])
+    return visited
 
 
 def find_duplicate_symbols(scan_elfs, all_parsed, resolver,
                            filter_cxx_vague=True, proj_set=None):
     # type: (list[str], dict, LibResolver, bool, set[str] | None) -> list[dict]
-    """Run duplicate-symbol detection for every scan target.
+    """Find symbols defined by more than one DSO in each target's load image.
 
-    Returns list of per-target records (only targets with ≥1 duplicate).
+    For every target in *scan_elfs*, walks its DT_NEEDED closure (inclusive),
+    collects defined symbols with ``(dso_path, bind)``, and reports symbols
+    defined by multiple DSOs in that closure.
+
+    Severity:
+      * STRONG x STRONG (no WEAK binds)      -> 'error'
+      * WEAK only / mixed STRONG+WEAK        -> 'warn'
+
+    If *proj_set* is provided, only duplicates with at least one provider
+    inside the project are kept — system-lib-only duplicates (e.g. libc
+    vs ld-linux) are filtered out as non-actionable noise.
+
+    Performance: rather than rebuilding a providers dict per target over
+    *every* defined symbol in the closure, we precompute a global
+    symbol -> [(path, bind), ...] map across all reachable DSOs, restrict
+    it to symbols defined by >1 DSO globally, and invert to per-DSO
+    multi-defined contributions.  Each target then only iterates over
+    contributions from DSOs in its closure — typically two orders of
+    magnitude fewer items than the full defined-syms set.
+
+    Returns list of per-target records (only targets with >=1 duplicate).
     """
+    # Phase 1: resolve closures for every scan target (lazy-parses any
+    # deps missing from all_parsed).  Record the union of reachable DSOs.
+    closures = {}  # type: dict[str, set[str]]
+    reachable = set()  # type: set[str]
+    for target in scan_elfs:
+        cl = _compute_closure(target, all_parsed, resolver)
+        if cl:
+            closures[target] = cl
+            reachable.update(cl)
+
+    if not reachable:
+        return []
+
+    # Phase 2: build global sym -> [(path, bind)] across reachable DSOs,
+    # applying the IGNORE / vague filters exactly once per symbol.
+    global_provs = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
+    for path in reachable:
+        parsed = all_parsed.get(path)
+        if not parsed:
+            continue
+        for sym, bind in parsed[2].items():
+            if sym in IGNORE_SYMS:
+                continue
+            if filter_cxx_vague and is_cxx_vague(sym):
+                continue
+            global_provs[sym].append((path, bind))
+
+    # Phase 3: keep only symbols with >1 provider globally, and invert to
+    # per-DSO multi-defined contribution lists.  Unique-globally symbols
+    # cannot form a duplicate in any target's closure — skipping them up
+    # front is where most of the speedup comes from.
+    dso_contrib = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
+    multi_provs = {}  # type: dict[str, list[tuple[str, str]]]
+    for sym, provs in global_provs.items():
+        if len(provs) < 2:
+            continue
+        multi_provs[sym] = provs
+        for path, bind in provs:
+            dso_contrib[path].append((sym, bind))
+
+    if not multi_provs:
+        return []
+
+    # Phase 4: per target, collect providers from its closure using the
+    # precomputed per-DSO contribution lists, classify severity.
     results = []  # type: list[dict]
     for target in scan_elfs:
-        dups = find_duplicate_symbols_for_target(
-            target, all_parsed, resolver,
-            filter_cxx_vague=filter_cxx_vague, proj_set=proj_set)
+        cl = closures.get(target)
+        if not cl:
+            continue
+        providers_here = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
+        for path in cl:
+            for sym, bind in dso_contrib.get(path, ()):
+                providers_here[sym].append((path, bind))
+
+        dups = []  # type: list[dict]
+        for sym, provs in providers_here.items():
+            if len(provs) < 2:
+                continue
+            if proj_set is not None and not any(p in proj_set for p, _ in provs):
+                continue
+            binds = {b for _, b in provs}
+            severity = 'warn' if 'WEAK' in binds else 'error'
+            dups.append({
+                'symbol': sym,
+                'providers': provs,
+                'severity': severity,
+            })
+
         if dups:
+            dups.sort(key=lambda d: (d['severity'] != 'error', d['symbol']))
             results.append({
                 'consumer': target,
                 'consumer_type': classify_elf(target) or 'unknown',
                 'duplicates': dups,
             })
+
     return results
 
 
