@@ -44,7 +44,7 @@ import struct
 import subprocess
 import sys
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
 
 # -- Parse cache -------------------------------------------------------------
@@ -56,6 +56,12 @@ _CACHE_PATH = os.path.expanduser('~/.cache/antirev/missing_syms.pkl')
 _CACHE_VERSION = 1
 _PARSE_CACHE = {}  # type: dict[str, tuple[float, int, tuple]]
 _CACHE_DIRTY = False
+
+
+def _mark_cache_dirty():
+    # type: () -> None
+    global _CACHE_DIRTY
+    _CACHE_DIRTY = True
 
 
 def _load_parse_cache():
@@ -129,39 +135,23 @@ def classify_elf(path):
     return None
 
 
-def parse_elf(path):
+_EMPTY_PARSE = ('', [], {}, set())
+
+
+def _parse_elf_raw(path):
     # type: (str) -> tuple[str, list[str], dict[str, str], set[str]]
-    """Parse an ELF in one readelf invocation.
+    """Pure parse: invoke readelf and extract dynamic info.  No caching.
 
-    Returns ``(soname, dt_needed, defined_syms, undefined_syms)`` where
-    *defined_syms* is ``{sym_name: bind}`` (bind is ``'GLOBAL'``,
-    ``'WEAK'``, or ``'UNIQUE'``).  WEAK undefined symbols are excluded
-    (they are optional).  If the same symbol appears under multiple
-    versions with different binds, GLOBAL wins over WEAK.
-
-    Result is cached in ``_PARSE_CACHE`` keyed on (realpath, mtime, size);
-    the cache is persisted across runs via ``_load_parse_cache`` /
-    ``_save_parse_cache``.
+    Module-level so it is picklable for ``ProcessPoolExecutor`` workers.
+    Returns the same shape as :func:`parse_elf`; see its docstring.
     """
-    abs_path = os.path.realpath(path)
-    try:
-        st = os.stat(abs_path)
-    except OSError:
-        return '', [], {}, set()
-
-    cached = _PARSE_CACHE.get(abs_path)
-    if (cached is not None
-            and cached[0] == st.st_mtime
-            and cached[1] == st.st_size):
-        return cached[2]
-
     try:
         out = subprocess.check_output(
             ['readelf', '-d', '--dyn-syms', '-W', path],
             stderr=subprocess.DEVNULL, text=True, timeout=30)
     except (subprocess.CalledProcessError, FileNotFoundError,
             subprocess.TimeoutExpired):
-        return '', [], {}, set()
+        return _EMPTY_PARSE
 
     soname = ''
     dt_needed = []  # type: list[str]
@@ -206,10 +196,42 @@ def parse_elf(path):
             if prev is None or (prev == 'WEAK' and bind != 'WEAK'):
                 defined[clean] = bind
 
-    result = (soname, dt_needed, defined, undefined)
-    _PARSE_CACHE[abs_path] = (st.st_mtime, st.st_size, result)
-    global _CACHE_DIRTY
-    _CACHE_DIRTY = True
+    return (soname, dt_needed, defined, undefined)
+
+
+def parse_elf(path):
+    # type: (str) -> tuple[str, list[str], dict[str, str], set[str]]
+    """Parse an ELF via readelf, with an on-disk cache.
+
+    Returns ``(soname, dt_needed, defined_syms, undefined_syms)`` where
+    *defined_syms* is ``{sym_name: bind}`` (bind is ``'GLOBAL'``,
+    ``'WEAK'``, or ``'UNIQUE'``).  WEAK undefined symbols are excluded
+    (they are optional).  If the same symbol appears under multiple
+    versions with different binds, GLOBAL wins over WEAK.
+
+    Result is cached in ``_PARSE_CACHE`` keyed on (realpath, mtime, size);
+    persisted via ``_load_parse_cache`` / ``_save_parse_cache``.  For bulk
+    parses, the main flow does the cache lookup in the parent and
+    dispatches only misses to :func:`_parse_elf_raw` on a process pool.
+    This function is the single-threaded fallback used by later lazy
+    parses (e.g. transitive-closure walks).
+    """
+    abs_path = os.path.realpath(path)
+    try:
+        st = os.stat(abs_path)
+    except OSError:
+        return _EMPTY_PARSE
+
+    cached = _PARSE_CACHE.get(abs_path)
+    if (cached is not None
+            and cached[0] == st.st_mtime
+            and cached[1] == st.st_size):
+        return cached[2]
+
+    result = _parse_elf_raw(path)
+    if result != _EMPTY_PARSE:
+        _PARSE_CACHE[abs_path] = (st.st_mtime, st.st_size, result)
+        _mark_cache_dirty()
     return result
 
 
@@ -1363,22 +1385,56 @@ def main():
     all_elfs = all_proj_elfs + ext_libs
 
     # -- Parallel parse ------------------------------------------------------
+    # Cache lookups run in the parent so workers are stateless; misses
+    # are dispatched to a ProcessPoolExecutor so Python-side parsing can
+    # actually run on multiple cores (threads would serialize on the GIL).
     _load_parse_cache()
     atexit.register(_save_parse_cache)
-    log('[parse] Parsing %d ELF files (cache: %d entries) ...' %
-        (len(all_elfs), len(_PARSE_CACHE)))
-    all_parsed = {}  # type: dict[str, tuple]
 
-    n_workers = min(os.cpu_count() or 4, len(all_elfs), 64)
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(parse_elf, p): p for p in all_elfs}
-        done = 0
-        for fut in as_completed(futures):
-            p = futures[fut]
-            all_parsed[p] = fut.result()
-            done += 1
-            if args.verbose and done % 200 == 0:
-                log('[parse] ... %d / %d' % (done, len(all_elfs)))
+    all_parsed = {}  # type: dict[str, tuple]
+    misses = []  # type: list[str]
+    miss_stats = {}  # type: dict[str, tuple[float, int, str]]
+
+    for p in all_elfs:
+        abs_p = os.path.realpath(p)
+        try:
+            st = os.stat(abs_p)
+        except OSError:
+            all_parsed[p] = _EMPTY_PARSE
+            continue
+        cached = _PARSE_CACHE.get(abs_p)
+        if (cached is not None
+                and cached[0] == st.st_mtime
+                and cached[1] == st.st_size):
+            all_parsed[p] = cached[2]
+        else:
+            misses.append(p)
+            miss_stats[p] = (st.st_mtime, st.st_size, abs_p)
+
+    log('[parse] %d ELF file(s): %d cached, %d to parse' %
+        (len(all_elfs), len(all_elfs) - len(misses), len(misses)))
+
+    if misses:
+        # Leave one core for the user.
+        n_cpu = os.cpu_count() or 2
+        n_workers = max(1, min(n_cpu - 1, len(misses), 64))
+        # Larger chunksize amortises pickle overhead across many small tasks.
+        chunksize = max(1, len(misses) // (n_workers * 4))
+        log('[parse] Using %d worker process(es) (of %d CPU cores)' %
+            (n_workers, n_cpu))
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            done = 0
+            for p, result in zip(misses,
+                                 pool.map(_parse_elf_raw, misses,
+                                          chunksize=chunksize)):
+                all_parsed[p] = result
+                if result != _EMPTY_PARSE:
+                    mtime, size, abs_p = miss_stats[p]
+                    _PARSE_CACHE[abs_p] = (mtime, size, result)
+                done += 1
+                if args.verbose and done % 200 == 0:
+                    log('[parse] ... %d / %d' % (done, len(misses)))
+        _mark_cache_dirty()
 
     log('[parse] Done.')
 
