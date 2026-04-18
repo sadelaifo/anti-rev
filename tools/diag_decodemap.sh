@@ -50,30 +50,40 @@ while IFS= read -r line; do
 done < <(grep -E "$LIB_RE" "/proc/$PID/maps" | awk '$2 ~ /x/ {print}')
 
 echo
-echo "=== $SYM symbol offset in each lib (from in-memory image) ==="
+echo "=== $SYM symbol offset in each lib (demangled substring match) ==="
 for name in "${!BASE[@]}"; do
-    # Prefer map_files path (stable kernel-backed view), fall back to /proc/PID/root + original path
+    # Prefer map_files path (stable kernel-backed view), fall back to the path from maps
     mf=""
     for m in /proc/$PID/map_files/*; do
         t=$(readlink "$m" 2>/dev/null) || continue
         [[ "$t" == *"$name"* ]] && { mf="$m"; break; }
     done
-    if [[ -n "$mf" ]]; then
-        off=$(nm -D "$mf" 2>/dev/null | awk -v s="$SYM" '$3==s && $2 ~ /[Tt]/ {print $1; exit}')
-    else
-        off=""
+    src="$mf"
+    [[ -z "$src" || ! -r "$src" ]] && src="${PATHS[$name]}"
+
+    # nm -C demangles; match SYM anywhere in the (demangled) name, pick T/t/W/w (defined text/weak)
+    mapfile -t hits < <(nm -D -C "$src" 2>/dev/null | \
+        awk -v s="$SYM" '$2 ~ /[TtWw]/ && index($0, s) > 0 {print}')
+
+    if [[ ${#hits[@]} -eq 0 ]]; then
+        echo "$name  $SYM: NOT FOUND"
+        echo "  -- showing any symbols containing the substring (if any) --"
+        nm -D -C "$src" 2>/dev/null | grep -i -- "$SYM" | head -10 | sed 's/^/    /'
+        echo "  -- first 5 defined T symbols (for sanity) --"
+        nm -D -C "$src" 2>/dev/null | awk '$2=="T" {print}' | head -5 | sed 's/^/    /'
+        continue
     fi
-    if [[ -z "$off" ]]; then
-        # fallback: nm on the path from maps (may be /proc/self/fd/N — won't resolve from outside)
-        off=$(nm -D "${PATHS[$name]}" 2>/dev/null | awk -v s="$SYM" '$3==s && $2 ~ /[Tt]/ {print $1; exit}')
-    fi
-    if [[ -n "$off" ]]; then
-        # compute runtime VA = base + offset (subtract lowest loadable vaddr if PIE — for most .so it's 0)
-        runtime=$(printf '0x%x' $((0x${BASE[$name]} + 0x$off)))
-        echo "$name  offset=0x$off  runtime_addr=$runtime"
-    else
-        echo "$name  $SYM: NOT FOUND (lib may not export it, or nm couldn't read the image)"
-    fi
+
+    echo "$name:"
+    for h in "${hits[@]}"; do
+        off=$(echo "$h" | awk '{print $1}')
+        # strip leading 0s so arithmetic works, but keep as hex
+        off_hex=${off##0000000000}
+        [[ -z "$off_hex" ]] && off_hex="$off"
+        runtime=$(printf '0x%x' $((16#${off} + 16#${BASE[$name]})))
+        demangled=$(echo "$h" | awk '{$1=""; $2=""; sub(/^  */,""); print}')
+        echo "    offset=0x$off  runtime=$runtime  $demangled"
+    done
 done
 
 echo
