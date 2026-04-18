@@ -1347,6 +1347,19 @@ add_custom_target(test_python_reload
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_missing_syms — missing_syms.py finds missing DT_NEEDED edges
+#  and circular dependencies in a synthetic lib graph
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_target(test_missing_syms
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_missing_syms ==="
+    COMMAND bash "${CMAKE_SOURCE_DIR}/tests/missing_syms/run_test.sh"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "missing_syms.py: missing DT_NEEDED + circular deps test"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  run_tests — runs all tests and prints a summary
 # ═══════════════════════════════════════════════════════════════════════
 

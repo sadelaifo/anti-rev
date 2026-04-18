@@ -31,6 +31,7 @@ set(TESTS
     test_fd_reduction     # exe_shim ctor closes DT_NEEDED memfds
     test_wrong_key        # wrong key -> clean failure
     test_tamper           # bit-flipped ciphertext -> clean failure
+    test_missing_syms     # missing_syms.py: missing DT_NEEDED + circular deps
 )
 
 # Tests disabled — need further work:

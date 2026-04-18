@@ -4,8 +4,8 @@ build/
 # Key files (contain secrets)
 *.key
 
-# Benchmark generated project (large binaries + 100MB data file)
-bench/project/
+# Benchmark generated projects (large binaries + 100MB data file)
+bench/*project/
 
 # Compiled artifacts
 *.o
@@ -15,3 +15,27 @@ bench/project/
 # Python cache
 __pycache__/
 *.pyc
+
+# Test scratch dirs
+tests/**/_workdir/
+tests/**/out_*/
+
+# Local Claude Code settings (per-machine)
+.claude/settings.local.json
+
+# Generated presentation
+*.pptx
+
+# Debug symbol files
+*.debug
+
+# Core dumps
+core
+core.*
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# CMake tooling
+compile_commands.json
