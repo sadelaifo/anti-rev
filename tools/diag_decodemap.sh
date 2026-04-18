@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # Diagnose DecodeMap symbol resolution in antirev-encrypted binary.
-# Usage:  ./diag_decodemap.sh ./加密bin [lib_regex] [symbol]
-# Example: ./diag_decodemap.sh ./myapp 'libRH(ROE|AXE)' DecodeMap
+# Usage:  ./diag_decodemap.sh <bin> [bin args...]
+#         LIB_RE=... SYM=... WAIT=... ./diag_decodemap.sh <bin> [args...]
+# Example: LIB_RE='libRH(ROE|AXE)' SYM=DecodeMap ./diag_decodemap.sh ./myapp -c config.yaml
 
 set -u
 
-BIN="${1:?usage: $0 <encrypted_bin> [lib_regex] [symbol]}"
-LIB_RE="${2:-libRH(ROE|AXE)}"
-SYM="${3:-DecodeMap}"
+BIN="${1:?usage: $0 <encrypted_bin> [args...]   (env: LIB_RE, SYM, WAIT)}"
+shift
+LIB_RE="${LIB_RE:-libRH(ROE|AXE)}"
+SYM="${SYM:-DecodeMap}"
+WAIT="${WAIT:-3}"
 LOG=/tmp/antirev_dl_$$.log
-WAIT=3
 
 [[ -x "$BIN" ]] || { echo "not executable: $BIN" >&2; exit 1; }
 
-echo "=== launching: $BIN (dlopen log -> $LOG) ==="
-ANTIREV_DLOPEN_LOG="$LOG" "$BIN" >/tmp/antirev_stdout_$$.log 2>/tmp/antirev_stderr_$$.log &
+echo "=== launching: $BIN $* (dlopen log -> $LOG) ==="
+ANTIREV_DLOPEN_LOG="$LOG" "$BIN" "$@" >/tmp/antirev_stdout_$$.log 2>/tmp/antirev_stderr_$$.log &
 PID=$!
 sleep "$WAIT"
 
