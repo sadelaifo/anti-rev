@@ -297,7 +297,7 @@ content_slide(prs, "Core Components", [
     "Supporting components:",
     "antirev_client.py  --  Python client: patches import + ctypes.CDLL",
     "build.py  --  Compile/obfuscate Python via Cython, Nuitka, or PyArmor",
-    "Diagnostic tools  --  depgraph.py, symbol_collision.py, missing_syms.py",
+    "Diagnostic tools  --  depgraph.py, missing_syms.py",
 ])
 
 # ── Slide 4: Encryption ─────────────────────────────────────────────
@@ -618,11 +618,6 @@ section_slide(prs, 9, "Diagnostic Tools",
               "Validate before deployment, diagnose in the field")
 
 content_slide(prs, "Diagnostic Tooling", [
-    "symbol_collision.py",
-    "  Detect LD_PRELOAD symbol interposition risks",
-    "  Encrypted lib symbols vs unencrypted lib symbols",
-    "  Run BEFORE deployment to catch silent misbehavior",
-    "",
     "depgraph.py",
     "  Visualize ELF dependency graph (text or PNG)",
     "  Cycle detection, topological ordering",
@@ -634,6 +629,8 @@ content_slide(prs, "Diagnostic Tooling", [
     "  Locate providers on LD_LIBRARY_PATH, suggest patchelf --add-needed",
     "  Detect circular dependencies (Tarjan's SCC) and latent cycles",
     "  Combined-graph analysis: catch transitive cycles across multiple fixes",
+    "  Per-target duplicate-symbol scan: STRONG x STRONG = error,",
+    "    WEAK / mixed = warning; project-scoped by default",
     "  Blacklist third-party dirs, dedup versioned copies",
     "",
     "ANTIREV_DLOPEN_LOG=<path>: runtime dlopen decision logging",

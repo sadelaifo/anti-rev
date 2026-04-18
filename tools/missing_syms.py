@@ -88,11 +88,14 @@ def classify_elf(path):
 
 
 def parse_elf(path):
-    # type: (str) -> tuple[str, list[str], set[str], set[str]]
+    # type: (str) -> tuple[str, list[str], dict[str, str], set[str]]
     """Parse an ELF in one readelf invocation.
 
-    Returns ``(soname, dt_needed, defined_syms, undefined_syms)``.
-    WEAK undefined symbols are excluded (they are optional).
+    Returns ``(soname, dt_needed, defined_syms, undefined_syms)`` where
+    *defined_syms* is ``{sym_name: bind}`` (bind is ``'GLOBAL'``,
+    ``'WEAK'``, or ``'UNIQUE'``).  WEAK undefined symbols are excluded
+    (they are optional).  If the same symbol appears under multiple
+    versions with different binds, GLOBAL wins over WEAK.
     """
     try:
         out = subprocess.check_output(
@@ -100,11 +103,11 @@ def parse_elf(path):
             stderr=subprocess.DEVNULL, text=True, timeout=30)
     except (subprocess.CalledProcessError, FileNotFoundError,
             subprocess.TimeoutExpired):
-        return '', [], set(), set()
+        return '', [], {}, set()
 
     soname = ''
     dt_needed = []  # type: list[str]
-    defined = set()  # type: set[str]
+    defined = {}  # type: dict[str, str]
     undefined = set()  # type: set[str]
 
     for line in out.splitlines():
@@ -117,8 +120,13 @@ def parse_elf(path):
             dt_needed.append(m.group(1))
             continue
         # Symbol table line: Num Value Size Type Bind Vis Ndx Name
+        # readelf also prints version-definition/need tables that share
+        # many column widths; reject anything whose first field is not a
+        # "N:" symbol index.
         parts = line.split()
         if len(parts) < 8:
+            continue
+        if not (parts[0].endswith(':') and parts[0][:-1].isdigit()):
             continue
         ndx, bind, sym_name = parts[6], parts[4], parts[7]
         if not sym_name:
@@ -129,10 +137,16 @@ def parse_elf(path):
                 if clean and clean not in IGNORE_SYMS:
                     undefined.add(clean)
         else:
-            if bind != 'LOCAL':
-                clean = sym_name.split('@@')[0].split('@')[0]
-                if clean:
-                    defined.add(clean)
+            if bind == 'LOCAL':
+                continue
+            clean = sym_name.split('@@')[0].split('@')[0]
+            if not clean:
+                continue
+            # GLOBAL/UNIQUE wins over WEAK if the same name appears twice
+            # (e.g. under two different symbol versions).
+            prev = defined.get(clean)
+            if prev is None or (prev == 'WEAK' and bind != 'WEAK'):
+                defined[clean] = bind
 
     return soname, dt_needed, defined, undefined
 
@@ -334,7 +348,7 @@ def compute_available_syms(target, all_parsed, resolver, verbose=False):
     if not parsed:
         return set()
 
-    available = set(parsed[2])           # target's own defined syms
+    available = set(parsed[2].keys())    # target's own defined syms
     visited = set()  # type: set[str]    # realpaths already walked
     queue = deque(parsed[1])             # DT_NEEDED names to resolve
 
@@ -367,7 +381,7 @@ def compute_available_syms(target, all_parsed, resolver, verbose=False):
             print('  [resolve] EMPTY parse: %s -> %s (0 defined syms)' %
                   (name, resolved), file=sys.stderr)
 
-        available |= dep_parsed[2]      # defined syms
+        available.update(dep_parsed[2].keys())   # defined syms
 
         for dep_name in dep_parsed[1]:   # DT_NEEDED
             queue.append(dep_name)
@@ -403,7 +417,7 @@ def build_sym_index(all_parsed):
     """Build symbol -> [provider_realpath, ...] index from all parsed ELFs."""
     idx = defaultdict(list)  # type: defaultdict[str, list[str]]
     for path, (soname, needed, defined, undef) in all_parsed.items():
-        for s in defined:
+        for s in defined.keys():
             idx[s].append(path)
     return dict(idx)
 
@@ -448,6 +462,123 @@ def match_providers(missing_results, sym_index, proj_set, all_parsed):
             'missing': entries,
         })
     return output
+
+
+# -- Analysis: duplicate symbols --------------------------------------------
+
+# C++ vague-linkage prefixes.  These symbols are emitted WEAK in every TU
+# that instantiates the type; duplicates across DSOs are expected and
+# dedup'd by the resolver, so they are noise by default.
+#   _ZTV = vtable, _ZTI = typeinfo, _ZTS = typeinfo-name,
+#   _ZTC = construction-vtable, _ZTT = VTT (virtual table table)
+CXX_VAGUE_PREFIXES = ('_ZTV', '_ZTI', '_ZTS', '_ZTC', '_ZTT')
+
+
+def is_cxx_vague(sym):
+    # type: (str) -> bool
+    return sym.startswith(CXX_VAGUE_PREFIXES)
+
+
+def find_duplicate_symbols_for_target(target, all_parsed, resolver,
+                                      filter_cxx_vague=True,
+                                      proj_set=None):
+    # type: (str, dict, LibResolver, bool, set[str] | None) -> list[dict]
+    """Find symbols defined by more than one DSO in target's load image.
+
+    Walks target's transitive DT_NEEDED closure (including target itself),
+    collects every defined symbol with its originating (dso_path, bind),
+    and returns entries where multiple DSOs define the same symbol.
+
+    Severity:
+      * STRONG x STRONG (any non-WEAK binds) -> 'error'
+      * WEAK x WEAK                          -> 'warn'
+      * STRONG x WEAK                        -> 'warn'
+
+    If *proj_set* is provided, only duplicates with at least one provider
+    inside the project are kept — system-lib-only duplicates (e.g. libc
+    vs ld-linux) are filtered out as non-actionable noise.
+    """
+    parsed = all_parsed.get(target)
+    if not parsed:
+        return []
+
+    providers = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
+
+    def _collect(path, defined):
+        # type: (str, dict[str, str]) -> None
+        for sym, bind in defined.items():
+            if sym in IGNORE_SYMS:
+                continue
+            if filter_cxx_vague and is_cxx_vague(sym):
+                continue
+            providers[sym].append((path, bind))
+
+    _collect(target, parsed[2])
+
+    # Seed visited with target so a DT_NEEDED cycle back to target doesn't
+    # double-count its symbols.
+    visited = {target}  # type: set[str]
+    queue = deque(parsed[1])
+
+    while queue:
+        name = queue.popleft()
+        resolved = resolver.resolve(name)
+        if not resolved or resolved in visited:
+            continue
+        visited.add(resolved)
+
+        dep_parsed = all_parsed.get(resolved)
+        if dep_parsed is None:
+            dep_parsed = parse_elf(resolved)
+            all_parsed[resolved] = dep_parsed
+
+        _collect(resolved, dep_parsed[2])
+
+        for dep_name in dep_parsed[1]:
+            queue.append(dep_name)
+
+    dups = []  # type: list[dict]
+    for sym, provs in providers.items():
+        if len(provs) < 2:
+            continue
+        if proj_set is not None and not any(p in proj_set for p, _ in provs):
+            continue
+        binds = {b for _, b in provs}
+        if 'WEAK' in binds and len(binds) == 1:
+            severity = 'warn'          # all weak
+        elif 'WEAK' in binds:
+            severity = 'warn'          # mixed strong + weak
+        else:
+            severity = 'error'         # all strong
+        dups.append({
+            'symbol': sym,
+            'providers': provs,
+            'severity': severity,
+        })
+
+    dups.sort(key=lambda d: (d['severity'] != 'error', d['symbol']))
+    return dups
+
+
+def find_duplicate_symbols(scan_elfs, all_parsed, resolver,
+                           filter_cxx_vague=True, proj_set=None):
+    # type: (list[str], dict, LibResolver, bool, set[str] | None) -> list[dict]
+    """Run duplicate-symbol detection for every scan target.
+
+    Returns list of per-target records (only targets with ≥1 duplicate).
+    """
+    results = []  # type: list[dict]
+    for target in scan_elfs:
+        dups = find_duplicate_symbols_for_target(
+            target, all_parsed, resolver,
+            filter_cxx_vague=filter_cxx_vague, proj_set=proj_set)
+        if dups:
+            results.append({
+                'consumer': target,
+                'consumer_type': classify_elf(target) or 'unknown',
+                'duplicates': dups,
+            })
+    return results
 
 
 # -- Analysis: circular dependencies ----------------------------------------
@@ -812,6 +943,76 @@ def print_latent_cycle_report(latent_cycles):
     print()
 
 
+def _bind_label(bind):
+    # type: (str) -> str
+    return 'WEAK' if bind == 'WEAK' else 'STRONG'
+
+
+def print_duplicate_report(dup_results, proj_dir, do_demangle=False):
+    # type: (list[dict], str, bool) -> None
+    print('=' * 60)
+    print('  Duplicate symbols in per-target DT_NEEDED closures')
+    print('=' * 60)
+
+    if not dup_results:
+        print('\n  No duplicate symbols found.\n')
+        return
+
+    demangled = {}  # type: dict[str, str]
+    if do_demangle:
+        all_syms = []  # type: list[str]
+        for r in dup_results:
+            all_syms.extend(d['symbol'] for d in r['duplicates'])
+        demangled = demangle_batch(all_syms)
+
+    total_err = 0
+    total_warn = 0
+
+    for r in dup_results:
+        consumer = r['consumer']
+        rel = os.path.relpath(consumer, proj_dir)
+        ctype = r['consumer_type']
+        errors = [d for d in r['duplicates'] if d['severity'] == 'error']
+        warns = [d for d in r['duplicates'] if d['severity'] == 'warn']
+        total_err += len(errors)
+        total_warn += len(warns)
+
+        print('\n  %s  (%s, %d error%s, %d warning%s):' %
+              (rel, ctype,
+               len(errors), 's' if len(errors) != 1 else '',
+               len(warns), 's' if len(warns) != 1 else ''))
+
+        def _fmt_dup(d):
+            # type: (dict) -> None
+            sym = d['symbol']
+            display = sym
+            if do_demangle and demangled.get(sym, sym) != sym:
+                display = '%s  [%s]' % (demangled[sym], sym)
+            provs = ', '.join(
+                '%s:%s' % (os.path.basename(p), _bind_label(b))
+                for p, b in d['providers'])
+            print('      %s' % display)
+            print('        in: %s' % provs)
+
+        if errors:
+            print('    ERRORS (STRONG x STRONG):')
+            for d in errors:
+                _fmt_dup(d)
+        if warns:
+            print('    WARNINGS (WEAK or mixed):')
+            for d in warns:
+                _fmt_dup(d)
+
+    print()
+    print('-' * 60)
+    print('  Total: %d duplicate-symbol error%s, %d warning%s '
+          'in %d consumer%s' %
+          (total_err, 's' if total_err != 1 else '',
+           total_warn, 's' if total_warn != 1 else '',
+           len(dup_results), 's' if len(dup_results) != 1 else ''))
+    print()
+
+
 def print_patchelf_commands(results, proj_edges, path_to_name):
     # type: (list[dict], dict[str, list[str]], dict[str, str]) -> None
     """Print safe patchelf commands and warn about unsafe ones.
@@ -907,8 +1108,9 @@ def print_patchelf_commands(results, proj_edges, path_to_name):
         print()
 
 
-def print_json_output(results, sccs, edges, proj_dir, latent_cycles=None):
-    # type: (list[dict], list[list[str]], dict[str, list[str]], str) -> None
+def print_json_output(results, sccs, edges, proj_dir, latent_cycles=None,
+                      dup_results=None):
+    # type: (list[dict], list[list[str]], dict[str, list[str]], str, list[dict] | None, list[dict] | None) -> None
     cycles = []  # type: list[dict]
     for scc in sccs:
         cycle_path = find_cycle_path(edges, scc)
@@ -946,11 +1148,34 @@ def print_json_output(results, sccs, edges, proj_dir, latent_cycles=None):
             'symbols': lc['symbols'],
         })
 
+    dup_out = []  # type: list[dict]
+    for r in (dup_results or []):
+        entry = {
+            'consumer': os.path.relpath(r['consumer'], proj_dir),
+            'consumer_type': r['consumer_type'],
+            'duplicates': [],
+        }  # type: dict
+        for d in r['duplicates']:
+            entry['duplicates'].append({
+                'symbol': d['symbol'],
+                'severity': d['severity'],
+                'providers': [
+                    {
+                        'path': os.path.relpath(p, proj_dir)
+                                if p.startswith(proj_dir) else p,
+                        'bind': b,
+                    }
+                    for p, b in d['providers']
+                ],
+            })
+        dup_out.append(entry)
+
     output = {
         'proj_dir': proj_dir,
         'missing_symbols': missing_out,
         'circular_dependencies': cycles,
         'latent_circular_dependencies': latent_out,
+        'duplicate_symbols': dup_out,
     }
     print(json.dumps(output, indent=2))
 
@@ -973,6 +1198,18 @@ def main():
                     help='Only report circular dependencies')
     ap.add_argument('--demangle', action='store_true',
                     help='Demangle C++ symbols via c++filt')
+    ap.add_argument('--all-cxx', action='store_true',
+                    help='Include C++ vague-linkage symbols (vtables, '
+                         'typeinfo) in the duplicate-symbol report.  These '
+                         'are filtered by default as they are benign '
+                         'ODR-dedup noise.')
+    ap.add_argument('--no-duplicates', action='store_true',
+                    help='Skip duplicate-symbol detection (runs by default).')
+    ap.add_argument('--system-dups', action='store_true',
+                    help='Include duplicates whose providers are all system '
+                         'libs (e.g. libc vs ld-linux).  By default only '
+                         'duplicates touching at least one project ELF are '
+                         'reported.')
     ap.add_argument('--blacklist', metavar='FILE',
                     help='File listing paths (relative to proj_dir) whose '
                          'ELFs are indexed as symbol providers but not '
@@ -1108,9 +1345,24 @@ def main():
     # -- Latent cycle detection ----------------------------------------------
     latent_cycles = detect_latent_cycles(results, proj_edges, path_to_name)
 
+    # -- Duplicate-symbol detection ------------------------------------------
+    dup_results = []  # type: list[dict]
+    if not args.no_duplicates:
+        log('[analyze] Scanning for duplicate symbols ...')
+        dup_proj_set = None if args.system_dups else proj_set
+        dup_results = find_duplicate_symbols(
+            scan_elfs, all_parsed, resolver,
+            filter_cxx_vague=not args.all_cxx,
+            proj_set=dup_proj_set)
+
+    dup_errors = sum(
+        1 for r in dup_results for d in r['duplicates']
+        if d['severity'] == 'error')
+
     # -- Output --------------------------------------------------------------
     if is_json:
-        print_json_output(results, sccs, proj_edges, proj_dir, latent_cycles)
+        print_json_output(results, sccs, proj_edges, proj_dir,
+                          latent_cycles, dup_results)
     else:
         print()
         print('=' * 60)
@@ -1121,9 +1373,12 @@ def main():
         print_missing_report(results, proj_dir, do_demangle=args.demangle)
         print_cycle_report(sccs, proj_edges)
         print_latent_cycle_report(latent_cycles)
+        if not args.no_duplicates:
+            print_duplicate_report(
+                dup_results, proj_dir, do_demangle=args.demangle)
         print_patchelf_commands(results, proj_edges, path_to_name)
 
-    has_issues = bool(results) or bool(sccs)
+    has_issues = bool(results) or bool(sccs) or dup_errors > 0
     sys.exit(1 if has_issues else 0)
 
 
