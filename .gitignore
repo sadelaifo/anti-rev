@@ -4,8 +4,8 @@ build/
 # Key files (contain secrets)
 *.key
 
-# Benchmark generated project (large binaries + 100MB data file)
-bench/project/
+# Benchmark generated projects (large binaries + 100MB data file)
+bench/*project/
 
 # Compiled artifacts
 *.o
