@@ -35,14 +35,56 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
+import pickle
 import re
 import struct
 import subprocess
 import sys
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# -- Parse cache -------------------------------------------------------------
+# readelf is ~5-20 ms per ELF.  For a 550-lib project that dominates wall-time
+# on repeat runs where only a handful of files actually changed.  Cache the
+# parse result keyed on (realpath, mtime, size) in a single pickle file.
+
+_CACHE_PATH = os.path.expanduser('~/.cache/antirev/missing_syms.pkl')
+_CACHE_VERSION = 1
+_PARSE_CACHE = {}  # type: dict[str, tuple[float, int, tuple]]
+_CACHE_DIRTY = False
+
+
+def _load_parse_cache():
+    # type: () -> None
+    global _PARSE_CACHE
+    try:
+        with open(_CACHE_PATH, 'rb') as f:
+            data = pickle.load(f)
+    except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+        return
+    except Exception:
+        return
+    if isinstance(data, dict) and data.get('version') == _CACHE_VERSION:
+        _PARSE_CACHE = data.get('entries', {})
+
+
+def _save_parse_cache():
+    # type: () -> None
+    if not _CACHE_DIRTY:
+        return
+    try:
+        os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
+        tmp = _CACHE_PATH + '.tmp.%d' % os.getpid()
+        with open(tmp, 'wb') as f:
+            pickle.dump({'version': _CACHE_VERSION, 'entries': _PARSE_CACHE},
+                        f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, _CACHE_PATH)
+    except OSError:
+        pass
 
 
 # -- Constants ---------------------------------------------------------------
@@ -96,7 +138,23 @@ def parse_elf(path):
     ``'WEAK'``, or ``'UNIQUE'``).  WEAK undefined symbols are excluded
     (they are optional).  If the same symbol appears under multiple
     versions with different binds, GLOBAL wins over WEAK.
+
+    Result is cached in ``_PARSE_CACHE`` keyed on (realpath, mtime, size);
+    the cache is persisted across runs via ``_load_parse_cache`` /
+    ``_save_parse_cache``.
     """
+    abs_path = os.path.realpath(path)
+    try:
+        st = os.stat(abs_path)
+    except OSError:
+        return '', [], {}, set()
+
+    cached = _PARSE_CACHE.get(abs_path)
+    if (cached is not None
+            and cached[0] == st.st_mtime
+            and cached[1] == st.st_size):
+        return cached[2]
+
     try:
         out = subprocess.check_output(
             ['readelf', '-d', '--dyn-syms', '-W', path],
@@ -148,7 +206,11 @@ def parse_elf(path):
             if prev is None or (prev == 'WEAK' and bind != 'WEAK'):
                 defined[clean] = bind
 
-    return soname, dt_needed, defined, undefined
+    result = (soname, dt_needed, defined, undefined)
+    _PARSE_CACHE[abs_path] = (st.st_mtime, st.st_size, result)
+    global _CACHE_DIRTY
+    _CACHE_DIRTY = True
+    return result
 
 
 # -- Library resolution ------------------------------------------------------
@@ -1301,7 +1363,10 @@ def main():
     all_elfs = all_proj_elfs + ext_libs
 
     # -- Parallel parse ------------------------------------------------------
-    log('[parse] Parsing %d ELF files ...' % len(all_elfs))
+    _load_parse_cache()
+    atexit.register(_save_parse_cache)
+    log('[parse] Parsing %d ELF files (cache: %d entries) ...' %
+        (len(all_elfs), len(_PARSE_CACHE)))
     all_parsed = {}  # type: dict[str, tuple]
 
     n_workers = min(os.cpu_count() or 4, len(all_elfs), 64)
