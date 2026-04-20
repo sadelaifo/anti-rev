@@ -1,139 +1,135 @@
 #!/usr/bin/env python3
 """
 Scan the GUI executable and its dlopen'd libs' transitive DT_NEEDED closures
-for a specific symbol.  Edit the three variables below, then run:
+for a specific symbol.  Edit find_symbol_in_closure.json, then run:
 
-    python3 tools/find_symbol_in_closure.py
+    python3 tools/find_symbol_in_closure.py [config.json]
 """
 
+import json
 import os
 import re
 import subprocess
 import sys
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── Edit these ──────────────────────────────────────────────────────────────
-SYMBOL = 'descriptor_table_your_proto_2eproto'  # substring match by default
+DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'find_symbol_in_closure.json')
 
-GUI_EXE = '/proj/bin/GUI'  # the main executable — also scanned
-
-TOP_LIBS = [
-    # the 23 libs that GUI dlopens — edit these names
-    '/proj/lib/libFoo.so',
-    '/proj/lib/libBar.so',
-    # '/proj/lib/libBaz.so',
-    # ...
-]
-
-LIB_DIR = '/proj/lib'  # root dir to resolve DT_NEEDED sonames
-# ────────────────────────────────────────────────────────────────────────────
+# ── Caches (populated once, reused across closures) ────────────────────────
+_needed_cache = {}   # realpath -> [soname, ...]
+_symbols_cache = {}  # realpath -> set of defined symbol names
+_lib_index = {}      # soname -> realpath
 
 
-def find_lib(soname, lib_dir, _cache={}):
-    """Find a library by soname under lib_dir (cached)."""
-    if soname in _cache:
-        return _cache[soname]
-
-    # Build index on first call
-    if not _cache.get('__indexed__'):
-        for root, dirs, files in os.walk(lib_dir):
-            for f in files:
-                if f.endswith('.so') or '.so.' in f:
-                    full = os.path.join(root, f)
-                    _cache.setdefault(f, full)
-                    # Also index without version suffix: libfoo.so.1.2 -> libfoo.so
-                    base = f.split('.so')[0] + '.so'
-                    _cache.setdefault(base, full)
-        _cache['__indexed__'] = True
-
-    return _cache.get(soname)
+def build_lib_index(lib_dir):
+    """Walk lib_dir once and index all .so files by soname."""
+    for root, _, files in os.walk(lib_dir):
+        for f in files:
+            if f.endswith('.so') or '.so.' in f:
+                full = os.path.realpath(os.path.join(root, f))
+                _lib_index.setdefault(f, full)
+                base = f.split('.so')[0] + '.so'
+                _lib_index.setdefault(base, full)
 
 
 def get_needed(elf_path):
-    """Return list of DT_NEEDED sonames for an ELF."""
+    """Return list of DT_NEEDED sonames (cached)."""
+    if elf_path in _needed_cache:
+        return _needed_cache[elf_path]
     try:
         out = subprocess.check_output(
             ['readelf', '-d', elf_path],
             stderr=subprocess.DEVNULL, text=True
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
+        _needed_cache[elf_path] = []
         return []
     needed = []
     for line in out.splitlines():
         m = re.search(r'\(NEEDED\)\s+Shared library:\s+\[(.+?)\]', line)
         if m:
             needed.append(m.group(1))
+    _needed_cache[elf_path] = needed
     return needed
 
 
 def get_defined_symbols(elf_path):
-    """Return set of defined (non-UND) symbol names."""
+    """Return set of defined symbol names (cached)."""
+    if elf_path in _symbols_cache:
+        return _symbols_cache[elf_path]
     try:
         out = subprocess.check_output(
             ['nm', '-D', '--defined-only', elf_path],
             stderr=subprocess.DEVNULL, text=True
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
+        _symbols_cache[elf_path] = set()
         return set()
     syms = set()
     for line in out.splitlines():
         parts = line.strip().split()
         if len(parts) >= 3:
-            syms.add(parts[-1])  # symbol name is last column
+            syms.add(parts[-1])
+    _symbols_cache[elf_path] = syms
     return syms
 
 
-def walk_closure(start_lib, lib_dir):
-    """BFS walk of transitive DT_NEEDED from start_lib. Returns set of paths."""
+def walk_closure(start_lib):
+    """BFS walk of transitive DT_NEEDED. Returns set of realpaths."""
     visited = set()
     queue = deque()
-
     start_real = os.path.realpath(start_lib)
     queue.append(start_real)
     visited.add(start_real)
-
     while queue:
         current = queue.popleft()
         for soname in get_needed(current):
-            dep_path = find_lib(soname, lib_dir)
-            if dep_path:
-                dep_real = os.path.realpath(dep_path)
-                if dep_real not in visited:
-                    visited.add(dep_real)
-                    queue.append(dep_real)
+            dep_path = _lib_index.get(soname)
+            if dep_path and dep_path not in visited:
+                visited.add(dep_path)
+                queue.append(dep_path)
     return visited
 
 
-def demangle(sym):
-    """Demangle a C++ symbol."""
-    try:
-        out = subprocess.check_output(
-            ['c++filt', sym], stderr=subprocess.DEVNULL, text=True
-        )
-        return out.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return sym
+def parse_elf(path):
+    """Parse both DT_NEEDED and defined symbols for a single ELF (for parallel use)."""
+    get_needed(path)
+    get_defined_symbols(path)
 
 
 def main():
-    lib_dir = os.path.realpath(LIB_DIR)
-    symbol = SYMBOL
+    cfg_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CONFIG
+    if not os.path.isfile(cfg_path):
+        print(f'ERROR: config not found: {cfg_path}', file=sys.stderr)
+        print(f'Copy find_symbol_in_closure.json.example and edit it.', file=sys.stderr)
+        sys.exit(1)
 
-    # Build scan list: GUI exe + all top-level dlopen'd libs
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+
+    symbol = cfg['symbol']
+    gui_exe = cfg.get('gui_exe', '')
+    top_libs = cfg['top_libs']
+    lib_dir = os.path.realpath(cfg['lib_dir'])
+    workers = cfg.get('workers', 8)
+
+    # Build scan list: GUI exe + dlopen'd libs
     scan_targets = []
-    if GUI_EXE:
-        rp = os.path.realpath(GUI_EXE)
+    if gui_exe:
+        rp = os.path.realpath(gui_exe)
         if os.path.isfile(rp):
             scan_targets.append(rp)
         else:
-            print(f'WARNING: GUI_EXE {GUI_EXE} not found, skipping', file=sys.stderr)
+            print(f'WARNING: gui_exe {gui_exe} not found, skipping', file=sys.stderr)
 
-    for p in TOP_LIBS:
+    for p in top_libs:
         rp = os.path.realpath(p)
-        if not os.path.isfile(rp):
+        if os.path.isfile(rp):
+            scan_targets.append(rp)
+        else:
             print(f'WARNING: {p} not found, skipping', file=sys.stderr)
-            continue
-        scan_targets.append(rp)
 
     if not scan_targets:
         print('ERROR: no valid targets to scan', file=sys.stderr)
@@ -141,23 +137,49 @@ def main():
 
     print(f'Symbol:    {symbol}')
     print(f'Lib dir:   {lib_dir}')
-    print(f'Targets:   {len(scan_targets)} (1 exe + {len(scan_targets)-1} dlopen\'d libs)')
+    print(f'Targets:   {len(scan_targets)} (exe + dlopen\'d libs)')
+    print(f'Workers:   {workers}')
     print()
 
-    # For each top-level lib, walk its closure and find the symbol
-    # Track: which libs define it, and which top-level lib pulls them in
-    symbol_providers = defaultdict(set)  # provider_path -> set of top-level libs
-    closure_sizes = {}
+    # Phase 1: index all .so files under lib_dir
+    print('Indexing lib dir ...', flush=True)
+    build_lib_index(lib_dir)
+    print(f'  {len(_lib_index)} sonames indexed')
 
+    # Phase 2: walk closures (sequential — needs cached DT_NEEDED)
+    # But first, parallel-parse DT_NEEDED for all indexed libs
+    print(f'Parsing DT_NEEDED for all libs ({workers} threads) ...', flush=True)
+    all_lib_paths = list(set(_lib_index.values()))
+    all_lib_paths.extend(scan_targets)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(get_needed, p): p for p in all_lib_paths}
+        for fut in as_completed(futs):
+            fut.result()
+    print(f'  {len(_needed_cache)} ELFs parsed')
+
+    # Walk closures
+    closures = {}  # target_name -> set of realpaths
+    all_closure_libs = set()
     for tl in scan_targets:
         tl_name = os.path.basename(tl)
-        print(f'Scanning closure of {tl_name} ...', end=' ', flush=True)
-        closure = walk_closure(tl, lib_dir)
-        closure_sizes[tl_name] = len(closure)
-        print(f'{len(closure)} libs')
+        closure = walk_closure(tl)
+        closures[tl_name] = closure
+        all_closure_libs.update(closure)
+        print(f'  {tl_name}: {len(closure)} libs in closure')
 
+    # Phase 3: parallel symbol scan — only for unique libs across all closures
+    print(f'\nScanning symbols in {len(all_closure_libs)} unique libs ({workers} threads) ...',
+          flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(get_defined_symbols, p): p for p in all_closure_libs}
+        for fut in as_completed(futs):
+            fut.result()
+
+    # Phase 4: match symbol
+    symbol_providers = defaultdict(set)  # provider_path -> set of target names
+    for tl_name, closure in closures.items():
         for lib_path in closure:
-            syms = get_defined_symbols(lib_path)
+            syms = _symbols_cache.get(lib_path, set())
             for s in syms:
                 if symbol in s:
                     symbol_providers[lib_path].add(tl_name)
@@ -172,7 +194,6 @@ def main():
     print(f'=== Found symbol in {len(symbol_providers)} lib(s) ===')
     print()
 
-    # Sort by number of top-level importers (most shared first)
     for provider, importers in sorted(symbol_providers.items(),
                                        key=lambda x: -len(x[1])):
         pname = os.path.relpath(provider, lib_dir)
@@ -180,7 +201,6 @@ def main():
         print(f'    pulled in by: {", ".join(sorted(importers))}')
         print()
 
-    # Summary: which top-level libs share a provider?
     if len(symbol_providers) > 1:
         print('=== DUPLICATE: symbol defined in multiple libs in the same load image ===')
         print('If GUI dlopens multiple top-level libs whose closures overlap on')
