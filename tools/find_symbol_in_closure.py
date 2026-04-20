@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
 Scan the GUI executable and its dlopen'd libs' transitive DT_NEEDED closures
-for a specific symbol.  Edit find_symbol_in_closure.json, then run:
+for specific symbols.
 
-    python3 tools/find_symbol_in_closure.py [config.json]
+Usage:
+    python3 tools/find_symbol_in_closure.py --config config.json
+    python3 tools/find_symbol_in_closure.py   # uses find_symbol_in_closure.json next to script
 """
 
+import argparse
 import json
 import os
 import re
@@ -100,10 +103,17 @@ def parse_elf(path):
 
 
 def main():
-    cfg_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CONFIG
+    ap = argparse.ArgumentParser(
+        description='Trace symbols through DT_NEEDED closures of an exe '
+                    'and its dlopen\'d libs.')
+    ap.add_argument('--config', '-c', default=DEFAULT_CONFIG,
+                    help='Path to JSON config file (default: '
+                         'find_symbol_in_closure.json next to this script)')
+    cli_args = ap.parse_args()
+
+    cfg_path = cli_args.config
     if not os.path.isfile(cfg_path):
         print(f'ERROR: config not found: {cfg_path}', file=sys.stderr)
-        print(f'Copy find_symbol_in_closure.json.example and edit it.', file=sys.stderr)
         sys.exit(1)
 
     with open(cfg_path) as f:
