@@ -35,14 +35,62 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
+import pickle
 import re
 import struct
 import subprocess
 import sys
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+
+# -- Parse cache -------------------------------------------------------------
+# readelf is ~5-20 ms per ELF.  For a 550-lib project that dominates wall-time
+# on repeat runs where only a handful of files actually changed.  Cache the
+# parse result keyed on (realpath, mtime, size) in a single pickle file.
+
+_CACHE_PATH = os.path.expanduser('~/.cache/antirev/missing_syms.pkl')
+_CACHE_VERSION = 1
+_PARSE_CACHE = {}  # type: dict[str, tuple[float, int, tuple]]
+_CACHE_DIRTY = False
+
+
+def _mark_cache_dirty():
+    # type: () -> None
+    global _CACHE_DIRTY
+    _CACHE_DIRTY = True
+
+
+def _load_parse_cache():
+    # type: () -> None
+    global _PARSE_CACHE
+    try:
+        with open(_CACHE_PATH, 'rb') as f:
+            data = pickle.load(f)
+    except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+        return
+    except Exception:
+        return
+    if isinstance(data, dict) and data.get('version') == _CACHE_VERSION:
+        _PARSE_CACHE = data.get('entries', {})
+
+
+def _save_parse_cache():
+    # type: () -> None
+    if not _CACHE_DIRTY:
+        return
+    try:
+        os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
+        tmp = _CACHE_PATH + '.tmp.%d' % os.getpid()
+        with open(tmp, 'wb') as f:
+            pickle.dump({'version': _CACHE_VERSION, 'entries': _PARSE_CACHE},
+                        f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, _CACHE_PATH)
+    except OSError:
+        pass
 
 
 # -- Constants ---------------------------------------------------------------
@@ -87,12 +135,15 @@ def classify_elf(path):
     return None
 
 
-def parse_elf(path):
-    # type: (str) -> tuple[str, list[str], set[str], set[str]]
-    """Parse an ELF in one readelf invocation.
+_EMPTY_PARSE = ('', [], {}, set())
 
-    Returns ``(soname, dt_needed, defined_syms, undefined_syms)``.
-    WEAK undefined symbols are excluded (they are optional).
+
+def _parse_elf_raw(path):
+    # type: (str) -> tuple[str, list[str], dict[str, str], set[str]]
+    """Pure parse: invoke readelf and extract dynamic info.  No caching.
+
+    Module-level so it is picklable for ``ProcessPoolExecutor`` workers.
+    Returns the same shape as :func:`parse_elf`; see its docstring.
     """
     try:
         out = subprocess.check_output(
@@ -100,11 +151,11 @@ def parse_elf(path):
             stderr=subprocess.DEVNULL, text=True, timeout=30)
     except (subprocess.CalledProcessError, FileNotFoundError,
             subprocess.TimeoutExpired):
-        return '', [], set(), set()
+        return _EMPTY_PARSE
 
     soname = ''
     dt_needed = []  # type: list[str]
-    defined = set()  # type: set[str]
+    defined = {}  # type: dict[str, str]
     undefined = set()  # type: set[str]
 
     for line in out.splitlines():
@@ -117,8 +168,13 @@ def parse_elf(path):
             dt_needed.append(m.group(1))
             continue
         # Symbol table line: Num Value Size Type Bind Vis Ndx Name
+        # readelf also prints version-definition/need tables that share
+        # many column widths; reject anything whose first field is not a
+        # "N:" symbol index.
         parts = line.split()
         if len(parts) < 8:
+            continue
+        if not (parts[0].endswith(':') and parts[0][:-1].isdigit()):
             continue
         ndx, bind, sym_name = parts[6], parts[4], parts[7]
         if not sym_name:
@@ -129,12 +185,54 @@ def parse_elf(path):
                 if clean and clean not in IGNORE_SYMS:
                     undefined.add(clean)
         else:
-            if bind != 'LOCAL':
-                clean = sym_name.split('@@')[0].split('@')[0]
-                if clean:
-                    defined.add(clean)
+            if bind == 'LOCAL':
+                continue
+            clean = sym_name.split('@@')[0].split('@')[0]
+            if not clean:
+                continue
+            # GLOBAL/UNIQUE wins over WEAK if the same name appears twice
+            # (e.g. under two different symbol versions).
+            prev = defined.get(clean)
+            if prev is None or (prev == 'WEAK' and bind != 'WEAK'):
+                defined[clean] = bind
 
-    return soname, dt_needed, defined, undefined
+    return (soname, dt_needed, defined, undefined)
+
+
+def parse_elf(path):
+    # type: (str) -> tuple[str, list[str], dict[str, str], set[str]]
+    """Parse an ELF via readelf, with an on-disk cache.
+
+    Returns ``(soname, dt_needed, defined_syms, undefined_syms)`` where
+    *defined_syms* is ``{sym_name: bind}`` (bind is ``'GLOBAL'``,
+    ``'WEAK'``, or ``'UNIQUE'``).  WEAK undefined symbols are excluded
+    (they are optional).  If the same symbol appears under multiple
+    versions with different binds, GLOBAL wins over WEAK.
+
+    Result is cached in ``_PARSE_CACHE`` keyed on (realpath, mtime, size);
+    persisted via ``_load_parse_cache`` / ``_save_parse_cache``.  For bulk
+    parses, the main flow does the cache lookup in the parent and
+    dispatches only misses to :func:`_parse_elf_raw` on a process pool.
+    This function is the single-threaded fallback used by later lazy
+    parses (e.g. transitive-closure walks).
+    """
+    abs_path = os.path.realpath(path)
+    try:
+        st = os.stat(abs_path)
+    except OSError:
+        return _EMPTY_PARSE
+
+    cached = _PARSE_CACHE.get(abs_path)
+    if (cached is not None
+            and cached[0] == st.st_mtime
+            and cached[1] == st.st_size):
+        return cached[2]
+
+    result = _parse_elf_raw(path)
+    if result != _EMPTY_PARSE:
+        _PARSE_CACHE[abs_path] = (st.st_mtime, st.st_size, result)
+        _mark_cache_dirty()
+    return result
 
 
 # -- Library resolution ------------------------------------------------------
@@ -334,7 +432,7 @@ def compute_available_syms(target, all_parsed, resolver, verbose=False):
     if not parsed:
         return set()
 
-    available = set(parsed[2])           # target's own defined syms
+    available = set(parsed[2].keys())    # target's own defined syms
     visited = set()  # type: set[str]    # realpaths already walked
     queue = deque(parsed[1])             # DT_NEEDED names to resolve
 
@@ -367,7 +465,7 @@ def compute_available_syms(target, all_parsed, resolver, verbose=False):
             print('  [resolve] EMPTY parse: %s -> %s (0 defined syms)' %
                   (name, resolved), file=sys.stderr)
 
-        available |= dep_parsed[2]      # defined syms
+        available.update(dep_parsed[2].keys())   # defined syms
 
         for dep_name in dep_parsed[1]:   # DT_NEEDED
             queue.append(dep_name)
@@ -375,26 +473,108 @@ def compute_available_syms(target, all_parsed, resolver, verbose=False):
     return available
 
 
+def prepopulate_all_deps(proj_elfs, all_parsed, resolver, verbose=False):
+    # type: (list[str], dict, LibResolver, bool) -> None
+    """Eagerly resolve all transitive DT_NEEDED chains, parsing any system
+    libs not yet in *all_parsed*.
+
+    After this call, *all_parsed* contains every reachable DSO and is
+    safe to read from multiple threads without mutation.
+    """
+    visited = set()  # type: set[str]
+    queue = deque()  # type: deque[str]
+
+    for target in proj_elfs:
+        parsed = all_parsed.get(target)
+        if not parsed:
+            continue
+        visited.add(target)
+        for name in parsed[1]:
+            queue.append(name)
+
+    while queue:
+        name = queue.popleft()
+        resolved = resolver.resolve(name)
+        if not resolved or resolved in visited:
+            continue
+        visited.add(resolved)
+        dep_parsed = all_parsed.get(resolved)
+        if dep_parsed is None:
+            dep_parsed = parse_elf(resolved)
+            all_parsed[resolved] = dep_parsed
+            dep_soname = dep_parsed[0]
+            dep_basename = os.path.basename(resolved)
+            if dep_basename not in resolver.local_map:
+                resolver.local_map[dep_basename] = resolved
+            if dep_soname and dep_soname not in resolver.local_map:
+                resolver.local_map[dep_soname] = resolved
+        for dep_name in dep_parsed[1]:
+            queue.append(dep_name)
+
+
+def _check_one_target(args_tuple):
+    # type: (tuple) -> tuple[str, set[str]] | None
+    """Worker for parallel find_missing_symbols.
+
+    Receives the resolver cache snapshot and the full all_parsed dict
+    so it can walk the DT_NEEDED closure without mutation.
+    """
+    target, parsed_target, all_parsed, resolver_cache = args_tuple
+    undef = parsed_target[3]
+    if not undef:
+        return None
+    # Inline closure walk using read-only all_parsed
+    available = set(parsed_target[2].keys())
+    visited = set()  # type: set[str]
+    queue = deque(parsed_target[1])
+    while queue:
+        name = queue.popleft()
+        resolved = resolver_cache.get(name)
+        if not resolved or resolved in visited:
+            continue
+        visited.add(resolved)
+        dep_parsed = all_parsed.get(resolved)
+        if dep_parsed is None:
+            continue
+        available.update(dep_parsed[2].keys())
+        for dep_name in dep_parsed[1]:
+            queue.append(dep_name)
+    missing = undef - available
+    if missing:
+        return (target, missing)
+    return None
+
+
 def find_missing_symbols(proj_elfs, all_parsed, resolver, verbose=False):
     # type: (list[str], dict, LibResolver, bool) -> list[tuple[str, set[str]]]
     """For each proj ELF, find undefined syms not in transitive DT_NEEDED.
 
     Returns list of ``(target_path, missing_syms_set)``.
-    Side-effect: *all_parsed* may be extended with on-demand parsed libs.
+    Requires prepopulate_all_deps() to have been called first so that
+    all_parsed is complete and read-only.
     """
-    results = []  # type: list[tuple[str, set[str]]]
+    # Snapshot the resolver cache so workers can use it
+    resolver_snapshot = dict(resolver._cache)
+
+    work = []
     for target in proj_elfs:
         parsed = all_parsed.get(target)
         if not parsed:
             continue
-        undef = parsed[3]
-        if not undef:
-            continue
-        available = compute_available_syms(
-            target, all_parsed, resolver, verbose=verbose)
-        missing = undef - available
-        if missing:
-            results.append((target, missing))
+        work.append((target, parsed, all_parsed, resolver_snapshot))
+
+    n_cpu = os.cpu_count() or 2
+    n_workers = max(1, min(n_cpu - 1, len(work), 64))
+
+    results = []  # type: list[tuple[str, set[str]]]
+    # Use threads here — the work is dict-lookup heavy but each target
+    # shares the same read-only all_parsed dict (no pickle cost).
+    # GIL contention is acceptable because the alternative is pickling
+    # the entire all_parsed dict (hundreds of MB) to each process.
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for result in pool.map(_check_one_target, work):
+            if result is not None:
+                results.append(result)
     return results
 
 
@@ -403,7 +583,7 @@ def build_sym_index(all_parsed):
     """Build symbol -> [provider_realpath, ...] index from all parsed ELFs."""
     idx = defaultdict(list)  # type: defaultdict[str, list[str]]
     for path, (soname, needed, defined, undef) in all_parsed.items():
-        for s in defined:
+        for s in defined.keys():
             idx[s].append(path)
     return dict(idx)
 
@@ -448,6 +628,191 @@ def match_providers(missing_results, sym_index, proj_set, all_parsed):
             'missing': entries,
         })
     return output
+
+
+# -- Analysis: duplicate symbols --------------------------------------------
+
+# C++ vague-linkage prefixes.  These symbols are emitted WEAK in every TU
+# that instantiates the type; duplicates across DSOs are expected and
+# dedup'd by the resolver, so they are noise by default.
+#   _ZTV = vtable, _ZTI = typeinfo, _ZTS = typeinfo-name,
+#   _ZTC = construction-vtable, _ZTT = VTT (virtual table table)
+CXX_VAGUE_PREFIXES = ('_ZTV', '_ZTI', '_ZTS', '_ZTC', '_ZTT')
+
+
+def is_cxx_vague(sym):
+    # type: (str) -> bool
+    return sym.startswith(CXX_VAGUE_PREFIXES)
+
+
+def _compute_closure(target, all_parsed, resolver):
+    # type: (str, dict, LibResolver) -> set[str]
+    """Transitive DT_NEEDED closure of *target* (inclusive).
+
+    Lazy-parses any resolved dep missing from *all_parsed* and inserts
+    it, so the caller's global map stays complete.
+    """
+    parsed = all_parsed.get(target)
+    if not parsed:
+        return set()
+    visited = {target}
+    queue = deque(parsed[1])
+    while queue:
+        name = queue.popleft()
+        resolved = resolver.resolve(name)
+        if not resolved or resolved in visited:
+            continue
+        visited.add(resolved)
+        dep_parsed = all_parsed.get(resolved)
+        if dep_parsed is None:
+            dep_parsed = parse_elf(resolved)
+            all_parsed[resolved] = dep_parsed
+        queue.extend(dep_parsed[1])
+    return visited
+
+
+def _build_provs_chunk(args_tuple):
+    # type: (tuple) -> dict[str, list[tuple[str, str]]]
+    """Worker: build sym->(path,bind) map for a chunk of DSOs.
+
+    Receives only the slice of parsed data it needs (not the full dict)
+    to minimise pickle overhead when used with ProcessPoolExecutor.
+    """
+    parsed_slice, filter_cxx_vague = args_tuple
+    local = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
+    for path, parsed in parsed_slice:
+        for sym, bind in parsed[2].items():
+            if sym in IGNORE_SYMS:
+                continue
+            if filter_cxx_vague and is_cxx_vague(sym):
+                continue
+            local[sym].append((path, bind))
+    return dict(local)
+
+
+def _scan_target_dups(args_tuple):
+    # type: (tuple) -> dict | None
+    """Worker: scan one target for duplicate symbols in its closure."""
+    target, closure, dso_contrib, proj_set, target_type = args_tuple
+    providers_here = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
+    for path in closure:
+        for sym, bind in dso_contrib.get(path, ()):
+            providers_here[sym].append((path, bind))
+
+    dups = []  # type: list[dict]
+    for sym, provs in providers_here.items():
+        if len(provs) < 2:
+            continue
+        if proj_set is not None and not any(p in proj_set for p, _ in provs):
+            continue
+        binds = {b for _, b in provs}
+        severity = 'warn' if 'WEAK' in binds else 'error'
+        dups.append({
+            'symbol': sym,
+            'providers': provs,
+            'severity': severity,
+        })
+
+    if not dups:
+        return None
+    dups.sort(key=lambda d: (d['severity'] != 'error', d['symbol']))
+    return {
+        'consumer': target,
+        'consumer_type': target_type,
+        'duplicates': dups,
+    }
+
+
+def find_duplicate_symbols(scan_elfs, all_parsed, resolver,
+                           filter_cxx_vague=True, proj_set=None):
+    # type: (list[str], dict, LibResolver, bool, set[str] | None) -> list[dict]
+    """Find symbols defined by more than one DSO in each target's load image.
+
+    For every target in *scan_elfs*, walks its DT_NEEDED closure (inclusive),
+    collects defined symbols with ``(dso_path, bind)``, and reports symbols
+    defined by multiple DSOs in that closure.
+
+    Severity:
+      * STRONG x STRONG (no WEAK binds)      -> 'error'
+      * WEAK only / mixed STRONG+WEAK        -> 'warn'
+
+    If *proj_set* is provided, only duplicates with at least one provider
+    inside the project are kept — system-lib-only duplicates (e.g. libc
+    vs ld-linux) are filtered out as non-actionable noise.
+
+    Performance: rather than rebuilding a providers dict per target over
+    *every* defined symbol in the closure, we precompute a global
+    symbol -> [(path, bind), ...] map across all reachable DSOs, restrict
+    it to symbols defined by >1 DSO globally, and invert to per-DSO
+    multi-defined contributions.  Each target then only iterates over
+    contributions from DSOs in its closure — typically two orders of
+    magnitude fewer items than the full defined-syms set.
+
+    Phases 2 and 4 are parallelized with threads.
+
+    Returns list of per-target records (only targets with >=1 duplicate).
+    """
+    n_cpu = os.cpu_count() or 2
+    n_workers = max(1, min(n_cpu - 1, 64))
+
+    # Phase 1: resolve closures for every scan target (lazy-parses any
+    # deps missing from all_parsed).  Record the union of reachable DSOs.
+    closures = {}  # type: dict[str, set[str]]
+    reachable = set()  # type: set[str]
+    for target in scan_elfs:
+        cl = _compute_closure(target, all_parsed, resolver)
+        if cl:
+            closures[target] = cl
+            reachable.update(cl)
+
+    if not reachable:
+        return []
+
+    # Phase 2: build global sym -> [(path, bind)] across reachable DSOs.
+    # Shard DSOs across processes — each worker receives only its slice
+    # of parsed data to avoid pickling the entire dict.
+    reachable_list = list(reachable)
+    chunk_size = max(1, len(reachable_list) // (n_workers * 4))
+    chunks = [reachable_list[i:i + chunk_size]
+              for i in range(0, len(reachable_list), chunk_size)]
+
+    global_provs = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        work = [([(p, all_parsed[p]) for p in chunk if p in all_parsed],
+                  filter_cxx_vague) for chunk in chunks]
+        for partial in pool.map(_build_provs_chunk, work):
+            for sym, provs in partial.items():
+                global_provs[sym].extend(provs)
+
+    # Phase 3: keep only symbols with >1 provider globally, and invert to
+    # per-DSO multi-defined contribution lists.  Unique-globally symbols
+    # cannot form a duplicate in any target's closure — skipping them up
+    # front is where most of the speedup comes from.
+    dso_contrib = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
+    for sym, provs in global_provs.items():
+        if len(provs) < 2:
+            continue
+        for path, bind in provs:
+            dso_contrib[path].append((sym, bind))
+
+    if not dso_contrib:
+        return []
+
+    # Phase 4: per target, collect providers from its closure using the
+    # precomputed per-DSO contribution lists, classify severity.
+    # Parallelized across processes.
+    dso_contrib_dict = dict(dso_contrib)
+    target_work = [(target, closures[target], dso_contrib_dict, proj_set,
+                    classify_elf(target) or 'unknown')
+                   for target in scan_elfs if target in closures]
+
+    results = []  # type: list[dict]
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        for result in pool.map(_scan_target_dups, target_work):
+            if result is not None:
+                results.append(result)
+
+    return results
 
 
 # -- Analysis: circular dependencies ----------------------------------------
@@ -812,6 +1177,80 @@ def print_latent_cycle_report(latent_cycles):
     print()
 
 
+def _bind_label(bind):
+    # type: (str) -> str
+    return 'WEAK' if bind == 'WEAK' else 'STRONG'
+
+
+def print_duplicate_report(dup_results, proj_dir, do_demangle=False,
+                           errors_only=False):
+    # type: (list[dict], str, bool, bool) -> None
+    print('=' * 60)
+    print('  Duplicate symbols in per-target DT_NEEDED closures')
+    print('=' * 60)
+
+    if not dup_results:
+        print('\n  No duplicate symbols found.\n')
+        return
+
+    demangled = {}  # type: dict[str, str]
+    if do_demangle:
+        all_syms = []  # type: list[str]
+        for r in dup_results:
+            all_syms.extend(d['symbol'] for d in r['duplicates'])
+        demangled = demangle_batch(all_syms)
+
+    total_err = 0
+    total_warn = 0
+
+    for r in dup_results:
+        consumer = r['consumer']
+        rel = os.path.relpath(consumer, proj_dir)
+        ctype = r['consumer_type']
+        errors = [d for d in r['duplicates'] if d['severity'] == 'error']
+        warns = [d for d in r['duplicates'] if d['severity'] == 'warn']
+        total_err += len(errors)
+        total_warn += len(warns)
+
+        if errors_only and not errors:
+            continue
+
+        print('\n  %s  (%s, %d error%s, %d warning%s):' %
+              (rel, ctype,
+               len(errors), 's' if len(errors) != 1 else '',
+               len(warns), 's' if len(warns) != 1 else ''))
+
+        def _fmt_dup(d):
+            # type: (dict) -> None
+            sym = d['symbol']
+            display = sym
+            if do_demangle and demangled.get(sym, sym) != sym:
+                display = '%s  [%s]' % (demangled[sym], sym)
+            provs = ', '.join(
+                '%s:%s' % (os.path.basename(p), _bind_label(b))
+                for p, b in d['providers'])
+            print('      %s' % display)
+            print('        in: %s' % provs)
+
+        if errors:
+            print('    ERRORS (STRONG x STRONG):')
+            for d in errors:
+                _fmt_dup(d)
+        if warns and not errors_only:
+            print('    WARNINGS (WEAK or mixed):')
+            for d in warns:
+                _fmt_dup(d)
+
+    print()
+    print('-' * 60)
+    print('  Total: %d duplicate-symbol error%s, %d warning%s '
+          'in %d consumer%s' %
+          (total_err, 's' if total_err != 1 else '',
+           total_warn, 's' if total_warn != 1 else '',
+           len(dup_results), 's' if len(dup_results) != 1 else ''))
+    print()
+
+
 def print_patchelf_commands(results, proj_edges, path_to_name):
     # type: (list[dict], dict[str, list[str]], dict[str, str]) -> None
     """Print safe patchelf commands and warn about unsafe ones.
@@ -907,8 +1346,9 @@ def print_patchelf_commands(results, proj_edges, path_to_name):
         print()
 
 
-def print_json_output(results, sccs, edges, proj_dir, latent_cycles=None):
-    # type: (list[dict], list[list[str]], dict[str, list[str]], str) -> None
+def print_json_output(results, sccs, edges, proj_dir, latent_cycles=None,
+                      dup_results=None):
+    # type: (list[dict], list[list[str]], dict[str, list[str]], str, list[dict] | None, list[dict] | None) -> None
     cycles = []  # type: list[dict]
     for scc in sccs:
         cycle_path = find_cycle_path(edges, scc)
@@ -946,11 +1386,34 @@ def print_json_output(results, sccs, edges, proj_dir, latent_cycles=None):
             'symbols': lc['symbols'],
         })
 
+    dup_out = []  # type: list[dict]
+    for r in (dup_results or []):
+        entry = {
+            'consumer': os.path.relpath(r['consumer'], proj_dir),
+            'consumer_type': r['consumer_type'],
+            'duplicates': [],
+        }  # type: dict
+        for d in r['duplicates']:
+            entry['duplicates'].append({
+                'symbol': d['symbol'],
+                'severity': d['severity'],
+                'providers': [
+                    {
+                        'path': os.path.relpath(p, proj_dir)
+                                if p.startswith(proj_dir) else p,
+                        'bind': b,
+                    }
+                    for p, b in d['providers']
+                ],
+            })
+        dup_out.append(entry)
+
     output = {
         'proj_dir': proj_dir,
         'missing_symbols': missing_out,
         'circular_dependencies': cycles,
         'latent_circular_dependencies': latent_out,
+        'duplicate_symbols': dup_out,
     }
     print(json.dumps(output, indent=2))
 
@@ -973,6 +1436,22 @@ def main():
                     help='Only report circular dependencies')
     ap.add_argument('--demangle', action='store_true',
                     help='Demangle C++ symbols via c++filt')
+    ap.add_argument('--all-cxx', action='store_true',
+                    help='Include C++ vague-linkage symbols (vtables, '
+                         'typeinfo) in the duplicate-symbol report.  These '
+                         'are filtered by default as they are benign '
+                         'ODR-dedup noise.')
+    ap.add_argument('--no-duplicates', action='store_true',
+                    help='Skip duplicate-symbol detection (runs by default).')
+    ap.add_argument('--system-dups', action='store_true',
+                    help='Include duplicates whose providers are all system '
+                         'libs (e.g. libc vs ld-linux).  By default only '
+                         'duplicates touching at least one project ELF are '
+                         'reported.')
+    ap.add_argument('--dups-errors-only', action='store_true',
+                    help='Suppress WEAK / mixed-binding duplicate warnings '
+                         'from the text report; only print STRONG x STRONG '
+                         'errors.  JSON output is unchanged.')
     ap.add_argument('--blacklist', metavar='FILE',
                     help='File listing paths (relative to proj_dir) whose '
                          'ELFs are indexed as symbol providers but not '
@@ -1025,19 +1504,56 @@ def main():
     all_elfs = all_proj_elfs + ext_libs
 
     # -- Parallel parse ------------------------------------------------------
-    log('[parse] Parsing %d ELF files ...' % len(all_elfs))
-    all_parsed = {}  # type: dict[str, tuple]
+    # Cache lookups run in the parent so workers are stateless; misses
+    # are dispatched to a ProcessPoolExecutor so Python-side parsing can
+    # actually run on multiple cores (threads would serialize on the GIL).
+    _load_parse_cache()
+    atexit.register(_save_parse_cache)
 
-    n_workers = min(os.cpu_count() or 4, len(all_elfs), 64)
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(parse_elf, p): p for p in all_elfs}
-        done = 0
-        for fut in as_completed(futures):
-            p = futures[fut]
-            all_parsed[p] = fut.result()
-            done += 1
-            if args.verbose and done % 200 == 0:
-                log('[parse] ... %d / %d' % (done, len(all_elfs)))
+    all_parsed = {}  # type: dict[str, tuple]
+    misses = []  # type: list[str]
+    miss_stats = {}  # type: dict[str, tuple[float, int, str]]
+
+    for p in all_elfs:
+        abs_p = os.path.realpath(p)
+        try:
+            st = os.stat(abs_p)
+        except OSError:
+            all_parsed[p] = _EMPTY_PARSE
+            continue
+        cached = _PARSE_CACHE.get(abs_p)
+        if (cached is not None
+                and cached[0] == st.st_mtime
+                and cached[1] == st.st_size):
+            all_parsed[p] = cached[2]
+        else:
+            misses.append(p)
+            miss_stats[p] = (st.st_mtime, st.st_size, abs_p)
+
+    log('[parse] %d ELF file(s): %d cached, %d to parse' %
+        (len(all_elfs), len(all_elfs) - len(misses), len(misses)))
+
+    if misses:
+        # Leave one core for the user.
+        n_cpu = os.cpu_count() or 2
+        n_workers = max(1, min(n_cpu - 1, len(misses), 64))
+        # Larger chunksize amortises pickle overhead across many small tasks.
+        chunksize = max(1, len(misses) // (n_workers * 4))
+        log('[parse] Using %d worker process(es) (of %d CPU cores)' %
+            (n_workers, n_cpu))
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            done = 0
+            for p, result in zip(misses,
+                                 pool.map(_parse_elf_raw, misses,
+                                          chunksize=chunksize)):
+                all_parsed[p] = result
+                if result != _EMPTY_PARSE:
+                    mtime, size, abs_p = miss_stats[p]
+                    _PARSE_CACHE[abs_p] = (mtime, size, result)
+                done += 1
+                if args.verbose and done % 200 == 0:
+                    log('[parse] ... %d / %d' % (done, len(misses)))
+        _mark_cache_dirty()
 
     log('[parse] Done.')
 
@@ -1093,7 +1609,14 @@ def main():
             print_cycle_report(sccs, proj_edges)
         sys.exit(1 if sccs else 0)
 
-    # -- Missing symbol analysis ---------------------------------------------
+    # -- Pre-populate all transitive deps (single-threaded) -------------------
+    log('[analyze] Pre-populating transitive DT_NEEDED deps ...')
+    prepopulate_all_deps(scan_elfs, all_parsed, resolver,
+                         verbose=args.verbose)
+    log('[analyze] all_parsed now has %d ELFs (analysis is read-only)'
+        % len(all_parsed))
+
+    # -- Missing symbol analysis (parallel) ------------------------------------
     log('[analyze] Checking symbol resolution ...')
     missing_results = find_missing_symbols(
         scan_elfs, all_parsed, resolver, verbose=args.verbose)
@@ -1108,9 +1631,24 @@ def main():
     # -- Latent cycle detection ----------------------------------------------
     latent_cycles = detect_latent_cycles(results, proj_edges, path_to_name)
 
+    # -- Duplicate-symbol detection ------------------------------------------
+    dup_results = []  # type: list[dict]
+    if not args.no_duplicates:
+        log('[analyze] Scanning for duplicate symbols ...')
+        dup_proj_set = None if args.system_dups else proj_set
+        dup_results = find_duplicate_symbols(
+            scan_elfs, all_parsed, resolver,
+            filter_cxx_vague=not args.all_cxx,
+            proj_set=dup_proj_set)
+
+    dup_errors = sum(
+        1 for r in dup_results for d in r['duplicates']
+        if d['severity'] == 'error')
+
     # -- Output --------------------------------------------------------------
     if is_json:
-        print_json_output(results, sccs, proj_edges, proj_dir, latent_cycles)
+        print_json_output(results, sccs, proj_edges, proj_dir,
+                          latent_cycles, dup_results)
     else:
         print()
         print('=' * 60)
@@ -1121,9 +1659,13 @@ def main():
         print_missing_report(results, proj_dir, do_demangle=args.demangle)
         print_cycle_report(sccs, proj_edges)
         print_latent_cycle_report(latent_cycles)
+        if not args.no_duplicates:
+            print_duplicate_report(
+                dup_results, proj_dir, do_demangle=args.demangle,
+                errors_only=args.dups_errors_only)
         print_patchelf_commands(results, proj_edges, path_to_name)
 
-    has_issues = bool(results) or bool(sccs)
+    has_issues = bool(results) or bool(sccs) or dup_errors > 0
     sys.exit(1 if has_issues else 0)
 
 

@@ -1886,10 +1886,28 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
     }
 
-    /* +11: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP, LD_LIBRARY_PATH,
+    /* Blacklist: exe basenames that need ANTIREV_NO_PRELOAD=1 because their
+     * dlopen'd libs have implicit inter-lib symbol dependencies that break
+     * when constructors run in per-dep isolation.  Add names here. */
+    static const char *no_preload_blacklist[] = {
+        "GUI",
+        /* add more exe basenames here as needed */
+        NULL
+    };
+    const char *exe_basename = strrchr(real_exe, '/');
+    exe_basename = exe_basename ? exe_basename + 1 : real_exe;
+    int force_no_preload = 0;
+    for (int k = 0; no_preload_blacklist[k]; k++) {
+        if (strcmp(exe_basename, no_preload_blacklist[k]) == 0) {
+            force_no_preload = 1;
+            break;
+        }
+    }
+
+    /* +12: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP, LD_LIBRARY_PATH,
      * ANTIREV_CLOSE_FDS, ANTIREV_LIBD_SOCK, ANTIREV_ENC_LIBS,
-     * ANTIREV_SYMLINK_DIR, NULL + spare */
-    char **new_env = malloc((size_t)(envc + 11) * sizeof(char *));
+     * ANTIREV_SYMLINK_DIR, ANTIREV_NO_PRELOAD, NULL + spare */
+    char **new_env = malloc((size_t)(envc + 12) * sizeof(char *));
     if (!new_env) { perror("malloc env"); return 1; }
 
     char real_exe_entry[4096 + 32];
@@ -2018,6 +2036,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         if (strncmp(envp[j], "ANTIREV_LIBD_SOCK=",     18) == 0) continue;
         if (strncmp(envp[j], "ANTIREV_ENC_LIBS=",      17) == 0) continue;
         if (strncmp(envp[j], "ANTIREV_SYMLINK_DIR=",   20) == 0) continue;
+        if (strncmp(envp[j], "ANTIREV_NO_PRELOAD=",   19) == 0) continue;
         new_env[ei++] = envp[j];
     }
     new_env[ei++] = real_exe_entry;
@@ -2035,6 +2054,8 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         new_env[ei++] = enc_libs_entry;
     if (symlink_dir_entry)
         new_env[ei++] = symlink_dir_entry;
+    if (force_no_preload)
+        new_env[ei++] = "ANTIREV_NO_PRELOAD=1";
     new_env[ei]   = NULL;
 
     /* Phase 6. Replace this process with the decrypted binary — no fork, same PID.

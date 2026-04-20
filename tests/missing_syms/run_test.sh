@@ -168,6 +168,46 @@ gcc -shared -fPIC -o "$WORKDIR/libclean.so" "$WORKDIR/clean.c" \
 cp "$WORKDIR/libclean.so" "$WORKDIR/libclean.so.1"
 cp "$WORKDIR/libclean.so" "$WORKDIR/libclean.so.1.2.3"
 
+# Duplicate-symbol test fixtures ────────────────────────────────────
+# libdup_a.so and libdup_b.so both export:
+#   dup_strong  (STRONG in both)    -> STRONG x STRONG = error
+#   dup_weak    (WEAK in both)      -> WEAK x WEAK     = warning
+#   dup_mixed   (STRONG in a, WEAK in b) -> mixed     = warning
+#   _ZTV7Example (WEAK in both, vague-linkage) -> filtered by default
+#   dup_a_only / dup_b_only         -> unique, no dup
+# test_dup links to both libs, so its closure contains the duplicates.
+cat > "$WORKDIR/dup_a.c" << 'SRC'
+int dup_strong(int x) { return x + 1; }
+__attribute__((weak)) int dup_weak(int x) { return x + 10; }
+int dup_mixed(int x) { return x + 100; }
+__attribute__((weak)) int _ZTV7Example = 42;
+int dup_a_only(int x) { return x; }
+SRC
+cat > "$WORKDIR/dup_b.c" << 'SRC'
+int dup_strong(int x) { return x + 2; }
+__attribute__((weak)) int dup_weak(int x) { return x + 20; }
+__attribute__((weak)) int dup_mixed(int x) { return x + 200; }
+__attribute__((weak)) int _ZTV7Example = 43;
+int dup_b_only(int x) { return x; }
+SRC
+gcc -shared -fPIC -o "$WORKDIR/libdup_a.so" "$WORKDIR/dup_a.c" \
+    -Wl,-soname,libdup_a.so
+gcc -shared -fPIC -o "$WORKDIR/libdup_b.so" "$WORKDIR/dup_b.c" \
+    -Wl,-soname,libdup_b.so
+
+cat > "$WORKDIR/dup_main.c" << 'SRC'
+extern int dup_a_only(int);
+extern int dup_b_only(int);
+extern int dup_strong(int);
+#include <stdio.h>
+int main(void) {
+    printf("%d\n", dup_a_only(0) + dup_b_only(0) + dup_strong(0));
+    return 0;
+}
+SRC
+gcc -o "$WORKDIR/test_dup" "$WORKDIR/dup_main.c" \
+    -L"$WORKDIR" -ldup_a -ldup_b -Wl,-rpath,"$WORKDIR"
+
 echo
 echo "=== Built test binaries ==="
 file "$WORKDIR"/test_main "$WORKDIR"/lib*.so*
@@ -289,6 +329,95 @@ fi
 
 echo
 
+# --- Duplicate-symbol detection (default mode) ---
+# Extract just the duplicate section to make assertions order-robust.
+DUP_SECTION=$(echo "$TEXT_OUT" | awk '
+    /Duplicate symbols in per-target/ {on=1}
+    /Patchelf commands/ {on=0}
+    on {print}
+')
+
+# test_dup should appear as a consumer
+if echo "$DUP_SECTION" | grep -q "test_dup"; then
+    echo "PASS: test_dup listed in duplicate report"
+else
+    echo "FAIL: test_dup not listed in duplicate report"
+    FAIL=1
+fi
+
+# dup_strong: STRONG x STRONG -> error
+if echo "$DUP_SECTION" | grep -A1 "dup_strong$" | grep -q "libdup_a.so:STRONG"; then
+    if echo "$DUP_SECTION" | grep -A1 "dup_strong$" | grep -q "libdup_b.so:STRONG"; then
+        echo "PASS: dup_strong reported as STRONG x STRONG"
+    else
+        echo "FAIL: dup_strong missing libdup_b provider"
+        FAIL=1
+    fi
+else
+    echo "FAIL: dup_strong not reported"
+    FAIL=1
+fi
+
+# dup_weak must be in WARNINGS section, not ERRORS.
+# Per-consumer section layout: "ERRORS ..." block then "WARNINGS ..." block.
+# We check that dup_weak appears after a WARNINGS header somewhere.
+if echo "$DUP_SECTION" | awk '
+    /WARNINGS \(WEAK or mixed\)/ {warn=1; next}
+    /ERRORS \(STRONG x STRONG\)/ {warn=0; next}
+    warn && /dup_weak$/ {found=1}
+    END {exit !found}
+'; then
+    echo "PASS: dup_weak reported as WEAK warning"
+else
+    echo "FAIL: dup_weak not found under WARNINGS"
+    FAIL=1
+fi
+
+# dup_mixed: STRONG in a, WEAK in b -> warning
+if echo "$DUP_SECTION" | awk '
+    /WARNINGS \(WEAK or mixed\)/ {warn=1; next}
+    /ERRORS \(STRONG x STRONG\)/ {warn=0; next}
+    warn && /dup_mixed$/ {found=1}
+    END {exit !found}
+'; then
+    echo "PASS: dup_mixed reported as mixed warning"
+else
+    echo "FAIL: dup_mixed not found under WARNINGS"
+    FAIL=1
+fi
+
+# _ZTV7Example should NOT appear in default output (vague-linkage filter)
+if echo "$DUP_SECTION" | grep -q "_ZTV7Example"; then
+    echo "FAIL: _ZTV7Example should be filtered by default"
+    FAIL=1
+else
+    echo "PASS: C++ vague-linkage symbol filtered by default"
+fi
+
+# Exit code: STRONG x STRONG duplicate should make exit non-zero.
+# The tool already exits 1 when missing_syms or cycles exist, but confirm
+# the dup-error path on its own by running --no-duplicates first:
+"$TOOL" "$WORKDIR" --no-duplicates --cycles-only > /dev/null 2>&1 || true
+# Already tested elsewhere; just confirm --no-duplicates suppresses output.
+NODUP_OUT=$("$TOOL" "$WORKDIR" --no-duplicates 2>&1) || true
+if echo "$NODUP_OUT" | grep -q "Duplicate symbols in per-target"; then
+    echo "FAIL: --no-duplicates did not skip duplicate section"
+    FAIL=1
+else
+    echo "PASS: --no-duplicates suppresses duplicate report"
+fi
+
+# --all-cxx should surface _ZTV7Example
+ALLCXX_OUT=$("$TOOL" "$WORKDIR" --all-cxx 2>&1) || true
+if echo "$ALLCXX_OUT" | grep -q "_ZTV7Example"; then
+    echo "PASS: --all-cxx surfaces vague-linkage symbol"
+else
+    echo "FAIL: --all-cxx did not include _ZTV7Example"
+    FAIL=1
+fi
+
+echo
+
 # --- Blacklist mode ---
 BL_OUT=$("$TOOL" "$WORKDIR" --blacklist "$WORKDIR/blacklist.txt" --demangle 2>&1) || true
 echo "$BL_OUT"
@@ -351,6 +480,19 @@ assert len(data['latent_circular_dependencies']) >= 1, 'no latent cycles'
 lc = data['latent_circular_dependencies'][0]
 assert 'cycle' in lc, 'latent cycle missing cycle path'
 assert 'symbols' in lc, 'latent cycle missing symbols'
+assert 'duplicate_symbols' in data, 'no duplicate_symbols key'
+# At least one consumer must report dup_strong as error
+found_dup = False
+for r in data['duplicate_symbols']:
+    for d in r['duplicates']:
+        if d['symbol'] == 'dup_strong':
+            found_dup = True
+            assert d['severity'] == 'error', \
+                'dup_strong severity = %s, want error' % d['severity']
+            binds = sorted(p['bind'] for p in d['providers'])
+            assert binds == ['GLOBAL', 'GLOBAL'], \
+                'dup_strong binds = %s' % binds
+assert found_dup, 'dup_strong not in JSON duplicate_symbols'
 print('PASS: JSON content validated')
 "; then
     :

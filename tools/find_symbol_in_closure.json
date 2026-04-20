@@ -1,0 +1,13 @@
+{
+    "symbols": [
+        "descriptor_table_your_proto_2eproto",
+        "descriptor_table_another_proto_2eproto"
+    ],
+    "gui_exe": "/proj/bin/GUI",
+    "top_libs": [
+        "/proj/lib/libFoo.so",
+        "/proj/lib/libBar.so"
+    ],
+    "lib_dir": "/proj/lib",
+    "workers": 8
+}
