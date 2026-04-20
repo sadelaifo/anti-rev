@@ -1499,8 +1499,20 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 size_t dirlen = slash ? (size_t)(slash - real_exe) : 1;
                 if (!slash) { daemon_path[0] = '.'; dirlen = 1; }
                 else memcpy(daemon_path, real_exe, dirlen);
+                /* Try arch-specific daemon first, then generic */
+#if defined(__x86_64__) || defined(__i386__)
+                snprintf(daemon_path + dirlen,
+                         sizeof(daemon_path) - dirlen, "/.antirev-libd-x86_64");
+#elif defined(__aarch64__)
+                snprintf(daemon_path + dirlen,
+                         sizeof(daemon_path) - dirlen, "/.antirev-libd-aarch64");
+#else
                 snprintf(daemon_path + dirlen,
                          sizeof(daemon_path) - dirlen, "/.antirev-libd");
+#endif
+                if (access(daemon_path, X_OK) != 0)
+                    snprintf(daemon_path + dirlen,
+                             sizeof(daemon_path) - dirlen, "/.antirev-libd");
                 if (access(daemon_path, X_OK) == 0) {
                     pid_t pid = fork();
                     if (pid == 0) {
@@ -1658,16 +1670,31 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
 
             /* First failure: try to auto-launch the daemon */
             if (!daemon_launched && retry == 0) {
-                /* Build path: dirname(real_exe) + "/.antirev-libd" */
+                /* Build path: dirname(real_exe) + "/.antirev-libd[-arch]" */
                 char daemon_path[4096];
                 {
                     char *slash = strrchr(real_exe, '/');
                     size_t dirlen = slash ? (size_t)(slash - real_exe) : 1;
                     if (!slash) { daemon_path[0] = '.'; dirlen = 1; }
                     else memcpy(daemon_path, real_exe, dirlen);
+                    /* Try arch-specific daemon first, then generic */
+#if defined(__x86_64__) || defined(__i386__)
+                    snprintf(daemon_path + dirlen,
+                             sizeof(daemon_path) - dirlen,
+                             "/.antirev-libd-x86_64");
+#elif defined(__aarch64__)
+                    snprintf(daemon_path + dirlen,
+                             sizeof(daemon_path) - dirlen,
+                             "/.antirev-libd-aarch64");
+#else
                     snprintf(daemon_path + dirlen,
                              sizeof(daemon_path) - dirlen,
                              "/.antirev-libd");
+#endif
+                    if (access(daemon_path, X_OK) != 0)
+                        snprintf(daemon_path + dirlen,
+                                 sizeof(daemon_path) - dirlen,
+                                 "/.antirev-libd");
                 }
 
                 if (access(daemon_path, X_OK) == 0) {
@@ -2031,7 +2058,132 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         new_env[ei++] = "ANTIREV_NO_PRELOAD=1";
     new_env[ei]   = NULL;
 
-    /* Phase 6. Replace this process with the decrypted binary — no fork, same PID */
+    /* Phase 6. Replace this process with the decrypted binary — no fork, same PID.
+     *
+     * Runtime cross-architecture detection: read the ELF e_machine field from
+     * the decrypted binary. If it differs from the host architecture, QEMU
+     * user-mode is needed — try direct QEMU exec with the binary name as
+     * argv[0] so "ps -ef" shows it correctly. Otherwise fexecve directly.
+     *
+     * This avoids affecting native same-arch execution (x86→x86, aarch64→aarch64). */
+    {
+        int needs_qemu = 0;
+        uint8_t elf_hdr[20];
+        if (pread(main_fd, elf_hdr, sizeof(elf_hdr), 0) == sizeof(elf_hdr)
+            && elf_hdr[0] == 0x7f && elf_hdr[1] == 'E'
+            && elf_hdr[2] == 'L' && elf_hdr[3] == 'F') {
+            uint16_t e_machine = elf_hdr[18] | ((uint16_t)elf_hdr[19] << 8);
+#if defined(__x86_64__) || defined(__i386__)
+            needs_qemu = (e_machine != 0x3E && e_machine != 0x03); /* not x86_64/x86 */
+#elif defined(__aarch64__)
+            needs_qemu = (e_machine != 0xB7); /* not aarch64 */
+#endif
+        }
+
+        if (needs_qemu) {
+            const char *binname = strrchr(real_exe, '/');
+            binname = binname ? binname + 1 : real_exe;
+
+            int orig_argc = 0;
+            while (argv[orig_argc]) orig_argc++;
+
+            char fd_path[32];
+            snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
+
+            char **new_argv = malloc((size_t)(orig_argc + 2) * sizeof(char *));
+            if (new_argv) {
+                static const char *qemu_candidates[] = {
+                    "/tmp/.antirev-qemu-aarch64",
+                    "/usr/bin/qemu-aarch64-static",
+                    "/usr/bin/qemu-aarch64",
+                    NULL
+                };
+
+                new_argv[0] = (char *)binname;
+                new_argv[1] = fd_path;
+                for (int i = 1; i < orig_argc; i++) new_argv[i + 1] = argv[i];
+                new_argv[orig_argc + 1] = NULL;
+
+                for (int qi = 0; qemu_candidates[qi]; qi++) {
+                    struct stat st;
+                    if (stat(qemu_candidates[qi], &st) == 0) {
+                        execve(qemu_candidates[qi], new_argv, new_env);
+                    }
+                }
+                free(new_argv);
+            }
+
+            /* Probe-cache: fork a short-lived child via binfmt_misc to
+             * discover the QEMU binary from /proc/<child>/exe. Copy it
+             * to /tmp, kill the child, then re-exec with correct argv[0].
+             * This handles Docker where QEMU isn't on PATH (binfmt_misc
+             * F flag keeps it kernel-side only). */
+            pid_t probe = fork();
+            if (probe == 0) {
+                fexecve(main_fd, argv, new_env);
+                _exit(127);
+            }
+            if (probe > 0) {
+                /* Wait for child to exec into QEMU */
+                char probe_exe_path[64];
+                snprintf(probe_exe_path, sizeof(probe_exe_path),
+                         "/proc/%d/exe", (int)probe);
+
+                int cached = 0;
+                for (int i = 0; i < 50; i++) {  /* 50 × 20ms = 1s max */
+                    usleep(20000);
+                    char qemu_path[256];
+                    ssize_t ql = readlink(probe_exe_path, qemu_path,
+                                          sizeof(qemu_path) - 1);
+                    if (ql > 0) {
+                        qemu_path[ql] = '\0';
+                        if (strstr(qemu_path, "qemu") != NULL) {
+                            /* Found QEMU — copy it to cache */
+                            int src = open(probe_exe_path, O_RDONLY);
+                            if (src >= 0) {
+                                int dst = open("/tmp/.antirev-qemu-aarch64",
+                                               O_WRONLY | O_CREAT | O_TRUNC,
+                                               0755);
+                                if (dst >= 0) {
+                                    char cpbuf[8192];
+                                    ssize_t cpn;
+                                    while ((cpn = read(src, cpbuf,
+                                                       sizeof(cpbuf))) > 0)
+                                        write(dst, cpbuf, (size_t)cpn);
+                                    close(dst);
+                                    cached = 1;
+                                }
+                                close(src);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                /* Kill probe child */
+                kill(probe, SIGKILL);
+                int st;
+                waitpid(probe, &st, 0);
+
+                if (cached) {
+                    /* Re-exec through cached QEMU with binary name argv[0] */
+                    char **re_argv = malloc((size_t)(orig_argc + 2)
+                                           * sizeof(char *));
+                    if (re_argv) {
+                        re_argv[0] = (char *)binname;
+                        re_argv[1] = fd_path;
+                        for (int i = 1; i < orig_argc; i++)
+                            re_argv[i + 1] = argv[i];
+                        re_argv[orig_argc + 1] = NULL;
+                        execve("/tmp/.antirev-qemu-aarch64",
+                               re_argv, new_env);
+                        free(re_argv);
+                    }
+                }
+            }
+            /* probe/cache failed — fall through to normal fexecve */
+        }
+    }
     fexecve(main_fd, argv, new_env);
     perror("fexecve");
     return 1;

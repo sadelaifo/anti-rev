@@ -132,6 +132,13 @@ def is_blacklisted(rel_path: str, blacklist: list[tuple[str, str]]) -> bool:
             if rel_normalized.startswith(pattern) or \
                rel_normalized == pattern.rstrip('/'):
                 return True
+        elif kind == 'dir_any':
+            # Match directory name anywhere in path using fnmatch.
+            # "*helf/" matches exact "helf", "*helf*/" matches "shelf", "myhelf" etc.
+            dir_pattern = pattern.rstrip('/')
+            for part in rel_normalized.split('/')[:-1]:  # check each dir component
+                if fnmatch.fnmatch(part, dir_pattern):
+                    return True
         elif kind == 'path':
             if rel_normalized == pattern or \
                rel_normalized.startswith(pattern + '/'):
@@ -144,13 +151,23 @@ def is_blacklisted(rel_path: str, blacklist: list[tuple[str, str]]) -> bool:
 
 
 def compile_blacklist(raw: list[str]) -> list[tuple[str, str]]:
-    """Pre-classify blacklist entries once instead of per-file."""
+    """Pre-classify blacklist entries once instead of per-file.
+
+    Entry types:
+      'dir'      — "bin/"        matches paths starting with bin/
+      'dir_any'  — "*helf/"      matches paths containing /helf/ anywhere
+      'path'     — "L3/bin/3rd"  matches exact path or children
+      'name'     — "libfoo.so*"  matches filename with glob
+    """
     compiled = []
     for entry in raw:
         if not entry:
             continue
         entry = entry.replace('\\', '/')
-        if entry.endswith('/'):
+        if entry.startswith('*') and entry.endswith('/'):
+            # *helf/ → match directory name anywhere in path
+            compiled.append((entry[1:], 'dir_any'))
+        elif entry.endswith('/'):
             compiled.append((entry, 'dir'))
         elif '/' in entry:
             compiled.append((entry, 'path'))
@@ -677,29 +694,31 @@ def main():
                 except Exception as e:
                     sys.exit(f"[error] encrypt lib failed for {futures[fut]}: {e}")
 
-        # Build lightweight daemon: stub + key only, no bundled libs
-        daemon_arch = next(iter(stubs))
-        daemon_stub = stubs[daemon_arch]
-        daemon_path = output_dir / '.antirev-libd'
-        stub_data = daemon_stub.read_bytes()
-        bundle = struct.pack("<IB", 0, 0)  # 0 files, no flags
-        bundle_offset = len(stub_data)
-        trailer = struct.pack("<Q", bundle_offset) + key + MAGIC
-        daemon_path.parent.mkdir(parents=True, exist_ok=True)
-        daemon_path.write_bytes(stub_data + bundle + trailer)
-        os.chmod(str(daemon_path), 0o755)
-        print(f"[pack] Daemon binary: {daemon_path.name}  "
-              f"({daemon_path.stat().st_size:,} bytes, reads libs from disk)")
+        # Build lightweight daemon and wrapper for each architecture
+        for arch, stub_path in stubs.items():
+            stub_data = stub_path.read_bytes()
+            suffix = f'-{arch}' if len(stubs) > 1 else ''
 
-        # Build wrapper binary: connects to daemon, sets up env, execs argv[1...]
-        wrapper_path = output_dir / '.antirev-wrap'
-        wrap_bundle = struct.pack("<IB", 0, BFLAG_WRAPPER)
-        wrap_offset = len(stub_data)
-        wrap_trailer = struct.pack("<Q", wrap_offset) + key + MAGIC
-        wrapper_path.write_bytes(stub_data + wrap_bundle + wrap_trailer)
-        os.chmod(str(wrapper_path), 0o755)
-        print(f"[pack] Wrapper binary: {wrapper_path.name}  "
-              f"(use: .antirev-wrap <command> [args...])")
+            # Daemon: stub + key only, no bundled libs
+            daemon_path = output_dir / f'.antirev-libd{suffix}'
+            bundle = struct.pack("<IB", 0, 0)  # 0 files, no flags
+            bundle_offset = len(stub_data)
+            trailer = struct.pack("<Q", bundle_offset) + key + MAGIC
+            daemon_path.parent.mkdir(parents=True, exist_ok=True)
+            daemon_path.write_bytes(stub_data + bundle + trailer)
+            os.chmod(str(daemon_path), 0o755)
+            print(f"[pack] Daemon binary: {daemon_path.name}  "
+                  f"({daemon_path.stat().st_size:,} bytes, {arch})")
+
+            # Wrapper: connects to daemon, sets up env, execs argv[1...]
+            wrapper_path = output_dir / f'.antirev-wrap{suffix}'
+            wrap_bundle = struct.pack("<IB", 0, BFLAG_WRAPPER)
+            wrap_offset = len(stub_data)
+            wrap_trailer = struct.pack("<Q", wrap_offset) + key + MAGIC
+            wrapper_path.write_bytes(stub_data + wrap_bundle + wrap_trailer)
+            os.chmod(str(wrapper_path), 0o755)
+            print(f"[pack] Wrapper binary: {wrapper_path.name}  "
+                  f"({arch}, use: {wrapper_path.name} <command> [args...])")
         print()
 
     if exe_files:
