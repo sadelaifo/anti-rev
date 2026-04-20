@@ -158,14 +158,10 @@ def main():
 
         for lib_path in closure:
             syms = get_defined_symbols(lib_path)
-            if args.exact:
-                if symbol in syms:
+            for s in syms:
+                if symbol in s:
                     symbol_providers[lib_path].add(tl_name)
-            else:
-                for s in syms:
-                    if symbol in s:
-                        symbol_providers[lib_path].add(tl_name)
-                        break
+                    break
 
     # Report
     print()
