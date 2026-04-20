@@ -48,31 +48,10 @@ extern char *program_invocation_short_name;
  * /proc/self/exe, realpath, etc. intercepted — they are different
  * binaries and ANTIREV_REAL_EXE refers to the parent. */
 static pid_t g_owner_pid = 0;
-static int g_owner_checked = 0;  /* 1 = constructor has determined ownership */
 
-/* Lazy ownership check — covers calls that arrive before the constructor
- * (e.g. C++ global static initializers in DT_NEEDED libraries). */
 static int is_owner_process(void)
 {
-    if (g_owner_checked)
-        return g_owner_pid != 0 && getpid() == g_owner_pid;
-
-    /* Constructor hasn't run yet.  Detect ownership on the fly by
-     * checking if /proc/self/exe points to a memfd. */
-    if (!getenv("ANTIREV_REAL_EXE"))
-        return 0;
-    char exe_buf[256];
-    ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
-                                 "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
-    if (n > 0) {
-        exe_buf[n] = '\0';
-        if (strstr(exe_buf, "memfd:") != NULL) {
-            g_owner_pid = getpid();
-            g_owner_checked = 1;
-            return 1;
-        }
-    }
-    return 0;
+    return g_owner_pid != 0 && getpid() == g_owner_pid;
 }
 
 /* ------------------------------------------------------------------ */
@@ -139,7 +118,10 @@ static void restore_identity(void)
     }
 
     if (!is_owner) {
-        /* QEMU fallback: check if ANTIREV_MAIN_FD points to a memfd */
+        /* QEMU fallback: check if ANTIREV_MAIN_FD points to a memfd.
+         * In QEMU user-mode /proc/self/fd readlinkat may not return "memfd:"
+         * so we also trust the mere presence of ANTIREV_MAIN_FD — the stub
+         * only injects it into the direct fexecve target, never children. */
         const char *main_fd_str = getenv("ANTIREV_MAIN_FD");
         if (main_fd_str) {
             char fd_link[64], fd_target[256];
@@ -153,19 +135,77 @@ static void restore_identity(void)
                 if (strstr(fd_target, "memfd:") != NULL)
                     is_owner = 1;
             }
+            /* QEMU: readlinkat didn't confirm "memfd:" — trust presence alone */
+            if (!is_owner)
+                is_owner = 1;
         }
     }
 
+    /* Consume the marker regardless of detection path so forked+exec'd
+     * children never inherit it and false-positive as owner. */
+    unsetenv("ANTIREV_MAIN_FD");
+
     if (!is_owner) {
-        g_owner_checked = 1;
+        /* Non-owner child process (e.g., WAE.elf loaded by helf loadpg).
+         * Clean up anti-rev env vars to prevent dlopen_shim from
+         * redirecting dlopen calls via ANTIREV_FD_MAP, and to prevent
+         * LD_LIBRARY_PATH from pointing to anti-rev's symlink dir. */
+        unsetenv("ANTIREV_FD_MAP");
+        unsetenv("ANTIREV_REAL_EXE");
+
+        /* Remove anti-rev /proc/self/fd/ entries from LD_PRELOAD,
+         * keeping any user-specified preloads intact. */
+        const char *preload = getenv("LD_PRELOAD");
+        if (preload && strstr(preload, "/proc/self/fd/") != NULL) {
+            char clean[4096];
+            int off = 0;
+            const char *p = preload;
+            while (*p) {
+                const char *end = p;
+                while (*end && *end != ':') end++;
+                size_t len = (size_t)(end - p);
+                if (len > 0 && strncmp(p, "/proc/self/fd/", 14) != 0) {
+                    if (off > 0) clean[off++] = ':';
+                    memcpy(clean + off, p, len);
+                    off += (int)len;
+                }
+                p = (*end == ':') ? end + 1 : end;
+            }
+            clean[off] = '\0';
+            if (off > 0)
+                setenv("LD_PRELOAD", clean, 1);
+            else
+                unsetenv("LD_PRELOAD");
+        }
+
+        /* Remove anti-rev /tmp/antirev_ dir from LD_LIBRARY_PATH */
+        const char *ldpath = getenv("LD_LIBRARY_PATH");
+        if (ldpath && strstr(ldpath, "/tmp/antirev_") != NULL) {
+            char clean_path[8192];
+            int poff = 0;
+            const char *lp = ldpath;
+            while (*lp) {
+                const char *lend = lp;
+                while (*lend && *lend != ':') lend++;
+                size_t llen = (size_t)(lend - lp);
+                if (llen > 0 && strncmp(lp, "/tmp/antirev_", 13) != 0) {
+                    if (poff > 0) clean_path[poff++] = ':';
+                    memcpy(clean_path + poff, lp, llen);
+                    poff += (int)llen;
+                }
+                lp = (*lend == ':') ? lend + 1 : lend;
+            }
+            clean_path[poff] = '\0';
+            if (poff > 0)
+                setenv("LD_LIBRARY_PATH", clean_path, 1);
+            else
+                unsetenv("LD_LIBRARY_PATH");
+        }
+
         return;
     }
 
-    /* Consume the marker so forked children don't false-positive. */
-    unsetenv("ANTIREV_MAIN_FD");
-
     g_owner_pid = getpid();
-    g_owner_checked = 1;
 
     /* Close DT_NEEDED memfds now that glibc's dynamic linker has finished
      * mapping them.  The fds are pure bookkeeping at this point — the
@@ -191,6 +231,60 @@ static void restore_identity(void)
         }
     }
     unsetenv("ANTIREV_CLOSE_FDS");
+
+    /* Clean up anti-rev entries from LD_PRELOAD and LD_LIBRARY_PATH even
+     * for the owner process. The shims are already loaded in memory —
+     * removing them from env prevents children (popen, system, etc.) from
+     * inheriting /proc/self/fd/N paths that may become invalid. */
+    {
+        const char *preload = getenv("LD_PRELOAD");
+        if (preload && strstr(preload, "/proc/self/fd/") != NULL) {
+            char clean[4096];
+            int coff = 0;
+            const char *p = preload;
+            while (*p) {
+                const char *end = p;
+                while (*end && *end != ':') end++;
+                size_t slen = (size_t)(end - p);
+                if (slen > 0 && strncmp(p, "/proc/self/fd/", 14) != 0) {
+                    if (coff > 0) clean[coff++] = ':';
+                    memcpy(clean + coff, p, slen);
+                    coff += (int)slen;
+                }
+                p = (*end == ':') ? end + 1 : end;
+            }
+            clean[coff] = '\0';
+            if (coff > 0)
+                setenv("LD_PRELOAD", clean, 1);
+            else
+                unsetenv("LD_PRELOAD");
+        }
+
+        const char *ldpath = getenv("LD_LIBRARY_PATH");
+        if (ldpath && strstr(ldpath, "/tmp/antirev_") != NULL) {
+            char clean_path[8192];
+            int poff = 0;
+            const char *lp = ldpath;
+            while (*lp) {
+                const char *lend = lp;
+                while (*lend && *lend != ':') lend++;
+                size_t llen = (size_t)(lend - lp);
+                if (llen > 0 && strncmp(lp, "/tmp/antirev_", 13) != 0) {
+                    if (poff > 0) clean_path[poff++] = ':';
+                    memcpy(clean_path + poff, lp, llen);
+                    poff += (int)llen;
+                }
+                lp = (*lend == ':') ? lend + 1 : lend;
+            }
+            clean_path[poff] = '\0';
+            if (poff > 0)
+                setenv("LD_LIBRARY_PATH", clean_path, 1);
+            else
+                unsetenv("LD_LIBRARY_PATH");
+        }
+
+        unsetenv("ANTIREV_FD_MAP");
+    }
 
     const char *base = strrchr(real, '/');
     base = base ? base + 1 : real;
@@ -373,4 +467,81 @@ unsigned long getauxval(unsigned long type)
     }
     syscall(SYS_close, fd);
     return result;
+}
+
+/* ------------------------------------------------------------------ */
+/*  popen interception                                                  */
+/*                                                                      */
+/*  glibc popen uses vfork (CLONE_VM|CLONE_VFORK) which shares the     */
+/*  parent's address space. Under anti-rev with many memfds and         */
+/*  LD_PRELOAD shims, the vfork'd child can behave unexpectedly.        */
+/*  We intercept popen to use a clean fork+exec instead.                */
+/* ------------------------------------------------------------------ */
+
+static FILE *(*g_real_popen)(const char *, const char *) = NULL;
+
+static void resolve_real_popen(void)
+{
+    if (g_real_popen)
+        return;
+    void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
+    if (libc) {
+        g_real_popen = dlsym(libc, "popen");
+        dlclose(libc);
+        if (g_real_popen)
+            return;
+    }
+    g_real_popen = dlsym(RTLD_NEXT, "popen");
+}
+
+__attribute__((visibility("default")))
+FILE *popen(const char *command, const char *type)
+{
+    if (!is_owner_process()) {
+        if (!g_real_popen) resolve_real_popen();
+        if (g_real_popen) return g_real_popen(command, type);
+        return NULL;
+    }
+
+    /* Owner process: implement popen with fork (not vfork) and clean env.
+     * This avoids vfork issues with memfd-heavy processes. */
+    if (type[0] != 'r') {
+        /* Only intercept read-mode popen for now */
+        if (!g_real_popen) resolve_real_popen();
+        if (g_real_popen) return g_real_popen(command, type);
+        return NULL;
+    }
+
+    int pipefd[2];
+    if (pipe(pipefd) < 0)
+        return NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return NULL;
+    }
+
+    if (pid == 0) {
+        /* Child: redirect stdout to pipe, exec sh */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+
+        /* Clean anti-rev env vars for the child */
+        unsetenv("ANTIREV_FD_MAP");
+        unsetenv("ANTIREV_REAL_EXE");
+        unsetenv("LD_PRELOAD");
+
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+
+    /* Parent: return read end of pipe as FILE* */
+    close(pipefd[1]);
+    FILE *fp = fdopen(pipefd[0], "r");
+    if (!fp)
+        close(pipefd[0]);
+    return fp;
 }
