@@ -44,7 +44,7 @@ import struct
 import subprocess
 import sys
 from collections import defaultdict, deque
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 
 # -- Parse cache -------------------------------------------------------------
@@ -473,26 +473,108 @@ def compute_available_syms(target, all_parsed, resolver, verbose=False):
     return available
 
 
+def prepopulate_all_deps(proj_elfs, all_parsed, resolver, verbose=False):
+    # type: (list[str], dict, LibResolver, bool) -> None
+    """Eagerly resolve all transitive DT_NEEDED chains, parsing any system
+    libs not yet in *all_parsed*.
+
+    After this call, *all_parsed* contains every reachable DSO and is
+    safe to read from multiple threads without mutation.
+    """
+    visited = set()  # type: set[str]
+    queue = deque()  # type: deque[str]
+
+    for target in proj_elfs:
+        parsed = all_parsed.get(target)
+        if not parsed:
+            continue
+        visited.add(target)
+        for name in parsed[1]:
+            queue.append(name)
+
+    while queue:
+        name = queue.popleft()
+        resolved = resolver.resolve(name)
+        if not resolved or resolved in visited:
+            continue
+        visited.add(resolved)
+        dep_parsed = all_parsed.get(resolved)
+        if dep_parsed is None:
+            dep_parsed = parse_elf(resolved)
+            all_parsed[resolved] = dep_parsed
+            dep_soname = dep_parsed[0]
+            dep_basename = os.path.basename(resolved)
+            if dep_basename not in resolver.local_map:
+                resolver.local_map[dep_basename] = resolved
+            if dep_soname and dep_soname not in resolver.local_map:
+                resolver.local_map[dep_soname] = resolved
+        for dep_name in dep_parsed[1]:
+            queue.append(dep_name)
+
+
+def _check_one_target(args_tuple):
+    # type: (tuple) -> tuple[str, set[str]] | None
+    """Worker for parallel find_missing_symbols.
+
+    Receives the resolver cache snapshot and the full all_parsed dict
+    so it can walk the DT_NEEDED closure without mutation.
+    """
+    target, parsed_target, all_parsed, resolver_cache = args_tuple
+    undef = parsed_target[3]
+    if not undef:
+        return None
+    # Inline closure walk using read-only all_parsed
+    available = set(parsed_target[2].keys())
+    visited = set()  # type: set[str]
+    queue = deque(parsed_target[1])
+    while queue:
+        name = queue.popleft()
+        resolved = resolver_cache.get(name)
+        if not resolved or resolved in visited:
+            continue
+        visited.add(resolved)
+        dep_parsed = all_parsed.get(resolved)
+        if dep_parsed is None:
+            continue
+        available.update(dep_parsed[2].keys())
+        for dep_name in dep_parsed[1]:
+            queue.append(dep_name)
+    missing = undef - available
+    if missing:
+        return (target, missing)
+    return None
+
+
 def find_missing_symbols(proj_elfs, all_parsed, resolver, verbose=False):
     # type: (list[str], dict, LibResolver, bool) -> list[tuple[str, set[str]]]
     """For each proj ELF, find undefined syms not in transitive DT_NEEDED.
 
     Returns list of ``(target_path, missing_syms_set)``.
-    Side-effect: *all_parsed* may be extended with on-demand parsed libs.
+    Requires prepopulate_all_deps() to have been called first so that
+    all_parsed is complete and read-only.
     """
-    results = []  # type: list[tuple[str, set[str]]]
+    # Snapshot the resolver cache so workers can use it
+    resolver_snapshot = dict(resolver._cache)
+
+    work = []
     for target in proj_elfs:
         parsed = all_parsed.get(target)
         if not parsed:
             continue
-        undef = parsed[3]
-        if not undef:
-            continue
-        available = compute_available_syms(
-            target, all_parsed, resolver, verbose=verbose)
-        missing = undef - available
-        if missing:
-            results.append((target, missing))
+        work.append((target, parsed, all_parsed, resolver_snapshot))
+
+    n_cpu = os.cpu_count() or 2
+    n_workers = max(1, min(n_cpu - 1, len(work), 64))
+
+    results = []  # type: list[tuple[str, set[str]]]
+    # Use threads here — the work is dict-lookup heavy but each target
+    # shares the same read-only all_parsed dict (no pickle cost).
+    # GIL contention is acceptable because the alternative is pickling
+    # the entire all_parsed dict (hundreds of MB) to each process.
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for result in pool.map(_check_one_target, work):
+            if result is not None:
+                results.append(result)
     return results
 
 
@@ -589,6 +671,58 @@ def _compute_closure(target, all_parsed, resolver):
     return visited
 
 
+def _build_provs_chunk(args_tuple):
+    # type: (tuple) -> dict[str, list[tuple[str, str]]]
+    """Worker: build sym->(path,bind) map for a chunk of DSOs.
+
+    Receives only the slice of parsed data it needs (not the full dict)
+    to minimise pickle overhead when used with ProcessPoolExecutor.
+    """
+    parsed_slice, filter_cxx_vague = args_tuple
+    local = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
+    for path, parsed in parsed_slice:
+        for sym, bind in parsed[2].items():
+            if sym in IGNORE_SYMS:
+                continue
+            if filter_cxx_vague and is_cxx_vague(sym):
+                continue
+            local[sym].append((path, bind))
+    return dict(local)
+
+
+def _scan_target_dups(args_tuple):
+    # type: (tuple) -> dict | None
+    """Worker: scan one target for duplicate symbols in its closure."""
+    target, closure, dso_contrib, proj_set, target_type = args_tuple
+    providers_here = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
+    for path in closure:
+        for sym, bind in dso_contrib.get(path, ()):
+            providers_here[sym].append((path, bind))
+
+    dups = []  # type: list[dict]
+    for sym, provs in providers_here.items():
+        if len(provs) < 2:
+            continue
+        if proj_set is not None and not any(p in proj_set for p, _ in provs):
+            continue
+        binds = {b for _, b in provs}
+        severity = 'warn' if 'WEAK' in binds else 'error'
+        dups.append({
+            'symbol': sym,
+            'providers': provs,
+            'severity': severity,
+        })
+
+    if not dups:
+        return None
+    dups.sort(key=lambda d: (d['severity'] != 'error', d['symbol']))
+    return {
+        'consumer': target,
+        'consumer_type': target_type,
+        'duplicates': dups,
+    }
+
+
 def find_duplicate_symbols(scan_elfs, all_parsed, resolver,
                            filter_cxx_vague=True, proj_set=None):
     # type: (list[str], dict, LibResolver, bool, set[str] | None) -> list[dict]
@@ -614,8 +748,13 @@ def find_duplicate_symbols(scan_elfs, all_parsed, resolver,
     contributions from DSOs in its closure — typically two orders of
     magnitude fewer items than the full defined-syms set.
 
+    Phases 2 and 4 are parallelized with threads.
+
     Returns list of per-target records (only targets with >=1 duplicate).
     """
+    n_cpu = os.cpu_count() or 2
+    n_workers = max(1, min(n_cpu - 1, 64))
+
     # Phase 1: resolve closures for every scan target (lazy-parses any
     # deps missing from all_parsed).  Record the union of reachable DSOs.
     closures = {}  # type: dict[str, set[str]]
@@ -629,69 +768,49 @@ def find_duplicate_symbols(scan_elfs, all_parsed, resolver,
     if not reachable:
         return []
 
-    # Phase 2: build global sym -> [(path, bind)] across reachable DSOs,
-    # applying the IGNORE / vague filters exactly once per symbol.
+    # Phase 2: build global sym -> [(path, bind)] across reachable DSOs.
+    # Shard DSOs across processes — each worker receives only its slice
+    # of parsed data to avoid pickling the entire dict.
+    reachable_list = list(reachable)
+    chunk_size = max(1, len(reachable_list) // (n_workers * 4))
+    chunks = [reachable_list[i:i + chunk_size]
+              for i in range(0, len(reachable_list), chunk_size)]
+
     global_provs = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
-    for path in reachable:
-        parsed = all_parsed.get(path)
-        if not parsed:
-            continue
-        for sym, bind in parsed[2].items():
-            if sym in IGNORE_SYMS:
-                continue
-            if filter_cxx_vague and is_cxx_vague(sym):
-                continue
-            global_provs[sym].append((path, bind))
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        work = [([(p, all_parsed[p]) for p in chunk if p in all_parsed],
+                  filter_cxx_vague) for chunk in chunks]
+        for partial in pool.map(_build_provs_chunk, work):
+            for sym, provs in partial.items():
+                global_provs[sym].extend(provs)
 
     # Phase 3: keep only symbols with >1 provider globally, and invert to
     # per-DSO multi-defined contribution lists.  Unique-globally symbols
     # cannot form a duplicate in any target's closure — skipping them up
     # front is where most of the speedup comes from.
     dso_contrib = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
-    multi_provs = {}  # type: dict[str, list[tuple[str, str]]]
     for sym, provs in global_provs.items():
         if len(provs) < 2:
             continue
-        multi_provs[sym] = provs
         for path, bind in provs:
             dso_contrib[path].append((sym, bind))
 
-    if not multi_provs:
+    if not dso_contrib:
         return []
 
     # Phase 4: per target, collect providers from its closure using the
     # precomputed per-DSO contribution lists, classify severity.
+    # Parallelized across processes.
+    dso_contrib_dict = dict(dso_contrib)
+    target_work = [(target, closures[target], dso_contrib_dict, proj_set,
+                    classify_elf(target) or 'unknown')
+                   for target in scan_elfs if target in closures]
+
     results = []  # type: list[dict]
-    for target in scan_elfs:
-        cl = closures.get(target)
-        if not cl:
-            continue
-        providers_here = defaultdict(list)  # type: defaultdict[str, list[tuple[str, str]]]
-        for path in cl:
-            for sym, bind in dso_contrib.get(path, ()):
-                providers_here[sym].append((path, bind))
-
-        dups = []  # type: list[dict]
-        for sym, provs in providers_here.items():
-            if len(provs) < 2:
-                continue
-            if proj_set is not None and not any(p in proj_set for p, _ in provs):
-                continue
-            binds = {b for _, b in provs}
-            severity = 'warn' if 'WEAK' in binds else 'error'
-            dups.append({
-                'symbol': sym,
-                'providers': provs,
-                'severity': severity,
-            })
-
-        if dups:
-            dups.sort(key=lambda d: (d['severity'] != 'error', d['symbol']))
-            results.append({
-                'consumer': target,
-                'consumer_type': classify_elf(target) or 'unknown',
-                'duplicates': dups,
-            })
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        for result in pool.map(_scan_target_dups, target_work):
+            if result is not None:
+                results.append(result)
 
     return results
 
@@ -1490,7 +1609,14 @@ def main():
             print_cycle_report(sccs, proj_edges)
         sys.exit(1 if sccs else 0)
 
-    # -- Missing symbol analysis ---------------------------------------------
+    # -- Pre-populate all transitive deps (single-threaded) -------------------
+    log('[analyze] Pre-populating transitive DT_NEEDED deps ...')
+    prepopulate_all_deps(scan_elfs, all_parsed, resolver,
+                         verbose=args.verbose)
+    log('[analyze] all_parsed now has %d ELFs (analysis is read-only)'
+        % len(all_parsed))
+
+    # -- Missing symbol analysis (parallel) ------------------------------------
     log('[analyze] Checking symbol resolution ...')
     missing_results = find_missing_symbols(
         scan_elfs, all_parsed, resolver, verbose=args.verbose)

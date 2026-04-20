@@ -109,7 +109,17 @@ def main():
     with open(cfg_path) as f:
         cfg = json.load(f)
 
-    symbol = cfg['symbol']
+    # Support both "symbol" (string) and "symbols" (list) in config
+    raw_syms = cfg.get('symbols', cfg.get('symbol', []))
+    if isinstance(raw_syms, str):
+        symbols = [raw_syms]
+    else:
+        symbols = list(raw_syms)
+
+    if not symbols:
+        print('ERROR: no symbols specified in config', file=sys.stderr)
+        sys.exit(1)
+
     gui_exe = cfg.get('gui_exe', '')
     top_libs = cfg['top_libs']
     lib_dir = os.path.realpath(cfg['lib_dir'])
@@ -135,7 +145,9 @@ def main():
         print('ERROR: no valid targets to scan', file=sys.stderr)
         sys.exit(1)
 
-    print(f'Symbol:    {symbol}')
+    print(f'Symbols:   {len(symbols)}')
+    for sym in symbols:
+        print(f'  - {sym}')
     print(f'Lib dir:   {lib_dir}')
     print(f'Targets:   {len(scan_targets)} (exe + dlopen\'d libs)')
     print(f'Workers:   {workers}')
@@ -175,42 +187,57 @@ def main():
         for fut in as_completed(futs):
             fut.result()
 
-    # Phase 4: match symbol
-    symbol_providers = defaultdict(set)  # provider_path -> set of target names
-    for tl_name, closure in closures.items():
-        for lib_path in closure:
-            syms = _symbols_cache.get(lib_path, set())
-            for s in syms:
-                if symbol in s:
+    # Phase 4: single pass — match ALL query symbols against each lib at once.
+    # Build lib_path -> set of matched query symbols, then look up per closure.
+    print(f'\nMatching {len(symbols)} symbol(s) across {len(all_closure_libs)} libs ...',
+          flush=True)
+    lib_matches = defaultdict(set)  # lib_path -> {matched query symbols}
+    for lib_path in all_closure_libs:
+        lib_syms = _symbols_cache.get(lib_path, set())
+        for s in lib_syms:
+            for query in symbols:
+                if query in s:
+                    lib_matches[lib_path].add(query)
+
+    # Report per symbol
+    for sym_idx, symbol in enumerate(symbols):
+        if sym_idx > 0:
+            print()
+            print('=' * 60)
+
+        print(f'\n--- Symbol: {symbol} ---')
+
+        # provider_path -> set of target names that pull it in
+        symbol_providers = defaultdict(set)
+        for tl_name, closure in closures.items():
+            for lib_path in closure:
+                if symbol in lib_matches.get(lib_path, set()):
                     symbol_providers[lib_path].add(tl_name)
-                    break
 
-    # Report
-    print()
-    if not symbol_providers:
-        print(f'Symbol "{symbol}" NOT found in any closure.')
-        return
+        if not symbol_providers:
+            print(f'  NOT found in any closure.')
+            continue
 
-    print(f'=== Found symbol in {len(symbol_providers)} lib(s) ===')
-    print()
-
-    for provider, importers in sorted(symbol_providers.items(),
-                                       key=lambda x: -len(x[1])):
-        pname = os.path.relpath(provider, lib_dir)
-        print(f'  {pname}')
-        print(f'    pulled in by: {", ".join(sorted(importers))}')
+        print(f'  Found in {len(symbol_providers)} lib(s):')
         print()
 
-    if len(symbol_providers) > 1:
-        print('=== DUPLICATE: symbol defined in multiple libs in the same load image ===')
-        print('If GUI dlopens multiple top-level libs whose closures overlap on')
-        print('different providers of this symbol, protobuf will double-register')
-        print('the descriptor and crash.')
-        print()
         for provider, importers in sorted(symbol_providers.items(),
                                            key=lambda x: -len(x[1])):
             pname = os.path.relpath(provider, lib_dir)
-            print(f'  {pname}  <--  {", ".join(sorted(importers))}')
+            print(f'  {pname}')
+            print(f'    pulled in by: {", ".join(sorted(importers))}')
+            print()
+
+        if len(symbol_providers) > 1:
+            print('  DUPLICATE: symbol defined in multiple libs in the same load image')
+            print('  If GUI dlopens multiple top-level libs whose closures overlap on')
+            print('  different providers of this symbol, protobuf will double-register')
+            print('  the descriptor and crash.')
+            print()
+            for provider, importers in sorted(symbol_providers.items(),
+                                               key=lambda x: -len(x[1])):
+                pname = os.path.relpath(provider, lib_dir)
+                print(f'    {pname}  <--  {", ".join(sorted(importers))}')
 
 
 if __name__ == '__main__':
