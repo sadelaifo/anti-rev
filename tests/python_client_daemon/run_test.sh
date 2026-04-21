@@ -18,9 +18,13 @@ TD="$(dirname "$STUB")/python_client_daemon_test"
 rm -rf "$TD"
 mkdir -p "$TD"
 
+python3 "$PROTECT" encrypt-lib \
+    --key "$TD/daemon.key" \
+    --libs "$MYLIB" "$LIBLINKEDMATH" \
+    --output-dir "$TD" >/dev/null
+
 python3 "$PROTECT" protect-daemon \
     --stub "$STUB" --key "$TD/daemon.key" \
-    --libs "$MYLIB" "$LIBLINKEDMATH" \
     --output "$TD/antirev-libd" >/dev/null
 
 "$TD/antirev-libd"

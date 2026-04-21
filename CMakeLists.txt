@@ -307,7 +307,9 @@ function(compile_test_bin OUTPUT COMPILER SOURCE)
 endfunction()
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Helper: daemon-mode test (protect-daemon + protect-exe --daemon-libs)
+#  Helper: daemon-mode test (encrypt-lib + lightweight protect-daemon
+#  + protect-exe --daemon-libs). Libs are encrypted as standalone files
+#  in the test dir; the daemon scans that dir at startup.
 #  Usage: daemon_test(test_name client_bin "comment" lib1.so [lib2.so])
 #         add_dependencies(test_name stub mylib client_target ...)
 # ═══════════════════════════════════════════════════════════════════════
@@ -316,10 +318,13 @@ function(daemon_test TEST_NAME CLIENT_BIN COMMENT_STR)
     add_custom_target(${TEST_NAME}
         COMMAND ${CMAKE_COMMAND} -E echo "=== ${TEST_NAME} ==="
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD}"
+        COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+                --key        "${_TD}/test.key"
+                --libs       ${ARGN}
+                --output-dir "${_TD}"
         COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
                 --stub   "${CMAKE_BINARY_DIR}/stub"
                 --key    "${_TD}/test.key"
-                --libs   ${ARGN}
                 --output "${_TD}/.antirev-libd"
         COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
                 --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -453,11 +458,14 @@ set(_TD_TRANS "${CMAKE_BINARY_DIR}/daemon_test_dlopen_transitive")
 add_custom_target(test_dlopen_transitive
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_transitive ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_TRANS}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_TRANS}/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libmiddle.so"
+                         "${CMAKE_BINARY_DIR}/libinner.so"
+            --output-dir "${_TD_TRANS}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_TRANS}/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libmiddle.so"
-                     "${CMAKE_BINARY_DIR}/libinner.so"
             --output "${_TD_TRANS}/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -507,20 +515,20 @@ add_custom_target(test_dlopen_dt_needed
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_dt_needed ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_DTN}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_DTN}/enc_disk"
-    # Pack libs into daemon
-    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
-            --stub   "${CMAKE_BINARY_DIR}/stub"
-            --key    "${_TD_DTN}/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libfoo.so"
-                     "${CMAKE_BINARY_DIR}/libbar.so"
-            --output "${_TD_DTN}/.antirev-libd"
-    # Put encrypted copies on disk so the linker finds them (and fails
-    # with "invalid ELF header" rather than "not found")
+    # Encrypted copies on disk at enc_disk/; the daemon recursively scans
+    # _TD_DTN and picks them up, and the runtime sets LD_LIBRARY_PATH to
+    # enc_disk so the linker also finds them (and fails with "invalid ELF
+    # header" rather than "not found" — which is what the test checks).
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
             --key    "${_TD_DTN}/test.key"
             --libs   "${CMAKE_BINARY_DIR}/libfoo.so"
                      "${CMAKE_BINARY_DIR}/libbar.so"
             --output-dir "${_TD_DTN}/enc_disk"
+    # Lightweight daemon
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_DTN}/test.key"
+            --output "${_TD_DTN}/.antirev-libd"
     # Protect exe
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -560,10 +568,13 @@ add_custom_target(test_dlopen_reload
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_reload ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_RELOAD}"
     COMMAND ${CMAKE_COMMAND} -E remove -f /tmp/test_dlopen_reload.log
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_RELOAD}/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libreload.so"
+            --output-dir "${_TD_RELOAD}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_RELOAD}/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libreload.so"
             --output "${_TD_RELOAD}/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -644,13 +655,16 @@ set(_TD_INTER "${CMAKE_BINARY_DIR}/daemon_test_dlopen_interpose")
 add_custom_target(test_dlopen_interpose
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_interpose ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_INTER}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_INTER}/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libregistrar.so"
+                         "${CMAKE_BINARY_DIR}/libinterpose_dup1.so"
+                         "${CMAKE_BINARY_DIR}/libinterpose_dup2.so"
+                         "${CMAKE_BINARY_DIR}/libroot.so"
+            --output-dir "${_TD_INTER}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_INTER}/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libregistrar.so"
-                     "${CMAKE_BINARY_DIR}/libinterpose_dup1.so"
-                     "${CMAKE_BINARY_DIR}/libinterpose_dup2.so"
-                     "${CMAKE_BINARY_DIR}/libroot.so"
             --output "${_TD_INTER}/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -733,9 +747,7 @@ add_custom_target(test_plain_so
     USES_TERMINAL
 )
 
-# ═══════════════════════════════════════════════════════════════════════
-#  test_plain_exe_enc_so — plain exe + encrypted .so via protect.py run
-# ═══════════════════════════════════════════════════════════════════════
+# (test_plain_exe_enc_so was here — removed along with protect.py run/LD_AUDIT)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  test_multi_so — two protected shared libraries loaded via dlopen
@@ -775,7 +787,7 @@ add_custom_target(test_multi_so
 )
 
 # ═══════════════════════════════════════════════════════════════════════
-#  test_linked — DT_NEEDED library loaded via LD_AUDIT audit shim
+#  test_linked — DT_NEEDED library served by the daemon (symlink-dir path)
 # ═══════════════════════════════════════════════════════════════════════
 
 compile_lib("${CMAKE_BINARY_DIR}/liblinkedmath.so"
@@ -824,7 +836,7 @@ add_dependencies(test_fd_reduction stub liblinkedmath fd_reduction_main)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  test_fork_exec — child process spawned via fork()+exec() must be able
-#  to dlopen an encrypted .so via the inherited LD_AUDIT shim
+#  to dlopen an encrypted .so via the inherited dlopen_shim
 # ═══════════════════════════════════════════════════════════════════════
 
 compile_test_bin("${CMAKE_BINARY_DIR}/fork_exec_parent"
@@ -1246,10 +1258,13 @@ set(_TD_FSL "${CMAKE_BINARY_DIR}/daemon_test_fork_same_lib")
 add_custom_target(test_fork_same_lib
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_fork_same_lib ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_FSL}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_FSL}/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/mylib.so"
+            --output-dir "${_TD_FSL}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_FSL}/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/mylib.so"
             --output "${_TD_FSL}/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -1290,10 +1305,13 @@ add_custom_target(test_fork_diff_lib
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_fork_diff_lib ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_FDL}/parent" "${_TD_FDL}/child"
     # Daemon + client for parent (libparent.so)
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_FDL}/parent/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libparent.so"
+            --output-dir "${_TD_FDL}/parent"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_FDL}/parent/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libparent.so"
             --output "${_TD_FDL}/parent/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -1302,10 +1320,13 @@ add_custom_target(test_fork_diff_lib
             --daemon-libs
             --output "${_TD_FDL}/parent/parent.protected"
     # Daemon + client for child (libchild.so, different key)
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_FDL}/child/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libchild.so"
+            --output-dir "${_TD_FDL}/child"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_FDL}/child/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libchild.so"
             --output "${_TD_FDL}/child/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -1350,12 +1371,15 @@ add_custom_target(test_script_multi_bin
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_script_multi_bin ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_SMB}"
     # One daemon serves all libs (same key for both clients)
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_SMB}/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libcommon.so"
+                         "${CMAKE_BINARY_DIR}/libA_only.so"
+                         "${CMAKE_BINARY_DIR}/libB_only.so"
+            --output-dir "${_TD_SMB}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_SMB}/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libcommon.so"
-                     "${CMAKE_BINARY_DIR}/libA_only.so"
-                     "${CMAKE_BINARY_DIR}/libB_only.so"
             --output "${_TD_SMB}/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
