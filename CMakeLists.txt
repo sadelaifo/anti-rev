@@ -23,15 +23,44 @@ else()
     find_program(AARCH64_STRIP NAMES aarch64-linux-gnu-strip aarch64-suse-linux-strip)
 endif()
 
+# Verify that a found compiler can actually compile a trivial source
+# including a system header (dlfcn.h). find_program may locate a
+# cross-compiler whose sysroot is missing — the binary exists but it
+# can't find libc headers. Skip such compilers so targets that would
+# use them are not emitted.
+function(_verify_compiler VAR)
+    if(NOT ${VAR})
+        return()
+    endif()
+    set(_test_src "${CMAKE_BINARY_DIR}/_compiler_check_${VAR}.c")
+    file(WRITE "${_test_src}"
+         "#include <dlfcn.h>\nint main(void){return 0;}\n")
+    execute_process(
+        COMMAND "${${VAR}}" -c "${_test_src}"
+                -o "${_test_src}.o"
+        RESULT_VARIABLE _rc
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    file(REMOVE "${_test_src}" "${_test_src}.o")
+    if(NOT _rc EQUAL 0)
+        message(STATUS "${VAR} (${${VAR}}) cannot compile a file that "
+                       "includes <dlfcn.h> — disabling (sysroot/headers missing?)")
+        unset(${VAR} PARENT_SCOPE)
+    endif()
+endfunction()
+
+_verify_compiler(X86_GCC)
+_verify_compiler(AARCH64_GCC)
+
 if(AARCH64_GCC)
     message(STATUS "aarch64 compiler: ${AARCH64_GCC}")
 else()
-    message(STATUS "no aarch64 compiler — skipping ARM64 targets")
+    message(STATUS "no usable aarch64 compiler — skipping ARM64 targets")
 endif()
 if(X86_GCC)
     message(STATUS "x86_64 compiler: ${X86_GCC}")
 else()
-    message(STATUS "no x86_64 compiler — skipping x86-64 targets")
+    message(STATUS "no usable x86_64 compiler — skipping x86-64 targets")
 endif()
 
 # ── Helper: compile the exe shim (readlink interceptor) ───────────────
