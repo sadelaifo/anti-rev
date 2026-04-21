@@ -169,8 +169,10 @@ endif()
 #  Test binaries
 # ═══════════════════════════════════════════════════════════════════════
 
-add_executable(hello tests/hello/main.c)
-target_compile_options(hello PRIVATE -O2)
+if(X86_GCC)
+    add_executable(hello tests/hello/main.c)
+    target_compile_options(hello PRIVATE -O2)
+endif()
 
 if(AARCH64_GCC)
     add_custom_command(
@@ -226,6 +228,13 @@ if(AARCH64_GCC)
         USES_TERMINAL
     )
 endif()
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Everything below is x86-64 specific: the tests hard-code `gcc` as
+#  compiler and depend on the `stub` target (x86-64). Skip on hosts
+#  without an x86-64 compiler.
+# ═══════════════════════════════════════════════════════════════════════
+if(X86_GCC)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Helper: compile a shared library with a given compiler
@@ -1407,3 +1416,5 @@ add_custom_target(run_tests
     COMMENT "Running all tests"
     USES_TERMINAL
 )
+
+endif()  # X86_GCC (x86-64 specific tests)
