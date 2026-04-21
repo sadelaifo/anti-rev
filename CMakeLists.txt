@@ -4,63 +4,25 @@ project(antirev C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# ── Host / target compiler detection ──────────────────────────────────
-# On a native aarch64 host, the system gcc is already an aarch64 compiler —
-# no cross toolchain needed. On x86 hosts, we look for common cross-compiler
-# names across distributions (Debian/Ubuntu, SUSE, Red Hat).
-# Use find_program for the native side too so PATH is respected (instead
-# of hard-coding /usr/bin/gcc, which may not be the compiler the user's
-# environment expects — e.g. a custom toolchain via modules / conda).
+# ── Native-only compiler detection ────────────────────────────────────
+# Build only for the host architecture: aarch64 host → build aarch64,
+# x86_64 host → build x86_64. No cross-compilation.
 if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "aarch64")
     find_program(AARCH64_GCC   NAMES gcc)
     find_program(AARCH64_STRIP NAMES strip)
-    find_program(X86_GCC       NAMES x86_64-linux-gnu-gcc)
-    find_program(X86_STRIP     NAMES x86_64-linux-gnu-strip)
+    set(X86_GCC   "")
+    set(X86_STRIP "")
+    message(STATUS "aarch64 host: building ARM64 targets with ${AARCH64_GCC}")
+elseif(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
+    find_program(X86_GCC   NAMES gcc)
+    find_program(X86_STRIP NAMES strip)
+    set(AARCH64_GCC   "")
+    set(AARCH64_STRIP "")
+    message(STATUS "x86_64 host: building x86-64 targets with ${X86_GCC}")
 else()
-    find_program(X86_GCC       NAMES gcc)
-    find_program(X86_STRIP     NAMES strip)
-    find_program(AARCH64_GCC   NAMES aarch64-linux-gnu-gcc aarch64-suse-linux-gcc)
-    find_program(AARCH64_STRIP NAMES aarch64-linux-gnu-strip aarch64-suse-linux-strip)
-endif()
-
-# Verify that a found compiler can actually compile a trivial source
-# including a system header (dlfcn.h). find_program may locate a
-# cross-compiler whose sysroot is missing — the binary exists but it
-# can't find libc headers. Skip such compilers so targets that would
-# use them are not emitted.
-function(_verify_compiler VAR)
-    if(NOT ${VAR})
-        return()
-    endif()
-    set(_test_src "${CMAKE_BINARY_DIR}/_compiler_check_${VAR}.c")
-    file(WRITE "${_test_src}"
-         "#include <dlfcn.h>\nint main(void){return 0;}\n")
-    execute_process(
-        COMMAND "${${VAR}}" -c "${_test_src}"
-                -o "${_test_src}.o"
-        RESULT_VARIABLE _rc
-        OUTPUT_QUIET ERROR_QUIET
-    )
-    file(REMOVE "${_test_src}" "${_test_src}.o")
-    if(NOT _rc EQUAL 0)
-        message(STATUS "${VAR} (${${VAR}}) cannot compile a file that "
-                       "includes <dlfcn.h> — disabling (sysroot/headers missing?)")
-        unset(${VAR} PARENT_SCOPE)
-    endif()
-endfunction()
-
-_verify_compiler(X86_GCC)
-_verify_compiler(AARCH64_GCC)
-
-if(AARCH64_GCC)
-    message(STATUS "aarch64 compiler: ${AARCH64_GCC}")
-else()
-    message(STATUS "no usable aarch64 compiler — skipping ARM64 targets")
-endif()
-if(X86_GCC)
-    message(STATUS "x86_64 compiler: ${X86_GCC}")
-else()
-    message(STATUS "no usable x86_64 compiler — skipping x86-64 targets")
+    message(FATAL_ERROR
+        "Unsupported host arch: ${CMAKE_HOST_SYSTEM_PROCESSOR}. "
+        "Supported: x86_64, aarch64.")
 endif()
 
 # ── Helper: compile the exe shim (readlink interceptor) ───────────────
