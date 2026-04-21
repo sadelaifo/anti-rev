@@ -22,9 +22,13 @@ LOG="$TD/reload.log"
 rm -rf "$TD"
 mkdir -p "$TD"
 
+python3 "$PROTECT" encrypt-lib \
+    --key "$TD/daemon.key" \
+    --libs "$LIBRELOAD" \
+    --output-dir "$TD" >/dev/null
+
 python3 "$PROTECT" protect-daemon \
     --stub "$STUB" --key "$TD/daemon.key" \
-    --libs "$LIBRELOAD" \
     --output "$TD/antirev-libd" >/dev/null
 
 "$TD/antirev-libd"

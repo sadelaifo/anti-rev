@@ -291,7 +291,6 @@ content_slide(prs, "Core Components", [
     "exe_shim  --  LD_PRELOAD: hides memfd paths from /proc/self/exe",
     "dlopen_shim  --  LD_PRELOAD: redirects dlopen() to encrypted libs",
     "Daemon (.antirev-libd)  --  Decrypt once, serve many via SCM_RIGHTS",
-    "Wrapper (.antirev-wrap)  --  Let unencrypted binaries (python3) load encrypted libs",
     "Encryptor (antirev-pack.py)  --  Batch encrypt & bundle with topology metadata",
     "",
     "Supporting components:",
@@ -344,9 +343,7 @@ content_slide(prs, "Bundle Format (appended to stub ELF)", [
     "+  Trailer:  [bundle_offset: 8B]  [AES key: 32B]  [magic: \"ANTREV01\"]",
     "",
     "Bundle flags control operational mode:",
-    "  bit 0 (HAS_LIBS)       -- bundle contains encrypted shared libraries",
     "  bit 1 (DAEMON_LIBS)  -- stub is a daemon client, fetch libs from daemon",
-    "  bit 2 (WRAPPER)        -- no main exe, exec argv[1] with LD_PRELOAD",
     "",
     "Needed-libs section: topologically sorted DT_NEEDED set for the exe",
     "  Computed by antirev-pack.py using Kahn's algorithm",
@@ -499,70 +496,44 @@ content_slide(prs, "Daemon Protocol v2", [
 
 # ── Slide 11: Operational Modes ─────────────────────────────────────
 section_slide(prs, 6, "Operational Modes",
-              "Standalone, Daemon+Client, Wrapper")
+              "Daemon + Client")
 
-content_slide(prs, "Three Deployment Modes", [
-    "Mode A: Standalone (small apps)",
-    "  Stub bundles exe + all its libs",
-    "  Decrypt all into memfds, create symlink dir, fexecve",
-    "  Simple but duplicates libs across processes",
+content_slide(prs, "Deployment Model: Daemon + Client", [
+    "Lightweight daemon (.antirev-libd)",
+    "  Scans its directory for encrypted .so files at startup",
+    "  Decrypts 550+ libs once into memfds, serves via abstract socket",
+    "  One daemon instance serves 100+ client processes",
     "",
-    "Mode B: Daemon + Client (large deployments)",
-    "  .antirev-libd daemon: decrypts 550+ libs once, serves via socket",
-    "  Client stubs: bundle only the exe, fetch libs from daemon on startup",
-    "  Lazy fetch: only DT_NEEDED set eagerly; dlopen libs fetched on demand",
-    "  Massive fd savings: one daemon instance serves 100+ client processes",
+    "Client stubs (protected exes, BFLAG_DAEMON_LIBS)",
+    "  Bundle only the exe's ciphertext in the stub trailer",
+    "  On launch: connect to daemon, receive lib fds via SCM_RIGHTS",
+    "  Lazy fetch: DT_NEEDED set eagerly; dlopen libs fetched on demand",
     "",
-    "Mode D: Wrapper (Python / non-encrypted binaries)",
-    "  .antirev-wrap python3 script.py",
-    "  Wrapper connects to daemon, receives all lib fds",
-    "  Sets LD_PRELOAD with dlopen_shim + ANTIREV_FD_MAP",
-    "  execvp(python3) -- interpreter loads encrypted .so via dlopen transparently",
-    "",
-    "Mode selection is automatic based on bundle flags",
+    "Massive fd savings compared to per-process lib duplication",
 ])
 
 # ── Slide 12: Python Integration ────────────────────────────────────
 section_slide(prs, 7, "Python Integration",
               "1000+ Python scripts loading encrypted native extensions")
 
-two_col_slide(prs,
-    "Python Integration: Two Mechanisms",
-    "Wrapper Mode (C-level)",
-    [
-        ".antirev-wrap python3 script.py",
-        "",
-        "Flow:",
-        "1. Wrapper connects to daemon",
-        "2. Receives all lib fds via SCM_RIGHTS",
-        "3. Sets LD_PRELOAD = dlopen_shim",
-        "4. Sets ANTIREV_FD_MAP = lib->fd map",
-        "5. execvp(python3, script.py)",
-        "",
-        "dlopen_shim intercepts C-level dlopen()",
-        "Works for any ctypes.CDLL / cffi / numpy",
-        "No Python code changes needed",
-    ],
-    "antirev_client.py (Python-level)",
-    [
-        "from antirev_client import activate",
-        "activate('/path/to/.antirev-libd')",
-        "",
-        "Patches:",
-        "  ctypes.CDLL -> load from memfd",
-        "  sys.meta_path -> intercept import",
-        "",
-        "Pure-Python ELF parser:",
-        "  Reads PT_DYNAMIC, DT_NEEDED, DT_SONAME",
-        "  No readelf dependency",
-        "",
-        "Dependency ordering:",
-        "  _ensure_loaded() recursively preloads",
-        "  transitive DT_NEEDED with RTLD_GLOBAL",
-        "",
-        "Creates soname symlinks in temp dir",
-        "prepended to LD_LIBRARY_PATH",
-    ])
+content_slide(prs, "antirev_client.py (Python-level)", [
+    "from antirev_client import activate",
+    "activate('/path/to/.antirev-libd')",
+    "",
+    "Patches:",
+    "  ctypes.CDLL -> load from memfd",
+    "  sys.meta_path -> intercept import",
+    "",
+    "Pure-Python ELF parser:",
+    "  Reads PT_DYNAMIC, DT_NEEDED, DT_SONAME",
+    "  No readelf dependency",
+    "",
+    "Dependency ordering:",
+    "  _ensure_loaded() recursively preloads",
+    "  transitive DT_NEEDED with RTLD_GLOBAL",
+    "",
+    "Creates soname symlinks in temp dir prepended to LD_LIBRARY_PATH",
+])
 
 # ── Slide 13: Encryptor / Packer ────────────────────────────────────
 section_slide(prs, 8, "Encryptor & Packer",
@@ -731,7 +702,7 @@ add_bullet(tf, "Memory-only execution via memfd + fexecve (no disk plaintext)", 
 add_bullet(tf, "Daemon architecture for 550+ lib scale (decrypt once, serve many)", size=16, color=LIGHT)
 add_bullet(tf, "Symlink-dir approach preserves glibc symbol resolution semantics", size=16, color=LIGHT)
 add_bullet(tf, "Transparent to application code (no source changes required)", size=16, color=LIGHT)
-add_bullet(tf, "Python integration via wrapper mode and client library", size=16, color=LIGHT)
+add_bullet(tf, "Python integration via antirev_client library", size=16, color=LIGHT)
 add_bullet(tf, "Comprehensive diagnostic tooling for pre-deployment validation", size=16, color=LIGHT)
 
 # ── Save ────────────────────────────────────────────────────────────

@@ -6,8 +6,7 @@ Binary protection system that encrypts executables and shared libraries, then ru
 - **exe_shim**: LD_PRELOAD shim that intercepts `readlink`, `realpath`, `getauxval` to hide memfd paths from the protected process
 - **dlopen_shim**: LD_PRELOAD shim that redirects `dlopen()` calls to decrypted memfd-backed libraries via `ANTIREV_FD_MAP`
 - **encryptor** (`protect.py`, `antirev-pack.py`): Python tools that encrypt and bundle binaries with AES-256-GCM
-- **daemon mode** (`.antirev-libd`): a lib-server process decrypts shared libraries once and serves them to client processes via SCM_RIGHTS
-- **wrapper mode** (`.antirev-wrap`): connects to daemon, receives lib fds, sets up `LD_PRELOAD` with dlopen_shim + `ANTIREV_FD_MAP`, then execs an arbitrary command (e.g. `python3`). Used for non-encrypted binaries that need to dlopen encrypted libs.
+- **daemon mode** (`.antirev-libd`): a lightweight lib-server process that scans its directory for encrypted `.so` files, decrypts them into memfds, and serves the fds to client processes via SCM_RIGHTS
 - **antirev_client.py**: Python client that connects to the daemon, receives decrypted lib memfds via SCM_RIGHTS, and patches `import` + `ctypes.CDLL` to transparently load encrypted libs. Handles dependency ordering via `_ensure_loaded()` which recursively preloads transitive DT_NEEDED deps with `RTLD_GLOBAL`.
 - **build.py**: compiles/obfuscates Python source files via Cython, Nuitka, or PyArmor
 
@@ -58,9 +57,7 @@ When adding or changing features, update this CLAUDE.md file to reflect the new 
 
 ### Python integration
 
-Python scripts load encrypted libs via two mechanisms:
-1. **Wrapper mode**: `.antirev-wrap python3 script.py` — the wrapper connects to the daemon, sets up dlopen_shim via LD_PRELOAD, then execs Python. The dlopen_shim intercepts C-level dlopen calls.
-2. **antirev_client.py**: called from within Python (`from antirev_client import activate`). Connects to the daemon, patches `ctypes.CDLL` and `sys.meta_path` to redirect to memfd-backed libs. Loads encrypted libs with `RTLD_GLOBAL` and creates soname symlinks in a temp dir prepended to `LD_LIBRARY_PATH`. Speaks daemon protocol v2 — sends `OP_INIT` on connect and collects `OP_BATCH`/`OP_END` framed replies. Covered by `test_python_client_daemon`.
+Python scripts load encrypted libs via `antirev_client.py` — called from within Python (`from antirev_client import activate`). Connects to the daemon, patches `ctypes.CDLL` and `sys.meta_path` to redirect to memfd-backed libs. Loads encrypted libs with `RTLD_GLOBAL` and creates soname symlinks in a temp dir prepended to `LD_LIBRARY_PATH`. Speaks daemon protocol v2 — sends `OP_INIT` on connect and collects `OP_BATCH`/`OP_END` framed replies. Covered by `test_python_client_daemon`.
 
 ### Known issues with memfd loading
 
