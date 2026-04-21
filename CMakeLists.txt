@@ -8,14 +8,17 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # On a native aarch64 host, the system gcc is already an aarch64 compiler —
 # no cross toolchain needed. On x86 hosts, we look for common cross-compiler
 # names across distributions (Debian/Ubuntu, SUSE, Red Hat).
+# Use find_program for the native side too so PATH is respected (instead
+# of hard-coding /usr/bin/gcc, which may not be the compiler the user's
+# environment expects — e.g. a custom toolchain via modules / conda).
 if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "aarch64")
-    set(AARCH64_GCC   "/usr/bin/gcc")
-    set(AARCH64_STRIP "/usr/bin/strip")
-    find_program(X86_GCC   NAMES x86_64-linux-gnu-gcc)
-    find_program(X86_STRIP NAMES x86_64-linux-gnu-strip)
+    find_program(AARCH64_GCC   NAMES gcc)
+    find_program(AARCH64_STRIP NAMES strip)
+    find_program(X86_GCC       NAMES x86_64-linux-gnu-gcc)
+    find_program(X86_STRIP     NAMES x86_64-linux-gnu-strip)
 else()
-    set(X86_GCC   "/usr/bin/gcc")
-    set(X86_STRIP "/usr/bin/strip")
+    find_program(X86_GCC       NAMES gcc)
+    find_program(X86_STRIP     NAMES strip)
     find_program(AARCH64_GCC   NAMES aarch64-linux-gnu-gcc aarch64-suse-linux-gcc)
     find_program(AARCH64_STRIP NAMES aarch64-linux-gnu-strip aarch64-suse-linux-strip)
 endif()
