@@ -41,10 +41,18 @@ int main(int argc, char *argv[]) {
 }
 EOF
 
-# -static avoids the interpreter-path mismatch when shipping the binary
-# across hosts with different /lib layouts (Debian vs RedHat/SUSE), which
-# otherwise surfaces as the confusing "No such file or directory" at exec.
-"$CC" -O2 -static -o popen_test popen_test.c
+# Must be DYNAMIC — the repro depends on exe_shim being LD_PRELOAD'd
+# into the encrypted binary at runtime. Static binaries skip the dynamic
+# linker entirely, so LD_PRELOAD has no effect and the shim never loads
+# (which means the vfork+shim interaction we're trying to reproduce
+# never happens, and the test silently passes on the wrong basis).
+#
+# If the resulting binary hits "No such file or directory" on the run
+# machine, that's a PT_INTERP layout mismatch. Fix on the run host:
+#   sudo ln -sf /lib64/ld-linux-aarch64.so.1 /lib/ld-linux-aarch64.so.1
+# or rebuild here with an explicit interpreter path:
+#   CC='gcc -Wl,--dynamic-linker=/lib64/ld-linux-aarch64.so.1' $0
+"$CC" -O2 -o popen_test popen_test.c
 
 echo "[+] built:  $OUT/popen_test"
 file popen_test | sed 's/^/         /'
