@@ -4,12 +4,31 @@ project(antirev C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# ── Cross-compiler detection ──────────────────────────────────────────
-find_program(AARCH64_GCC aarch64-linux-gnu-gcc)
-if(AARCH64_GCC)
-    message(STATUS "aarch64 cross-compiler: ${AARCH64_GCC}")
+# ── Host / target compiler detection ──────────────────────────────────
+# On a native aarch64 host, the system gcc is already an aarch64 compiler —
+# no cross toolchain needed. On x86 hosts, we look for common cross-compiler
+# names across distributions (Debian/Ubuntu, SUSE, Red Hat).
+if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    set(AARCH64_GCC   "/usr/bin/gcc")
+    set(AARCH64_STRIP "/usr/bin/strip")
+    find_program(X86_GCC   NAMES x86_64-linux-gnu-gcc)
+    find_program(X86_STRIP NAMES x86_64-linux-gnu-strip)
 else()
-    message(STATUS "aarch64-linux-gnu-gcc not found — skipping ARM64 targets")
+    set(X86_GCC   "/usr/bin/gcc")
+    set(X86_STRIP "/usr/bin/strip")
+    find_program(AARCH64_GCC   NAMES aarch64-linux-gnu-gcc aarch64-suse-linux-gcc)
+    find_program(AARCH64_STRIP NAMES aarch64-linux-gnu-strip aarch64-suse-linux-strip)
+endif()
+
+if(AARCH64_GCC)
+    message(STATUS "aarch64 compiler: ${AARCH64_GCC}")
+else()
+    message(STATUS "no aarch64 compiler — skipping ARM64 targets")
+endif()
+if(X86_GCC)
+    message(STATUS "x86_64 compiler: ${X86_GCC}")
+else()
+    message(STATUS "no x86_64 compiler — skipping x86-64 targets")
 endif()
 
 # ── Helper: compile the exe shim (readlink interceptor) ───────────────
@@ -53,21 +72,27 @@ function(make_blob_header OUTPUT INPUT VARNAME DEP)
 endfunction()
 
 # ── Helper: build a stub binary with a given compiler ─────────────────
-# Usage: build_stub(<output> <compiler> <stripper> <exe_blob_dep> <dlopen_blob_dep>)
-function(build_stub OUTPUT COMPILER STRIPPER EXE_BLOB_DEP DLOPEN_BLOB_DEP)
-    # Extra flags: pass -static for cross-compiled (non-native) stubs so they run
-    # on QEMU user-mode (no ARM64 dynamic linker on the host) and on embedded targets.
-    # Native x86-64 stub stays dynamically linked (faster startup, smaller binary).
-    if("${COMPILER}" STREQUAL "gcc")
-        set(EXTRA_FLAGS "")
-    else()
-        # Enable ARM Crypto Extensions for aarch64 AES hardware acceleration
-        string(FIND "${COMPILER}" "aarch64" _is_aarch64)
-        if(NOT _is_aarch64 EQUAL -1)
+# Usage: build_stub(<output> <compiler> <stripper> <target_arch> <exe_blob_dep> <dlopen_blob_dep>)
+#   target_arch: "x86_64" or "aarch64"
+function(build_stub OUTPUT COMPILER STRIPPER TARGET_ARCH EXE_BLOB_DEP DLOPEN_BLOB_DEP)
+    # Extra flags by target arch:
+    #   - aarch64: always enable ARM Crypto Extensions for AES hardware accel
+    #   - non-native target: -static so the stub runs under QEMU user-mode
+    #     (no target-arch dynamic linker on the host) and on embedded targets
+    if(TARGET_ARCH STREQUAL "aarch64")
+        if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "aarch64")
+            set(EXTRA_FLAGS -march=armv8-a+crypto)
+        else()
             set(EXTRA_FLAGS -static -march=armv8-a+crypto)
+        endif()
+    elseif(TARGET_ARCH STREQUAL "x86_64")
+        if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
+            set(EXTRA_FLAGS "")
         else()
             set(EXTRA_FLAGS -static)
         endif()
+    else()
+        message(FATAL_ERROR "build_stub: unknown TARGET_ARCH '${TARGET_ARCH}'")
     endif()
     add_custom_command(
         OUTPUT  "${OUTPUT}"
@@ -89,28 +114,30 @@ function(build_stub OUTPUT COMPILER STRIPPER EXE_BLOB_DEP DLOPEN_BLOB_DEP)
 endfunction()
 
 # ═══════════════════════════════════════════════════════════════════════
-#  x86-64 targets
+#  x86-64 targets (only when x86-64 compiler is present)
 # ═══════════════════════════════════════════════════════════════════════
 
-set(STUB_X86    "${CMAKE_BINARY_DIR}/stub")
+if(X86_GCC)
+    set(STUB_X86    "${CMAKE_BINARY_DIR}/stub")
 
-set(EXE_SHIM_X86        "${CMAKE_BINARY_DIR}/exe_shim_x86_64.so")
-set(EXE_SHIM_BLOB_X86_H "${CMAKE_BINARY_DIR}/exe_shim_blob.h")
-set(DLOPEN_SHIM_X86        "${CMAKE_BINARY_DIR}/dlopen_shim_x86_64.so")
-set(DLOPEN_SHIM_BLOB_X86_H "${CMAKE_BINARY_DIR}/dlopen_shim_blob.h")
+    set(EXE_SHIM_X86        "${CMAKE_BINARY_DIR}/exe_shim_x86_64.so")
+    set(EXE_SHIM_BLOB_X86_H "${CMAKE_BINARY_DIR}/exe_shim_blob.h")
+    set(DLOPEN_SHIM_X86        "${CMAKE_BINARY_DIR}/dlopen_shim_x86_64.so")
+    set(DLOPEN_SHIM_BLOB_X86_H "${CMAKE_BINARY_DIR}/dlopen_shim_blob.h")
 
-compile_exe_shim("${EXE_SHIM_X86}" gcc)
-add_custom_target(exe_shim_x86 DEPENDS "${EXE_SHIM_X86}")
-compile_dlopen_shim("${DLOPEN_SHIM_X86}" gcc)
-add_custom_target(dlopen_shim_x86 DEPENDS "${DLOPEN_SHIM_X86}")
+    compile_exe_shim("${EXE_SHIM_X86}" "${X86_GCC}")
+    add_custom_target(exe_shim_x86 DEPENDS "${EXE_SHIM_X86}")
+    compile_dlopen_shim("${DLOPEN_SHIM_X86}" "${X86_GCC}")
+    add_custom_target(dlopen_shim_x86 DEPENDS "${DLOPEN_SHIM_X86}")
 
-make_blob_header("${EXE_SHIM_BLOB_X86_H}" "${EXE_SHIM_X86}" "exe_shim_blob" "${EXE_SHIM_X86}")
-add_custom_target(exe_shim_blob_h DEPENDS "${EXE_SHIM_BLOB_X86_H}")
-make_blob_header("${DLOPEN_SHIM_BLOB_X86_H}" "${DLOPEN_SHIM_X86}" "dlopen_shim_blob" "${DLOPEN_SHIM_X86}")
-add_custom_target(dlopen_shim_blob_h DEPENDS "${DLOPEN_SHIM_BLOB_X86_H}")
+    make_blob_header("${EXE_SHIM_BLOB_X86_H}" "${EXE_SHIM_X86}" "exe_shim_blob" "${EXE_SHIM_X86}")
+    add_custom_target(exe_shim_blob_h DEPENDS "${EXE_SHIM_BLOB_X86_H}")
+    make_blob_header("${DLOPEN_SHIM_BLOB_X86_H}" "${DLOPEN_SHIM_X86}" "dlopen_shim_blob" "${DLOPEN_SHIM_X86}")
+    add_custom_target(dlopen_shim_blob_h DEPENDS "${DLOPEN_SHIM_BLOB_X86_H}")
 
-build_stub("${STUB_X86}" gcc strip "${EXE_SHIM_BLOB_X86_H}" "${DLOPEN_SHIM_BLOB_X86_H}")
-add_custom_target(stub ALL DEPENDS "${STUB_X86}")
+    build_stub("${STUB_X86}" "${X86_GCC}" "${X86_STRIP}" x86_64 "${EXE_SHIM_BLOB_X86_H}" "${DLOPEN_SHIM_BLOB_X86_H}")
+    add_custom_target(stub ALL DEPENDS "${STUB_X86}")
+endif()
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ARM64 targets (only when cross-compiler is present)
@@ -134,7 +161,7 @@ if(AARCH64_GCC)
     make_blob_header("${DLOPEN_SHIM_BLOB_ARM64_H}" "${DLOPEN_SHIM_ARM64}" "dlopen_shim_blob" "${DLOPEN_SHIM_ARM64}")
     add_custom_target(dlopen_shim_blob_aarch64_h DEPENDS "${DLOPEN_SHIM_BLOB_ARM64_H}")
 
-    build_stub("${STUB_ARM64}" "${AARCH64_GCC}" aarch64-linux-gnu-strip "${EXE_SHIM_BLOB_ARM64_H}" "${DLOPEN_SHIM_BLOB_ARM64_H}")
+    build_stub("${STUB_ARM64}" "${AARCH64_GCC}" "${AARCH64_STRIP}" aarch64 "${EXE_SHIM_BLOB_ARM64_H}" "${DLOPEN_SHIM_BLOB_ARM64_H}")
     add_custom_target(stub_aarch64 ALL DEPENDS "${STUB_ARM64}")
 endif()
 
@@ -161,22 +188,24 @@ endif()
 #  End-to-end tests
 # ═══════════════════════════════════════════════════════════════════════
 
-add_custom_target(run_test
-    COMMAND ${CMAKE_COMMAND} -E echo "=== x86-64 test ==="
-    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
-            --stub   "${CMAKE_BINARY_DIR}/stub"
-            --main   "$<TARGET_FILE:hello>"
-            --key    "${CMAKE_BINARY_DIR}/test.key"
-            --output "${CMAKE_BINARY_DIR}/hello.protected"
-    COMMAND ${CMAKE_COMMAND}
-            "-DBINARY=${CMAKE_BINARY_DIR}/hello.protected"
-            "-DEXPECTED_EXIT=42"
-            -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
-    DEPENDS stub hello
-    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "x86-64 end-to-end test"
-    USES_TERMINAL
-)
+if(X86_GCC)
+    add_custom_target(run_test
+        COMMAND ${CMAKE_COMMAND} -E echo "=== x86-64 test ==="
+        COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+                --stub   "${CMAKE_BINARY_DIR}/stub"
+                --main   "$<TARGET_FILE:hello>"
+                --key    "${CMAKE_BINARY_DIR}/test.key"
+                --output "${CMAKE_BINARY_DIR}/hello.protected"
+        COMMAND ${CMAKE_COMMAND}
+                "-DBINARY=${CMAKE_BINARY_DIR}/hello.protected"
+                "-DEXPECTED_EXIT=42"
+                -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
+        DEPENDS stub hello
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "x86-64 end-to-end test"
+        USES_TERMINAL
+    )
+endif()
 
 if(AARCH64_GCC)
     add_custom_target(run_test_aarch64
