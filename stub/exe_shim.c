@@ -32,6 +32,10 @@
 #include <sys/prctl.h>
 #include <sys/auxv.h>
 #include <fcntl.h>
+#if defined(__aarch64__)
+#  include <sys/wait.h>
+#  include <pthread.h>
+#endif
 
 #include <dlfcn.h>
 
@@ -470,47 +474,99 @@ unsigned long getauxval(unsigned long type)
 }
 
 /* ------------------------------------------------------------------ */
-/*  popen interception                                                  */
+/*  popen / pclose interception (aarch64 only)                          */
 /*                                                                      */
-/*  glibc popen uses vfork (CLONE_VM|CLONE_VFORK) which shares the     */
-/*  parent's address space. Under anti-rev with many memfds and         */
-/*  LD_PRELOAD shims, the vfork'd child can behave unexpectedly.        */
-/*  We intercept popen to use a clean fork+exec instead.                */
+/*  glibc's popen implementation spawns the child via vfork             */
+/*  (CLONE_VM|CLONE_VFORK), sharing the parent's address space until    */
+/*  the child exec's. In antirev-protected processes on aarch64 —      */
+/*  memfd-heavy, LD_PRELOAD shims active, crypto extensions in use —   */
+/*  the vfork'd child corrupts parent state before exec, leading to    */
+/*  crashes or wrong output. We override popen to use plain fork+exec.  */
+/*                                                                      */
+/*  pclose must also be overridden: glibc's pclose looks up the child  */
+/*  pid in its private popen hash table, which our FILE* isn't in. If  */
+/*  the caller pclose's our FILE*, glibc silently fails to waitpid,    */
+/*  leaving the child as a zombie. We maintain our own FILE*→pid map   */
+/*  and delegate to the real pclose for FILEs that aren't ours.        */
+/*                                                                      */
+/*  x86-64 does not exhibit the vfork corruption in practice, so this  */
+/*  whole section is compiled out on non-aarch64 targets.               */
 /* ------------------------------------------------------------------ */
 
-static FILE *(*g_real_popen)(const char *, const char *) = NULL;
+#if defined(__aarch64__)
 
-static void resolve_real_popen(void)
+#define POPEN_TABLE_SIZE 64
+
+static FILE *(*g_real_popen )(const char *, const char *) = NULL;
+static int   (*g_real_pclose)(FILE *)                      = NULL;
+
+static struct popen_entry {
+    FILE *fp;
+    pid_t pid;
+} g_popen_table[POPEN_TABLE_SIZE];
+static pthread_mutex_t g_popen_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void resolve_real_popen_funcs(void)
 {
-    if (g_real_popen)
+    if (g_real_popen && g_real_pclose)
         return;
     void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
     if (libc) {
-        g_real_popen = dlsym(libc, "popen");
+        if (!g_real_popen ) g_real_popen  = dlsym(libc, "popen");
+        if (!g_real_pclose) g_real_pclose = dlsym(libc, "pclose");
         dlclose(libc);
-        if (g_real_popen)
-            return;
     }
-    g_real_popen = dlsym(RTLD_NEXT, "popen");
+    if (!g_real_popen ) g_real_popen  = dlsym(RTLD_NEXT, "popen");
+    if (!g_real_pclose) g_real_pclose = dlsym(RTLD_NEXT, "pclose");
+}
+
+static int popen_table_insert(FILE *fp, pid_t pid)
+{
+    pthread_mutex_lock(&g_popen_lock);
+    for (int i = 0; i < POPEN_TABLE_SIZE; i++) {
+        if (!g_popen_table[i].fp) {
+            g_popen_table[i].fp  = fp;
+            g_popen_table[i].pid = pid;
+            pthread_mutex_unlock(&g_popen_lock);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_popen_lock);
+    return -1;
+}
+
+/* Returns pid on success, or (pid_t)-1 if fp wasn't from our popen. */
+static pid_t popen_table_remove(FILE *fp)
+{
+    pthread_mutex_lock(&g_popen_lock);
+    for (int i = 0; i < POPEN_TABLE_SIZE; i++) {
+        if (g_popen_table[i].fp == fp) {
+            pid_t pid = g_popen_table[i].pid;
+            g_popen_table[i].fp  = NULL;
+            g_popen_table[i].pid = 0;
+            pthread_mutex_unlock(&g_popen_lock);
+            return pid;
+        }
+    }
+    pthread_mutex_unlock(&g_popen_lock);
+    return (pid_t)-1;
 }
 
 __attribute__((visibility("default")))
 FILE *popen(const char *command, const char *type)
 {
-    if (!is_owner_process()) {
-        if (!g_real_popen) resolve_real_popen();
-        if (g_real_popen) return g_real_popen(command, type);
-        return NULL;
-    }
+    resolve_real_popen_funcs();
 
-    /* Owner process: implement popen with fork (not vfork) and clean env.
-     * This avoids vfork issues with memfd-heavy processes. */
-    if (type[0] != 'r') {
-        /* Only intercept read-mode popen for now */
-        if (!g_real_popen) resolve_real_popen();
-        if (g_real_popen) return g_real_popen(command, type);
-        return NULL;
-    }
+    /* Child processes inherit LD_PRELOAD but aren't the protected binary;
+     * fall through to the real popen so they behave normally. */
+    if (!is_owner_process())
+        return g_real_popen ? g_real_popen(command, type) : NULL;
+
+    /* Write-mode popen is less common and would need a separate pipe
+     * direction. Keep the override read-only; delegate write-mode to
+     * the real popen (if that path crashes on aarch64, extend later). */
+    if (!type || type[0] != 'r')
+        return g_real_popen ? g_real_popen(command, type) : NULL;
 
     int pipefd[2];
     if (pipe(pipefd) < 0)
@@ -524,12 +580,12 @@ FILE *popen(const char *command, const char *type)
     }
 
     if (pid == 0) {
-        /* Child: redirect stdout to pipe, exec sh */
+        /* Child: redirect stdout to pipe, exec sh. Strip antirev env so
+         * grandchildren don't inherit stale memfd fd numbers / preloads. */
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
 
-        /* Clean anti-rev env vars for the child */
         unsetenv("ANTIREV_FD_MAP");
         unsetenv("ANTIREV_REAL_EXE");
         unsetenv("LD_PRELOAD");
@@ -538,10 +594,50 @@ FILE *popen(const char *command, const char *type)
         _exit(127);
     }
 
-    /* Parent: return read end of pipe as FILE* */
+    /* Parent */
     close(pipefd[1]);
     FILE *fp = fdopen(pipefd[0], "r");
-    if (!fp)
+    if (!fp) {
+        int st;
         close(pipefd[0]);
+        waitpid(pid, &st, 0);
+        return NULL;
+    }
+
+    if (popen_table_insert(fp, pid) < 0) {
+        /* Table full (>POPEN_TABLE_SIZE concurrent popens outstanding).
+         * Reap the child synchronously and fail the call rather than
+         * leaking a zombie. */
+        int st;
+        fclose(fp);
+        waitpid(pid, &st, 0);
+        errno = ENOMEM;
+        return NULL;
+    }
+
     return fp;
 }
+
+__attribute__((visibility("default")))
+int pclose(FILE *stream)
+{
+    pid_t pid = popen_table_remove(stream);
+    if (pid == (pid_t)-1) {
+        /* Not from our popen — forward to real pclose so FILEs opened by
+         * the unintercepted path (non-owner, write-mode) still work. */
+        resolve_real_popen_funcs();
+        if (g_real_pclose) return g_real_pclose(stream);
+        errno = EINVAL;
+        return -1;
+    }
+
+    fclose(stream);
+    int status;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR)
+            return -1;
+    }
+    return status;
+}
+
+#endif  /* __aarch64__ */
