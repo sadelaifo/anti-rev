@@ -41,7 +41,10 @@ int main(int argc, char *argv[]) {
 }
 EOF
 
-"$CC" -O2 -o popen_test popen_test.c
+# -static avoids the interpreter-path mismatch when shipping the binary
+# across hosts with different /lib layouts (Debian vs RedHat/SUSE), which
+# otherwise surfaces as the confusing "No such file or directory" at exec.
+"$CC" -O2 -static -o popen_test popen_test.c
 
 echo "[+] built:  $OUT/popen_test"
 file popen_test | sed 's/^/         /'
