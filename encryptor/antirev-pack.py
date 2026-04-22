@@ -26,12 +26,14 @@ Config format:
     libs: encrypt                      # optional: encrypt|skip (default: encrypt)
 
     encrypt_libs:                      # optional whitelist: only encrypt these libs
-      - libsecret.so                   #   all other libs are copied as plaintext
+      - libsecret.so                   #   all other libs/.elf are copied as plaintext
       - lib/crypto/                    #   supports same patterns as blacklist
+      - pg_*.elf                       #   .elf PG binaries use the same filters
 
-    plaintext_libs:                    # optional blacklist: don't encrypt these libs
-      - libcrypto.so*                  #   all other libs are encrypted
+    plaintext_libs:                    # optional blacklist: don't encrypt these libs/.elf
+      - libcrypto.so*                  #   all other libs/.elf are encrypted
       - lib/3rd/                       #   (mutually exclusive with encrypt_libs)
+      - pg_debug.elf                   #   e.g. keep a specific PG binary plaintext
 
     copy:                              # optional: non-ELF files to copy as-is
       - etc/                           # copy entire config directory
@@ -40,7 +42,8 @@ Config format:
 
 What it does:
   - Recursively scans install_dir for all ELF files (executables and libraries)
-  - Classifies each as executable (ET_EXEC/ET_DYN without .so) or shared library
+  - Classifies each as executable (ET_EXEC/ET_DYN without .so/.elf) or lib-category
+    asset (.so libraries and .elf PG binaries both go through the lib pipeline)
   - Skips blacklisted ELF files entirely (not copied, not encrypted)
   - Only copies non-ELF files that match the 'copy' list (if omitted, nothing copied)
   - Protects executables with the stub
@@ -87,6 +90,11 @@ def classify_elf(path: Path) -> tuple[str, str]:
     """Classify an ELF file. Returns (kind, arch) or None if not ELF.
 
     kind: 'exe' or 'lib'
+      - 'lib'  — filename contains '.so' (shared library) OR ends with
+                 '.elf' (ANTI_LoadProcess PG binary / firmware blob).  These
+                 go into the daemon asset pool.
+      - 'exe'  — any other ET_EXEC / ET_DYN ELF.  Gets wrapped by the
+                 protect-exe flow into a standalone stub binary.
     arch: 'x86_64' or 'aarch64'
     """
     try:
@@ -106,8 +114,17 @@ def classify_elf(path: Path) -> tuple[str, str]:
 
             arch = 'aarch64' if e_machine == EM_AARCH64 else 'x86_64'
 
-            is_so = '.so' in path.name
-            if e_type == ET_EXEC:
+            # .elf suffix = ANTI_LoadProcess-style PG binary / firmware blob.
+            # These are data-like assets served by the daemon, NEVER
+            # wrapped as standalone protected executables even when
+            # ET_EXEC, so treat the suffix as a lib-category marker.
+            # The encrypt_libs / plaintext_libs filters then apply to
+            # .elf just like they apply to .so.
+            is_so  = '.so'  in path.name
+            is_elf = path.name.endswith('.elf')
+            if is_elf:
+                kind = 'lib'
+            elif e_type == ET_EXEC:
                 kind = 'exe'
             elif e_type == ET_DYN:
                 kind = 'lib' if is_so else 'exe'
@@ -428,18 +445,22 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
 # ── Worker functions (run in child processes) ─────────────────────────
 
 def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
-    """Encrypt a single .so file. Returns status string.
+    """Encrypt a single .so file (or .elf PG binary). Returns status string.
 
-    If the lib has no DT_SONAME, patch a copy with patchelf before
-    encrypting so that glibc can match the LD_PRELOAD'd memfd to
-    DT_NEEDED entries at runtime.
+    If a .so has no DT_SONAME, patch a copy with patchelf first so that
+    glibc can match the LD_PRELOAD'd memfd to DT_NEEDED entries at
+    runtime.  .elf PG binaries are looked up by basename at runtime
+    (aarch64_extend_shim → OP_GET_LIB), never go through DT_NEEDED resolution,
+    and usually have no SONAME — skip patchelf for them.
     """
     src_p, dst_p = Path(src), Path(dst)
     patched = None
     soname_note = ""
 
-    # Check if SONAME is missing
-    if not get_dt_soname(src_p):
+    is_elf_asset = src_p.name.endswith('.elf')
+
+    # Check if SONAME is missing (.so only — .elf files don't need one).
+    if not is_elf_asset and not get_dt_soname(src_p):
         tmp_dir = tempfile.mkdtemp(prefix="antirev_patch_")
         patched = Path(tmp_dir) / src_p.name
         shutil.copy2(src_p, patched)
@@ -595,13 +616,14 @@ def main():
     lib_blacklist = compile_blacklist(raw_plaintext_libs) if raw_plaintext_libs else []
 
     # ── Scan all files ────────────────────────────────────────────────
-    exe_files   = []   # (rel_path, arch, abs_path)
-    lib_files   = []   # abs_path — libs to encrypt
-    plain_libs  = []   # abs_path — libs to copy as plaintext
-    copy_files  = []   # abs_path — non-ELF files to copy
-    symlinks    = []   # (abs_path, target) — symlinks to recreate in output
-    skipped     = []   # rel_path
-    ignored     = 0    # non-ELF files not in copy list
+    exe_files          = []   # (rel_path, arch, abs_path)
+    lib_files          = []   # abs_path — libs to encrypt
+    plain_libs         = []   # abs_path — libs to copy as plaintext
+    unsupported_arch   = []   # (rel, arch, src) — ELF whose arch is not in stubs
+    copy_files         = []   # abs_path — non-ELF files to copy
+    symlinks           = []   # (abs_path, target) — symlinks to recreate in output
+    skipped            = []   # rel_path
+    ignored            = 0    # non-ELF files not in copy list
 
     for src in sorted(install_dir.rglob('*')):
         if src.is_symlink():
@@ -626,6 +648,16 @@ def main():
             continue
 
         kind, arch = elf_info
+
+        # Out-of-scope arch: user only configured stubs for some arches,
+        # so this ELF gets copied through verbatim (the install tree
+        # stays complete; runtime just won't see encryption for it).
+        # A summary is printed below so a typo'd / missing stub config
+        # is still visible.
+        if arch not in stubs:
+            unsupported_arch.append((rel, arch, src))
+            continue
+
         if kind == 'exe':
             exe_files.append((rel, arch, src))
         else:
@@ -661,6 +693,18 @@ def main():
         print(f"[pack]   Blacklisted:   {len(skipped)}")
         for rel in skipped:
             print(f"[pack]     skip: {rel}")
+    if unsupported_arch:
+        # Group per arch so the warning is concise even if there are many.
+        per_arch: dict[str, list[str]] = {}
+        for rel, arch, _src in unsupported_arch:
+            per_arch.setdefault(arch, []).append(rel)
+        configured = ", ".join(sorted(stubs.keys())) or "<none>"
+        for arch, rels in sorted(per_arch.items()):
+            print(f"[pack]   WARNING: {len(rels)} ELF(s) with arch '{arch}' "
+                  f"have no configured stub (configured: {configured}) — "
+                  f"copying as plaintext")
+            for rel in rels:
+                print(f"[pack]     plain (arch={arch}): {rel}")
     print()
 
     # ── Lib handling mode ────────────────────────────────────────────────
@@ -723,10 +767,9 @@ def main():
 
     if exe_files:
         print(f"[pack] Protecting {len(exe_files)} executable(s)...")
-        for rel, arch, src in exe_files:
-            if arch not in stubs:
-                sys.exit(f"[error] no stub for arch '{arch}' "
-                         f"(needed by {rel}). Add it to 'stubs' in config.")
+        # Arch-vs-stubs mismatch is filtered out earlier in the scan
+        # phase (see 'unsupported_arch'), so every entry here has a
+        # matching stub by construction.
 
         exe_daemon_libs = libs_mode == 'encrypt' and bool(lib_files)
 
@@ -777,11 +820,16 @@ def main():
         print()
 
     # ── Copy plaintext libs + other files (parallel, batched) ─────────
-    # Merge plain_libs into copy_files
-    all_copy = copy_files + plain_libs
+    # Merge plain_libs and unsupported-arch ELFs into copy_files —
+    # they all just go to output_dir verbatim.
+    unsupported_paths = [src for _rel, _arch, src in unsupported_arch]
+    all_copy = copy_files + plain_libs + unsupported_paths
     if plain_libs:
         print(f"[pack] Copying {len(plain_libs)} plaintext "
               f"librar{'y' if len(plain_libs) == 1 else 'ies'} as-is...")
+    if unsupported_paths:
+        print(f"[pack] Copying {len(unsupported_paths)} unsupported-arch "
+              f"ELF(s) as plaintext...")
     if all_copy:
         pairs = [
             (str(src), str(output_dir / src.relative_to(install_dir)))

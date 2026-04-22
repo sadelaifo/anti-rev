@@ -67,6 +67,7 @@
 #if defined(__aarch64__)
 #  include "exe_shim_blob_aarch64.h"     /* exe_shim_blob,    exe_shim_blob_len    */
 #  include "dlopen_shim_blob_aarch64.h"  /* dlopen_shim_blob, dlopen_shim_blob_len */
+#  include "aarch64_extend_shim_blob.h"  /* aarch64_extend_shim_blob,    aarch64_extend_shim_blob_len */
 #else
 #  include "exe_shim_blob.h"
 #  include "dlopen_shim_blob.h"
@@ -1081,7 +1082,13 @@ static void *pool_worker(void *arg)
     return NULL;
 }
 
-/* Recursively collect paths of encrypted .so files (ANTREV01 magic) */
+/* Recursively collect paths of encrypted .so / .elf files (ANTREV01 magic).
+ *
+ * The extension check is a fast-path filter so we do not open every
+ * regular file in the tree to test for our magic — the real
+ * authoritative filter is the magic-byte check below.  .elf files
+ * are program binaries consumed by ANTI_LoadProcess (served to aarch64_extend_shim
+ * via OP_GET_LIB) and coexist with .so libs in the same asset pool. */
 static void collect_enc_paths(const char *dir, dec_job_t *jobs, int *njobs,
                               int max)
 {
@@ -1104,7 +1111,7 @@ static void collect_enc_paths(const char *dir, dec_job_t *jobs, int *njobs,
             continue;
         }
         if (!S_ISREG(st.st_mode)) continue;
-        if (!strstr(de->d_name, ".so")) continue;
+        if (!strstr(de->d_name, ".so") && !strstr(de->d_name, ".elf")) continue;
 
         /* Skip duplicate filenames (same lib in different subdirs) */
         int dup = 0;
@@ -1739,6 +1746,23 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     if (write_chunk(dlopen_shim_fd, dlopen_shim_blob, dlopen_shim_blob_len) != 0) return 1;
     if (lseek(dlopen_shim_fd, 0, SEEK_SET) < 0) { perror("lseek dlopen_shim"); return 1; }
 
+    /* aarch64_extend_shim is aarch64-only — houses ANTI_LoadProcess
+     * interception and the popen/pclose workaround for glibc's
+     * vfork-based popen corrupting memfd-heavy parent processes on
+     * this arch. */
+    int aarch64_extend_shim_fd = -1;
+#if defined(__aarch64__)
+    aarch64_extend_shim_fd = make_memfd("antirev_aarch64_extend_shim.so");
+    if (aarch64_extend_shim_fd < 0) return 1;
+    if (write_chunk(aarch64_extend_shim_fd,
+                    aarch64_extend_shim_blob,
+                    aarch64_extend_shim_blob_len) != 0) return 1;
+    if (lseek(aarch64_extend_shim_fd, 0, SEEK_SET) < 0) {
+        perror("lseek aarch64_extend_shim");
+        return 1;
+    }
+#endif
+
     /* Phase 4b. Split libs into DT_NEEDED (symlink dir) and rest (ANTIREV_FD_MAP).
      *
      * DT_NEEDED libs are resolved by glibc's normal BFS through the symlink
@@ -1918,7 +1942,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     snprintf(main_fd_entry, sizeof(main_fd_entry),
              "ANTIREV_MAIN_FD=%d", main_fd);
 
-    /* Build LD_PRELOAD: exe_shim + dlopen_shim only.
+    /* Build LD_PRELOAD: exe_shim + dlopen_shim, plus aarch64_extend_shim on aarch64.
      *
      * Encrypted DT_NEEDED libs are NOT on LD_PRELOAD — they are resolved
      * by glibc's normal DT_NEEDED BFS through the symlink dir on
@@ -1937,6 +1961,10 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     int off = snprintf(ld_preload_entry, preload_len,
                        "LD_PRELOAD=/proc/self/fd/%d:/proc/self/fd/%d",
                        exe_shim_fd, dlopen_shim_fd);
+    if (aarch64_extend_shim_fd >= 0) {
+        off += snprintf(ld_preload_entry + off, preload_len - (size_t)off,
+                        ":/proc/self/fd/%d", aarch64_extend_shim_fd);
+    }
     if (compat_preload) {
         for (int j = 0; j < n_dt_needed; j++)
             off += snprintf(ld_preload_entry + off, preload_len - (size_t)off,

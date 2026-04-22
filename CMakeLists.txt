@@ -53,6 +53,20 @@ function(compile_dlopen_shim OUTPUT COMPILER)
     )
 endfunction()
 
+# ── Helper: compile the aarch64-extend shim (ANTI_LoadProcess + popen/pclose) ─
+# Usage: compile_aarch64_extend_shim(<output.so> <compiler>)
+function(compile_aarch64_extend_shim OUTPUT COMPILER)
+    add_custom_command(
+        OUTPUT  "${OUTPUT}"
+        COMMAND "${COMPILER}" -shared -fPIC -O2 -fvisibility=hidden
+                -o "${OUTPUT}"
+                "${CMAKE_SOURCE_DIR}/stub/aarch64_extend_shim.c"
+                -ldl -pthread
+        DEPENDS "${CMAKE_SOURCE_DIR}/stub/aarch64_extend_shim.c"
+        COMMENT "Building aarch64-extend shim: ${OUTPUT}"
+    )
+endfunction()
+
 # ── Helper: generate C blob header from a binary file ─────────────────
 # Usage: make_blob_header(<output.h> <input.so> <varname> <dep_target>)
 function(make_blob_header OUTPUT INPUT VARNAME DEP)
@@ -66,9 +80,13 @@ function(make_blob_header OUTPUT INPUT VARNAME DEP)
 endfunction()
 
 # ── Helper: build a stub binary with a given compiler ─────────────────
-# Usage: build_stub(<output> <compiler> <stripper> <target_arch> <exe_blob_dep> <dlopen_blob_dep>)
+# Usage: build_stub(<output> <compiler> <stripper> <target_arch> <exe_blob_dep> <dlopen_blob_dep> [<aarch64_extend_blob_dep>])
 #   target_arch: "x86_64" or "aarch64"
+#   aarch64_extend_blob_dep: aarch64-only extra dependency (aarch64_extend
+#                 shim blob header).  Omit/empty on x86_64 — stub.c
+#                 conditionally includes the header under __aarch64__.
 function(build_stub OUTPUT COMPILER STRIPPER TARGET_ARCH EXE_BLOB_DEP DLOPEN_BLOB_DEP)
+    set(AARCH64_EXTEND_BLOB_DEP "${ARGN}")
     # Extra flags by target arch:
     #   - aarch64: always enable ARM Crypto Extensions for AES hardware accel
     #   - non-native target: -static so the stub runs under QEMU user-mode
@@ -103,6 +121,7 @@ function(build_stub OUTPUT COMPILER STRIPPER TARGET_ARCH EXE_BLOB_DEP DLOPEN_BLO
             "${CMAKE_SOURCE_DIR}/stub/crypto.h"
             "${EXE_BLOB_DEP}"
             "${DLOPEN_BLOB_DEP}"
+            ${AARCH64_EXTEND_BLOB_DEP}
         COMMENT "Building and stripping stub: ${OUTPUT}"
     )
 endfunction()
@@ -144,18 +163,26 @@ if(AARCH64_GCC)
     set(EXE_SHIM_BLOB_ARM64_H "${CMAKE_BINARY_DIR}/exe_shim_blob_aarch64.h")
     set(DLOPEN_SHIM_ARM64        "${CMAKE_BINARY_DIR}/dlopen_shim_aarch64.so")
     set(DLOPEN_SHIM_BLOB_ARM64_H "${CMAKE_BINARY_DIR}/dlopen_shim_blob_aarch64.h")
+    set(AARCH64_EXTEND_SHIM        "${CMAKE_BINARY_DIR}/aarch64_extend_shim.so")
+    set(AARCH64_EXTEND_SHIM_BLOB_H "${CMAKE_BINARY_DIR}/aarch64_extend_shim_blob.h")
 
     compile_exe_shim("${EXE_SHIM_ARM64}" "${AARCH64_GCC}")
     add_custom_target(exe_shim_aarch64 DEPENDS "${EXE_SHIM_ARM64}")
     compile_dlopen_shim("${DLOPEN_SHIM_ARM64}" "${AARCH64_GCC}")
     add_custom_target(dlopen_shim_aarch64 DEPENDS "${DLOPEN_SHIM_ARM64}")
+    compile_aarch64_extend_shim("${AARCH64_EXTEND_SHIM}" "${AARCH64_GCC}")
+    add_custom_target(aarch64_extend_shim DEPENDS "${AARCH64_EXTEND_SHIM}")
 
     make_blob_header("${EXE_SHIM_BLOB_ARM64_H}" "${EXE_SHIM_ARM64}" "exe_shim_blob" "${EXE_SHIM_ARM64}")
     add_custom_target(exe_shim_blob_aarch64_h DEPENDS "${EXE_SHIM_BLOB_ARM64_H}")
     make_blob_header("${DLOPEN_SHIM_BLOB_ARM64_H}" "${DLOPEN_SHIM_ARM64}" "dlopen_shim_blob" "${DLOPEN_SHIM_ARM64}")
     add_custom_target(dlopen_shim_blob_aarch64_h DEPENDS "${DLOPEN_SHIM_BLOB_ARM64_H}")
+    make_blob_header("${AARCH64_EXTEND_SHIM_BLOB_H}" "${AARCH64_EXTEND_SHIM}" "aarch64_extend_shim_blob" "${AARCH64_EXTEND_SHIM}")
+    add_custom_target(aarch64_extend_shim_blob_h DEPENDS "${AARCH64_EXTEND_SHIM_BLOB_H}")
 
-    build_stub("${STUB_ARM64}" "${AARCH64_GCC}" "${AARCH64_STRIP}" aarch64 "${EXE_SHIM_BLOB_ARM64_H}" "${DLOPEN_SHIM_BLOB_ARM64_H}")
+    build_stub("${STUB_ARM64}" "${AARCH64_GCC}" "${AARCH64_STRIP}" aarch64
+               "${EXE_SHIM_BLOB_ARM64_H}" "${DLOPEN_SHIM_BLOB_ARM64_H}"
+               "${AARCH64_EXTEND_SHIM_BLOB_H}")
     add_custom_target(stub_aarch64 ALL DEPENDS "${STUB_ARM64}")
 endif()
 
