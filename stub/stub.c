@@ -898,18 +898,25 @@ static void build_deps_graph(const int *lib_fds,
     for (int i = 0; i < nlibs; i++) {
         g_deps_count[i] = 0;
         int n_dt = parse_dt_needed(lib_fds[i], dt_names, MAX_DEPS_PER_LIB);
-        if (n_dt < 0) {
-            /* Parser signaled truncation — some DT_NEEDED entries
-             * didn't fit.  This is very bad for lazy closure fetch:
-             * any dropped encrypted dep will send glibc to disk at
-             * load time and abort with "invalid elf header".  Bump
-             * MAX_DEPS_PER_LIB above the real count and rebuild. */
+        if (n_dt == -1) {
+            /* Parse failure (no PT_DYNAMIC, ELF32, no DT_STRTAB, etc.)
+             * — treat as zero deps.  Common and benign for .elf PG
+             * binaries and statically-linked libs. */
+            continue;
+        }
+        if (n_dt < -1) {
+            /* Truncation: parse_dt_needed returns -(total) when the
+             * total DT_NEEDED count exceeded MAX_DEPS_PER_LIB.  This
+             * is bad for lazy closure fetch — any dropped encrypted
+             * dep will send glibc to disk at load time and abort
+             * with "invalid elf header".  Bump the cap and rebuild. */
+            int total = -n_dt;
             fprintf(stderr, "[antirev] WARNING: %s has %d DT_NEEDED "
                     "entries, only %d captured (MAX_DEPS_PER_LIB=%d). "
                     "Increase the cap.\n",
-                    lib_names[i], -n_dt, MAX_DEPS_PER_LIB,
+                    lib_names[i], total, MAX_DEPS_PER_LIB,
                     MAX_DEPS_PER_LIB);
-            n_dt = MAX_DEPS_PER_LIB;  /* use what we got */
+            n_dt = MAX_DEPS_PER_LIB;
         }
         if (n_dt == 0) continue;
         for (int k = 0; k < n_dt; k++) {
