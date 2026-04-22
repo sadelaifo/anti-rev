@@ -71,7 +71,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from protect import (load_or_create_key, encrypt_data, MAGIC,
-                     BFLAG_DAEMON_LIBS)
+                     BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS)
 
 # ELF magic and type constants
 ELF_MAGIC = b'\x7fELF'
@@ -466,14 +466,12 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
 
     entry  = struct.pack("<H", len(name_b))
     entry += name_b
-    entry += struct.pack("<B", 1)   # flags: is_main
     entry += iv
     entry += tag
     entry += struct.pack("<Q", len(ct))
     entry += ct
 
-    num_files = 1
-    flags = 0x00
+    flags = BFLAG_HAS_MAIN
     if daemon_libs:
         flags |= BFLAG_DAEMON_LIBS
 
@@ -485,7 +483,7 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
             nb = name.encode()
             needed_section += struct.pack("<H", len(nb)) + nb
 
-    bundle = struct.pack("<IB", num_files, flags) + entry \
+    bundle = struct.pack("<B", flags) + entry \
            + needed_section
 
     stub_data     = stub_p.read_bytes()

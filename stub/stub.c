@@ -2,13 +2,13 @@
  * antirev stub launcher
  *
  * Appended-bundle format (at end of this binary after protection):
- *   [num_files     : 4 B LE]
- *   [bundle_flags  : 1 B]        bit1 = libs served by external daemon
- *   for each file:
- *     [name_len : 2 B LE] [name : name_len bytes] [flags : 1 B] (bit0 = is_main)
- *     [iv       : 12 B]
- *     [tag      : 16 B]
- *     [ct_size  : 8 B LE]
+ *   [bundle_flags  : 1 B]        bit0 = main entry follows (BFLAG_HAS_MAIN)
+ *                                bit1 = libs served by external daemon
+ *   if BFLAG_HAS_MAIN:
+ *     [name_len   : 2 B LE] [name : name_len bytes]
+ *     [iv         : 12 B]
+ *     [tag        : 16 B]
+ *     [ct_size    : 8 B LE]
  *     [ciphertext : ct_size bytes]
  *   [bundle_start_offset : 8 B LE]   <- offset from file start
  *   [key  : 32 B]                    <- AES-256 key embedded in binary
@@ -88,7 +88,6 @@
 /* ------------------------------------------------------------------ */
 typedef struct {
     char     name[MAX_NAME + 1];
-    int      is_main;
     uint8_t  iv[IV_SIZE];
     uint8_t  tag[TAG_SIZE];
     uint64_t ct_size;
@@ -133,6 +132,7 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
     return 0;
 }
 
+#define BFLAG_HAS_MAIN     0x01  /* one encrypted main entry follows the header */
 #define BFLAG_DAEMON_LIBS  0x02  /* libs served by external daemon */
 
 /* ------------------------------------------------------------------ */
@@ -1222,22 +1222,18 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * ---------------------------------------------------------------- */
     uint8_t tmp[2 + MAX_NAME + 1 + IV_SIZE + TAG_SIZE + 8]; /* max header */
 
-    /* Read num_files (4 bytes) + bundle_flags (1 byte) */
-    if (pread(self, tmp, 5, (off_t)bundle_off) != 5) {
-        perror("pread num_files"); return 1;
+    /* Read bundle_flags (1 byte) */
+    if (pread(self, tmp, 1, (off_t)bundle_off) != 1) {
+        perror("pread bundle_flags"); return 1;
     }
-    uint32_t nfiles = u32le(tmp);
-    uint8_t bundle_flags = tmp[4];
-    if (nfiles > MAX_FILES) {
-        fprintf(stderr, "[antirev] too many files in bundle (%u)\n", nfiles);
-        return 1;
-    }
+    uint8_t bundle_flags = tmp[0];
 
-    file_entry_t entries[MAX_FILES];
-    off_t scan = (off_t)bundle_off + 5;
+    file_entry_t main_entry;
+    int have_main = (bundle_flags & BFLAG_HAS_MAIN) != 0;
+    off_t scan = (off_t)bundle_off + 1;
 
-    for (uint32_t i = 0; i < nfiles; i++) {
-        file_entry_t *e = &entries[i];
+    if (have_main) {
+        file_entry_t *e = &main_entry;
 
         /* name_len (2 bytes) */
         if (pread(self, tmp, 2, scan) != 2) { perror("pread name_len"); return 1; }
@@ -1248,17 +1244,16 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
         scan += 2;
 
-        /* name + flags + iv + tag + ct_size */
-        ssize_t hdr_rest = nlen + 1 + IV_SIZE + TAG_SIZE + 8;
+        /* name + iv + tag + ct_size */
+        ssize_t hdr_rest = nlen + IV_SIZE + TAG_SIZE + 8;
         if (pread(self, tmp, (size_t)hdr_rest, scan) != hdr_rest) {
             perror("pread file header"); return 1;
         }
         memcpy(e->name, tmp, nlen);
         e->name[nlen]  = '\0';
-        e->is_main     = tmp[nlen] & 1;
-        memcpy(e->iv,  tmp + nlen + 1,                     IV_SIZE);
-        memcpy(e->tag, tmp + nlen + 1 + IV_SIZE,           TAG_SIZE);
-        e->ct_size     = u64le(tmp + nlen + 1 + IV_SIZE + TAG_SIZE);
+        memcpy(e->iv,  tmp + nlen,                     IV_SIZE);
+        memcpy(e->tag, tmp + nlen + IV_SIZE,           TAG_SIZE);
+        e->ct_size     = u64le(tmp + nlen + IV_SIZE + TAG_SIZE);
         scan          += hdr_rest;
 
         e->ct_offset   = (uint64_t)scan;
@@ -1311,8 +1306,8 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     char lib_names[MAX_FILES][MAX_NAME + 1];
     int nlibs = 0;
 
-    for (uint32_t i = 0; i < nfiles; i++) {
-        file_entry_t *e = &entries[i];
+    if (have_main) {
+        file_entry_t *e = &main_entry;
         aes256gcm_ctx ctx;
 
         /* Single pass: GHASH + CTR simultaneously (halves I/O) */
@@ -1339,12 +1334,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
         if (lseek(fd, 0, SEEK_SET) < 0) { perror("lseek memfd"); return 1; }
 
-        if (e->is_main) {
-            main_fd = fd;
-        } else {
-            memcpy(lib_names[nlibs], e->name, MAX_NAME + 1);
-            lib_fds[nlibs++] = fd;
-        }
+        main_fd = fd;
     }
 
     /* Done reading from the binary */
