@@ -79,16 +79,16 @@ def encrypt_data(data: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
 
 # ── Bundle building ────────────────────────────────────────────────
 
+BFLAG_HAS_MAIN    = 0x01
 BFLAG_DAEMON_LIBS = 0x02
 
 
-def _build_entry(path: Path, data: bytes, key: bytes, is_main: bool) -> bytes:
+def _build_entry(path: Path, data: bytes, key: bytes) -> bytes:
     """Build a single bundle entry (header + encrypted data)."""
     iv, tag, ct = encrypt_data(data, key)
     name_b = path.name.encode()
     entry  = struct.pack("<H", len(name_b))
     entry += name_b
-    entry += struct.pack("<B", 1 if is_main else 0)
     entry += iv
     entry += tag
     entry += struct.pack("<Q", len(ct))
@@ -192,10 +192,10 @@ def _get_transitive_needed(main_path: Path) -> list[str]:
 
 
 def _build_protected(stub_path: Path, out_path: Path, key: bytes,
-                     bundle_entries: bytes, num_files: int,
+                     bundle_entries: bytes,
                      bundle_flags: int, needed_section: bytes = b""):
     """Write stub + bundle + trailer to out_path."""
-    bundle = struct.pack("<IB", num_files, bundle_flags) \
+    bundle = struct.pack("<B", bundle_flags) \
            + bundle_entries + needed_section
 
     stub_data     = stub_path.read_bytes()
@@ -226,12 +226,11 @@ def cmd_protect_exe(args):
 
     # Main exe entry
     main_data = main_path.read_bytes()
-    main_entry = _build_entry(main_path, main_data, key, is_main=True)
+    main_entry = _build_entry(main_path, main_data, key)
     print(f"[antirev] Encrypted main: {main_path.name}  "
           f"({len(main_data):,} bytes)")
 
-    num_files = 1
-    bundle_flags = 0x00
+    bundle_flags = BFLAG_HAS_MAIN
     if daemon_libs:
         bundle_flags |= BFLAG_DAEMON_LIBS
 
@@ -246,7 +245,7 @@ def cmd_protect_exe(args):
             needed_section += struct.pack("<H", len(nb)) + nb
 
     out_size = _build_protected(stub_path, out_path, key,
-                                main_entry, num_files,
+                                main_entry,
                                 bundle_flags, needed_section)
 
     mode_str = ""
@@ -272,7 +271,7 @@ def cmd_protect_daemon(args):
     # Lightweight daemon: stub + trailer, no bundled libs.
     # At runtime it scans its directory for encrypted .so files.
     out_size = _build_protected(stub_path, out_path, key,
-                                b"", num_files=0, bundle_flags=0)
+                                b"", bundle_flags=0)
 
     print(f"\n[antirev] Lib daemon binary → {out_path}  ({out_size:,} bytes)")
     print(f"[antirev] Key file          → {key_path}  (keep secret)")
