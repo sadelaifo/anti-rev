@@ -1,6 +1,12 @@
 #!/bin/sh
-# Check which ELF/SO files are encrypted by anti-rev.
+# Check which ELF / .so / .elf files are encrypted by anti-rev.
 # Usage: ./check_encrypted.sh <directory>
+#
+# Recognizes two encrypted formats:
+#   - Protected exe: stub ELF + bundle + trailer ending in "ANTREV01".
+#     Header is still \x7fELF (the stub); we detect via tail magic.
+#   - Encrypted lib/.elf asset: "ANTREV01" + iv + tag + ciphertext.
+#     Header is NOT \x7fELF (first 8 bytes are the magic).
 
 DIR="${1:-.}"
 
@@ -16,26 +22,26 @@ plain=0
 
 for f in $(find "$DIR" -type f 2>/dev/null); do
     name=$(basename "$f")
-    is_elf=0
-    is_so=0
+    is_elf_header=0
+    is_libasset=0
 
-    # Check if .so file
+    # Name-based lib-asset detection: .so / .so.N / .elf
     case "$name" in
-        *.so|*.so.*) is_so=1 ;;
+        *.so|*.so.*|*.elf) is_libasset=1 ;;
     esac
 
-    # Check ELF magic
+    # Magic-based ELF-header detection
     { header=$(dd if="$f" bs=1 count=4 2>/dev/null); } 2>/dev/null
-    [ "$header" = "$ELF_MAGIC" ] && is_elf=1
+    [ "$header" = "$ELF_MAGIC" ] && is_elf_header=1
 
-    # Only check ELF files and .so files
-    [ $is_elf -eq 0 ] && [ $is_so -eq 0 ] && continue
+    # Only report ELF-header files and lib-asset-named files
+    [ $is_elf_header -eq 0 ] && [ $is_libasset -eq 0 ] && continue
 
     total=$((total + 1))
 
-    # Encrypted exe: ELF + ANTREV01 trailer
-    # Encrypted lib: .so but no longer ELF (content is ciphertext)
-    if [ $is_elf -eq 1 ]; then
+    if [ $is_elf_header -eq 1 ]; then
+        # Header is \x7fELF — either a plaintext ELF or a protected
+        # exe whose trailer ends in ANTREV01.
         if tail -c 8 "$f" 2>/dev/null | grep -q "ANTREV01"; then
             encrypted=$((encrypted + 1))
             echo "[encrypted] $f"
@@ -44,7 +50,8 @@ for f in $(find "$DIR" -type f 2>/dev/null); do
             echo "[plain]     $f"
         fi
     else
-        # .so file that's not ELF = encrypted by anti-rev
+        # Name is .so/.elf but header is not \x7fELF — treat as
+        # antirev-encrypted lib asset (ANTREV01 magic prefix).
         encrypted=$((encrypted + 1))
         echo "[encrypted] $f"
     fi
