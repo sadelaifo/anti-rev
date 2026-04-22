@@ -7,6 +7,20 @@
 #     Header is still \x7fELF (the stub); we detect via tail magic.
 #   - Encrypted lib/.elf asset: "ANTREV01" + iv + tag + ciphertext.
 #     Header is NOT \x7fELF (first 8 bytes are the magic).
+#
+# Decision matrix (first matching row wins):
+#
+#   filename    head \x7fELF?   tail ANTREV01?   verdict
+#   ---------   -------------   ---------------   ---------
+#   *.so        yes             —                 plain
+#   *.so        no              —                 encrypted  (lib-prefix format)
+#   *.elf       yes             no                plain
+#   *.elf       yes             yes               encrypted  (rare; only if protect-exe
+#                                                             wrongly wrapped it)
+#   *.elf       no              —                 encrypted  (lib-prefix format)
+#   other ELF   yes             no                plain      (regular executable)
+#   other ELF   yes             yes               encrypted  (protect-exe output)
+#   anything    no              —                 skipped    (not an antirev artifact)
 
 DIR="${1:-.}"
 
