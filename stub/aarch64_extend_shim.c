@@ -42,12 +42,14 @@ typedef int _aarch64_extend_shim_empty;
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -510,6 +512,182 @@ int ANTI_LoadProcess(void *info_raw)
     LOG("ANTI_LoadProcess(pg=%s): rc=%d\n",
         info->pgName ? info->pgName : "?", rc);
     return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/*  openat / newfstatat / stat interception for encrypted .elf paths   */
+/*                                                                      */
+/*  The ANTI_LoadProcess symbol hijack above can only fire if the       */
+/*  business code calls ANTI_LoadProcess via the PLT / GOT (cross-DSO   */
+/*  lookup), so LD_PRELOAD interposition beats the real symbol.         */
+/*  Real-world business .so's frequently build with -Bsymbolic or       */
+/*  dlsym(handle, ...) to their own local copy, which bypasses          */
+/*  LD_PRELOAD entirely — our struct-level hook never sees the call.    */
+/*                                                                      */
+/*  Fallback: intercept at the libc file-IO layer.  Whoever ends up     */
+/*  opening/stat'ing the .elf path goes through libc's openat /         */
+/*  newfstatat / stat / lstat — which ARE resolved cross-DSO and can    */
+/*  be interposed.  We rewrite any path whose basename is an encrypted  */
+/*  .elf asset to "/proc/self/fd/N" (backed by the cached memfd) and    */
+/*  hand the call to the real libc function.  Kernel resolves the       */
+/*  magic /proc symlink and the loader reads plaintext ELF bytes.       */
+/*                                                                      */
+/*  Scope:                                                              */
+/*   - owner process only (child processes see plaintext).              */
+/*   - basename must end in ".elf" AND be listed in ANTIREV_ENC_LIBS —  */
+/*     scoping to .elf keeps us out of dlopen's and glibc's internal    */
+/*     openat traffic on .so paths (handled by dlopen_shim).            */
+/*   - paths already under /proc/self/fd/ pass through untouched to    */
+/*     avoid any chance of recursion via real_openat.                   */
+/* ------------------------------------------------------------------ */
+
+static int     (*g_real_openat)(int, const char *, int, ...) = NULL;
+static int     (*g_real_newfstatat)(int, const char *, struct stat *, int) = NULL;
+static int     (*g_real_stat)(const char *, struct stat *) = NULL;
+static int     (*g_real_lstat)(const char *, struct stat *) = NULL;
+static int     (*g_real_access)(const char *, int) = NULL;
+
+static void resolve_real_io_funcs(void)
+{
+    if (g_real_openat && g_real_newfstatat) return;
+    if (!g_real_openat)     g_real_openat     = dlsym(RTLD_NEXT, "openat");
+    if (!g_real_newfstatat) g_real_newfstatat = dlsym(RTLD_NEXT, "newfstatat");
+    if (!g_real_stat)       g_real_stat       = dlsym(RTLD_NEXT, "stat");
+    if (!g_real_lstat)      g_real_lstat      = dlsym(RTLD_NEXT, "lstat");
+    if (!g_real_access)     g_real_access     = dlsym(RTLD_NEXT, "access");
+}
+
+/* Return stable /proc/self/fd/N path if this pathname refers to an
+ * encrypted .elf asset, else NULL (caller should pass through). */
+static const char *maybe_rewrite_elf_path(const char *pathname)
+{
+    if (!pathname || !*pathname) return NULL;
+    if (!is_owner_process())     return NULL;
+
+    /* Don't recurse on our own rewritten paths. */
+    if (strncmp(pathname, "/proc/self/fd/", 14) == 0) return NULL;
+
+    const char *base = strrchr(pathname, '/');
+    base = base ? base + 1 : pathname;
+
+    size_t blen = strlen(base);
+    if (blen < 5) return NULL;                      /* "x.elf" is 5 */
+    if (strcmp(base + blen - 4, ".elf") != 0) return NULL;
+    if (!is_encrypted(base)) return NULL;
+
+    return resolve_path(base);
+}
+
+__attribute__((visibility("default")))
+int openat(int dirfd, const char *pathname, int flags, ...)
+{
+    resolve_real_io_funcs();
+
+    /* O_CREAT / O_TMPFILE pass a mode_t via varargs; forward verbatim. */
+    mode_t mode = 0;
+    int has_mode = (flags & (O_CREAT | O_TMPFILE)) != 0;
+    if (has_mode) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+
+    const char *redirect = maybe_rewrite_elf_path(pathname);
+    if (redirect) {
+        LOG("openat redirect %s -> %s\n", pathname, redirect);
+        if (!g_real_openat) { errno = ENOSYS; return -1; }
+        return g_real_openat(AT_FDCWD, redirect, flags, mode);
+    }
+
+    if (!g_real_openat) { errno = ENOSYS; return -1; }
+    return has_mode
+        ? g_real_openat(dirfd, pathname, flags, mode)
+        : g_real_openat(dirfd, pathname, flags);
+}
+
+/* Some glibc builds call open() -> openat(AT_FDCWD, ...) internally,
+ * but hijacking open() as well covers binaries that bind to open
+ * directly (older builds, static, or explicitly resolved symbol). */
+__attribute__((visibility("default")))
+int open(const char *pathname, int flags, ...)
+{
+    mode_t mode = 0;
+    int has_mode = (flags & (O_CREAT | O_TMPFILE)) != 0;
+    if (has_mode) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    return has_mode
+        ? openat(AT_FDCWD, pathname, flags, mode)
+        : openat(AT_FDCWD, pathname, flags);
+}
+
+__attribute__((visibility("default")))
+int newfstatat(int dirfd, const char *pathname, struct stat *buf, int flags)
+{
+    resolve_real_io_funcs();
+    const char *redirect = maybe_rewrite_elf_path(pathname);
+    if (redirect) {
+        LOG("newfstatat redirect %s -> %s\n", pathname, redirect);
+        if (!g_real_newfstatat) { errno = ENOSYS; return -1; }
+        return g_real_newfstatat(AT_FDCWD, redirect, buf, flags);
+    }
+    if (!g_real_newfstatat) { errno = ENOSYS; return -1; }
+    return g_real_newfstatat(dirfd, pathname, buf, flags);
+}
+
+__attribute__((visibility("default")))
+int stat(const char *pathname, struct stat *buf)
+{
+    resolve_real_io_funcs();
+    const char *redirect = maybe_rewrite_elf_path(pathname);
+    if (redirect) {
+        LOG("stat redirect %s -> %s\n", pathname, redirect);
+        if (g_real_stat) return g_real_stat(redirect, buf);
+        /* Fall back to newfstatat if libc's stat isn't exported (glibc
+         * >= 2.33 provides stat as an inline wrapper in headers). */
+        if (g_real_newfstatat) return g_real_newfstatat(AT_FDCWD, redirect, buf, 0);
+        errno = ENOSYS; return -1;
+    }
+    if (g_real_stat) return g_real_stat(pathname, buf);
+    if (g_real_newfstatat) return g_real_newfstatat(AT_FDCWD, pathname, buf, 0);
+    errno = ENOSYS; return -1;
+}
+
+__attribute__((visibility("default")))
+int lstat(const char *pathname, struct stat *buf)
+{
+    resolve_real_io_funcs();
+    const char *redirect = maybe_rewrite_elf_path(pathname);
+    if (redirect) {
+        /* For our rewrite the symlink-vs-target distinction is
+         * irrelevant — /proc/self/fd/N IS a symlink but we want the
+         * target (the memfd), matching plaintext semantics. */
+        LOG("lstat redirect %s -> %s\n", pathname, redirect);
+        if (g_real_newfstatat) return g_real_newfstatat(AT_FDCWD, redirect, buf, 0);
+        errno = ENOSYS; return -1;
+    }
+    if (g_real_lstat) return g_real_lstat(pathname, buf);
+    if (g_real_newfstatat)
+        return g_real_newfstatat(AT_FDCWD, pathname, buf, AT_SYMLINK_NOFOLLOW);
+    errno = ENOSYS; return -1;
+}
+
+__attribute__((visibility("default")))
+int access(const char *pathname, int mode)
+{
+    resolve_real_io_funcs();
+    const char *redirect = maybe_rewrite_elf_path(pathname);
+    if (redirect) {
+        LOG("access redirect %s -> %s\n", pathname, redirect);
+        if (g_real_access) return g_real_access(redirect, mode);
+        errno = ENOSYS; return -1;
+    }
+    if (g_real_access) return g_real_access(pathname, mode);
+    errno = ENOSYS; return -1;
 }
 
 /* ------------------------------------------------------------------ */
