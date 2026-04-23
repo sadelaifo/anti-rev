@@ -12,12 +12,17 @@
 #   VmRSS  / VmHWM   — resident physical memory, current & peak
 #   VmData           — heap + anon mappings (closest to "what the program itself malloc'd")
 #   Pss / Uss        — shared-aware accounting (from smaps_rollup)
+#   Category breakdown — RSS/PSS split by mapping backing:
+#     elf_disk  = on-disk .so/.elf/exe (shared libs + main binary)
+#     elf_memfd = ELF mapped from memfd (antirev-decrypted libs)
+#     heap / stack / anon / vdso / sysv_shm / posix_shm / other
+#   Top ELF files by PSS (loaded shared libraries, sorted)
 #   SysV shm / POSIX shm / memfd — shared-memory segments visible in /proc/<PID>/maps
 
 set -euo pipefail
 
 usage() {
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -81,6 +86,59 @@ kv_from_rollup() {
     awk -v k="$2:" '$1==k {print $2; exit}' "/proc/$1/smaps_rollup" 2>/dev/null || true
 }
 
+# Parse /proc/<pid>/smaps and bucket Rss/Pss by backing-file category.
+# Emits two tab-separated sections on stdout:
+#   C<TAB>category<TAB>rss_kb<TAB>pss_kb
+#   F<TAB>rss_kb<TAB>pss_kb<TAB>category<TAB>path       (one line per ELF mapping file)
+classify_smaps() {
+    local pid=$1
+    local smaps="/proc/$pid/smaps"
+    [[ -r "$smaps" ]] || return 1
+    awk '
+        function classify(p, perm,    base) {
+            if (p == "")                       return "anon"
+            if (p ~ /^\[heap\]/)               return "heap"
+            if (p ~ /^\[stack/)                return "stack"
+            if (p ~ /^\[vvar\]|^\[vdso\]|^\[vsyscall\]/) return "vdso"
+            if (p ~ /^\[anon/)                 return "anon"
+            if (p ~ /SYSV[0-9a-fA-F]+/)        return "sysv_shm"
+            if (p ~ /^\/dev\/shm\//)           return "posix_shm"
+            if (p ~ /\/memfd:|^memfd:/)        return "elf_memfd"
+            if (p ~ /\.so($|\.)/)              return "elf_disk"
+            if (p ~ /\.elf($|[ .])/)           return "elf_disk"
+            # executable permission on a real file path => main exe or plugin
+            if (index(perm, "x") > 0 && p ~ /^\//) return "elf_disk"
+            return "other"
+        }
+        /^[0-9a-f]+-[0-9a-f]+ / {
+            path = ""
+            for (i=6; i<=NF; i++) path = path (i==6 ? "" : " ") $i
+            cur_cat = classify(path, $2)
+            cur_path = path
+            next
+        }
+        /^Rss:/  { cat_rss[cur_cat] += $2
+                   if (cur_cat == "elf_disk" || cur_cat == "elf_memfd") {
+                       file_rss[cur_path] += $2
+                       file_cat[cur_path] = cur_cat
+                   } }
+        /^Pss:/  { cat_pss[cur_cat] += $2
+                   if (cur_cat == "elf_disk" || cur_cat == "elf_memfd") {
+                       file_pss[cur_path] += $2
+                   } }
+        END {
+            split("elf_disk elf_memfd heap stack anon sysv_shm posix_shm vdso other", order, " ")
+            for (i=1; i<=9; i++) {
+                k = order[i]
+                if ((k in cat_rss) || (k in cat_pss))
+                    printf "C\t%s\t%d\t%d\n", k, cat_rss[k]+0, cat_pss[k]+0
+            }
+            for (f in file_rss)
+                printf "F\t%d\t%d\t%s\t%s\n", file_rss[f], file_pss[f]+0, file_cat[f], f
+        }
+    ' "$smaps"
+}
+
 print_report() {
     local pid=$1
     local cmd status_file
@@ -118,6 +176,35 @@ print_report() {
     printf '%-10s %12s   %s\n' "VmSwap" "$(human "${vmswap:-0}")" "swapped out"
     [[ -n "$pss" ]] && printf '%-10s %12s   %s\n' "Pss" "$(human "$pss")" "shared memory apportioned by ref count"
     [[ -n "${uss:-}" ]] && printf '%-10s %12s   %s\n' "Uss" "$(human "$uss")" "strictly private (would free on exit)"
+
+    # category breakdown + per-ELF list (from smaps)
+    local smaps_out
+    smaps_out=$(classify_smaps "$pid" 2>/dev/null || true)
+    if [[ -n "$smaps_out" ]]; then
+        echo
+        echo "Memory by mapping category (RSS / PSS):"
+        printf '%-12s  %12s  %12s\n' "category" "rss" "pss"
+        echo "$smaps_out" | awk -F'\t' '$1=="C"{print $2"\t"$3"\t"$4}' \
+            | while IFS=$'\t' read -r cat rss pss; do
+                printf '  %-10s  %12s  %12s\n' "$cat" "$(human "$rss")" "$(human "$pss")"
+            done
+
+        local elf_lines
+        elf_lines=$(echo "$smaps_out" | awk -F'\t' '$1=="F"{print $0}' | sort -t$'\t' -k2,2 -n -r)
+        if [[ -n "$elf_lines" ]]; then
+            echo
+            echo "Loaded ELF files (top 20 by RSS):"
+            printf '%12s  %12s  %-10s  %s\n' "rss" "pss" "kind" "path"
+            echo "$elf_lines" | head -20 | while IFS=$'\t' read -r _ rss pss cat path; do
+                printf '%12s  %12s  %-10s  %s\n' "$(human "$rss")" "$(human "$pss")" "$cat" "$path"
+            done
+            local elf_total_rss elf_total_pss
+            elf_total_rss=$(echo "$elf_lines" | awk -F'\t' '{s+=$2} END{print s+0}')
+            elf_total_pss=$(echo "$elf_lines" | awk -F'\t' '{s+=$3} END{print s+0}')
+            printf '%12s  %12s  %-10s  %s\n' \
+                "$(human "$elf_total_rss")" "$(human "$elf_total_pss")" "TOTAL" "(all loaded ELFs)"
+        fi
+    fi
 
     # shared-memory segments visible in the process
     local maps="/proc/$pid/maps"
