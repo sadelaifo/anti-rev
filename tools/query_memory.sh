@@ -167,23 +167,23 @@ print_report() {
     fi
 
     printf '=== PID %s  (%s) ===\n' "$pid" "$cmd"
-    printf '%-10s %12s   %s\n' "Field" "Value" "Meaning"
-    printf '%-10s %12s   %s\n' "VmSize" "$(human "${vmsize:-0}")" "virtual address space (current)"
-    printf '%-10s %12s   %s\n' "VmPeak" "$(human "${vmpeak:-0}")" "virtual address space (peak)"
-    printf '%-10s %12s   %s\n' "VmRSS"  "$(human "${vmrss:-0}")"  "resident physical memory (current)"
-    printf '%-10s %12s   %s\n' "VmHWM"  "$(human "${vmhwm:-0}")"  "resident physical memory (peak)"
-    printf '%-10s %12s   %s\n' "VmData" "$(human "${vmdata:-0}")" "heap + anon (program-allocated)"
-    printf '%-10s %12s   %s\n' "VmSwap" "$(human "${vmswap:-0}")" "swapped out"
-    [[ -n "$pss" ]] && printf '%-10s %12s   %s\n' "Pss" "$(human "$pss")" "shared memory apportioned by ref count"
-    [[ -n "${uss:-}" ]] && printf '%-10s %12s   %s\n' "Uss" "$(human "$uss")" "strictly private (would free on exit)"
+    printf '%-10s %12s   %s\n' "Field" "Value" "含义"
+    printf '%-10s %12s   %s\n' "VmSize" "$(human "${vmsize:-0}")" "虚拟地址空间（当前）"
+    printf '%-10s %12s   %s\n' "VmPeak" "$(human "${vmpeak:-0}")" "虚拟地址空间（历史峰值）"
+    printf '%-10s %12s   %s\n' "VmRSS"  "$(human "${vmrss:-0}")"  "常驻物理内存（当前）"
+    printf '%-10s %12s   %s\n' "VmHWM"  "$(human "${vmhwm:-0}")"  "常驻物理内存（历史峰值）"
+    printf '%-10s %12s   %s\n' "VmData" "$(human "${vmdata:-0}")" "堆 + 匿名映射（程序自己申请的部分）"
+    printf '%-10s %12s   %s\n' "VmSwap" "$(human "${vmswap:-0}")" "已换出到 swap"
+    [[ -n "$pss" ]] && printf '%-10s %12s   %s\n' "Pss" "$(human "$pss")" "按引用数分摊后的共享内存"
+    [[ -n "${uss:-}" ]] && printf '%-10s %12s   %s\n' "Uss" "$(human "$uss")" "进程独占（退出即可释放）"
 
     # category breakdown + per-ELF list (from smaps)
     local smaps_out
     smaps_out=$(classify_smaps "$pid" 2>/dev/null || true)
     if [[ -n "$smaps_out" ]]; then
         echo
-        echo "Memory by mapping category (RSS / PSS):"
-        printf '%-12s  %12s  %12s\n' "category" "rss" "pss"
+        echo "按映射类别统计 (RSS / PSS):"
+        printf '%-12s  %12s  %12s\n' "类别" "rss" "pss"
         echo "$smaps_out" | awk -F'\t' '$1=="C"{print $2"\t"$3"\t"$4}' \
             | while IFS=$'\t' read -r cat rss pss; do
                 printf '  %-10s  %12s  %12s\n' "$cat" "$(human "$rss")" "$(human "$pss")"
@@ -193,8 +193,8 @@ print_report() {
         elf_lines=$(echo "$smaps_out" | awk -F'\t' '$1=="F"{print $0}' | sort -t$'\t' -k2,2 -n -r)
         if [[ -n "$elf_lines" ]]; then
             echo
-            echo "Loaded ELF files (top 20 by RSS):"
-            printf '%12s  %12s  %-10s  %s\n' "rss" "pss" "kind" "path"
+            echo "已加载的 ELF 文件 (按 RSS 排序, 前 20):"
+            printf '%12s  %12s  %-10s  %s\n' "rss" "pss" "类型" "路径"
             echo "$elf_lines" | head -20 | while IFS=$'\t' read -r _ rss pss cat path; do
                 printf '%12s  %12s  %-10s  %s\n' "$(human "$rss")" "$(human "$pss")" "$cat" "$path"
             done
@@ -202,7 +202,7 @@ print_report() {
             elf_total_rss=$(echo "$elf_lines" | awk -F'\t' '{s+=$2} END{print s+0}')
             elf_total_pss=$(echo "$elf_lines" | awk -F'\t' '{s+=$3} END{print s+0}')
             printf '%12s  %12s  %-10s  %s\n' \
-                "$(human "$elf_total_rss")" "$(human "$elf_total_pss")" "TOTAL" "(all loaded ELFs)"
+                "$(human "$elf_total_rss")" "$(human "$elf_total_pss")" "合计" "(所有已加载 ELF)"
         fi
     fi
 
@@ -213,7 +213,7 @@ print_report() {
         shm_lines=$(grep -E 'SYSV|/dev/shm|/memfd:' "$maps" || true)
         if [[ -n "$shm_lines" ]]; then
             echo
-            echo "Shared-memory / memfd mappings:"
+            echo "共享内存 / memfd 映射:"
             echo "$shm_lines" | awk '
                 {
                     split($1, r, "-")
@@ -236,7 +236,7 @@ print_report() {
     # optional per-mapping breakdown
     if [[ "$DETAIL" == "1" ]] && command -v pmap >/dev/null; then
         echo
-        echo "Top 15 mappings by RSS (pmap -x):"
+        echo "按 RSS 排序的前 15 个映射 (pmap -x):"
         pmap -x "$pid" | awk 'NR>2 && $1!="total" {print}' \
             | sort -k3 -n -r | head -15
     fi
