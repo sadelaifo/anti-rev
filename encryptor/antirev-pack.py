@@ -38,6 +38,9 @@ Config format:
       - bin/start.sh                   # copy a specific file
       - *.conf                         # copy by pattern
 
+Path fields (install_dir, output_dir, key, stub, stubs.*) expand ~ and
+$VAR / ${VAR} from the environment, e.g. install_dir: $HOME/myapp.
+
 What it does:
   - Recursively scans install_dir for all ELF files (executables and libraries)
   - Classifies each as executable (ET_EXEC/ET_DYN without .so) or shared library
@@ -532,9 +535,12 @@ def main():
     if 'stub' not in cfg and 'stubs' not in cfg:
         sys.exit("[error] config must have 'stub' or 'stubs' field")
 
-    install_dir = Path(cfg['install_dir']).resolve()
-    output_dir  = Path(cfg['output_dir']).resolve()
-    key_path    = (config_path.parent / cfg.get('key', 'antirev.key')).resolve()
+    def _expand(p: str) -> str:
+        return os.path.expanduser(os.path.expandvars(p))
+
+    install_dir = Path(_expand(cfg['install_dir'])).resolve()
+    output_dir  = Path(_expand(cfg['output_dir'])).resolve()
+    key_path    = (config_path.parent / _expand(cfg.get('key', 'antirev.key'))).resolve()
     blacklist   = compile_blacklist(cfg.get('blacklist', []))
     workers     = args.jobs if args.jobs > 0 else (os.cpu_count() or 4)
 
@@ -542,9 +548,9 @@ def main():
     stubs: dict[str, Path] = {}
     if 'stubs' in cfg:
         for arch, p in cfg['stubs'].items():
-            stubs[arch] = (config_path.parent / p).resolve()
+            stubs[arch] = (config_path.parent / _expand(p)).resolve()
     elif 'stub' in cfg:
-        single = (config_path.parent / cfg['stub']).resolve()
+        single = (config_path.parent / _expand(cfg['stub'])).resolve()
         elf_info = classify_elf(single)
         if elf_info:
             stubs[elf_info[1]] = single
