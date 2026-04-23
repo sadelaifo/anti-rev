@@ -215,9 +215,18 @@ print_report() {
             echo
             echo "共享内存 / memfd 映射:"
             echo "$shm_lines" | awk '
+                function hex2dec(s,   n, i, c, v) {
+                    n = 0
+                    for (i = 1; i <= length(s); i++) {
+                        c = tolower(substr(s, i, 1))
+                        v = index("0123456789abcdef", c) - 1
+                        if (v >= 0) n = n * 16 + v
+                    }
+                    return n
+                }
                 {
                     split($1, r, "-")
-                    sz = strtonum("0x" r[2]) - strtonum("0x" r[1])
+                    sz = hex2dec(r[2]) - hex2dec(r[1])
                     name = ""
                     for (i=6; i<=NF; i++) name = name " " $i
                     key = name
