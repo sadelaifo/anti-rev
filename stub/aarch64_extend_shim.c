@@ -558,7 +558,21 @@ static void resolve_real_io_funcs(void)
 }
 
 /* Return stable /proc/self/fd/N path if this pathname refers to an
- * encrypted .elf asset, else NULL (caller should pass through). */
+ * encrypted .elf asset, else NULL (caller should pass through).
+ *
+ * The basename must be listed either in ANTIREV_ENC_LIBS (daemon /
+ * lazy mode, dlopen_shim-style name list) OR in ANTIREV_FD_MAP
+ * (eager / bundled mode: name=fd pairs baked in by stub).  Mode B /
+ * Mode A protect-exe paths never populate ANTIREV_ENC_LIBS, so
+ * checking only the name list missed them and left openat
+ * unredirected. */
+static int name_is_known_elf_asset(const char *base)
+{
+    if (is_encrypted(base)) return 1;
+    if (g_fd_map && eager_lookup_fd(base) >= 0) return 1;
+    return 0;
+}
+
 static const char *maybe_rewrite_elf_path(const char *pathname)
 {
     if (!pathname || !*pathname) return NULL;
@@ -573,7 +587,7 @@ static const char *maybe_rewrite_elf_path(const char *pathname)
     size_t blen = strlen(base);
     if (blen < 5) return NULL;                      /* "x.elf" is 5 */
     if (strcmp(base + blen - 4, ".elf") != 0) return NULL;
-    if (!is_encrypted(base)) return NULL;
+    if (!name_is_known_elf_asset(base)) return NULL;
 
     return resolve_path(base);
 }
