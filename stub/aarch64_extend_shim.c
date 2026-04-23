@@ -92,12 +92,21 @@ static const char *g_fd_map = NULL;
 static char g_enc_names[MAX_FILES][MAX_NAME + 1];
 static int  g_enc_count = 0;
 
-/* Cache of pgName → memfd fd returned from the daemon.  Pinned for
- * process lifetime: the kernel keeps the mapping alive through the
- * mmap ANTI_LoadProcess does internally, but we keep the fd open so
- * /proc/self/fd/N stays valid if the same pgName is loaded twice. */
+/* Cache of pgName → (memfd fd, stable "/proc/self/fd/N" string).
+ *
+ * Pinned for process lifetime on both axes:
+ *   - the fd stays open so /proc/self/fd/N remains a valid path for
+ *     any code that retains the rewritten ltrBin or reopens it later
+ *     (business loader frequently does: header-peek openat, close,
+ *     big anon mmap, then re-openat the same path for content reads);
+ *   - the path string lives in this static array so we can hand its
+ *     pointer to the caller's ltrBin and never restore/free it.  The
+ *     memfd mapping itself is pinned by the loader's mmap on top of
+ *     it independently of our fd. */
+#define FD_PATH_MAX 32   /* "/proc/self/fd/2147483647" + NUL fits in ~25 */
 static char g_cache_names[MAX_FILES][MAX_NAME + 1];
 static int  g_cache_fds[MAX_FILES];
+static char g_cache_paths[MAX_FILES][FD_PATH_MAX];
 static int  g_cache_count = 0;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -292,18 +301,26 @@ static int fetch_one(const char *base)
     return fds[0];
 }
 
-/* Resolve pgName basename to a memfd fd, caching on success.  Returns
- * fd on success, -1 if not available (caller should pass through). */
-static int resolve_fd(const char *base)
+/* Resolve pgName basename to a stable "/proc/self/fd/N" path string
+ * whose lifetime is the process's.  Returns a pointer into the
+ * per-entry cache (do NOT free) on success, NULL if not available
+ * (caller should pass through unmodified).
+ *
+ * Returning a stable persistent path — not a stack buffer, and never
+ * restored — is what keeps the rewrite durable across loader patterns
+ * that re-read info->ltrBin after ANTI_LoadProcess returns (deferred
+ * worker threads, multi-stage loaders that openat → close → mmap →
+ * re-openat, etc.). */
+static const char *resolve_path(const char *base)
 {
     pthread_mutex_lock(&g_lock);
 
     int idx = cache_find(base);
     if (idx >= 0) {
-        int fd = g_cache_fds[idx];
+        const char *p = g_cache_paths[idx];
         pthread_mutex_unlock(&g_lock);
-        LOG("  cache-hit %s -> fd=%d\n", base, fd);
-        return fd;
+        LOG("  cache-hit %s -> %s\n", base, p);
+        return p;
     }
 
     int fd = -1;
@@ -320,17 +337,26 @@ static int resolve_fd(const char *base)
         if (fd >= 0) LOG("  daemon-hit %s -> fd=%d\n", base, fd);
     }
 
-    if (fd >= 0 && g_cache_count < MAX_FILES) {
+    if (fd < 0) {
+        pthread_mutex_unlock(&g_lock);
+        return NULL;
+    }
+
+    const char *out = NULL;
+    if (g_cache_count < MAX_FILES) {
         size_t bl = strlen(base);
         if (bl <= MAX_NAME) {
             memcpy(g_cache_names[g_cache_count], base, bl + 1);
             g_cache_fds[g_cache_count] = fd;
+            snprintf(g_cache_paths[g_cache_count], FD_PATH_MAX,
+                     "/proc/self/fd/%d", fd);
+            out = g_cache_paths[g_cache_count];
             g_cache_count++;
         }
     }
 
     pthread_mutex_unlock(&g_lock);
-    return fd;
+    return out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -456,27 +482,31 @@ int ANTI_LoadProcess(void *info_raw)
     const char *base = strrchr(ltrBin, '/');
     base = base ? base + 1 : ltrBin;
 
-    int fd = resolve_fd(base);
-    if (fd < 0) {
+    const char *stable_path = resolve_path(base);
+    if (!stable_path) {
         LOG("ANTI_LoadProcess(pg=%s path=%s): no memfd, passthrough\n",
             info->pgName ? info->pgName : "?", ltrBin);
         return g_real_anti_loadprocess(info_raw);
     }
 
-    /* Swap ltrBin to /proc/self/fd/N for the call, restore after so the
-     * caller's struct stays bit-identical (it may be a const string
-     * literal or live on a stack frame the caller inspects later). */
-    char fd_path[32];
-    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
-
+    /* Rewrite ltrBin to the cached "/proc/self/fd/N" string and do
+     * NOT restore after the real call returns.  Business loaders
+     * commonly defer actual content reads (openat / mmap) to a
+     * worker thread or to a later API call, retaining the ltrBin
+     * pointer; if we restored here, those late reads would land on
+     * the original on-disk path and read ciphertext.
+     *
+     * Safety: the stable_path string lives in a static per-entry
+     * cache (never freed) and the memfd fd is pinned open for the
+     * process lifetime, so any subsequent openat on this path will
+     * continue to resolve to the same memfd. */
     const char *saved = info->ltrBin;
-    info->ltrBin = fd_path;
-    LOG("ANTI_LoadProcess(pg=%s): rewrote ltrBin %s -> %s\n",
-        info->pgName ? info->pgName : "?", saved, fd_path);
+    info->ltrBin = stable_path;
+    LOG("ANTI_LoadProcess(pg=%s): rewrote ltrBin %s -> %s (persistent)\n",
+        info->pgName ? info->pgName : "?", saved, stable_path);
 
     int rc = g_real_anti_loadprocess(info_raw);
 
-    info->ltrBin = saved;
     LOG("ANTI_LoadProcess(pg=%s): rc=%d\n",
         info->pgName ? info->pgName : "?", rc);
     return rc;
