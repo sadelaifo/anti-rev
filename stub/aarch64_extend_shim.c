@@ -597,6 +597,14 @@ int openat(int dirfd, const char *pathname, int flags, ...)
 {
     resolve_real_io_funcs();
 
+    /* Diagnostic: every openat invocation through this shim gets
+     * logged (path only).  If strace shows an openat for a given
+     * path but this log does not, the caller is bypassing libc
+     * (e.g. syscall(SYS_openat, ...) or inline svc) and LD_PRELOAD
+     * cannot interpose it at this layer — a syscall-level hook
+     * (seccomp-bpf user-notify / ptrace) would be required. */
+    if (g_log && pathname) LOG("openat trace: %s\n", pathname);
+
     /* O_CREAT / O_TMPFILE pass a mode_t via varargs; forward verbatim. */
     mode_t mode = 0;
     int has_mode = (flags & (O_CREAT | O_TMPFILE)) != 0;
