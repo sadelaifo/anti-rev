@@ -25,6 +25,19 @@ else()
         "Supported: x86_64, aarch64.")
 endif()
 
+# ── Force aarch64 stub INTERP to /lib64/ so it runs on RH-style rootfs ──
+# Debian-style aarch64 toolchains default INTERP to /lib/ld-linux-aarch64.so.1,
+# but openEuler / CentOS / SUSE / 麒麟 aarch64 only ship /lib64/. Force
+# --dynamic-linker=/lib64/... so the stub (and .antirev-libd /
+# .antirev-wrap derived from it by antirev-pack.py) launch on those
+# targets. x86_64 is left alone — its toolchain default is already
+# /lib64/ld-linux-x86-64.so.2 everywhere.
+if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    set(ANTIREV_INTERP_FLAG "-Wl,--dynamic-linker=/lib64/ld-linux-aarch64.so.1")
+else()
+    set(ANTIREV_INTERP_FLAG "")
+endif()
+
 # ── Helper: compile the exe shim (readlink interceptor) ───────────────
 # Usage: compile_exe_shim(<output.so> <compiler>)
 function(compile_exe_shim OUTPUT COMPILER)
@@ -106,9 +119,15 @@ function(build_stub OUTPUT COMPILER STRIPPER TARGET_ARCH EXE_BLOB_DEP DLOPEN_BLO
     else()
         message(FATAL_ERROR "build_stub: unknown TARGET_ARCH '${TARGET_ARCH}'")
     endif()
+    # -static builds have no INTERP; only inject --dynamic-linker for
+    # dynamically-linked stubs (native host build).
+    set(_INTERP_FLAG "")
+    if(ANTIREV_INTERP_FLAG AND NOT "${EXTRA_FLAGS}" MATCHES "-static")
+        set(_INTERP_FLAG ${ANTIREV_INTERP_FLAG})
+    endif()
     add_custom_command(
         OUTPUT  "${OUTPUT}"
-        COMMAND "${COMPILER}" -O2 -Wall -Wextra -pthread ${EXTRA_FLAGS}
+        COMMAND "${COMPILER}" -O2 -Wall -Wextra -pthread ${EXTRA_FLAGS} ${_INTERP_FLAG}
                 -I "${CMAKE_BINARY_DIR}"
                 -I "${CMAKE_SOURCE_DIR}/stub"
                 -o "${OUTPUT}"
