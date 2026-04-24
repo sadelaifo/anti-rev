@@ -1192,6 +1192,730 @@ static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
 }
 
 /* ------------------------------------------------------------------ */
+/*  Shared: raise the process fd limit to its hard cap                  */
+/* ------------------------------------------------------------------ */
+
+/* The daemon holds ~nlibs memfds + a listen socket; protected exes
+ * similarly receive ~nlibs fds via SCM_RIGHTS during Phase 3.  Both
+ * routinely outgrow the default 1024 soft limit. */
+static void raise_fd_limit(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &rl);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Phase 3 helpers: fetch encrypted lib fds from the libd daemon       */
+/* ------------------------------------------------------------------ */
+
+/* Write "<dir>/.antirev-libd[-arch]" to `out`, falling back to the
+ * arch-free name if the suffixed binary isn't present. */
+static void derive_daemon_path(const char *real_exe, char *out, size_t out_sz) {
+    const char *slash = strrchr(real_exe, '/');
+    size_t dirlen = slash ? (size_t) (slash - real_exe) : 1;
+    if (!slash) {
+        out[0] = '.';
+        dirlen = 1;
+    } else {
+        memcpy(out, real_exe, dirlen);
+    }
+#if defined(__x86_64__) || defined(__i386__)
+    snprintf(out + dirlen, out_sz - dirlen, "/.antirev-libd-x86_64");
+#elif defined(__aarch64__)
+    snprintf(out + dirlen, out_sz - dirlen, "/.antirev-libd-aarch64");
+#else
+    snprintf(out + dirlen, out_sz - dirlen, "/.antirev-libd");
+#endif
+    if (access(out, X_OK) != 0)
+        snprintf(out + dirlen, out_sz - dirlen, "/.antirev-libd");
+}
+
+/* Fork the daemon binary if it's on disk; parent waits for the daemon
+ * to self-daemonize (it _exit(0)s the launching process).  Returns 1
+ * if launched, 0 otherwise. */
+static int spawn_local_daemon(const char *real_exe, char *const *envp) {
+    char path[4096];
+    derive_daemon_path(real_exe, path, sizeof(path));
+    if (access(path, X_OK) != 0)
+        return 0;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *dargv[] = {path, NULL};
+        execve(path, dargv, envp);
+        _exit(127);
+    }
+    if (pid < 0)
+        return 0;
+    int st;
+    waitpid(pid, &st, 0);
+    return 1;
+}
+
+/* Compute DT_NEEDED ∩ encrypted — what we need to eagerly fetch.  The
+ * exe's DT_NEEDED list is a mix of encrypted (daemon-managed) and
+ * unencrypted (resolved by ld.so normally) libs; only the former
+ * should make a round trip. */
+static int intersect_needed_encrypted(const char (*needed)[MAX_NAME + 1], int n_needed, const char (*enc)[MAX_NAME + 1],
+                                      int n_enc, char (*out)[MAX_NAME + 1]) {
+    int n_out = 0;
+    for (int k = 0; k < n_needed; k++) {
+        for (int j = 0; j < n_enc; j++) {
+            if (strcmp(needed[k], enc[j]) == 0) {
+                memcpy(out[n_out++], needed[k], MAX_NAME + 1);
+                break;
+            }
+        }
+    }
+    return n_out;
+}
+
+/* Try one connect+fetch attempt.  Returns 0 on success (populates out
+ * params), -1 on protocol failure (socket already closed), -2 on
+ * connect failure (retry).  daemon_sd output is the kept-open socket
+ * in needed-section mode, or -1 if the socket was closed after fetch. */
+static int daemon_connect_and_fetch(const struct sockaddr_un *addr, socklen_t addr_len, int has_needed_section,
+                                    int n_needed, const char (*needed_names)[MAX_NAME + 1], int *lib_fds,
+                                    char (*lib_names)[MAX_NAME + 1], int *nlibs, char (*all_enc_names)[MAX_NAME + 1],
+                                    int *n_all_enc, int *daemon_sd) {
+    int sd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sd < 0)
+        return -2;
+    if (connect(sd, (struct sockaddr *) addr, addr_len) != 0) {
+        close(sd);
+        return -2;
+    }
+
+    /* Step 1: full name list, no fds. */
+    if (daemon_request_names(sd, all_enc_names, n_all_enc) < 0 || *n_all_enc == 0) {
+        close(sd);
+        return -1;
+    }
+
+    if (has_needed_section) {
+        char enc_needed[MAX_FILES][MAX_NAME + 1];
+        int n_enc_needed = intersect_needed_encrypted(needed_names, n_needed, all_enc_names, *n_all_enc, enc_needed);
+        if (n_enc_needed > 0) {
+            if (daemon_request_libs(sd, enc_needed, n_enc_needed, lib_fds, lib_names, nlibs) < 0 || *nlibs == 0) {
+                close(sd);
+                return -1;
+            }
+        } else {
+            /* No encrypted DT_NEEDED — dlopen_shim handles everything lazily. */
+            *nlibs = 0;
+        }
+        /* Keep socket open for lazy OP_GET_CLOSURE requests. */
+        *daemon_sd = sd;
+    } else {
+        /* Legacy bundle: fetch everything eagerly, drop the socket. */
+        if (daemon_request_libs(sd, NULL, 0, lib_fds, lib_names, nlibs) < 0 || *nlibs == 0) {
+            close(sd);
+            return -1;
+        }
+        daemon_send_bye(sd);
+        close(sd);
+        *n_all_enc = 0; /* no lazy mode */
+    }
+    return 0;
+}
+
+/* Connect to the lib daemon (launching it if missing), negotiate the
+ * encrypted lib set, and fetch the DT_NEEDED fds eagerly.  Keeps the
+ * socket open in lazy mode so dlopen_shim can request closures on
+ * demand.  Returns 0 on success, -1 on terminal failure. */
+static int fetch_libs_from_daemon(const char *real_exe, char *const *envp, const uint8_t *key, int has_needed_section,
+                                  int n_needed, const char (*needed_names)[MAX_NAME + 1], int *lib_fds,
+                                  char (*lib_names)[MAX_NAME + 1], int *nlibs, char (*all_enc_names)[MAX_NAME + 1],
+                                  int *n_all_enc, int *daemon_sd) {
+    raise_fd_limit(); /* ~nlibs fds will arrive via SCM_RIGHTS */
+
+    struct sockaddr_un addr;
+    socklen_t addr_len = make_sock_addr(&addr, key);
+
+    int daemon_launched = 0;
+    for (int retry = 0; retry < 50; retry++) {
+        int rc = daemon_connect_and_fetch(&addr, addr_len, has_needed_section, n_needed, needed_names, lib_fds,
+                                          lib_names, nlibs, all_enc_names, n_all_enc, daemon_sd);
+        if (rc == 0) {
+            fprintf(stderr,
+                    "[antirev] daemon: %d enc libs total, "
+                    "%d eagerly fetched (DT_NEEDED)\n",
+                    *n_all_enc, *nlibs);
+            return 0;
+        }
+        if (rc == -1)
+            break; /* protocol failure — no point retrying */
+
+        if (!daemon_launched && retry == 0)
+            daemon_launched = spawn_local_daemon(real_exe, envp);
+
+        usleep(100000);
+    }
+    fprintf(stderr, "[antirev] failed to connect to lib daemon\n");
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Phase 5 helpers: build the envp we hand the protected process        */
+/* ------------------------------------------------------------------ */
+
+/* All the per-launch state Phase 5 needs from main().  Bundled to
+ * keep build_exec_env()'s signature manageable — the 17 fields were
+ * previously 17 locals in main(). */
+typedef struct {
+    char *const *envp;
+    const char *real_exe;
+    int main_fd;
+    int antirev_shim_fd;
+    int aarch64_extend_shim_fd;
+    int has_needed_section;
+    int nlibs;
+    int n_dt_needed;
+    int *dt_needed_fds;
+    int n_fdmap;
+    const char (*fdmap_names)[MAX_NAME + 1];
+    int *fdmap_fds;
+    int daemon_sd;
+    int n_all_enc;
+    const char (*all_enc_names)[MAX_NAME + 1];
+    const char *link_dir_ptr; /* NULL if no symlink dir was created */
+    const char *link_dir;
+} exec_env_cfg_t;
+
+/* Copy the caller's LD_PRELOAD with antirev /proc/self/fd/ entries
+ * stripped — those come from a parent protected process and would
+ * cause a cascading double-load of the shims. */
+static void filter_inherited_ld_preload(char *const *envp, int envc, char *buf, size_t buf_sz) {
+    buf[0] = '\0';
+    for (int j = 0; j < envc; j++) {
+        if (strncmp(envp[j], "LD_PRELOAD=", 11) != 0)
+            continue;
+        const char *src = envp[j] + 11;
+        size_t off = 0;
+        while (*src) {
+            const char *end = src;
+            while (*end && *end != ':')
+                end++;
+            size_t tlen = (size_t) (end - src);
+            if (tlen > 0 && strncmp(src, "/proc/self/fd/", 14) != 0) {
+                if (off > 0 && off + 1 < buf_sz)
+                    buf[off++] = ':';
+                if (off + tlen < buf_sz) {
+                    memcpy(buf + off, src, tlen);
+                    off += tlen;
+                }
+            }
+            src = (*end == ':') ? end + 1 : end;
+        }
+        buf[off] = '\0';
+        return;
+    }
+}
+
+/* Look up an existing env var's value in the envp array, returning
+ * the pointer past the "NAME=" prefix, or NULL if not found. */
+static const char *find_env_value(char *const *envp, int envc, const char *name_eq, size_t name_eq_len) {
+    for (int j = 0; j < envc; j++) {
+        if (strncmp(envp[j], name_eq, name_eq_len) == 0)
+            return envp[j] + name_eq_len;
+    }
+    return NULL;
+}
+
+/* "LD_LIBRARY_PATH=<link_dir>[:<existing>]", heap-allocated. */
+static char *build_ld_library_path(char *const *envp, int envc, const char *link_dir) {
+    const char *existing = find_env_value(envp, envc, "LD_LIBRARY_PATH=", 16);
+    size_t need = 17 + strlen(link_dir) + (existing ? 1 + strlen(existing) : 0);
+    char *out = malloc(need);
+    if (!out)
+        return NULL;
+    if (existing && *existing)
+        snprintf(out, need, "LD_LIBRARY_PATH=%s:%s", link_dir, existing);
+    else
+        snprintf(out, need, "LD_LIBRARY_PATH=%s", link_dir);
+    return out;
+}
+
+/* True if `exe_basename` needs ANTIREV_NO_PRELOAD=1 — add names here
+ * for exes whose dlopen'd libs have implicit inter-lib symbol deps
+ * that break when constructors run in per-dep isolation. */
+static int exe_is_no_preload_blacklisted(const char *exe_basename) {
+    static const char *blacklist[] = {"GUI", NULL};
+    for (int k = 0; blacklist[k]; k++)
+        if (strcmp(exe_basename, blacklist[k]) == 0)
+            return 1;
+    return 0;
+}
+
+/* "LD_PRELOAD=/proc/self/fd/A[:/proc/self/fd/B][:<dt_needed_fds>][:<existing>]"
+ *
+ * antirev_shim is always first.  aarch64_extend_shim is appended on
+ * aarch64 builds (otherwise fd = -1, skipped).  The DT_NEEDED run is
+ * only emitted in backward-compat mode (no needed section): legacy
+ * packages don't carry a DT_NEEDED list so we fall back to putting
+ * every encrypted lib on LD_PRELOAD. */
+static char *build_ld_preload(int antirev_shim_fd, int aarch64_extend_shim_fd, int compat_preload, int n_dt_needed,
+                              const int *dt_needed_fds, const char *existing_preload) {
+    size_t need = 128 + (compat_preload ? (size_t) n_dt_needed * 24 : 0) +
+                  (existing_preload ? 1 + strlen(existing_preload) : 0);
+    char *out = malloc(need);
+    if (!out)
+        return NULL;
+    int off = snprintf(out, need, "LD_PRELOAD=/proc/self/fd/%d", antirev_shim_fd);
+    if (aarch64_extend_shim_fd >= 0)
+        off += snprintf(out + off, need - (size_t) off, ":/proc/self/fd/%d", aarch64_extend_shim_fd);
+    if (compat_preload) {
+        for (int j = 0; j < n_dt_needed; j++)
+            off += snprintf(out + off, need - (size_t) off, ":/proc/self/fd/%d", dt_needed_fds[j]);
+    }
+    if (existing_preload)
+        snprintf(out + off, need - (size_t) off, ":%s", existing_preload);
+    return out;
+}
+
+/* "ANTIREV_FD_MAP=name1=fd1,name2=fd2,…" for dlopen'd libs. */
+static char *build_antirev_fd_map(int n_fdmap, const char (*fdmap_names)[MAX_NAME + 1], const int *fdmap_fds) {
+    size_t need = 16 + (size_t) n_fdmap * (MAX_NAME + 16);
+    char *out = malloc(need);
+    if (!out)
+        return NULL;
+    int off = snprintf(out, need, "ANTIREV_FD_MAP=");
+    for (int j = 0; j < n_fdmap; j++) {
+        if (j > 0)
+            out[off++] = ',';
+        off += snprintf(out + off, need - (size_t) off, "%s=%d", fdmap_names[j], fdmap_fds[j]);
+    }
+    return out;
+}
+
+/* "ANTIREV_ENC_LIBS=name1,name2,…" — the full encrypted-lib set the
+ * daemon manages.  dlopen_shim checks incoming dlopen basenames
+ * against this set before opening the socket. */
+static char *build_enc_libs(int n_all_enc, const char (*all_enc_names)[MAX_NAME + 1]) {
+    size_t need = 20 + (size_t) n_all_enc * (MAX_NAME + 2);
+    char *out = malloc(need);
+    if (!out)
+        return NULL;
+    int off = snprintf(out, need, "ANTIREV_ENC_LIBS=");
+    for (int j = 0; j < n_all_enc; j++) {
+        if (j > 0)
+            out[off++] = ',';
+        off += snprintf(out + off, need - (size_t) off, "%s", all_enc_names[j]);
+    }
+    return out;
+}
+
+/* Build the three lazy-mode env strings into out-params.  `symlink_dir`
+ * is only produced when a symlink dir was set up; the other two are
+ * always produced in lazy mode. */
+static void build_lazy_env(int daemon_sd, const char *link_dir_ptr, const char *link_dir, int n_all_enc,
+                           const char (*all_enc_names)[MAX_NAME + 1], char **out_sock, char **out_sym, char **out_enc) {
+    *out_sock = malloc(48);
+    if (*out_sock)
+        snprintf(*out_sock, 48, "ANTIREV_LIBD_SOCK=%d", daemon_sd);
+
+    if (link_dir_ptr) {
+        *out_sym = malloc(64);
+        if (*out_sym)
+            snprintf(*out_sym, 64, "ANTIREV_SYMLINK_DIR=%s", link_dir);
+    } else {
+        *out_sym = NULL;
+    }
+
+    *out_enc = build_enc_libs(n_all_enc, all_enc_names);
+}
+
+/* "ANTIREV_CLOSE_FDS=fd1,fd2,…" — exe_shim closes these in its ctor.
+ * By that point glibc has already mmap'd every DT_NEEDED lib so the
+ * fds are pure bookkeeping; freeing the slots helps select() callers
+ * (FD_SETSIZE=1024). */
+static char *build_close_fds(int n_dt_needed, const int *dt_needed_fds) {
+    size_t need = 20 + (size_t) n_dt_needed * 12;
+    char *out = malloc(need);
+    if (!out)
+        return NULL;
+    int off = snprintf(out, need, "ANTIREV_CLOSE_FDS=");
+    for (int j = 0; j < n_dt_needed; j++) {
+        if (j > 0)
+            out[off++] = ',';
+        off += snprintf(out + off, need - (size_t) off, "%d", dt_needed_fds[j]);
+    }
+    return out;
+}
+
+/* True for env entries we're about to rewrite — skipped when copying
+ * the inherited env forward. */
+static int env_is_antirev_managed(const char *e) {
+    static const char *const prefixes[] = {
+            "LD_PRELOAD=",
+            "LD_LIBRARY_PATH=",
+            "ANTIREV_REAL_EXE=",
+            "ANTIREV_MAIN_FD=",
+            "ANTIREV_FD_MAP=",
+            "ANTIREV_CLOSE_FDS=",
+            "ANTIREV_LIBD_SOCK=",
+            "ANTIREV_ENC_LIBS=",
+            "ANTIREV_SYMLINK_DIR=",
+            "ANTIREV_NO_PRELOAD=",
+            NULL,
+    };
+    for (int i = 0; prefixes[i]; i++)
+        if (strncmp(e, prefixes[i], strlen(prefixes[i])) == 0)
+            return 1;
+    return 0;
+}
+
+/* Build the full env array for fexecve.  Returns a malloc'd
+ * NULL-terminated vector where the individual entries are a mix of
+ * caller-owned (inherited) and build_*-allocated strings — no attempt
+ * is made to track ownership since fexecve will replace the address
+ * space anyway. */
+static char **build_exec_env(const exec_env_cfg_t *cfg) {
+    int envc = 0;
+    while (cfg->envp[envc])
+        envc++;
+
+    char filtered[8192];
+    filter_inherited_ld_preload(cfg->envp, envc, filtered, sizeof(filtered));
+    const char *existing_preload = filtered[0] ? filtered : NULL;
+
+    char *ld_libpath = cfg->link_dir_ptr ? build_ld_library_path(cfg->envp, envc, cfg->link_dir) : NULL;
+
+    const char *base = strrchr(cfg->real_exe, '/');
+    base = base ? base + 1 : cfg->real_exe;
+    int force_no_preload = exe_is_no_preload_blacklisted(base);
+
+    /* +12 extras: REAL_EXE, MAIN_FD, LD_PRELOAD, FD_MAP, LIBPATH,
+     * CLOSE_FDS, LIBD_SOCK, ENC_LIBS, SYMLINK_DIR, NO_PRELOAD, NULL + spare */
+    char **out = malloc((size_t) (envc + 12) * sizeof(char *));
+    if (!out)
+        return NULL;
+
+    char *real_exe_entry = malloc(4096 + 32);
+    char *main_fd_entry = malloc(32);
+    if (!real_exe_entry || !main_fd_entry) {
+        free(out);
+        return NULL;
+    }
+    snprintf(real_exe_entry, 4096 + 32, "ANTIREV_REAL_EXE=%s", cfg->real_exe);
+    snprintf(main_fd_entry, 32, "ANTIREV_MAIN_FD=%d", cfg->main_fd);
+
+    int compat_preload = !cfg->has_needed_section && cfg->nlibs > 0;
+    char *ld_preload_entry = build_ld_preload(cfg->antirev_shim_fd, cfg->aarch64_extend_shim_fd, compat_preload,
+                                              cfg->n_dt_needed, cfg->dt_needed_fds, existing_preload);
+    if (!ld_preload_entry) {
+        free(out);
+        return NULL;
+    }
+
+    char *fd_map_entry = cfg->n_fdmap > 0 ? build_antirev_fd_map(cfg->n_fdmap, cfg->fdmap_names, cfg->fdmap_fds) : NULL;
+
+    char *libd_sock = NULL, *symlink_dir = NULL, *enc_libs = NULL;
+    int lazy_mode = (cfg->daemon_sd >= 0 && cfg->n_all_enc > 0);
+    if (lazy_mode)
+        build_lazy_env(cfg->daemon_sd, cfg->link_dir_ptr, cfg->link_dir, cfg->n_all_enc, cfg->all_enc_names, &libd_sock,
+                       &symlink_dir, &enc_libs);
+
+    char *close_fds = (cfg->has_needed_section && cfg->n_dt_needed > 0)
+                              ? build_close_fds(cfg->n_dt_needed, cfg->dt_needed_fds)
+                              : NULL;
+
+    int ei = 0;
+    for (int j = 0; j < envc; j++) {
+        if (env_is_antirev_managed(cfg->envp[j]))
+            continue;
+        out[ei++] = cfg->envp[j];
+    }
+    out[ei++] = real_exe_entry;
+    out[ei++] = main_fd_entry;
+    out[ei++] = ld_preload_entry;
+    if (fd_map_entry)
+        out[ei++] = fd_map_entry;
+    if (ld_libpath)
+        out[ei++] = ld_libpath;
+    if (close_fds)
+        out[ei++] = close_fds;
+    if (libd_sock)
+        out[ei++] = libd_sock;
+    if (enc_libs)
+        out[ei++] = enc_libs;
+    if (symlink_dir)
+        out[ei++] = symlink_dir;
+    if (force_no_preload)
+        out[ei++] = "ANTIREV_NO_PRELOAD=1";
+    out[ei] = NULL;
+    return out;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Mode A: lightweight lib daemon                                      */
+/* ------------------------------------------------------------------ */
+
+/* Scan /tmp/antirev-deps.log-style graph dump so it's reachable when
+ * the daemon's stderr is closed (e.g., launched from sysmgr). */
+static void dump_deps_graph_log(const char (*lib_names)[MAX_NAME + 1], int nlibs) {
+    FILE *lf = fopen("/tmp/antirev-deps.log", "w");
+    if (!lf)
+        return;
+    fprintf(lf, "# antirev deps graph (%d libs)\n", nlibs);
+    for (int i = 0; i < nlibs; i++) {
+        fprintf(lf, "%s %d", lib_names[i], g_deps_count[i]);
+        for (int k = 0; k < g_deps_count[i]; k++)
+            fprintf(lf, " %s", lib_names[g_deps_idx[i][k]]);
+        fprintf(lf, "\n");
+    }
+    fclose(lf);
+}
+
+/* Open, bind, and listen on the abstract socket derived from `key`.
+ * Returns the listen fd on success, -1 on failure. */
+static int daemon_open_listen_socket(const uint8_t *key) {
+    struct sockaddr_un addr;
+    socklen_t addr_len = make_sock_addr(&addr, key);
+
+    int sd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sd < 0) {
+        perror("socket");
+        return -1;
+    }
+    if (bind(sd, (struct sockaddr *) &addr, addr_len) < 0) {
+        perror("[antirev] daemon bind");
+        close(sd);
+        return -1;
+    }
+    listen(sd, 16);
+    return sd;
+}
+
+/* Time `scan_encrypted_libs` and print the decrypt duration. */
+static int decrypt_own_libs(const char *real_exe, const uint8_t *key, int *lib_fds, char (*lib_names)[MAX_NAME + 1],
+                            int *nlibs) {
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+    scan_encrypted_libs(real_exe, key, lib_fds, lib_names, nlibs);
+    if (*nlibs == 0) {
+        fprintf(stderr, "[antirev] no main binary and no libs found\n");
+        return -1;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    double elapsed = (double) (t_end.tv_sec - t_start.tv_sec) + (double) (t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+    fprintf(stderr, "[antirev] decrypted %d libs in %.1fs\n", *nlibs, elapsed);
+    return 0;
+}
+
+/* Build the per-lib DT_NEEDED adjacency used by OP_GET_CLOSURE so the
+ * daemon can return a lib plus its transitive encrypted deps in a
+ * single round trip.  Prints a summary + dumps the graph for debug. */
+static void build_and_log_deps_graph(int *lib_fds, const char (*lib_names)[MAX_NAME + 1], int nlibs) {
+    build_deps_graph(lib_fds, lib_names, nlibs);
+    int total_edges = 0, zero = 0;
+    for (int i = 0; i < nlibs; i++) {
+        total_edges += g_deps_count[i];
+        if (g_deps_count[i] == 0)
+            zero++;
+    }
+    fprintf(stderr,
+            "[antirev] deps graph: %d libs, %d edges, "
+            "%d libs with 0 deps\n",
+            nlibs, total_edges, zero);
+    dump_deps_graph_log(lib_names, nlibs);
+}
+
+/* Run as Mode A: decrypt own libs, build deps graph, daemonize, serve
+ * lib fds forever.  Returns to the caller only on failure (parent
+ * daemonized process _exit's directly; child loops in daemon_serve). */
+static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, char (*lib_names)[MAX_NAME + 1],
+                              int *nlibs) {
+    raise_fd_limit();
+
+    if (decrypt_own_libs(real_exe, key, lib_fds, lib_names, nlibs) < 0)
+        return 1;
+
+    build_and_log_deps_graph(lib_fds, lib_names, *nlibs);
+
+    int listen_sd = daemon_open_listen_socket(key);
+    explicit_bzero(key, KEY_SIZE);
+    if (listen_sd < 0)
+        return 1;
+    fprintf(stderr, "[antirev] lib daemon ready (%d libs)\n", *nlibs);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return 1;
+    }
+    if (pid > 0)
+        _exit(0); /* parent: daemon is running */
+
+    /* child */
+    setsid();
+    daemon_serve(listen_sd, lib_fds, lib_names, *nlibs);
+    _exit(0); /* unreachable */
+}
+
+/* ------------------------------------------------------------------ */
+/*  Phase 6 helpers: cross-arch exec via QEMU user-mode                 */
+/* ------------------------------------------------------------------ */
+
+/* Read the first 20 bytes of `fd` and return non-zero if its ELF
+ * e_machine differs from the host arch — i.e. we need QEMU to run it. */
+static int needs_qemu_for_fd(int fd) {
+    uint8_t hdr[20];
+    if (pread(fd, hdr, sizeof(hdr), 0) != sizeof(hdr))
+        return 0;
+    if (hdr[0] != 0x7f || hdr[1] != 'E' || hdr[2] != 'L' || hdr[3] != 'F')
+        return 0;
+    uint16_t e_machine = hdr[18] | ((uint16_t) hdr[19] << 8);
+#if defined(__x86_64__) || defined(__i386__)
+    return e_machine != 0x3E && e_machine != 0x03; /* not x86_64/x86 */
+#elif defined(__aarch64__)
+    return e_machine != 0xB7; /* not aarch64 */
+#else
+    (void) e_machine;
+    return 0;
+#endif
+}
+
+/* Build argv for a QEMU exec: [binname, /proc/self/fd/N, <original argv[1..]>, NULL].
+ * Caller owns the returned allocation. */
+static char **build_qemu_argv(const char *binname, const char *fd_path, char *const *argv, int orig_argc) {
+    char **out = malloc((size_t) (orig_argc + 2) * sizeof(char *));
+    if (!out)
+        return NULL;
+    out[0] = (char *) binname;
+    out[1] = (char *) fd_path;
+    for (int i = 1; i < orig_argc; i++)
+        out[i + 1] = argv[i];
+    out[orig_argc + 1] = NULL;
+    return out;
+}
+
+/* Try each well-known QEMU path in order; execve on the first hit.
+ * Returns only on failure (execve on success never returns). */
+static void try_exec_known_qemu(char **qemu_argv, char **new_env) {
+    static const char *qemu_candidates[] = {"/tmp/.antirev-qemu-aarch64", "/usr/bin/qemu-aarch64-static",
+                                            "/usr/bin/qemu-aarch64", NULL};
+    for (int qi = 0; qemu_candidates[qi]; qi++) {
+        struct stat st;
+        if (stat(qemu_candidates[qi], &st) == 0)
+            execve(qemu_candidates[qi], qemu_argv, new_env);
+    }
+}
+
+/* Buffered copy of an fd.  Returns 0 on success, -1 on any write error. */
+static int copy_fd_to_fd(int src, int dst) {
+    char buf[8192];
+    ssize_t n;
+    while ((n = read(src, buf, sizeof(buf))) > 0) {
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = write(dst, buf + off, (size_t) (n - off));
+            if (w <= 0)
+                return -1;
+            off += w;
+        }
+    }
+    return n < 0 ? -1 : 0;
+}
+
+/* Probe /proc/<pid>/exe for up to `timeout_ms` (polled at 20ms) looking
+ * for a path containing "qemu".  Returns the resolved path in `out` on
+ * success (NUL-terminated), or returns -1 on timeout. */
+static int wait_for_qemu_exe(pid_t pid, char *out, size_t out_sz, int timeout_ms) {
+    char proc_exe[64];
+    snprintf(proc_exe, sizeof(proc_exe), "/proc/%d/exe", (int) pid);
+    for (int i = 0; i < timeout_ms / 20; i++) {
+        usleep(20000);
+        ssize_t n = readlink(proc_exe, out, out_sz - 1);
+        if (n > 0) {
+            out[n] = '\0';
+            if (strstr(out, "qemu"))
+                return 0;
+        }
+    }
+    return -1;
+}
+
+/* Probe-cache path: fork a child through binfmt_misc, copy its
+ * /proc/<pid>/exe (= the QEMU binary the kernel chose) to /tmp so
+ * we can exec it directly next time.  Handles Docker where QEMU
+ * isn't on PATH (binfmt_misc F-flag keeps it kernel-side only).
+ *
+ * Returns 0 if the cache file is populated; -1 otherwise. */
+static int cache_qemu_from_probe(int main_fd, char *const *argv, char **new_env) {
+    pid_t probe = fork();
+    if (probe == 0) {
+        fexecve(main_fd, argv, new_env);
+        _exit(127);
+    }
+    if (probe < 0)
+        return -1;
+
+    char qemu_path[256];
+    int found = wait_for_qemu_exe(probe, qemu_path, sizeof(qemu_path), 1000);
+    int cached = -1;
+    if (found == 0) {
+        char proc_exe[64];
+        snprintf(proc_exe, sizeof(proc_exe), "/proc/%d/exe", (int) probe);
+        int src = open(proc_exe, O_RDONLY);
+        if (src >= 0) {
+            int dst = open("/tmp/.antirev-qemu-aarch64", O_WRONLY | O_CREAT | O_TRUNC, 0755);
+            if (dst >= 0) {
+                if (copy_fd_to_fd(src, dst) == 0)
+                    cached = 0;
+                close(dst);
+            }
+            close(src);
+        }
+    }
+
+    kill(probe, SIGKILL);
+    int st;
+    waitpid(probe, &st, 0);
+    return cached;
+}
+
+/* Phase 6 dispatcher.  On native execution: fexecve(main_fd).  On
+ * cross-arch: try cached QEMU, then known system paths, then fall
+ * back to binfmt_misc-probe-and-cache, then re-exec through the
+ * cached QEMU.  Any failure falls through to a direct fexecve — the
+ * kernel's own binfmt handling is the last line of defence. */
+static void exec_target(int main_fd, char *const *argv, char **new_env, const char *real_exe) {
+    if (!needs_qemu_for_fd(main_fd)) {
+        fexecve(main_fd, (char *const *) argv, new_env);
+        return;
+    }
+
+    const char *binname = strrchr(real_exe, '/');
+    binname = binname ? binname + 1 : real_exe;
+
+    int orig_argc = 0;
+    while (argv[orig_argc])
+        orig_argc++;
+
+    char fd_path[32];
+    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
+
+    char **qemu_argv = build_qemu_argv(binname, fd_path, argv, orig_argc);
+    if (qemu_argv) {
+        try_exec_known_qemu(qemu_argv, new_env);
+        free(qemu_argv);
+    }
+
+    if (cache_qemu_from_probe(main_fd, argv, new_env) == 0) {
+        char **re_argv = build_qemu_argv(binname, fd_path, argv, orig_argc);
+        if (re_argv) {
+            execve("/tmp/.antirev-qemu-aarch64", re_argv, new_env);
+            free(re_argv);
+        }
+    }
+
+    fexecve(main_fd, (char *const *) argv, new_env);
+}
+
+/* ------------------------------------------------------------------ */
 /*  main                                                               */
 /* ------------------------------------------------------------------ */
 int main(int argc __attribute__((unused)), char *argv[], char *envp[])
@@ -1361,236 +2085,19 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     free(chunk);
     close(self);
 
-    /* ----------------------------------------------------------------
-     * Mode A: Lightweight daemon (no main binary).
-     * Scan own directory for encrypted .so files, decrypt into memfds,
-     * then bind abstract socket and serve lib fds forever.
-     * ---------------------------------------------------------------- */
-    if (main_fd < 0) {
-        /* Raise fd limit: daemon holds ~nlibs memfds + listen socket */
-        struct rlimit rl;
-        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
-            rl.rlim_cur = rl.rlim_max;
-            setrlimit(RLIMIT_NOFILE, &rl);
-        }
+    /* Mode A: no main binary → run as a lightweight lib daemon forever. */
+    if (main_fd < 0)
+        return run_daemon_forever(real_exe, key, lib_fds, lib_names, &nlibs);
 
-        struct timespec t_start, t_end;
-        clock_gettime(CLOCK_MONOTONIC, &t_start);
-
-        scan_encrypted_libs(real_exe, key, lib_fds, lib_names, &nlibs);
-        if (nlibs == 0) {
-            fprintf(stderr, "[antirev] no main binary and no libs found\n");
-            return 1;
-        }
-
-        clock_gettime(CLOCK_MONOTONIC, &t_end);
-        double elapsed = (double)(t_end.tv_sec - t_start.tv_sec)
-                       + (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e9;
-        fprintf(stderr, "[antirev] decrypted %d libs in %.1fs\n",
-                nlibs, elapsed);
-
-        /* Build per-lib DT_NEEDED adjacency so OP_GET_CLOSURE can return
-         * a lib + its transitive encrypted deps in one round trip. */
-        build_deps_graph(lib_fds, lib_names, nlibs);
-        {
-            int total_edges = 0, zero = 0;
-            for (int i = 0; i < nlibs; i++) {
-                total_edges += g_deps_count[i];
-                if (g_deps_count[i] == 0) zero++;
-            }
-            fprintf(stderr, "[antirev] deps graph: %d libs, %d edges, "
-                    "%d libs with 0 deps\n", nlibs, total_edges, zero);
-
-            /* Dump the full graph to /tmp/antirev-deps.log so it is
-             * reachable even when the daemon's stderr is closed (e.g.
-             * launched from sysmgr).  This is a one-shot diagnostic
-             * file; safe to delete after debugging. */
-            FILE *lf = fopen("/tmp/antirev-deps.log", "w");
-            if (lf) {
-                fprintf(lf, "# antirev deps graph (%d libs)\n", nlibs);
-                for (int i = 0; i < nlibs; i++) {
-                    fprintf(lf, "%s %d", lib_names[i], g_deps_count[i]);
-                    for (int k = 0; k < g_deps_count[i]; k++)
-                        fprintf(lf, " %s", lib_names[g_deps_idx[i][k]]);
-                    fprintf(lf, "\n");
-                }
-                fclose(lf);
-            }
-        }
-
-        struct sockaddr_un addr;
-        socklen_t addr_len = make_sock_addr(&addr, key);
-        explicit_bzero(key, sizeof(key));
-
-        int listen_sd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (listen_sd < 0) { perror("socket"); return 1; }
-        if (bind(listen_sd, (struct sockaddr *)&addr, addr_len) < 0) {
-            perror("[antirev] daemon bind");
-            return 1;
-        }
-        listen(listen_sd, 16);
-
-        fprintf(stderr, "[antirev] lib daemon ready (%d libs)\n", nlibs);
-
-        /* Daemonize: fork, parent exits, child serves */
-        pid_t pid = fork();
-        if (pid < 0) { perror("fork"); return 1; }
-        if (pid > 0) {
-            /* Parent exits successfully — daemon is running */
-            _exit(0);
-        }
-        /* Child: become session leader, serve forever */
-        setsid();
-        daemon_serve(listen_sd, lib_fds, lib_names, nlibs);
-        _exit(0);  /* unreachable */
-    }
-
-    /* ----------------------------------------------------------------
-     * Phase 3: lib fd acquisition.
-     *
-     * Mode B (daemon libs): no libs bundled, must receive from daemon.
-     *
-     * Lazy-fetch flow:
-     *   1. OP_LIST            → full encrypted lib name list (no fds)
-     *   2. OP_INIT(DT_NEEDED) → fds for libs linked directly by the exe,
-     *                          so glibc can resolve them at startup.
-     *   3. Keep the socket open and pass its fd to the child so that
-     *      dlopen_shim can request lazy closures on-demand via
-     *      OP_GET_CLOSURE.
-     * ---------------------------------------------------------------- */
+    /* Phase 3. Mode B (daemon libs): fetch lib fds from the daemon. */
     int  daemon_sd = -1;
     char all_enc_names[MAX_FILES][MAX_NAME + 1];
     int  n_all_enc = 0;
 
     if ((bundle_flags & BFLAG_DAEMON_LIBS) && nlibs == 0) {
-
-        /* Raise fd limit: we'll receive ~nlibs fds via SCM_RIGHTS */
-        struct rlimit rl;
-        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
-            rl.rlim_cur = rl.rlim_max;
-            setrlimit(RLIMIT_NOFILE, &rl);
-        }
-
-        struct sockaddr_un addr;
-        socklen_t addr_len = make_sock_addr(&addr, key);
-
-        int connected = 0;
-        int daemon_launched = 0;
-
-        for (int retry = 0; retry < 50; retry++) {
-            int sd = socket(AF_UNIX, SOCK_STREAM, 0);
-            if (sd >= 0 && connect(sd, (struct sockaddr *)&addr, addr_len) == 0) {
-                /* Step 1: full name list, no fds. */
-                if (daemon_request_names(sd, all_enc_names, &n_all_enc) < 0
-                    || n_all_enc == 0) {
-                    close(sd);
-                    break;
-                }
-
-                if (has_needed_section) {
-                    /* needed_names is the exe's direct DT_NEEDED list
-                     * (encrypted + unencrypted).  Intersect with the
-                     * encrypted set so we only eagerly fetch libs that
-                     * actually live in the daemon. */
-                    char   enc_needed[MAX_FILES][MAX_NAME + 1];
-                    int    n_enc_needed = 0;
-                    for (int k = 0; k < n_needed; k++) {
-                        for (int j = 0; j < n_all_enc; j++) {
-                            if (strcmp(needed_names[k], all_enc_names[j]) == 0) {
-                                memcpy(enc_needed[n_enc_needed],
-                                       needed_names[k], MAX_NAME + 1);
-                                n_enc_needed++;
-                                break;
-                            }
-                        }
-                    }
-                    if (n_enc_needed > 0) {
-                        if (daemon_request_libs(sd, enc_needed, n_enc_needed,
-                                                lib_fds, lib_names, &nlibs) < 0
-                            || nlibs == 0) {
-                            close(sd);
-                            break;
-                        }
-                    } else {
-                        /* No encrypted DT_NEEDED — nothing to eager-fetch.
-                         * dlopen_shim handles everything lazily. */
-                        nlibs = 0;
-                    }
-                    /* Keep socket open for lazy OP_GET_CLOSURE requests. */
-                    daemon_sd = sd;
-                } else {
-                    /* Legacy bundle (no needed-libs section): fetch
-                     * everything eagerly, drop the socket. */
-                    if (daemon_request_libs(sd, NULL, 0,
-                                            lib_fds, lib_names, &nlibs) < 0
-                        || nlibs == 0) {
-                        close(sd);
-                        break;
-                    }
-                    daemon_send_bye(sd);
-                    close(sd);
-                    n_all_enc = 0;  /* no lazy mode */
-                }
-                connected = 1;
-                break;
-            }
-            if (sd >= 0) close(sd);
-
-            /* First failure: try to auto-launch the daemon */
-            if (!daemon_launched && retry == 0) {
-                /* Build path: dirname(real_exe) + "/.antirev-libd[-arch]" */
-                char daemon_path[4096];
-                {
-                    char *slash = strrchr(real_exe, '/');
-                    size_t dirlen = slash ? (size_t)(slash - real_exe) : 1;
-                    if (!slash) { daemon_path[0] = '.'; dirlen = 1; }
-                    else memcpy(daemon_path, real_exe, dirlen);
-                    /* Try arch-specific daemon first, then generic */
-#if defined(__x86_64__) || defined(__i386__)
-                    snprintf(daemon_path + dirlen,
-                             sizeof(daemon_path) - dirlen,
-                             "/.antirev-libd-x86_64");
-#elif defined(__aarch64__)
-                    snprintf(daemon_path + dirlen,
-                             sizeof(daemon_path) - dirlen,
-                             "/.antirev-libd-aarch64");
-#else
-                    snprintf(daemon_path + dirlen,
-                             sizeof(daemon_path) - dirlen,
-                             "/.antirev-libd");
-#endif
-                    if (access(daemon_path, X_OK) != 0)
-                        snprintf(daemon_path + dirlen,
-                                 sizeof(daemon_path) - dirlen,
-                                 "/.antirev-libd");
-                }
-
-                if (access(daemon_path, X_OK) == 0) {
-                    pid_t pid = fork();
-                    if (pid == 0) {
-                        char *dargv[] = { daemon_path, NULL };
-                        execve(daemon_path, dargv, envp);
-                        _exit(127);
-                    }
-                    if (pid > 0) {
-                        /* Wait for daemon to exit (it daemonizes itself,
-                         * so the parent exits quickly) */
-                        int st;
-                        waitpid(pid, &st, 0);
-                        daemon_launched = 1;
-                    }
-                }
-            }
-
-            usleep(100000); /* 100 ms — daemon may be starting */
-        }
-        if (!connected) {
-            fprintf(stderr, "[antirev] failed to connect to lib daemon\n");
+        if (fetch_libs_from_daemon(real_exe, envp, key, has_needed_section, n_needed, needed_names, lib_fds, lib_names,
+                                   &nlibs, all_enc_names, &n_all_enc, &daemon_sd) < 0)
             return 1;
-        }
-        fprintf(stderr, "[antirev] daemon: %d enc libs total, "
-                "%d eagerly fetched (DT_NEEDED)\n",
-                n_all_enc, nlibs);
     }
 
     /* Wipe key (after daemon socket name derivation) */
@@ -1721,375 +2228,33 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 link_dir, n_dt_needed + n_fdmap);
     }
 
-    /* Phase 5. Build new envp */
-    int envc = 0;
-    while (envp[envc]) envc++;
-
-    /* Find existing LD_PRELOAD, stripping /proc/self/fd/ entries from
-     * parent protected processes to prevent cascading duplicate loads. */
-    char filtered_preload[8192];
-    filtered_preload[0] = '\0';
-    for (int j = 0; j < envc; j++) {
-        if (strncmp(envp[j], "LD_PRELOAD=", 11) == 0) {
-            const char *src = envp[j] + 11;
-            int foff = 0;
-            while (*src) {
-                const char *end = src;
-                while (*end && *end != ':') end++;
-                size_t tlen = (size_t)(end - src);
-                /* Keep only real file paths, not /proc/self/fd/ memfd refs */
-                if (tlen > 0
-                    && strncmp(src, "/proc/self/fd/", 14) != 0) {
-                    if (foff > 0) filtered_preload[foff++] = ':';
-                    memcpy(filtered_preload + foff, src, tlen);
-                    foff += (int)tlen;
-                }
-                src = (*end == ':') ? end + 1 : end;
-            }
-            filtered_preload[foff] = '\0';
-            break;
-        }
-    }
-    const char *existing_preload = filtered_preload[0] ? filtered_preload : NULL;
-
-    /* Build LD_LIBRARY_PATH: prepend symlink dir so the linker finds
-     * encrypted libs when resolving DT_NEEDED of dlopen'd libraries. */
-    char *ld_libpath_entry = NULL;
-    if (link_dir_ptr) {
-        const char *existing_libpath = NULL;
-        for (int j = 0; j < envc; j++) {
-            if (strncmp(envp[j], "LD_LIBRARY_PATH=", 16) == 0) {
-                existing_libpath = envp[j] + 16;
-                break;
-            }
-        }
-        size_t lp_len = 17 + strlen(link_dir)
-                       + (existing_libpath ? 1 + strlen(existing_libpath) : 0);
-        ld_libpath_entry = malloc(lp_len);
-        if (ld_libpath_entry) {
-            if (existing_libpath && *existing_libpath)
-                snprintf(ld_libpath_entry, lp_len,
-                         "LD_LIBRARY_PATH=%s:%s", link_dir, existing_libpath);
-            else
-                snprintf(ld_libpath_entry, lp_len,
-                         "LD_LIBRARY_PATH=%s", link_dir);
-        }
+    /* Phase 5. Build the envp we'll hand fexecve. */
+    char **new_env = build_exec_env(&(exec_env_cfg_t) {
+            .envp = envp,
+            .real_exe = real_exe,
+            .main_fd = main_fd,
+            .antirev_shim_fd = antirev_shim_fd,
+            .aarch64_extend_shim_fd = aarch64_extend_shim_fd,
+            .has_needed_section = has_needed_section,
+            .nlibs = nlibs,
+            .n_dt_needed = n_dt_needed,
+            .dt_needed_fds = dt_needed_fds,
+            .n_fdmap = n_fdmap,
+            .fdmap_names = fdmap_names,
+            .fdmap_fds = fdmap_fds,
+            .daemon_sd = daemon_sd,
+            .n_all_enc = n_all_enc,
+            .all_enc_names = all_enc_names,
+            .link_dir_ptr = link_dir_ptr,
+            .link_dir = link_dir,
+    });
+    if (!new_env) {
+        perror("malloc env");
+        return 1;
     }
 
-    /* Blacklist: exe basenames that need ANTIREV_NO_PRELOAD=1 because their
-     * dlopen'd libs have implicit inter-lib symbol dependencies that break
-     * when constructors run in per-dep isolation.  Add names here. */
-    static const char *no_preload_blacklist[] = {
-        "GUI",
-        /* add more exe basenames here as needed */
-        NULL
-    };
-    const char *exe_basename = strrchr(real_exe, '/');
-    exe_basename = exe_basename ? exe_basename + 1 : real_exe;
-    int force_no_preload = 0;
-    for (int k = 0; no_preload_blacklist[k]; k++) {
-        if (strcmp(exe_basename, no_preload_blacklist[k]) == 0) {
-            force_no_preload = 1;
-            break;
-        }
-    }
-
-    /* +12: REAL_EXE, MAIN_FD, LD_PRELOAD, ANTIREV_FD_MAP, LD_LIBRARY_PATH,
-     * ANTIREV_CLOSE_FDS, ANTIREV_LIBD_SOCK, ANTIREV_ENC_LIBS,
-     * ANTIREV_SYMLINK_DIR, ANTIREV_NO_PRELOAD, NULL + spare */
-    char **new_env = malloc((size_t)(envc + 12) * sizeof(char *));
-    if (!new_env) { perror("malloc env"); return 1; }
-
-    char real_exe_entry[4096 + 32];
-    char main_fd_entry[32];
-
-    snprintf(real_exe_entry, sizeof(real_exe_entry),
-             "ANTIREV_REAL_EXE=%s", real_exe);
-    snprintf(main_fd_entry, sizeof(main_fd_entry),
-             "ANTIREV_MAIN_FD=%d", main_fd);
-
-    /* Build LD_PRELOAD: antirev_shim (exe + dlopen interceptors merged)
-     * plus aarch64_extend_shim on aarch64.
-     *
-     * Encrypted DT_NEEDED libs are NOT on LD_PRELOAD — they are resolved
-     * by glibc's normal DT_NEEDED BFS through the symlink dir on
-     * LD_LIBRARY_PATH.  This preserves the original symbol lookup order.
-     *
-     * Backward compat (no needed section): encrypted libs are added to
-     * LD_PRELOAD as before, since we can't rely on symlink-only resolution
-     * without knowing which libs are DT_NEEDED vs dlopen'd. */
-    int compat_preload = !has_needed_section && nlibs > 0;
-    size_t preload_len = 128
-                       + (compat_preload ? (size_t)n_dt_needed * 24 : 0)
-                       + (existing_preload ? 1 + strlen(existing_preload) : 0);
-    char *ld_preload_entry = malloc(preload_len);
-    if (!ld_preload_entry) { perror("malloc ld_preload"); return 1; }
-
-    int off = snprintf(ld_preload_entry, preload_len, "LD_PRELOAD=/proc/self/fd/%d", antirev_shim_fd);
-    if (aarch64_extend_shim_fd >= 0) {
-        off += snprintf(ld_preload_entry + off, preload_len - (size_t)off,
-                        ":/proc/self/fd/%d", aarch64_extend_shim_fd);
-    }
-    if (compat_preload) {
-        for (int j = 0; j < n_dt_needed; j++)
-            off += snprintf(ld_preload_entry + off, preload_len - (size_t)off,
-                            ":/proc/self/fd/%d", dt_needed_fds[j]);
-    }
-    if (existing_preload)
-        snprintf(ld_preload_entry + off, preload_len - (size_t)off,
-                 ":%s", existing_preload);
-
-    /* Build ANTIREV_FD_MAP: name=fd,name=fd,... for dlopen'd libs */
-    char *fd_map_entry = NULL;
-    if (n_fdmap > 0) {
-        size_t map_len = 16 + (size_t)n_fdmap * (MAX_NAME + 16);
-        fd_map_entry = malloc(map_len);
-        if (fd_map_entry) {
-            int moff = snprintf(fd_map_entry, map_len, "ANTIREV_FD_MAP=");
-            for (int j = 0; j < n_fdmap; j++) {
-                if (j > 0) fd_map_entry[moff++] = ',';
-                moff += snprintf(fd_map_entry + moff, map_len - (size_t)moff,
-                                 "%s=%d", fdmap_names[j], fdmap_fds[j]);
-            }
-        }
-    }
-
-    /* Lazy-fetch env vars (dlopen_shim side).
-     *
-     *   ANTIREV_LIBD_SOCK   — fd number of the open daemon socket,
-     *                         inherited through fexecve.
-     *   ANTIREV_SYMLINK_DIR — directory where dlopen_shim writes its
-     *                         per-lib symlinks (same dir stub uses).
-     *   ANTIREV_ENC_LIBS    — comma-separated list of every encrypted
-     *                         lib name the daemon manages.  dlopen_shim
-     *                         checks incoming dlopen basenames against
-     *                         this set before talking to the daemon.
-     *
-     * Only populated when Mode C is in lazy mode (daemon_sd >= 0). */
-    int lazy_mode = (daemon_sd >= 0 && n_all_enc > 0);
-
-    char *libd_sock_entry = NULL;
-    char *enc_libs_entry  = NULL;
-    char *symlink_dir_entry = NULL;
-
-    if (lazy_mode) {
-        libd_sock_entry = malloc(48);
-        if (libd_sock_entry)
-            snprintf(libd_sock_entry, 48, "ANTIREV_LIBD_SOCK=%d", daemon_sd);
-
-        if (link_dir_ptr) {
-            symlink_dir_entry = malloc(64);
-            if (symlink_dir_entry)
-                snprintf(symlink_dir_entry, 64,
-                         "ANTIREV_SYMLINK_DIR=%s", link_dir);
-        }
-
-        size_t enc_len = 20 + (size_t)n_all_enc * (MAX_NAME + 2);
-        enc_libs_entry = malloc(enc_len);
-        if (enc_libs_entry) {
-            int eo = snprintf(enc_libs_entry, enc_len, "ANTIREV_ENC_LIBS=");
-            for (int j = 0; j < n_all_enc; j++) {
-                if (j > 0) enc_libs_entry[eo++] = ',';
-                eo += snprintf(enc_libs_entry + eo, enc_len - (size_t)eo,
-                               "%s", all_enc_names[j]);
-            }
-        }
-    }
-
-    /* Build ANTIREV_CLOSE_FDS: comma-separated DT_NEEDED fds that exe_shim
-     * should close in its constructor.  By that point glibc has already
-     * mmap'd every DT_NEEDED lib, so the fds are pure bookkeeping — closing
-     * them frees fd-table slots without affecting the running process.
-     *
-     * Only populated on the symlink-dir path (has_needed_section).  The
-     * backward-compat path still uses LD_PRELOAD for encrypted libs and we
-     * don't want to close those fds — ld.so may still reference them. */
-    char *close_fds_entry = NULL;
-    if (has_needed_section && n_dt_needed > 0) {
-        size_t cf_len = 20 + (size_t)n_dt_needed * 12;
-        close_fds_entry = malloc(cf_len);
-        if (close_fds_entry) {
-            int cfo = snprintf(close_fds_entry, cf_len, "ANTIREV_CLOSE_FDS=");
-            for (int j = 0; j < n_dt_needed; j++) {
-                if (j > 0) close_fds_entry[cfo++] = ',';
-                cfo += snprintf(close_fds_entry + cfo, cf_len - (size_t)cfo,
-                                "%d", dt_needed_fds[j]);
-            }
-        }
-    }
-
-    int ei = 0;
-    for (int j = 0; j < envc; j++) {
-        if (strncmp(envp[j], "LD_PRELOAD=",            11) == 0) continue;
-        if (strncmp(envp[j], "LD_LIBRARY_PATH=",       16) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_REAL_EXE=",      17) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_MAIN_FD=",       16) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_FD_MAP=",        15) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_CLOSE_FDS=",     18) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_LIBD_SOCK=",     18) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_ENC_LIBS=",      17) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_SYMLINK_DIR=",   20) == 0) continue;
-        if (strncmp(envp[j], "ANTIREV_NO_PRELOAD=",   19) == 0) continue;
-        new_env[ei++] = envp[j];
-    }
-    new_env[ei++] = real_exe_entry;
-    new_env[ei++] = main_fd_entry;
-    new_env[ei++] = ld_preload_entry;
-    if (fd_map_entry)
-        new_env[ei++] = fd_map_entry;
-    if (ld_libpath_entry)
-        new_env[ei++] = ld_libpath_entry;
-    if (close_fds_entry)
-        new_env[ei++] = close_fds_entry;
-    if (libd_sock_entry)
-        new_env[ei++] = libd_sock_entry;
-    if (enc_libs_entry)
-        new_env[ei++] = enc_libs_entry;
-    if (symlink_dir_entry)
-        new_env[ei++] = symlink_dir_entry;
-    if (force_no_preload)
-        new_env[ei++] = "ANTIREV_NO_PRELOAD=1";
-    new_env[ei]   = NULL;
-
-    /* Phase 6. Replace this process with the decrypted binary — no fork, same PID.
-     *
-     * Runtime cross-architecture detection: read the ELF e_machine field from
-     * the decrypted binary. If it differs from the host architecture, QEMU
-     * user-mode is needed — try direct QEMU exec with the binary name as
-     * argv[0] so "ps -ef" shows it correctly. Otherwise fexecve directly.
-     *
-     * This avoids affecting native same-arch execution (x86→x86, aarch64→aarch64). */
-    {
-        int needs_qemu = 0;
-        uint8_t elf_hdr[20];
-        if (pread(main_fd, elf_hdr, sizeof(elf_hdr), 0) == sizeof(elf_hdr)
-            && elf_hdr[0] == 0x7f && elf_hdr[1] == 'E'
-            && elf_hdr[2] == 'L' && elf_hdr[3] == 'F') {
-            uint16_t e_machine = elf_hdr[18] | ((uint16_t)elf_hdr[19] << 8);
-#if defined(__x86_64__) || defined(__i386__)
-            needs_qemu = (e_machine != 0x3E && e_machine != 0x03); /* not x86_64/x86 */
-#elif defined(__aarch64__)
-            needs_qemu = (e_machine != 0xB7); /* not aarch64 */
-#endif
-        }
-
-        if (needs_qemu) {
-            const char *binname = strrchr(real_exe, '/');
-            binname = binname ? binname + 1 : real_exe;
-
-            int orig_argc = 0;
-            while (argv[orig_argc]) orig_argc++;
-
-            char fd_path[32];
-            snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
-
-            char **new_argv = malloc((size_t)(orig_argc + 2) * sizeof(char *));
-            if (new_argv) {
-                static const char *qemu_candidates[] = {
-                    "/tmp/.antirev-qemu-aarch64",
-                    "/usr/bin/qemu-aarch64-static",
-                    "/usr/bin/qemu-aarch64",
-                    NULL
-                };
-
-                new_argv[0] = (char *)binname;
-                new_argv[1] = fd_path;
-                for (int i = 1; i < orig_argc; i++) new_argv[i + 1] = argv[i];
-                new_argv[orig_argc + 1] = NULL;
-
-                for (int qi = 0; qemu_candidates[qi]; qi++) {
-                    struct stat st;
-                    if (stat(qemu_candidates[qi], &st) == 0) {
-                        execve(qemu_candidates[qi], new_argv, new_env);
-                    }
-                }
-                free(new_argv);
-            }
-
-            /* Probe-cache: fork a short-lived child via binfmt_misc to
-             * discover the QEMU binary from /proc/<child>/exe. Copy it
-             * to /tmp, kill the child, then re-exec with correct argv[0].
-             * This handles Docker where QEMU isn't on PATH (binfmt_misc
-             * F flag keeps it kernel-side only). */
-            pid_t probe = fork();
-            if (probe == 0) {
-                fexecve(main_fd, argv, new_env);
-                _exit(127);
-            }
-            if (probe > 0) {
-                /* Wait for child to exec into QEMU */
-                char probe_exe_path[64];
-                snprintf(probe_exe_path, sizeof(probe_exe_path),
-                         "/proc/%d/exe", (int)probe);
-
-                int cached = 0;
-                for (int i = 0; i < 50; i++) {  /* 50 × 20ms = 1s max */
-                    usleep(20000);
-                    char qemu_path[256];
-                    ssize_t ql = readlink(probe_exe_path, qemu_path,
-                                          sizeof(qemu_path) - 1);
-                    if (ql > 0) {
-                        qemu_path[ql] = '\0';
-                        if (strstr(qemu_path, "qemu") != NULL) {
-                            /* Found QEMU — copy it to cache */
-                            int src = open(probe_exe_path, O_RDONLY);
-                            if (src >= 0) {
-                                int dst = open("/tmp/.antirev-qemu-aarch64",
-                                               O_WRONLY | O_CREAT | O_TRUNC,
-                                               0755);
-                                if (dst >= 0) {
-                                    char cpbuf[8192];
-                                    ssize_t cpn;
-                                    int cp_ok = 1;
-                                    while ((cpn = read(src, cpbuf, sizeof(cpbuf))) > 0) {
-                                        ssize_t off = 0;
-                                        while (off < cpn) {
-                                            ssize_t w = write(dst, cpbuf + off, (size_t) (cpn - off));
-                                            if (w <= 0) {
-                                                cp_ok = 0;
-                                                break;
-                                            }
-                                            off += w;
-                                        }
-                                        if (!cp_ok)
-                                            break;
-                                    }
-                                    close(dst);
-                                    if (cp_ok && cpn == 0)
-                                        cached = 1;
-                                }
-                                close(src);
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                /* Kill probe child */
-                kill(probe, SIGKILL);
-                int st;
-                waitpid(probe, &st, 0);
-
-                if (cached) {
-                    /* Re-exec through cached QEMU with binary name argv[0] */
-                    char **re_argv = malloc((size_t)(orig_argc + 2)
-                                           * sizeof(char *));
-                    if (re_argv) {
-                        re_argv[0] = (char *)binname;
-                        re_argv[1] = fd_path;
-                        for (int i = 1; i < orig_argc; i++)
-                            re_argv[i + 1] = argv[i];
-                        re_argv[orig_argc + 1] = NULL;
-                        execve("/tmp/.antirev-qemu-aarch64",
-                               re_argv, new_env);
-                        free(re_argv);
-                    }
-                }
-            }
-            /* probe/cache failed — fall through to normal fexecve */
-        }
-    }
-    fexecve(main_fd, argv, new_env);
+    /* Phase 6. Replace this process with the decrypted binary. */
+    exec_target(main_fd, argv, new_env, real_exe);
     perror("fexecve");
     return 1;
 }
