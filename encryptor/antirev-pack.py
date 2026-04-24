@@ -40,6 +40,9 @@ Config format:
       - bin/start.sh                   # copy a specific file
       - *.conf                         # copy by pattern
 
+Path fields (install_dir, output_dir, key, stub, stubs.*) expand ~ and
+$VAR / ${VAR} from the environment, e.g. install_dir: $HOME/myapp.
+
 What it does:
   - Recursively scans install_dir for all ELF files (executables and libraries)
   - Classifies each as executable (ET_EXEC/ET_DYN without .so/.elf) or lib-category
@@ -74,7 +77,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from protect import (load_or_create_key, encrypt_data, MAGIC,
-                     BFLAG_HAS_LIBS, BFLAG_DAEMON_LIBS, BFLAG_WRAPPER)
+                     BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS)
 
 # ELF magic and type constants
 ELF_MAGIC = b'\x7fELF'
@@ -504,14 +507,12 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
 
     entry  = struct.pack("<H", len(name_b))
     entry += name_b
-    entry += struct.pack("<B", 1)   # flags: is_main
     entry += iv
     entry += tag
     entry += struct.pack("<Q", len(ct))
     entry += ct
 
-    num_files = 1
-    flags = 0x00
+    flags = BFLAG_HAS_MAIN
     if daemon_libs:
         flags |= BFLAG_DAEMON_LIBS
 
@@ -523,7 +524,7 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
             nb = name.encode()
             needed_section += struct.pack("<H", len(nb)) + nb
 
-    bundle = struct.pack("<IB", num_files, flags) + entry \
+    bundle = struct.pack("<B", flags) + entry \
            + needed_section
 
     stub_data     = stub_p.read_bytes()
@@ -572,9 +573,12 @@ def main():
     if 'stub' not in cfg and 'stubs' not in cfg:
         sys.exit("[error] config must have 'stub' or 'stubs' field")
 
-    install_dir = Path(cfg['install_dir']).resolve()
-    output_dir  = Path(cfg['output_dir']).resolve()
-    key_path    = (config_path.parent / cfg.get('key', 'antirev.key')).resolve()
+    def _expand(p: str) -> str:
+        return os.path.expanduser(os.path.expandvars(p))
+
+    install_dir = Path(_expand(cfg['install_dir'])).resolve()
+    output_dir  = Path(_expand(cfg['output_dir'])).resolve()
+    key_path    = (config_path.parent / _expand(cfg.get('key', 'antirev.key'))).resolve()
     blacklist   = compile_blacklist(cfg.get('blacklist', []))
     workers     = args.jobs if args.jobs > 0 else (os.cpu_count() or 4)
 
@@ -582,9 +586,9 @@ def main():
     stubs: dict[str, Path] = {}
     if 'stubs' in cfg:
         for arch, p in cfg['stubs'].items():
-            stubs[arch] = (config_path.parent / p).resolve()
+            stubs[arch] = (config_path.parent / _expand(p)).resolve()
     elif 'stub' in cfg:
-        single = (config_path.parent / cfg['stub']).resolve()
+        single = (config_path.parent / _expand(cfg['stub'])).resolve()
         elf_info = classify_elf(single)
         if elf_info:
             stubs[elf_info[1]] = single
@@ -738,12 +742,14 @@ def main():
                 except Exception as e:
                     sys.exit(f"[error] encrypt lib failed for {futures[fut]}: {e}")
 
-        # Build lightweight daemon and wrapper for each architecture
+        # Build lightweight daemon per architecture.  Multi-arch deploys
+        # get suffixed filenames (.antirev-libd-x86_64 / -aarch64); single-
+        # arch builds keep the unsuffixed .antirev-libd.  No wrapper binary
+        # — wrapper mode was retired.
         for arch, stub_path in stubs.items():
             stub_data = stub_path.read_bytes()
             suffix = f'-{arch}' if len(stubs) > 1 else ''
 
-            # Daemon: stub + key only, no bundled libs
             daemon_path = output_dir / f'.antirev-libd{suffix}'
             bundle = struct.pack("<IB", 0, 0)  # 0 files, no flags
             bundle_offset = len(stub_data)
@@ -753,16 +759,6 @@ def main():
             os.chmod(str(daemon_path), 0o755)
             print(f"[pack] Daemon binary: {daemon_path.name}  "
                   f"({daemon_path.stat().st_size:,} bytes, {arch})")
-
-            # Wrapper: connects to daemon, sets up env, execs argv[1...]
-            wrapper_path = output_dir / f'.antirev-wrap{suffix}'
-            wrap_bundle = struct.pack("<IB", 0, BFLAG_WRAPPER)
-            wrap_offset = len(stub_data)
-            wrap_trailer = struct.pack("<Q", wrap_offset) + key + MAGIC
-            wrapper_path.write_bytes(stub_data + wrap_bundle + wrap_trailer)
-            os.chmod(str(wrapper_path), 0o755)
-            print(f"[pack] Wrapper binary: {wrapper_path.name}  "
-                  f"({arch}, use: {wrapper_path.name} <command> [args...])")
         print()
 
     if exe_files:

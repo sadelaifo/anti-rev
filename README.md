@@ -75,8 +75,8 @@
             ▼
     ┌─────────────────────────────────────────────────────┐
     │ PHASE 4: write embedded shims to memfds             │
+    │   exe_shim_blob    → exe_shim_fd     (memfd)        │
     │   dlopen_shim_blob → dlopen_shim_fd  (memfd)        │
-    │   audit_shim_blob  → audit_shim_fd   (memfd)        │
     │   (blobs baked into stub at compile time)           │
     └─────────────────────────────────────────────────────┘
             │
@@ -84,9 +84,9 @@
     ┌─────────────────────────────────────────────────────┐
     │ PHASE 5: build envp for child                       │
     │   ANTIREV_FD_MAP=libfoo.so=6,libbar.so=7            │
-    │   LD_PRELOAD=/proc/self/fd/<dlopen_shim_fd>         │
-    │   LD_AUDIT=/proc/self/fd/<audit_shim_fd>            │
-    │   (strip any existing LD_PRELOAD/LD_AUDIT/FD_MAP)   │
+    │   LD_PRELOAD=/proc/self/fd/<exe_shim_fd>:           │
+    │              /proc/self/fd/<dlopen_shim_fd>         │
+    │   (strip any existing LD_PRELOAD/FD_MAP)            │
     │   wipe key from memory (explicit_bzero)             │
     └─────────────────────────────────────────────────────┘
             │
@@ -101,26 +101,19 @@
 
     kernel hands control to ld.so (of target binary)
             │
-            ├─── reads LD_AUDIT  → loads audit_shim.so from memfd
-            │         │
-            │         └─ la_version() handshake
-            │
-            ├─── reads LD_PRELOAD → loads dlopen_shim.so from memfd
+            ├─── reads LD_PRELOAD → loads exe_shim.so + dlopen_shim.so from memfd
             │
             ├─── processes DT_NEEDED entries:
             │     for each "libfoo.so":
-            │       → la_objsearch("libfoo.so", LA_SER_ORIG)
-            │           basename match in ANTIREV_FD_MAP?
-            │           YES → return "/proc/self/fd/6"
-            │           NO  → return name (normal search)
+            │       → glibc searches LD_LIBRARY_PATH first, hits the
+            │         stub's symlink dir:  libfoo.so → /proc/self/fd/6
             │       → ld.so opens /proc/self/fd/6 (memfd, RAM)
             │
             └─── target main() runs
                       │
                       └─ dlopen("/abs/path/to/libbar.so")
-                            → la_objsearch("/abs/.../libbar.so", LA_SER_ORIG)
-                                basename("libbar.so") → fd 7
-                                return "/proc/self/fd/7"
+                            → dlopen_shim intercepts, basename match
+                              in ANTIREV_FD_MAP → return fd
                             → ld.so opens memfd (RAM)
 
   Key properties visible in the flow:

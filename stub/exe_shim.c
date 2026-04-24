@@ -46,12 +46,45 @@ extern char *program_invocation_short_name;
 /* PID of the process that was actually protected by antirev.
  * Child processes inherit LD_PRELOAD but should NOT have their
  * /proc/self/exe, realpath, etc. intercepted — they are different
- * binaries and ANTIREV_REAL_EXE refers to the parent. */
+ * binaries and ANTIREV_REAL_EXE refers to the parent.
+ *
+ * On x86_64, ownership is detected lazily: interceptor calls that
+ * arrive before the shim's constructor (e.g. from a C++ global
+ * static initializer in a DT_NEEDED lib) fall into the lazy path
+ * and probe /proc/self/exe themselves.  On aarch64 we keep master's
+ * constructor-only detection (the ARM build has never needed the
+ * lazy path in practice and this keeps the runtime code identical
+ * to what's been field-tested on ARM). */
 static pid_t g_owner_pid = 0;
+#if !defined(__aarch64__)
+static int g_owner_checked = 0; /* 1 once constructor or lazy probe decided */
+#endif
 
 static int is_owner_process(void)
 {
+#if defined(__aarch64__)
     return g_owner_pid != 0 && getpid() == g_owner_pid;
+#else
+    if (g_owner_checked)
+        return g_owner_pid != 0 && getpid() == g_owner_pid;
+
+    /* Constructor hasn't decided yet — probe /proc/self/exe on the fly.
+     * Required when DT_NEEDED libs have C++ static initializers that
+     * call readlink/realpath/getauxval before restore_identity() runs. */
+    if (!getenv("ANTIREV_REAL_EXE"))
+        return 0;
+    char exe_buf[256];
+    ssize_t n = (ssize_t) syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    if (n > 0) {
+        exe_buf[n] = '\0';
+        if (strstr(exe_buf, "memfd:") != NULL) {
+            g_owner_pid = getpid();
+            g_owner_checked = 1;
+            return 1;
+        }
+    }
+    return 0;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -89,28 +122,63 @@ static void resolve_libc_realpath(void)
     g_libc_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
 }
 
-__attribute__((constructor))
-static void restore_identity(void)
-{
-    /* Resolve libc realpath for ALL processes — needed for the realpath
-     * wrapper fallthrough even in non-protected child processes. */
-    resolve_libc_realpath();
-
-    const char *real = getenv("ANTIREV_REAL_EXE");
-    if (!real)
+/* Rebuild the colon-separated env var `varname`, dropping any entry
+ * that starts with `prefix`.  Unsets the var if nothing remains.
+ * Used during constructor-time env hygiene so children inherit a
+ * clean LD_PRELOAD / LD_LIBRARY_PATH when we decide they shouldn't
+ * see our shim fds / temp dirs. */
+static void strip_env_path_entries(const char *varname, const char *prefix) {
+    const char *val = getenv(varname);
+    if (!val || !strstr(val, prefix))
         return;
 
-    /* Check if this is the protected (owner) process or a child that
-     * merely inherited LD_PRELOAD.
-     *
-     * Primary check: /proc/self/exe → "memfd:..." (normal kernel).
-     * Fallback: ANTIREV_MAIN_FD is set and the fd path contains "memfd:"
-     *   — covers QEMU user-mode where /proc/self/exe points to the QEMU
-     *   binary instead of the guest memfd. */
+    size_t plen = strlen(prefix);
+    char buf[8192];
+    size_t off = 0;
+    const char *p = val;
+    while (*p) {
+        const char *end = p;
+        while (*end && *end != ':')
+            end++;
+        size_t seg = (size_t) (end - p);
+        if (seg > 0 && strncmp(p, prefix, plen) != 0) {
+            if (off + seg + 2 >= sizeof(buf))
+                break;
+            if (off > 0)
+                buf[off++] = ':';
+            memcpy(buf + off, p, seg);
+            off += seg;
+        }
+        p = (*end == ':') ? end + 1 : end;
+    }
+    buf[off] = '\0';
+    if (off > 0)
+        setenv(varname, buf, 1);
+    else
+        unsetenv(varname);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Constructor helpers (arch-neutral)                                  */
+/* ------------------------------------------------------------------ */
+
+/* Returns 1 iff this process is the antirev owner.
+ *
+ * Primary check: readlinkat("/proc/self/exe") contains "memfd:"
+ *   — the normal kernel path.
+ * Fallback: ANTIREV_MAIN_FD set with an fd that reads back as a memfd
+ *   — covers QEMU user-mode where /proc/self/exe points to the QEMU
+ *   binary instead of the guest memfd.  In QEMU even the fd link
+ *   readlink may fail; presence of ANTIREV_MAIN_FD alone is trusted
+ *   because the stub only ever injects it into the direct fexecve
+ *   target, never into children.
+ *
+ * Consumes ANTIREV_MAIN_FD on return so forked+exec'd children never
+ * inherit the marker and false-positive as owner. */
+static int detect_owner(void) {
     int is_owner = 0;
     char exe_buf[256];
-    ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
-                                 "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    ssize_t n = (ssize_t) syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
     if (n > 0) {
         exe_buf[n] = '\0';
         if (strstr(exe_buf, "memfd:") != NULL)
@@ -118,189 +186,140 @@ static void restore_identity(void)
     }
 
     if (!is_owner) {
-        /* QEMU fallback: check if ANTIREV_MAIN_FD points to a memfd.
-         * In QEMU user-mode /proc/self/fd readlinkat may not return "memfd:"
-         * so we also trust the mere presence of ANTIREV_MAIN_FD — the stub
-         * only injects it into the direct fexecve target, never children. */
         const char *main_fd_str = getenv("ANTIREV_MAIN_FD");
         if (main_fd_str) {
             char fd_link[64], fd_target[256];
-            snprintf(fd_link, sizeof(fd_link),
-                     "/proc/self/fd/%s", main_fd_str);
-            ssize_t fn = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
-                                          fd_link, fd_target,
-                                          sizeof(fd_target) - 1);
+            snprintf(fd_link, sizeof(fd_link), "/proc/self/fd/%s", main_fd_str);
+            ssize_t fn = (ssize_t) syscall(SYS_readlinkat, AT_FDCWD, fd_link, fd_target, sizeof(fd_target) - 1);
             if (fn > 0) {
                 fd_target[fn] = '\0';
                 if (strstr(fd_target, "memfd:") != NULL)
                     is_owner = 1;
             }
-            /* QEMU: readlinkat didn't confirm "memfd:" — trust presence alone */
+            /* QEMU: readlinkat didn't confirm "memfd:" — trust presence alone. */
             if (!is_owner)
                 is_owner = 1;
         }
     }
 
-    /* Consume the marker regardless of detection path so forked+exec'd
-     * children never inherit it and false-positive as owner. */
     unsetenv("ANTIREV_MAIN_FD");
+    return is_owner;
+}
 
-    if (!is_owner) {
-        /* Non-owner child process (e.g., WAE.elf loaded by helf loadpg).
-         * Clean up anti-rev env vars to prevent dlopen_shim from
-         * redirecting dlopen calls via ANTIREV_FD_MAP, and to prevent
-         * LD_LIBRARY_PATH from pointing to anti-rev's symlink dir. */
-        unsetenv("ANTIREV_FD_MAP");
-        unsetenv("ANTIREV_REAL_EXE");
+/* Scrub antirev env from a non-owner child (e.g. WAE.elf loaded by
+ * helf loadpg).  ANTIREV_FD_MAP would otherwise make dlopen_shim
+ * redirect dlopen calls; antirev entries on LD_PRELOAD /
+ * LD_LIBRARY_PATH would keep our shim fds + symlink dir visible. */
+static void scrub_nonowner_env(void) {
+    unsetenv("ANTIREV_FD_MAP");
+    unsetenv("ANTIREV_REAL_EXE");
+    strip_env_path_entries("LD_PRELOAD", "/proc/self/fd/");
+    strip_env_path_entries("LD_LIBRARY_PATH", "/tmp/antirev_");
+}
 
-        /* Remove anti-rev /proc/self/fd/ entries from LD_PRELOAD,
-         * keeping any user-specified preloads intact. */
-        const char *preload = getenv("LD_PRELOAD");
-        if (preload && strstr(preload, "/proc/self/fd/") != NULL) {
-            char clean[4096];
-            int off = 0;
-            const char *p = preload;
-            while (*p) {
-                const char *end = p;
-                while (*end && *end != ':') end++;
-                size_t len = (size_t)(end - p);
-                if (len > 0 && strncmp(p, "/proc/self/fd/", 14) != 0) {
-                    if (off > 0) clean[off++] = ':';
-                    memcpy(clean + off, p, len);
-                    off += (int)len;
-                }
-                p = (*end == ':') ? end + 1 : end;
-            }
-            clean[off] = '\0';
-            if (off > 0)
-                setenv("LD_PRELOAD", clean, 1);
-            else
-                unsetenv("LD_PRELOAD");
-        }
-
-        /* Remove anti-rev /tmp/antirev_ dir from LD_LIBRARY_PATH */
-        const char *ldpath = getenv("LD_LIBRARY_PATH");
-        if (ldpath && strstr(ldpath, "/tmp/antirev_") != NULL) {
-            char clean_path[8192];
-            int poff = 0;
-            const char *lp = ldpath;
-            while (*lp) {
-                const char *lend = lp;
-                while (*lend && *lend != ':') lend++;
-                size_t llen = (size_t)(lend - lp);
-                if (llen > 0 && strncmp(lp, "/tmp/antirev_", 13) != 0) {
-                    if (poff > 0) clean_path[poff++] = ':';
-                    memcpy(clean_path + poff, lp, llen);
-                    poff += (int)llen;
-                }
-                lp = (*lend == ':') ? lend + 1 : lend;
-            }
-            clean_path[poff] = '\0';
-            if (poff > 0)
-                setenv("LD_LIBRARY_PATH", clean_path, 1);
-            else
-                unsetenv("LD_LIBRARY_PATH");
-        }
-
-        return;
-    }
-
-    g_owner_pid = getpid();
-
-    /* Close DT_NEEDED memfds now that glibc's dynamic linker has finished
-     * mapping them.  The fds are pure bookkeeping at this point — the
-     * libraries stay live via their mmap references — but closing them
-     * frees fd-table slots so that later socket()/open()/memfd_create()
-     * calls land at low fd numbers.  This matters for code that still
-     * uses select() (FD_SETSIZE=1024).
-     *
-     * Set by stub.c only on the symlink-dir code path (has_needed_section).
-     * Unset immediately so fork()ed children don't misinterpret stale fds. */
+/* Close DT_NEEDED memfds now that glibc's dynamic linker has finished
+ * mapping them.  The fds are pure bookkeeping at this point — the
+ * libraries stay live via their mmap references — but closing them
+ * frees fd-table slots so later socket()/open()/memfd_create() calls
+ * land at low fd numbers.  Matters for code that still uses select()
+ * (FD_SETSIZE=1024).
+ *
+ * Set by stub.c only on the symlink-dir code path (has_needed_section).
+ * Unset immediately so fork()ed children don't misinterpret stale fds. */
+static void close_dt_needed_fds(void) {
     const char *close_list = getenv("ANTIREV_CLOSE_FDS");
     if (close_list && *close_list) {
         const char *p = close_list;
         while (*p) {
             char *end = NULL;
             long fd = strtol(p, &end, 10);
-            if (end == p) break;
-            if (fd > 2) {
+            if (end == p)
+                break;
+            if (fd > 2)
                 (void)syscall(SYS_close, (int)fd);
-            }
-            if (*end != ',') break;
+            if (*end != ',')
+                break;
             p = end + 1;
         }
     }
     unsetenv("ANTIREV_CLOSE_FDS");
+}
 
-    /* Clean up anti-rev entries from LD_PRELOAD and LD_LIBRARY_PATH even
-     * for the owner process. The shims are already loaded in memory —
-     * removing them from env prevents children (popen, system, etc.) from
-     * inheriting /proc/self/fd/N paths that may become invalid. */
-    {
-        const char *preload = getenv("LD_PRELOAD");
-        if (preload && strstr(preload, "/proc/self/fd/") != NULL) {
-            char clean[4096];
-            int coff = 0;
-            const char *p = preload;
-            while (*p) {
-                const char *end = p;
-                while (*end && *end != ':') end++;
-                size_t slen = (size_t)(end - p);
-                if (slen > 0 && strncmp(p, "/proc/self/fd/", 14) != 0) {
-                    if (coff > 0) clean[coff++] = ':';
-                    memcpy(clean + coff, p, slen);
-                    coff += (int)slen;
-                }
-                p = (*end == ':') ? end + 1 : end;
-            }
-            clean[coff] = '\0';
-            if (coff > 0)
-                setenv("LD_PRELOAD", clean, 1);
-            else
-                unsetenv("LD_PRELOAD");
-        }
-
-        const char *ldpath = getenv("LD_LIBRARY_PATH");
-        if (ldpath && strstr(ldpath, "/tmp/antirev_") != NULL) {
-            char clean_path[8192];
-            int poff = 0;
-            const char *lp = ldpath;
-            while (*lp) {
-                const char *lend = lp;
-                while (*lend && *lend != ':') lend++;
-                size_t llen = (size_t)(lend - lp);
-                if (llen > 0 && strncmp(lp, "/tmp/antirev_", 13) != 0) {
-                    if (poff > 0) clean_path[poff++] = ':';
-                    memcpy(clean_path + poff, lp, llen);
-                    poff += (int)llen;
-                }
-                lp = (*lend == ':') ? lend + 1 : lend;
-            }
-            clean_path[poff] = '\0';
-            if (poff > 0)
-                setenv("LD_LIBRARY_PATH", clean_path, 1);
-            else
-                unsetenv("LD_LIBRARY_PATH");
-        }
-
-        unsetenv("ANTIREV_FD_MAP");
-    }
-
+/* Restore /proc/self/comm (ps -o comm) and the glibc
+ * program_invocation_name{,_short_name} globals so the protected
+ * process presents under its real name instead of "memfd:...". */
+static void restore_process_name(const char *real) {
     const char *base = strrchr(real, '/');
     base = base ? base + 1 : real;
 
-    /* Restore process comm (ps -o comm, /proc/pid/comm) */
     prctl(PR_SET_NAME, (unsigned long)base, 0, 0, 0);
 
-    /* Restore program_invocation_name and program_invocation_short_name */
     strncpy(g_inv_name, real, sizeof(g_inv_name) - 1);
     g_inv_name[sizeof(g_inv_name) - 1] = '\0';
     strncpy(g_inv_short, base, sizeof(g_inv_short) - 1);
     g_inv_short[sizeof(g_inv_short) - 1] = '\0';
 
-    program_invocation_name       = g_inv_name;
+    program_invocation_name = g_inv_name;
     program_invocation_short_name = g_inv_short;
 }
+
+/* ------------------------------------------------------------------ */
+/*  Constructor (per-arch variants, single #ifdef)                      */
+/*                                                                      */
+/*  Keep the two arches as dedicated functions instead of scattering    */
+/*  #ifdefs through a shared body.  The arch-specific differences are:  */
+/*    - x86 maintains g_owner_checked so the lazy probe in              */
+/*      is_owner_process() short-circuits once the constructor runs.    */
+/*    - aarch64 additionally scrubs ANTIREV_FD_MAP / LD_PRELOAD /       */
+/*      LD_LIBRARY_PATH in the owner (the ARM business stack closes     */
+/*      random fds; children inheriting /proc/self/fd/N preloads fail). */
+/*    - x86 deliberately skips that scrub — test_fork_same_lib needs a  */
+/*      fork+exec child to inherit the daemon-backed shim env.          */
+/* ------------------------------------------------------------------ */
+#if defined(__aarch64__)
+__attribute__((constructor)) static void restore_identity(void) {
+    resolve_libc_realpath();
+
+    const char *real = getenv("ANTIREV_REAL_EXE");
+    if (!real)
+        return;
+
+    if (!detect_owner()) {
+        scrub_nonowner_env();
+        return;
+    }
+
+    g_owner_pid = getpid();
+    close_dt_needed_fds();
+
+    /* aarch64-only owner scrub — see comment above. */
+    strip_env_path_entries("LD_PRELOAD", "/proc/self/fd/");
+    strip_env_path_entries("LD_LIBRARY_PATH", "/tmp/antirev_");
+    unsetenv("ANTIREV_FD_MAP");
+
+    restore_process_name(real);
+}
+#else /* !__aarch64__ : x86_64 */
+__attribute__((constructor)) static void restore_identity(void) {
+    resolve_libc_realpath();
+
+    const char *real = getenv("ANTIREV_REAL_EXE");
+    if (!real)
+        return;
+
+    if (!detect_owner()) {
+        scrub_nonowner_env();
+        g_owner_checked = 1;
+        return;
+    }
+
+    g_owner_pid = getpid();
+    g_owner_checked = 1;
+
+    close_dt_needed_fds();
+    restore_process_name(real);
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /*  Helper: check if path is /proc/self/exe or /proc/<pid>/exe         */

@@ -4,84 +4,45 @@ project(antirev C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# ── Native-only compiler detection ────────────────────────────────────
-# Build only for the host architecture: aarch64 host → build aarch64,
-# x86_64 host → build x86_64. No cross-compilation.
+# Emit compile_commands.json so CLion (and other clangd-based IDEs) can
+# index every translation unit with the real compile flags + include
+# paths.  Previously stub.c / exe_shim.c / dlopen_shim.c / crypto.c were
+# compiled through add_custom_command, which is opaque to CLion — code
+# inspection, goto-definition, and completion didn't work on them.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# ── Native-only build ────────────────────────────────────────────────
+# Build only for the host architecture: aarch64 host → aarch64, x86_64
+# host → x86_64.  Cross-compilation is not supported.
 if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "aarch64")
-    find_program(AARCH64_GCC   NAMES gcc)
-    find_program(AARCH64_STRIP NAMES strip)
-    set(X86_GCC   "")
-    set(X86_STRIP "")
-    message(STATUS "aarch64 host: building ARM64 targets with ${AARCH64_GCC}")
+    set(TARGET_ARCH   "aarch64")
+    set(ARCH_SUFFIX   "_aarch64")
+    set(STUB_NAME     "stub_aarch64")
 elseif(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
-    find_program(X86_GCC   NAMES gcc)
-    find_program(X86_STRIP NAMES strip)
-    set(AARCH64_GCC   "")
-    set(AARCH64_STRIP "")
-    message(STATUS "x86_64 host: building x86-64 targets with ${X86_GCC}")
+    set(TARGET_ARCH   "x86_64")
+    set(ARCH_SUFFIX   "_x86_64")
+    set(STUB_NAME     "stub")
 else()
     message(FATAL_ERROR
         "Unsupported host arch: ${CMAKE_HOST_SYSTEM_PROCESSOR}. "
         "Supported: x86_64, aarch64.")
 endif()
+message(STATUS "${TARGET_ARCH} host: native build with ${CMAKE_C_COMPILER}")
 
-# ── Force aarch64 stub INTERP to /lib64/ so it runs on RH-style rootfs ──
-# Debian-style aarch64 toolchains default INTERP to /lib/ld-linux-aarch64.so.1,
-# but openEuler / CentOS / SUSE / 麒麟 aarch64 only ship /lib64/. Force
-# --dynamic-linker=/lib64/... so the stub (and .antirev-libd /
-# .antirev-wrap derived from it by antirev-pack.py) launch on those
-# targets. x86_64 is left alone — its toolchain default is already
-# /lib64/ld-linux-x86-64.so.2 everywhere.
-if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "aarch64")
-    set(ANTIREV_INTERP_FLAG "-Wl,--dynamic-linker=/lib64/ld-linux-aarch64.so.1")
+# Convenience flag aliases so the test blocks below (gated on
+# X86_GCC / AARCH64_GCC) keep their existing shape without duplication.
+set(X86_GCC     "")
+set(AARCH64_GCC "")
+if(TARGET_ARCH STREQUAL "x86_64")
+    set(X86_GCC "${CMAKE_C_COMPILER}")
 else()
-    set(ANTIREV_INTERP_FLAG "")
+    set(AARCH64_GCC "${CMAKE_C_COMPILER}")
 endif()
 
-# ── Helper: compile the exe shim (readlink interceptor) ───────────────
-# Usage: compile_exe_shim(<output.so> <compiler>)
-function(compile_exe_shim OUTPUT COMPILER)
-    add_custom_command(
-        OUTPUT  "${OUTPUT}"
-        COMMAND "${COMPILER}" -shared -fPIC -O2 -fvisibility=hidden
-                -o "${OUTPUT}"
-                "${CMAKE_SOURCE_DIR}/stub/exe_shim.c"
-                -ldl -pthread
-        DEPENDS "${CMAKE_SOURCE_DIR}/stub/exe_shim.c"
-        COMMENT "Building exe shim: ${OUTPUT}"
-    )
-endfunction()
-
-# ── Helper: compile the dlopen shim (dlopen interceptor) ─────────────
-# Usage: compile_dlopen_shim(<output.so> <compiler>)
-function(compile_dlopen_shim OUTPUT COMPILER)
-    add_custom_command(
-        OUTPUT  "${OUTPUT}"
-        COMMAND "${COMPILER}" -shared -fPIC -O2 -fvisibility=hidden
-                -o "${OUTPUT}"
-                "${CMAKE_SOURCE_DIR}/stub/dlopen_shim.c"
-                -ldl -pthread
-        DEPENDS "${CMAKE_SOURCE_DIR}/stub/dlopen_shim.c"
-        COMMENT "Building dlopen shim: ${OUTPUT}"
-    )
-endfunction()
-
-# ── Helper: compile the aarch64-extend shim (ANTI_LoadProcess + popen/pclose) ─
-# Usage: compile_aarch64_extend_shim(<output.so> <compiler>)
-function(compile_aarch64_extend_shim OUTPUT COMPILER)
-    add_custom_command(
-        OUTPUT  "${OUTPUT}"
-        COMMAND "${COMPILER}" -shared -fPIC -O2 -fvisibility=hidden
-                -o "${OUTPUT}"
-                "${CMAKE_SOURCE_DIR}/stub/aarch64_extend_shim.c"
-                -ldl -pthread
-        DEPENDS "${CMAKE_SOURCE_DIR}/stub/aarch64_extend_shim.c"
-        COMMENT "Building aarch64-extend shim: ${OUTPUT}"
-    )
-endfunction()
-
 # ── Helper: generate C blob header from a binary file ─────────────────
-# Usage: make_blob_header(<output.h> <input.so> <varname> <dep_target>)
+# One legitimate add_custom_command — turning a built .so into a C
+# header is a file-gen step, not a translation unit.  Used by each
+# shim target below.
 function(make_blob_header OUTPUT INPUT VARNAME DEP)
     add_custom_command(
         OUTPUT  "${OUTPUT}"
@@ -92,118 +53,102 @@ function(make_blob_header OUTPUT INPUT VARNAME DEP)
     )
 endfunction()
 
-# ── Helper: build a stub binary with a given compiler ─────────────────
-# Usage: build_stub(<output> <compiler> <stripper> <target_arch> <exe_blob_dep> <dlopen_blob_dep> [<aarch64_extend_blob_dep>])
-#   target_arch: "x86_64" or "aarch64"
-#   aarch64_extend_blob_dep: aarch64-only extra dependency (aarch64_extend
-#                 shim blob header).  Omit/empty on x86_64 — stub.c
-#                 conditionally includes the header under __aarch64__.
-function(build_stub OUTPUT COMPILER STRIPPER TARGET_ARCH EXE_BLOB_DEP DLOPEN_BLOB_DEP)
-    set(AARCH64_EXTEND_BLOB_DEP "${ARGN}")
-    # Extra flags by target arch:
-    #   - aarch64: always enable ARM Crypto Extensions for AES hardware accel
-    #   - non-native target: -static so the stub runs under QEMU user-mode
-    #     (no target-arch dynamic linker on the host) and on embedded targets
-    if(TARGET_ARCH STREQUAL "aarch64")
-        if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "aarch64")
-            set(EXTRA_FLAGS -march=armv8-a+crypto)
-        else()
-            set(EXTRA_FLAGS -static -march=armv8-a+crypto)
-        endif()
-    elseif(TARGET_ARCH STREQUAL "x86_64")
-        if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64")
-            set(EXTRA_FLAGS "")
-        else()
-            set(EXTRA_FLAGS -static)
-        endif()
-    else()
-        message(FATAL_ERROR "build_stub: unknown TARGET_ARCH '${TARGET_ARCH}'")
-    endif()
-    # -static builds have no INTERP; only inject --dynamic-linker for
-    # dynamically-linked stubs (native host build).
-    set(_INTERP_FLAG "")
-    if(ANTIREV_INTERP_FLAG AND NOT "${EXTRA_FLAGS}" MATCHES "-static")
-        set(_INTERP_FLAG ${ANTIREV_INTERP_FLAG})
-    endif()
-    add_custom_command(
-        OUTPUT  "${OUTPUT}"
-        COMMAND "${COMPILER}" -O2 -Wall -Wextra -pthread ${EXTRA_FLAGS} ${_INTERP_FLAG}
-                -I "${CMAKE_BINARY_DIR}"
-                -I "${CMAKE_SOURCE_DIR}/stub"
-                -o "${OUTPUT}"
-                "${CMAKE_SOURCE_DIR}/stub/stub.c"
-                "${CMAKE_SOURCE_DIR}/stub/crypto.c"
-        COMMAND "${STRIPPER}" -s "${OUTPUT}"
-        DEPENDS
-            "${CMAKE_SOURCE_DIR}/stub/stub.c"
-            "${CMAKE_SOURCE_DIR}/stub/crypto.c"
-            "${CMAKE_SOURCE_DIR}/stub/crypto.h"
-            "${EXE_BLOB_DEP}"
-            "${DLOPEN_BLOB_DEP}"
-            ${AARCH64_EXTEND_BLOB_DEP}
-        COMMENT "Building and stripping stub: ${OUTPUT}"
+# ═══════════════════════════════════════════════════════════════════════
+#  antirev_shim.so — combined exe + dlopen interceptors
+# ═══════════════════════════════════════════════════════════════════════
+# exe_shim.c's identity interceptors (readlink / realpath / getauxval)
+# and dlopen_shim.c's dlopen interceptor ride in one DSO: they're always
+# LD_PRELOAD'd together, have disjoint symbol exports, and carry
+# independent file-scope state.  One .so = one memfd, one LD_PRELOAD
+# entry.  The aarch64-specific extend shim stays a separate .so.
+add_library(antirev_shim SHARED
+    stub/exe_shim.c
+    stub/dlopen_shim.c
+)
+set_target_properties(antirev_shim PROPERTIES
+    OUTPUT_NAME "antirev_shim${ARCH_SUFFIX}"
+    PREFIX ""                             # no "lib" prefix
+    POSITION_INDEPENDENT_CODE ON
+    C_VISIBILITY_PRESET hidden
+)
+target_compile_options(antirev_shim PRIVATE -O2)
+if(TARGET_ARCH STREQUAL "aarch64")
+    target_compile_options(antirev_shim PRIVATE -march=armv8-a+crypto)
+endif()
+target_link_libraries(antirev_shim PRIVATE dl pthread)
+
+# stub.c #includes this file — aarch64 looks for the suffixed name,
+# x86 looks for the plain one.  Keep both conventions.
+if(TARGET_ARCH STREQUAL "aarch64")
+    set(ANTIREV_SHIM_BLOB_H "${CMAKE_BINARY_DIR}/antirev_shim_blob_aarch64.h")
+else()
+    set(ANTIREV_SHIM_BLOB_H "${CMAKE_BINARY_DIR}/antirev_shim_blob.h")
+endif()
+make_blob_header("${ANTIREV_SHIM_BLOB_H}" "$<TARGET_FILE:antirev_shim>"
+                 "antirev_shim_blob" antirev_shim)
+add_custom_target(antirev_shim_blob_h DEPENDS "${ANTIREV_SHIM_BLOB_H}")
+
+# ═══════════════════════════════════════════════════════════════════════
+#  aarch64_extend_shim.so  (aarch64 only)
+# ═══════════════════════════════════════════════════════════════════════
+if(TARGET_ARCH STREQUAL "aarch64")
+    add_library(aarch64_extend_shim SHARED stub/aarch64_extend_shim.c)
+    set_target_properties(aarch64_extend_shim PROPERTIES
+        OUTPUT_NAME "aarch64_extend_shim"
+        PREFIX ""
+        POSITION_INDEPENDENT_CODE ON
+        C_VISIBILITY_PRESET hidden
     )
-endfunction()
+    target_compile_options(aarch64_extend_shim PRIVATE -O2 -march=armv8-a+crypto)
+    target_link_libraries(aarch64_extend_shim PRIVATE dl pthread)
 
-# ═══════════════════════════════════════════════════════════════════════
-#  x86-64 targets (only when x86-64 compiler is present)
-# ═══════════════════════════════════════════════════════════════════════
-
-if(X86_GCC)
-    set(STUB_X86    "${CMAKE_BINARY_DIR}/stub")
-
-    set(EXE_SHIM_X86        "${CMAKE_BINARY_DIR}/exe_shim_x86_64.so")
-    set(EXE_SHIM_BLOB_X86_H "${CMAKE_BINARY_DIR}/exe_shim_blob.h")
-    set(DLOPEN_SHIM_X86        "${CMAKE_BINARY_DIR}/dlopen_shim_x86_64.so")
-    set(DLOPEN_SHIM_BLOB_X86_H "${CMAKE_BINARY_DIR}/dlopen_shim_blob.h")
-
-    compile_exe_shim("${EXE_SHIM_X86}" "${X86_GCC}")
-    add_custom_target(exe_shim_x86 DEPENDS "${EXE_SHIM_X86}")
-    compile_dlopen_shim("${DLOPEN_SHIM_X86}" "${X86_GCC}")
-    add_custom_target(dlopen_shim_x86 DEPENDS "${DLOPEN_SHIM_X86}")
-
-    make_blob_header("${EXE_SHIM_BLOB_X86_H}" "${EXE_SHIM_X86}" "exe_shim_blob" "${EXE_SHIM_X86}")
-    add_custom_target(exe_shim_blob_h DEPENDS "${EXE_SHIM_BLOB_X86_H}")
-    make_blob_header("${DLOPEN_SHIM_BLOB_X86_H}" "${DLOPEN_SHIM_X86}" "dlopen_shim_blob" "${DLOPEN_SHIM_X86}")
-    add_custom_target(dlopen_shim_blob_h DEPENDS "${DLOPEN_SHIM_BLOB_X86_H}")
-
-    build_stub("${STUB_X86}" "${X86_GCC}" "${X86_STRIP}" x86_64 "${EXE_SHIM_BLOB_X86_H}" "${DLOPEN_SHIM_BLOB_X86_H}")
-    add_custom_target(stub ALL DEPENDS "${STUB_X86}")
-endif()
-
-# ═══════════════════════════════════════════════════════════════════════
-#  ARM64 targets (only when cross-compiler is present)
-# ═══════════════════════════════════════════════════════════════════════
-
-if(AARCH64_GCC)
-    set(STUB_ARM64       "${CMAKE_BINARY_DIR}/stub_aarch64")
-
-    set(EXE_SHIM_ARM64        "${CMAKE_BINARY_DIR}/exe_shim_aarch64.so")
-    set(EXE_SHIM_BLOB_ARM64_H "${CMAKE_BINARY_DIR}/exe_shim_blob_aarch64.h")
-    set(DLOPEN_SHIM_ARM64        "${CMAKE_BINARY_DIR}/dlopen_shim_aarch64.so")
-    set(DLOPEN_SHIM_BLOB_ARM64_H "${CMAKE_BINARY_DIR}/dlopen_shim_blob_aarch64.h")
-    set(AARCH64_EXTEND_SHIM        "${CMAKE_BINARY_DIR}/aarch64_extend_shim.so")
     set(AARCH64_EXTEND_SHIM_BLOB_H "${CMAKE_BINARY_DIR}/aarch64_extend_shim_blob.h")
-
-    compile_exe_shim("${EXE_SHIM_ARM64}" "${AARCH64_GCC}")
-    add_custom_target(exe_shim_aarch64 DEPENDS "${EXE_SHIM_ARM64}")
-    compile_dlopen_shim("${DLOPEN_SHIM_ARM64}" "${AARCH64_GCC}")
-    add_custom_target(dlopen_shim_aarch64 DEPENDS "${DLOPEN_SHIM_ARM64}")
-    compile_aarch64_extend_shim("${AARCH64_EXTEND_SHIM}" "${AARCH64_GCC}")
-    add_custom_target(aarch64_extend_shim DEPENDS "${AARCH64_EXTEND_SHIM}")
-
-    make_blob_header("${EXE_SHIM_BLOB_ARM64_H}" "${EXE_SHIM_ARM64}" "exe_shim_blob" "${EXE_SHIM_ARM64}")
-    add_custom_target(exe_shim_blob_aarch64_h DEPENDS "${EXE_SHIM_BLOB_ARM64_H}")
-    make_blob_header("${DLOPEN_SHIM_BLOB_ARM64_H}" "${DLOPEN_SHIM_ARM64}" "dlopen_shim_blob" "${DLOPEN_SHIM_ARM64}")
-    add_custom_target(dlopen_shim_blob_aarch64_h DEPENDS "${DLOPEN_SHIM_BLOB_ARM64_H}")
-    make_blob_header("${AARCH64_EXTEND_SHIM_BLOB_H}" "${AARCH64_EXTEND_SHIM}" "aarch64_extend_shim_blob" "${AARCH64_EXTEND_SHIM}")
-    add_custom_target(aarch64_extend_shim_blob_h DEPENDS "${AARCH64_EXTEND_SHIM_BLOB_H}")
-
-    build_stub("${STUB_ARM64}" "${AARCH64_GCC}" "${AARCH64_STRIP}" aarch64
-               "${EXE_SHIM_BLOB_ARM64_H}" "${DLOPEN_SHIM_BLOB_ARM64_H}"
-               "${AARCH64_EXTEND_SHIM_BLOB_H}")
-    add_custom_target(stub_aarch64 ALL DEPENDS "${STUB_ARM64}")
+    make_blob_header("${AARCH64_EXTEND_SHIM_BLOB_H}"
+                     "$<TARGET_FILE:aarch64_extend_shim>"
+                     "aarch64_extend_shim_blob" aarch64_extend_shim)
+    add_custom_target(aarch64_extend_shim_blob_h
+                      DEPENDS "${AARCH64_EXTEND_SHIM_BLOB_H}")
 endif()
+
+# ═══════════════════════════════════════════════════════════════════════
+#  stub executable
+# ═══════════════════════════════════════════════════════════════════════
+add_executable(${STUB_NAME} stub/stub.c stub/crypto.c)
+target_include_directories(${STUB_NAME} PRIVATE
+    "${CMAKE_BINARY_DIR}"        # generated blob headers
+    "${CMAKE_SOURCE_DIR}/stub"   # crypto.h
+)
+target_compile_options(${STUB_NAME} PRIVATE -O2 -Wall -Wextra)
+target_link_libraries(${STUB_NAME} PRIVATE pthread)
+
+if(TARGET_ARCH STREQUAL "aarch64")
+    # aarch64: enable ARM Crypto Extensions for AES hardware accel.
+    target_compile_options(${STUB_NAME} PRIVATE -march=armv8-a+crypto)
+    # openEuler / CentOS / SUSE / 麒麟 aarch64 only ship
+    # /lib64/ld-linux-aarch64.so.1 (Debian defaults to /lib/...).
+    # Force INTERP so the stub launches on either rootfs layout.
+    target_link_options(${STUB_NAME} PRIVATE
+        "-Wl,--dynamic-linker=/lib64/ld-linux-aarch64.so.1")
+endif()
+
+# stub.c #includes the generated blob headers — the object file can't
+# compile until they exist.  Declare both as OBJECT_DEPENDS and wire a
+# phony target dependency so parallel builds stay correct.
+set(STUB_BLOB_HEADERS "${ANTIREV_SHIM_BLOB_H}")
+if(TARGET_ARCH STREQUAL "aarch64")
+    list(APPEND STUB_BLOB_HEADERS "${AARCH64_EXTEND_SHIM_BLOB_H}")
+endif()
+add_custom_target(stub_blob_headers DEPENDS ${STUB_BLOB_HEADERS})
+add_dependencies(${STUB_NAME} stub_blob_headers)
+set_source_files_properties(stub/stub.c PROPERTIES
+    OBJECT_DEPENDS "${STUB_BLOB_HEADERS}"
+)
+
+# Match the old pipeline's artefact size — strip after link.
+add_custom_command(TARGET ${STUB_NAME} POST_BUILD
+    COMMAND ${CMAKE_STRIP} -s $<TARGET_FILE:${STUB_NAME}>
+    COMMENT "Stripping $<TARGET_FILE_NAME:${STUB_NAME}>"
+)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Test binaries
@@ -307,7 +252,9 @@ function(compile_test_bin OUTPUT COMPILER SOURCE)
 endfunction()
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Helper: daemon-mode test (protect-daemon + protect-exe --daemon-libs)
+#  Helper: daemon-mode test (encrypt-lib + lightweight protect-daemon
+#  + protect-exe --daemon-libs). Libs are encrypted as standalone files
+#  in the test dir; the daemon scans that dir at startup.
 #  Usage: daemon_test(test_name client_bin "comment" lib1.so [lib2.so])
 #         add_dependencies(test_name stub mylib client_target ...)
 # ═══════════════════════════════════════════════════════════════════════
@@ -316,10 +263,13 @@ function(daemon_test TEST_NAME CLIENT_BIN COMMENT_STR)
     add_custom_target(${TEST_NAME}
         COMMAND ${CMAKE_COMMAND} -E echo "=== ${TEST_NAME} ==="
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD}"
+        COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+                --key        "${_TD}/test.key"
+                --libs       ${ARGN}
+                --output-dir "${_TD}"
         COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
                 --stub   "${CMAKE_BINARY_DIR}/stub"
                 --key    "${_TD}/test.key"
-                --libs   ${ARGN}
                 --output "${_TD}/.antirev-libd"
         COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
                 --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -453,11 +403,14 @@ set(_TD_TRANS "${CMAKE_BINARY_DIR}/daemon_test_dlopen_transitive")
 add_custom_target(test_dlopen_transitive
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_transitive ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_TRANS}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_TRANS}/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libmiddle.so"
+                         "${CMAKE_BINARY_DIR}/libinner.so"
+            --output-dir "${_TD_TRANS}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_TRANS}/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libmiddle.so"
-                     "${CMAKE_BINARY_DIR}/libinner.so"
             --output "${_TD_TRANS}/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -507,20 +460,20 @@ add_custom_target(test_dlopen_dt_needed
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_dt_needed ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_DTN}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_DTN}/enc_disk"
-    # Pack libs into daemon
-    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
-            --stub   "${CMAKE_BINARY_DIR}/stub"
-            --key    "${_TD_DTN}/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libfoo.so"
-                     "${CMAKE_BINARY_DIR}/libbar.so"
-            --output "${_TD_DTN}/.antirev-libd"
-    # Put encrypted copies on disk so the linker finds them (and fails
-    # with "invalid ELF header" rather than "not found")
+    # Encrypted copies on disk at enc_disk/; the daemon recursively scans
+    # _TD_DTN and picks them up, and the runtime sets LD_LIBRARY_PATH to
+    # enc_disk so the linker also finds them (and fails with "invalid ELF
+    # header" rather than "not found" — which is what the test checks).
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
             --key    "${_TD_DTN}/test.key"
             --libs   "${CMAKE_BINARY_DIR}/libfoo.so"
                      "${CMAKE_BINARY_DIR}/libbar.so"
             --output-dir "${_TD_DTN}/enc_disk"
+    # Lightweight daemon
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_DTN}/test.key"
+            --output "${_TD_DTN}/.antirev-libd"
     # Protect exe
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -560,10 +513,13 @@ add_custom_target(test_dlopen_reload
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_reload ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_RELOAD}"
     COMMAND ${CMAKE_COMMAND} -E remove -f /tmp/test_dlopen_reload.log
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_RELOAD}/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libreload.so"
+            --output-dir "${_TD_RELOAD}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_RELOAD}/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libreload.so"
             --output "${_TD_RELOAD}/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -644,13 +600,16 @@ set(_TD_INTER "${CMAKE_BINARY_DIR}/daemon_test_dlopen_interpose")
 add_custom_target(test_dlopen_interpose
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_interpose ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_INTER}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_INTER}/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libregistrar.so"
+                         "${CMAKE_BINARY_DIR}/libinterpose_dup1.so"
+                         "${CMAKE_BINARY_DIR}/libinterpose_dup2.so"
+                         "${CMAKE_BINARY_DIR}/libroot.so"
+            --output-dir "${_TD_INTER}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_INTER}/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libregistrar.so"
-                     "${CMAKE_BINARY_DIR}/libinterpose_dup1.so"
-                     "${CMAKE_BINARY_DIR}/libinterpose_dup2.so"
-                     "${CMAKE_BINARY_DIR}/libroot.so"
             --output "${_TD_INTER}/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -733,9 +692,7 @@ add_custom_target(test_plain_so
     USES_TERMINAL
 )
 
-# ═══════════════════════════════════════════════════════════════════════
-#  test_plain_exe_enc_so — plain exe + encrypted .so via protect.py run
-# ═══════════════════════════════════════════════════════════════════════
+# (test_plain_exe_enc_so was here — removed along with protect.py run/LD_AUDIT)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  test_multi_so — two protected shared libraries loaded via dlopen
@@ -775,7 +732,7 @@ add_custom_target(test_multi_so
 )
 
 # ═══════════════════════════════════════════════════════════════════════
-#  test_linked — DT_NEEDED library loaded via LD_AUDIT audit shim
+#  test_linked — DT_NEEDED library served by the daemon (symlink-dir path)
 # ═══════════════════════════════════════════════════════════════════════
 
 compile_lib("${CMAKE_BINARY_DIR}/liblinkedmath.so"
@@ -824,7 +781,7 @@ add_dependencies(test_fd_reduction stub liblinkedmath fd_reduction_main)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  test_fork_exec — child process spawned via fork()+exec() must be able
-#  to dlopen an encrypted .so via the inherited LD_AUDIT shim
+#  to dlopen an encrypted .so via the inherited dlopen_shim
 # ═══════════════════════════════════════════════════════════════════════
 
 compile_test_bin("${CMAKE_BINARY_DIR}/fork_exec_parent"
@@ -1246,10 +1203,13 @@ set(_TD_FSL "${CMAKE_BINARY_DIR}/daemon_test_fork_same_lib")
 add_custom_target(test_fork_same_lib
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_fork_same_lib ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_FSL}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_FSL}/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/mylib.so"
+            --output-dir "${_TD_FSL}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_FSL}/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/mylib.so"
             --output "${_TD_FSL}/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -1290,10 +1250,13 @@ add_custom_target(test_fork_diff_lib
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_fork_diff_lib ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_FDL}/parent" "${_TD_FDL}/child"
     # Daemon + client for parent (libparent.so)
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_FDL}/parent/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libparent.so"
+            --output-dir "${_TD_FDL}/parent"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_FDL}/parent/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libparent.so"
             --output "${_TD_FDL}/parent/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -1302,10 +1265,13 @@ add_custom_target(test_fork_diff_lib
             --daemon-libs
             --output "${_TD_FDL}/parent/parent.protected"
     # Daemon + client for child (libchild.so, different key)
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_FDL}/child/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libchild.so"
+            --output-dir "${_TD_FDL}/child"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_FDL}/child/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libchild.so"
             --output "${_TD_FDL}/child/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -1350,12 +1316,15 @@ add_custom_target(test_script_multi_bin
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_script_multi_bin ==="
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_SMB}"
     # One daemon serves all libs (same key for both clients)
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_SMB}/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libcommon.so"
+                         "${CMAKE_BINARY_DIR}/libA_only.so"
+                         "${CMAKE_BINARY_DIR}/libB_only.so"
+            --output-dir "${_TD_SMB}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_SMB}/test.key"
-            --libs   "${CMAKE_BINARY_DIR}/libcommon.so"
-                     "${CMAKE_BINARY_DIR}/libA_only.so"
-                     "${CMAKE_BINARY_DIR}/libB_only.so"
             --output "${_TD_SMB}/.antirev-libd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"

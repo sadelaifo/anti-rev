@@ -20,10 +20,15 @@ TD="$(dirname "$STUB")/daemon_test"
 rm -rf "$TD"
 mkdir -p "$TD"
 
-# Build daemon with both libs
+# Encrypt libs next to the daemon (scanned at startup)
+python3 "$PROTECT" encrypt-lib \
+    --key "$TD/daemon.key" \
+    --libs "$MYLIB" "$LIBLINKEDMATH" \
+    --output-dir "$TD"
+
+# Build lightweight daemon
 python3 "$PROTECT" protect-daemon \
     --stub "$STUB" --key "$TD/daemon.key" \
-    --libs "$MYLIB" "$LIBLINKEDMATH" \
     --output "$TD/antirev-libd"
 
 # Build client exes (daemon-libs mode, same key)
