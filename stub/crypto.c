@@ -914,133 +914,159 @@ void aes256gcm_ctr_decrypt(aes256gcm_ctx *ctx,
     }
 }
 
-/* Single-pass: GHASH + CTR simultaneously (one read of ciphertext).
- * GHASH must read each block before CTR decryption overwrites it,
- * so ct == pt (in-place) is safe.  Uses 4-wide CTR pipelining. */
-void aes256gcm_onepass(aes256gcm_ctx *ctx,
-                       const uint8_t *ct, uint8_t *pt, size_t len)
-{
-    size_t pos = 0;
+/* ------------------------------------------------------------------ */
+/*  Single-pass GHASH + CTR — one read of ciphertext per call          */
+/*                                                                      */
+/*  GHASH must read each block before CTR decryption overwrites it,    */
+/*  so ct == pt (in-place) is safe.  Split per-arch: each variant is    */
+/*  a focused 4-wide-then-remainder loop that only references its own  */
+/*  arch intrinsics.                                                    */
+/* ------------------------------------------------------------------ */
 
 #if defined(__x86_64__) || defined(_M_X64)
-    if (hw_aesni) {
-        const __m128i *rk = (const __m128i *)ctx->rk;
-
-        /* 4-wide blocks: GHASH 4 blocks, then CTR decrypt 4-wide */
-        while (pos + 64 <= len) {
-            if (hw_pclmul)
-                ni_ghash_update_bulk(ctx->ghash, ctx->H, ct + pos, 4);
-            else
-                for (int k = 0; k < 4; k++)
-                    sw_ghash_update_blk(ctx->ghash, ctx->H, ct + pos + k * 16);
-
-            __m128i c0 = _mm_loadu_si128((const __m128i *)ctx->ctr); inc32_impl(ctx->ctr);
-            __m128i c1 = _mm_loadu_si128((const __m128i *)ctx->ctr); inc32_impl(ctx->ctr);
-            __m128i c2 = _mm_loadu_si128((const __m128i *)ctx->ctr); inc32_impl(ctx->ctr);
-            __m128i c3 = _mm_loadu_si128((const __m128i *)ctx->ctr); inc32_impl(ctx->ctr);
-            ni_aes256_enc4(&c0, &c1, &c2, &c3, rk);
-            __m128i d0 = _mm_loadu_si128((const __m128i *)(ct + pos));
-            __m128i d1 = _mm_loadu_si128((const __m128i *)(ct + pos + 16));
-            __m128i d2 = _mm_loadu_si128((const __m128i *)(ct + pos + 32));
-            __m128i d3 = _mm_loadu_si128((const __m128i *)(ct + pos + 48));
-            _mm_storeu_si128((__m128i *)(pt + pos),      _mm_xor_si128(d0, c0));
-            _mm_storeu_si128((__m128i *)(pt + pos + 16), _mm_xor_si128(d1, c1));
-            _mm_storeu_si128((__m128i *)(pt + pos + 32), _mm_xor_si128(d2, c2));
-            _mm_storeu_si128((__m128i *)(pt + pos + 48), _mm_xor_si128(d3, c3));
-            pos += 64;
-        }
-
-        /* Remaining full blocks (1-3) */
-        while (pos + 16 <= len) {
-            ghash_blk(ctx->ghash, ctx->H, ct + pos);
-            __m128i ctr = _mm_loadu_si128((const __m128i *)ctx->ctr);
-            __m128i ks = ni_aes256_enc(ctr, rk);
-            inc32_impl(ctx->ctr);
-            __m128i c = _mm_loadu_si128((const __m128i *)(ct + pos));
-            _mm_storeu_si128((__m128i *)(pt + pos), _mm_xor_si128(c, ks));
-            pos += 16;
-        }
-
-        /* Trailing partial block */
-        if (pos < len) {
-            uint8_t padded[16] = {0};
-            memcpy(padded, ct + pos, len - pos);
-            ghash_blk(ctx->ghash, ctx->H, padded);
-            __m128i ctr = _mm_loadu_si128((const __m128i *)ctx->ctr);
-            __m128i ks = ni_aes256_enc(ctr, rk);
-            inc32_impl(ctx->ctr);
-            _mm_storeu_si128((__m128i *)ctx->ks, ks);
-            ctx->ks_used = 0;
-            while (pos < len) {
-                pt[pos] = ct[pos] ^ ctx->ks[ctx->ks_used++];
-                pos++;
-            }
-        }
-
-        ctx->ghash_bytes += len;
-        return;
+/* 4-wide GHASH block for AES-NI; falls back to the software loop if
+ * PCLMULQDQ isn't available. */
+static inline void ni_onepass_ghash4(aes256gcm_ctx *ctx, const uint8_t *ct4) {
+    if (hw_pclmul) {
+        ni_ghash_update_bulk(ctx->ghash, ctx->H, ct4, 4);
+    } else {
+        for (int k = 0; k < 4; k++)
+            sw_ghash_update_blk(ctx->ghash, ctx->H, ct4 + k * 16);
     }
-#elif defined(__aarch64__)
-    if (hw_aes) {
-        const uint8x16_t *rk = (const uint8x16_t *)ctx->rk;
+}
 
-        /* 4-wide blocks: GHASH 4 blocks, then CTR decrypt 4-wide */
-        while (pos + 64 <= len) {
-            if (hw_pmull)
-                ce_ghash_update_bulk(ctx->ghash, ctx->H, ct + pos, 4);
-            else
-                for (int k = 0; k < 4; k++)
-                    sw_ghash_update_blk(ctx->ghash, ctx->H, ct + pos + k * 16);
+/* 64-byte AES-NI CTR block: encrypt four counters, XOR in four
+ * ciphertext blocks.  `ctx->ctr` advances by four. */
+static inline void ni_onepass_ctr4(aes256gcm_ctx *ctx, const __m128i *rk, const uint8_t *ct, uint8_t *pt) {
+    __m128i c0 = _mm_loadu_si128((const __m128i *) ctx->ctr);
+    inc32_impl(ctx->ctr);
+    __m128i c1 = _mm_loadu_si128((const __m128i *) ctx->ctr);
+    inc32_impl(ctx->ctr);
+    __m128i c2 = _mm_loadu_si128((const __m128i *) ctx->ctr);
+    inc32_impl(ctx->ctr);
+    __m128i c3 = _mm_loadu_si128((const __m128i *) ctx->ctr);
+    inc32_impl(ctx->ctr);
+    ni_aes256_enc4(&c0, &c1, &c2, &c3, rk);
+    __m128i d0 = _mm_loadu_si128((const __m128i *) (ct));
+    __m128i d1 = _mm_loadu_si128((const __m128i *) (ct + 16));
+    __m128i d2 = _mm_loadu_si128((const __m128i *) (ct + 32));
+    __m128i d3 = _mm_loadu_si128((const __m128i *) (ct + 48));
+    _mm_storeu_si128((__m128i *) (pt), _mm_xor_si128(d0, c0));
+    _mm_storeu_si128((__m128i *) (pt + 16), _mm_xor_si128(d1, c1));
+    _mm_storeu_si128((__m128i *) (pt + 32), _mm_xor_si128(d2, c2));
+    _mm_storeu_si128((__m128i *) (pt + 48), _mm_xor_si128(d3, c3));
+}
 
-            uint8x16_t c0 = vld1q_u8(ctx->ctr); inc32_impl(ctx->ctr);
-            uint8x16_t c1 = vld1q_u8(ctx->ctr); inc32_impl(ctx->ctr);
-            uint8x16_t c2 = vld1q_u8(ctx->ctr); inc32_impl(ctx->ctr);
-            uint8x16_t c3 = vld1q_u8(ctx->ctr); inc32_impl(ctx->ctr);
-            ce_aes256_enc4(&c0, &c1, &c2, &c3, rk);
-            uint8x16_t d0 = vld1q_u8(ct + pos);
-            uint8x16_t d1 = vld1q_u8(ct + pos + 16);
-            uint8x16_t d2 = vld1q_u8(ct + pos + 32);
-            uint8x16_t d3 = vld1q_u8(ct + pos + 48);
-            vst1q_u8(pt + pos,      veorq_u8(d0, c0));
-            vst1q_u8(pt + pos + 16, veorq_u8(d1, c1));
-            vst1q_u8(pt + pos + 32, veorq_u8(d2, c2));
-            vst1q_u8(pt + pos + 48, veorq_u8(d3, c3));
-            pos += 64;
-        }
+static void aes256gcm_onepass_ni(aes256gcm_ctx *ctx, const uint8_t *ct, uint8_t *pt, size_t len) {
+    const __m128i *rk = (const __m128i *) ctx->rk;
+    size_t pos = 0;
 
-        /* Remaining full blocks (1-3) */
-        while (pos + 16 <= len) {
-            ghash_blk(ctx->ghash, ctx->H, ct + pos);
-            uint8x16_t ctr = vld1q_u8(ctx->ctr);
-            uint8x16_t ks = ce_aes256_enc(ctr, rk);
-            inc32_impl(ctx->ctr);
-            uint8x16_t c = vld1q_u8(ct + pos);
-            vst1q_u8(pt + pos, veorq_u8(c, ks));
-            pos += 16;
-        }
-
-        /* Trailing partial block */
-        if (pos < len) {
-            uint8_t padded[16] = {0};
-            memcpy(padded, ct + pos, len - pos);
-            ghash_blk(ctx->ghash, ctx->H, padded);
-            uint8x16_t ctr = vld1q_u8(ctx->ctr);
-            uint8x16_t ks = ce_aes256_enc(ctr, rk);
-            inc32_impl(ctx->ctr);
-            vst1q_u8(ctx->ks, ks);
-            ctx->ks_used = 0;
-            while (pos < len) {
-                pt[pos] = ct[pos] ^ ctx->ks[ctx->ks_used++];
-                pos++;
-            }
-        }
-
-        ctx->ghash_bytes += len;
-        return;
+    while (pos + 64 <= len) {
+        ni_onepass_ghash4(ctx, ct + pos);
+        ni_onepass_ctr4(ctx, rk, ct + pos, pt + pos);
+        pos += 64;
     }
-#endif
+    while (pos + 16 <= len) {
+        ghash_blk(ctx->ghash, ctx->H, ct + pos);
+        __m128i ctr = _mm_loadu_si128((const __m128i *) ctx->ctr);
+        __m128i ks = ni_aes256_enc(ctr, rk);
+        inc32_impl(ctx->ctr);
+        __m128i c = _mm_loadu_si128((const __m128i *) (ct + pos));
+        _mm_storeu_si128((__m128i *) (pt + pos), _mm_xor_si128(c, ks));
+        pos += 16;
+    }
+    if (pos < len) {
+        uint8_t padded[16] = {0};
+        memcpy(padded, ct + pos, len - pos);
+        ghash_blk(ctx->ghash, ctx->H, padded);
+        __m128i ctr = _mm_loadu_si128((const __m128i *) ctx->ctr);
+        __m128i ks = ni_aes256_enc(ctr, rk);
+        inc32_impl(ctx->ctr);
+        _mm_storeu_si128((__m128i *) ctx->ks, ks);
+        ctx->ks_used = 0;
+        while (pos < len) {
+            pt[pos] = ct[pos] ^ ctx->ks[ctx->ks_used++];
+            pos++;
+        }
+    }
+    ctx->ghash_bytes += len;
+}
+#endif /* x86-64 */
 
-    /* Software fallback */
+#if defined(__aarch64__)
+/* 4-wide GHASH block for ARM CE; falls back to software if PMULL
+ * isn't available. */
+static inline void ce_onepass_ghash4(aes256gcm_ctx *ctx, const uint8_t *ct4) {
+    if (hw_pmull) {
+        ce_ghash_update_bulk(ctx->ghash, ctx->H, ct4, 4);
+    } else {
+        for (int k = 0; k < 4; k++)
+            sw_ghash_update_blk(ctx->ghash, ctx->H, ct4 + k * 16);
+    }
+}
+
+/* 64-byte ARM CE CTR block: encrypt four counters, XOR in four
+ * ciphertext blocks.  `ctx->ctr` advances by four. */
+static inline void ce_onepass_ctr4(aes256gcm_ctx *ctx, const uint8x16_t *rk, const uint8_t *ct, uint8_t *pt) {
+    uint8x16_t c0 = vld1q_u8(ctx->ctr);
+    inc32_impl(ctx->ctr);
+    uint8x16_t c1 = vld1q_u8(ctx->ctr);
+    inc32_impl(ctx->ctr);
+    uint8x16_t c2 = vld1q_u8(ctx->ctr);
+    inc32_impl(ctx->ctr);
+    uint8x16_t c3 = vld1q_u8(ctx->ctr);
+    inc32_impl(ctx->ctr);
+    ce_aes256_enc4(&c0, &c1, &c2, &c3, rk);
+    uint8x16_t d0 = vld1q_u8(ct);
+    uint8x16_t d1 = vld1q_u8(ct + 16);
+    uint8x16_t d2 = vld1q_u8(ct + 32);
+    uint8x16_t d3 = vld1q_u8(ct + 48);
+    vst1q_u8(pt, veorq_u8(d0, c0));
+    vst1q_u8(pt + 16, veorq_u8(d1, c1));
+    vst1q_u8(pt + 32, veorq_u8(d2, c2));
+    vst1q_u8(pt + 48, veorq_u8(d3, c3));
+}
+
+static void aes256gcm_onepass_ce(aes256gcm_ctx *ctx, const uint8_t *ct, uint8_t *pt, size_t len) {
+    const uint8x16_t *rk = (const uint8x16_t *) ctx->rk;
+    size_t pos = 0;
+
+    while (pos + 64 <= len) {
+        ce_onepass_ghash4(ctx, ct + pos);
+        ce_onepass_ctr4(ctx, rk, ct + pos, pt + pos);
+        pos += 64;
+    }
+    while (pos + 16 <= len) {
+        ghash_blk(ctx->ghash, ctx->H, ct + pos);
+        uint8x16_t ctr = vld1q_u8(ctx->ctr);
+        uint8x16_t ks = ce_aes256_enc(ctr, rk);
+        inc32_impl(ctx->ctr);
+        uint8x16_t c = vld1q_u8(ct + pos);
+        vst1q_u8(pt + pos, veorq_u8(c, ks));
+        pos += 16;
+    }
+    if (pos < len) {
+        uint8_t padded[16] = {0};
+        memcpy(padded, ct + pos, len - pos);
+        ghash_blk(ctx->ghash, ctx->H, padded);
+        uint8x16_t ctr = vld1q_u8(ctx->ctr);
+        uint8x16_t ks = ce_aes256_enc(ctr, rk);
+        inc32_impl(ctx->ctr);
+        vst1q_u8(ctx->ks, ks);
+        ctx->ks_used = 0;
+        while (pos < len) {
+            pt[pos] = ct[pos] ^ ctx->ks[ctx->ks_used++];
+            pos++;
+        }
+    }
+    ctx->ghash_bytes += len;
+}
+#endif /* __aarch64__ */
+
+/* Portable software fallback — always compiled in as the last-resort
+ * path for hosts without AES-NI or ARM CE. */
+static void aes256gcm_onepass_sw(aes256gcm_ctx *ctx, const uint8_t *ct, uint8_t *pt, size_t len) {
+    size_t pos = 0;
     while (pos + 16 <= len) {
         sw_ghash_update_blk(ctx->ghash, ctx->H, ct + pos);
         memcpy(ctx->ks, ctx->ctr, 16);
@@ -1064,4 +1090,20 @@ void aes256gcm_onepass(aes256gcm_ctx *ctx,
         }
     }
     ctx->ghash_bytes += len;
+}
+
+/* Public entry: dispatch to the right path based on detected HW. */
+void aes256gcm_onepass(aes256gcm_ctx *ctx, const uint8_t *ct, uint8_t *pt, size_t len) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (hw_aesni) {
+        aes256gcm_onepass_ni(ctx, ct, pt, len);
+        return;
+    }
+#elif defined(__aarch64__)
+    if (hw_aes) {
+        aes256gcm_onepass_ce(ctx, ct, pt, len);
+        return;
+    }
+#endif
+    aes256gcm_onepass_sw(ctx, ct, pt, len);
 }

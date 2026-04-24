@@ -226,42 +226,110 @@ static int cache_find(const char *base)
 /*  Lazy fetch                                                         */
 /* ------------------------------------------------------------------ */
 
-/* Request `base` and its transitive encrypted closure from the daemon,
- * materialize symlinks for any names we don't already have cached,
- * keep the fds open for the process lifetime, and then real_dlopen()
- * each fetched lib by its symlink path in the daemon's (topological)
- * return order — so leaves land in glibc's link map before their
- * dependents start loading.  That way a plugin whose DT_RPATH points
- * at the on-disk encrypted directory still satisfies its DT_NEEDED
- * chain via the link map instead of trying to mmap ciphertext.
- *
- * Caller must hold g_lock. */
-static void fetch_closure(const char *base)
-{
-    if (cache_find(base) >= 0) { LOG("  cache-hit %s\n", base); return; }
-    if (g_sock < 0 || !g_symlink_dir[0]) {
-        LOG("  no-sock (sock=%d dir='%s')\n", g_sock, g_symlink_dir);
-        return;
-    }
-
-    /* Collect newly-created lib names so we can pre-load them after
-     * all symlinks are in place. */
-    char new_names[MAX_FILES][MAX_NAME + 1];
-    int  new_count = 0;
-
+/* Send the OP_GET_CLOSURE request for `base`.  Returns 0 on success,
+ * -1 on name-length / send failure. */
+static int send_closure_request(const char *base) {
     uint16_t nlen = (uint16_t)strlen(base);
-    if (nlen == 0 || nlen > MAX_NAME) return;
+    if (nlen == 0 || nlen > MAX_NAME)
+        return -1;
 
     uint8_t req[2 + MAX_NAME];
     put_u16le(req, nlen);
     memcpy(req + 2, base, nlen);
     if (send_msg(g_sock, OP_GET_CLOSURE, req, (uint32_t)(2 + nlen)) < 0) {
         LOG("  send OP_GET_CLOSURE failed\n");
-        return;
+        return -1;
+    }
+    return 0;
+}
+
+/* Materialize a just-received (name, fd) pair: either drop it as a
+ * duplicate / overflow, or install it into the cache + create the
+ * symlink dir entry.  Returns 1 if newly installed (caller should
+ * append `name` to new_names), 0 if the fd was consumed (cached or
+ * dropped), -1 on symlink failure (fd already closed). */
+static int install_closure_member(const char *name, size_t nlen, int fd) {
+    if (cache_find(name) >= 0) {
+        LOG("    dup %s (closed fresh fd)\n", name);
+        close(fd);
+        return 0;
+    }
+    if (g_cache_count >= MAX_FILES) {
+        close(fd);
+        return 0;
     }
 
-    int n_received = 0;
+    char lpath[512], target[64];
+    snprintf(lpath, sizeof(lpath), "%s/%s", g_symlink_dir, name);
+    snprintf(target, sizeof(target), "/proc/self/fd/%d", fd);
 
+    /* Overwrite any stale symlink that points at a closed fd (e.g., a
+     * DT_NEEDED lib whose stub-era fd was reaped by exe_shim).  The
+     * in-memory mapping stays live regardless. */
+    unlink(lpath);
+    if (symlink(target, lpath) < 0) {
+        LOG("    symlink %s -> %s FAILED errno=%d\n", lpath, target, errno);
+        close(fd);
+        return -1;
+    }
+    LOG("    new  %s (fd=%d)\n", name, fd);
+    memcpy(g_cache_names[g_cache_count], name, nlen + 1);
+    g_cache_fds[g_cache_count] = fd;
+    g_cache_count++;
+    return 1;
+}
+
+/* Parse one OP_BATCH payload, installing each (name, fd) pair.
+ * Returns 0 on success, -1 on wire-format error (caller disconnects).
+ * Any fd not consumed by install_closure_member is closed. */
+static int process_closure_batch(const uint8_t *payload, uint32_t plen, int *fds, int nf,
+                                 char (*new_names)[MAX_NAME + 1], int *new_count, int *n_received) {
+    if (plen < 4)
+        goto wire_error;
+    uint32_t nl = u32le(payload);
+    if ((int) nl != nf)
+        goto wire_error;
+
+    size_t poff = 4;
+    for (uint32_t i = 0; i < nl; i++) {
+        if (poff + 2 > plen)
+            goto wire_error_from_i;
+        uint16_t l = (uint16_t) payload[poff] | ((uint16_t) payload[poff + 1] << 8);
+        poff += 2;
+        if (l == 0 || l > MAX_NAME || poff + l > plen)
+            goto wire_error_from_i;
+
+        char name[MAX_NAME + 1];
+        memcpy(name, payload + poff, l);
+        name[l] = '\0';
+        poff += l;
+
+        (*n_received)++;
+        int added = install_closure_member(name, l, fds[i]);
+        if (added == 1 && *new_count < MAX_FILES) {
+            memcpy(new_names[*new_count], name, (size_t) l + 1);
+            (*new_count)++;
+        }
+        continue;
+
+    wire_error_from_i:
+        for (uint32_t k = i; k < nl; k++)
+            close(fds[k]);
+        return -1;
+    }
+    return 0;
+
+wire_error:
+    for (int i = 0; i < nf; i++)
+        close(fds[i]);
+    return -1;
+}
+
+/* Drain OP_BATCH messages until OP_END.  Populates new_names with the
+ * libs newly added to the cache (in daemon-returned topological order)
+ * and returns the total count received.  Negative return on error. */
+static int recv_closure(char (*new_names)[MAX_NAME + 1], int *new_count) {
+    int n_received = 0;
     for (;;) {
         uint32_t op, plen;
         uint8_t  payload[MAX_PAYLOAD];
@@ -269,96 +337,39 @@ static void fetch_closure(const char *base)
         int      nf = 0;
         if (recv_msg(g_sock, &op, payload, &plen, MAX_PAYLOAD,
                      fds, &nf, SCM_BATCH) < 0)
-            return;
-        if (op == OP_END) break;
-        if (op != OP_BATCH || plen < 4) {
-            for (int i = 0; i < nf; i++) close(fds[i]);
-            return;
-        }
-        uint32_t nl = u32le(payload);
-        if ((int)nl != nf) {
-            for (int i = 0; i < nf; i++) close(fds[i]);
-            return;
-        }
-        size_t poff = 4;
-        for (uint32_t i = 0; i < nl; i++) {
-            if (poff + 2 > plen) {
-                for (uint32_t k = i; k < nl; k++) close(fds[k]);
-                return;
-            }
-            uint16_t l = (uint16_t)payload[poff]
-                        | ((uint16_t)payload[poff + 1] << 8);
-            poff += 2;
-            if (l == 0 || l > MAX_NAME || poff + l > plen) {
-                for (uint32_t k = i; k < nl; k++) close(fds[k]);
-                return;
-            }
-            char name[MAX_NAME + 1];
-            memcpy(name, payload + poff, l);
-            name[l] = '\0';
-            poff += l;
-
-            n_received++;
-            if (cache_find(name) >= 0) {
-                /* Already have it — close the fresh duplicate fd.
-                 * This does not break path dedup because we keep our
-                 * own cached fd (with a different number) pinned. */
-                LOG("    dup %s (closed fresh fd)\n", name);
+            return -1;
+        if (op == OP_END)
+            return n_received;
+        if (op != OP_BATCH) {
+            for (int i = 0; i < nf; i++)
                 close(fds[i]);
-                continue;
-            }
-            if (g_cache_count >= MAX_FILES) {
-                close(fds[i]);
-                continue;
-            }
-
-            char lpath[512], target[64];
-            snprintf(lpath, sizeof(lpath), "%s/%s", g_symlink_dir, name);
-            snprintf(target, sizeof(target), "/proc/self/fd/%d", fds[i]);
-            /* Overwrite any stale symlink that points at a closed fd
-             * (e.g., a DT_NEEDED lib whose stub-era fd was reaped by
-             * exe_shim).  The in-memory mapping stays live regardless. */
-            unlink(lpath);
-            if (symlink(target, lpath) < 0) {
-                LOG("    symlink %s -> %s FAILED errno=%d\n",
-                    lpath, target, errno);
-                close(fds[i]);
-                continue;
-            }
-            LOG("    new  %s (fd=%d)\n", name, fds[i]);
-            memcpy(g_cache_names[g_cache_count], name, (size_t)l + 1);
-            g_cache_fds[g_cache_count] = fds[i];
-            g_cache_count++;
-            if (new_count < MAX_FILES) {
-                memcpy(new_names[new_count], name, (size_t)l + 1);
-                new_count++;
-            }
+            return -1;
         }
+        if (process_closure_batch(payload, plen, fds, nf, new_names, new_count, &n_received) < 0)
+            return -1;
     }
-    LOG("  closure for %s: %d libs total\n", base, n_received);
+}
 
-    /* Escape hatch — see the comment on g_no_preload.  Skip the loop
-     * entirely when the user wants plaintext-equivalent natural-load
-     * semantics instead of per-dep preloading. */
-    if (g_no_preload) {
-        LOG("  preload skipped (ANTIREV_NO_PRELOAD=1)\n");
-        return;
-    }
-
-    /* Pre-load each DEPENDENCY via its symlink path, in the order the
-     * daemon returned them (topological: leaves first).  Each load
-     * registers the dep's SONAME in glibc's link map so the final
-     * real_dlopen() of `base` finds its DT_NEEDED chain in the link
-     * map instead of falling back to DT_RPATH / DT_RUNPATH on disk.
-     *
-     * Explicitly skip `base` itself: pinning the root's refcount here
-     * prevents the caller from ever fully dlclose()ing it, which
-     * breaks plugin systems that unload one plugin before loading the
-     * next — notably the libprotobuf "File already exists in database"
-     * conflict seen when two plugins carry overlapping descriptors.
-     * The caller's own real_dlopen() in the outer dlopen() handler
-     * takes the single reference that the user is entitled to
-     * manage. */
+/* Pre-load each newly-cached dep via its symlink path, in the order
+ * the daemon returned them (topological: leaves first).  Each load
+ * registers the dep's SONAME in glibc's link map so the caller's
+ * outer real_dlopen(base) finds its DT_NEEDED chain in the link map
+ * instead of falling back to DT_RPATH/DT_RUNPATH on disk.
+ *
+ * `base` is explicitly skipped: pinning the root's refcount here
+ * prevents the caller from ever fully dlclose()ing it, which breaks
+ * plugin systems that unload one plugin before loading the next —
+ * notably libprotobuf's "File already exists in database" when two
+ * plugins carry overlapping descriptors.
+ *
+ * RTLD_GLOBAL is mandatory — generated .pb.cc code exports
+ * `descriptor_table_<file>_2eproto` with default visibility and
+ * registers it via std::call_once on the table's own once_flag*.  If
+ * two DSOs statically link the same .pb.o, RTLD_LOCAL leaves their
+ * tables in separate symbol scopes, both ctors' call_once fire, and
+ * libprotobuf sees duplicate registrations.  RTLD_GLOBAL lets the
+ * first-loaded copy interpose, matching plaintext load-time semantics. */
+static void preload_closure_deps(const char *base, const char (*new_names)[MAX_NAME + 1], int new_count) {
     for (int i = 0; i < new_count; i++) {
         if (strcmp(new_names[i], base) == 0) {
             LOG("    skip-root %s\n", new_names[i]);
@@ -366,38 +377,52 @@ static void fetch_closure(const char *base)
         }
         char spath[512];
         snprintf(spath, sizeof(spath), "%s/%s", g_symlink_dir, new_names[i]);
-        /* RTLD_GLOBAL is mandatory here, not decorative.
-         *
-         * Generated .pb.cc code exports `descriptor_table_<file>_2eproto`
-         * with default visibility and registers it via a std::call_once
-         * hanging off the table's own `once_flag*`.  If two DSOs in the
-         * closure each statically link the same .pb.o, an RTLD_LOCAL
-         * preload leaves their tables in separate symbol scopes: each
-         * DSO's ctor reads its *own* `once_flag`, both run, libprotobuf
-         * sees two different-pointer-but-same-filename DescriptorTable
-         * registrations, and the process aborts with "File already
-         * exists in database".
-         *
-         * With RTLD_GLOBAL the first-loaded DSO's copy interposes every
-         * subsequent reference to the same symbol, the second ctor's
-         * `call_once` finds the already-ran flag on the interposed
-         * pointer and short-circuits, and libprotobuf never sees the
-         * duplicate.  This matches the plaintext load-time behavior
-         * where glibc places DT_NEEDED libs into the global scope
-         * automatically. */
         void *h = real_dlopen_fn(spath, RTLD_LAZY | RTLD_GLOBAL);
         if (!h) {
             const char *err = dlerror();
-            LOG("    preload(%s) FAILED: %s\n", new_names[i],
-                err ? err : "(null)");
+            LOG("    preload(%s) FAILED: %s\n", new_names[i], err ? err : "(null)");
         } else {
             LOG("    preload(%s) OK handle=%p\n", new_names[i], h);
         }
-        /* Deps are pinned intentionally — they're typically shared
-         * across plugins (libc++, libprotobuf, libQtCore, etc.) and
-         * must stay resident so repeated plugin loads don't drop and
-         * re-register them. */
+        /* Deps stay pinned — typically shared across plugins
+         * (libc++, libprotobuf, libQtCore, etc.) so repeated plugin
+         * loads don't drop and re-register them. */
     }
+}
+
+/* Request `base` and its transitive encrypted closure from the daemon,
+ * materialize symlinks for any names we don't already have cached,
+ * keep the fds open for the process lifetime, and pre-load each new
+ * dep so glibc resolves DT_NEEDED through the link map instead of the
+ * on-disk encrypted directory.  Caller must hold g_lock. */
+static void fetch_closure(const char *base) {
+    if (cache_find(base) >= 0) {
+        LOG("  cache-hit %s\n", base);
+        return;
+    }
+    if (g_sock < 0 || !g_symlink_dir[0]) {
+        LOG("  no-sock (sock=%d dir='%s')\n", g_sock, g_symlink_dir);
+        return;
+    }
+
+    if (send_closure_request(base) < 0)
+        return;
+
+    char new_names[MAX_FILES][MAX_NAME + 1];
+    int new_count = 0;
+    int n_received = recv_closure(new_names, &new_count);
+    if (n_received < 0)
+        return;
+    LOG("  closure for %s: %d libs total\n", base, n_received);
+
+    /* Escape hatch — see g_no_preload.  Skip the loop entirely when
+     * the user wants plaintext-equivalent natural-load semantics. */
+    if (g_no_preload) {
+        LOG("  preload skipped (ANTIREV_NO_PRELOAD=1)\n");
+        return;
+    }
+
+    preload_closure_deps(base, new_names, new_count);
 }
 
 /* ------------------------------------------------------------------ */

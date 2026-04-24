@@ -797,86 +797,127 @@ static socklen_t make_sock_addr(struct sockaddr_un *addr,
 static int  g_deps_count[MAX_FILES];
 static int  g_deps_idx[MAX_FILES][MAX_DEPS_PER_LIB];
 
-static int parse_dt_needed(int fd,
-                           char (*out_names)[MAX_NAME + 1],
-                           int max_out)
-{
-    struct stat st;
-    if (fstat(fd, &st) < 0 || st.st_size < (off_t)sizeof(Elf64_Ehdr))
+/* Bounds-check an ELF64 header and phdr table against the mapped size.
+ * Returns 0 on a usable ELF64, -1 otherwise. */
+static int elf64_header_ok(const Elf64_Ehdr *eh, size_t size) {
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0)
         return -1;
+    if (eh->e_ident[EI_CLASS] != ELFCLASS64)
+        return -1;
+    if (eh->e_phoff + (uint64_t) eh->e_phnum * eh->e_phentsize > (uint64_t) size)
+        return -1;
+    return 0;
+}
 
-    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (map == MAP_FAILED) return -1;
+/* Scan program headers for PT_DYNAMIC.  Returns pointer or NULL. */
+static const Elf64_Phdr *find_pt_dynamic(const Elf64_Phdr *phdrs, int phnum) {
+    for (int i = 0; i < phnum; i++)
+        if (phdrs[i].p_type == PT_DYNAMIC)
+            return &phdrs[i];
+    return NULL;
+}
 
-    int found = -1;
-    const uint8_t  *base = (const uint8_t *)map;
-    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)base;
-
-    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) goto out;
-    if (eh->e_ident[EI_CLASS] != ELFCLASS64) goto out;
-    if (eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > (uint64_t)st.st_size)
-        goto out;
-
-    const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(base + eh->e_phoff);
-    const Elf64_Phdr *dyn_ph = NULL;
-    for (int i = 0; i < eh->e_phnum; i++) {
-        if (phdrs[i].p_type == PT_DYNAMIC) { dyn_ph = &phdrs[i]; break; }
-    }
-    if (!dyn_ph) goto out;
-
-    /* PT_DYNAMIC's own p_offset is the file offset of .dynamic —
-     * more reliable than deriving it from a containing PT_LOAD. */
-    off_t dyn_off = (off_t)dyn_ph->p_offset;
-    if (dyn_off + (off_t)dyn_ph->p_filesz > st.st_size) goto out;
-
-    const Elf64_Dyn *dyn = (const Elf64_Dyn *)(base + dyn_off);
-    int ndyn = (int)(dyn_ph->p_filesz / sizeof(Elf64_Dyn));
-
-    uint64_t strtab_vaddr = 0;
+/* Find the DT_STRTAB vaddr in .dynamic.  Returns 0 if absent. */
+static uint64_t find_dt_strtab_vaddr(const Elf64_Dyn *dyn, int ndyn) {
     for (int i = 0; i < ndyn; i++) {
-        if (dyn[i].d_tag == DT_NULL) break;
-        if (dyn[i].d_tag == DT_STRTAB) { strtab_vaddr = dyn[i].d_un.d_ptr; break; }
+        if (dyn[i].d_tag == DT_NULL)
+            return 0;
+        if (dyn[i].d_tag == DT_STRTAB)
+            return dyn[i].d_un.d_ptr;
     }
-    if (!strtab_vaddr) goto out;
+    return 0;
+}
 
-    off_t strtab_off = -1;
-    for (int i = 0; i < eh->e_phnum; i++) {
-        if (phdrs[i].p_type != PT_LOAD) continue;
-        if (strtab_vaddr >= phdrs[i].p_vaddr
-            && strtab_vaddr < phdrs[i].p_vaddr + phdrs[i].p_memsz) {
-            strtab_off = (off_t)(strtab_vaddr - phdrs[i].p_vaddr
-                                 + phdrs[i].p_offset);
+/* Map a runtime vaddr back to its file offset via PT_LOAD segments.
+ * Returns -1 if the vaddr isn't covered by any loadable segment. */
+static off_t vaddr_to_file_offset(const Elf64_Phdr *phdrs, int phnum, uint64_t vaddr) {
+    for (int i = 0; i < phnum; i++) {
+        if (phdrs[i].p_type != PT_LOAD)
+            continue;
+        if (vaddr >= phdrs[i].p_vaddr && vaddr < phdrs[i].p_vaddr + phdrs[i].p_memsz)
+            return (off_t) (vaddr - phdrs[i].p_vaddr + phdrs[i].p_offset);
+    }
+    return -1;
+}
+
+/* Walk .dynamic collecting DT_NEEDED names into out[0..max_out-1].
+ * Returns the stored count; *total_observed gets the full DT_NEEDED
+ * count so the caller can detect truncation. */
+static int collect_dt_needed_names(const Elf64_Dyn *dyn, int ndyn, const char *strtab, size_t strtab_max,
+                                   char (*out)[MAX_NAME + 1], int max_out, int *total_observed) {
+    int n = 0, total = 0;
+    for (int i = 0; i < ndyn; i++) {
+        if (dyn[i].d_tag == DT_NULL)
             break;
-        }
-    }
-    if (strtab_off < 0 || strtab_off >= st.st_size) goto out;
-
-    const char *strtab     = (const char *)(base + strtab_off);
-    size_t      strtab_max = (size_t)(st.st_size - strtab_off);
-
-    int n = 0;
-    int total = 0;   /* total DT_NEEDED entries observed, capped or not */
-    for (int i = 0; i < ndyn; i++) {
-        if (dyn[i].d_tag == DT_NULL) break;
-        if (dyn[i].d_tag != DT_NEEDED) continue;
+        if (dyn[i].d_tag != DT_NEEDED)
+            continue;
         total++;
-        if (n >= max_out) continue;   /* cap reached — keep counting */
+        if (n >= max_out)
+            continue; /* cap reached — keep counting for truncation signal */
         uint64_t off = dyn[i].d_un.d_val;
-        if (off >= strtab_max) continue;
+        if (off >= strtab_max)
+            continue;
         size_t len = strnlen(strtab + off, strtab_max - off);
-        if (len == 0 || len > MAX_NAME) continue;
-        memcpy(out_names[n], strtab + off, len);
-        out_names[n][len] = '\0';
+        if (len == 0 || len > MAX_NAME)
+            continue;
+        memcpy(out[n], strtab + off, len);
+        out[n][len] = '\0';
         n++;
     }
-    /* Signal truncation by returning a negative of (actual total)
-     * so the caller knows the stored list is incomplete.  Positive
-     * return = full list fits in the output buffer. */
-    found = (total > max_out) ? -(total) : n;
+    *total_observed = total;
+    return n;
+}
 
-out:
+/* Parse an ELF64 shared lib's DT_NEEDED list from the mapped image.
+ * Returns the number of names written, or -1 on parse failure.
+ * Caller-facing truncation handling happens in parse_dt_needed(). */
+static int parse_dt_needed_mapped(const uint8_t *base, size_t size, char (*out)[MAX_NAME + 1], int max_out,
+                                  int *total_observed) {
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *) base;
+    if (elf64_header_ok(eh, size) < 0)
+        return -1;
+
+    const Elf64_Phdr *phdrs = (const Elf64_Phdr *) (base + eh->e_phoff);
+    const Elf64_Phdr *dyn_ph = find_pt_dynamic(phdrs, eh->e_phnum);
+    if (!dyn_ph || dyn_ph->p_offset + dyn_ph->p_filesz > (uint64_t) size)
+        return -1;
+
+    const Elf64_Dyn *dyn = (const Elf64_Dyn *) (base + dyn_ph->p_offset);
+    int ndyn = (int) (dyn_ph->p_filesz / sizeof(Elf64_Dyn));
+
+    uint64_t strtab_vaddr = find_dt_strtab_vaddr(dyn, ndyn);
+    if (!strtab_vaddr)
+        return -1;
+
+    off_t strtab_off = vaddr_to_file_offset(phdrs, eh->e_phnum, strtab_vaddr);
+    if (strtab_off < 0 || strtab_off >= (off_t) size)
+        return -1;
+
+    const char *strtab = (const char *) (base + strtab_off);
+    size_t strtab_max = size - (size_t) strtab_off;
+
+    return collect_dt_needed_names(dyn, ndyn, strtab, strtab_max, out, max_out, total_observed);
+}
+
+/* Parse an ELF64 fd's DT_NEEDED list.  Positive return = full list fits.
+ * Negative return = -total (truncation signal: caller should grow
+ * MAX_DEPS_PER_LIB).  -1 = parse failure (not ELF64, stripped, etc.). */
+static int parse_dt_needed(int fd, char (*out_names)[MAX_NAME + 1], int max_out) {
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size < (off_t) sizeof(Elf64_Ehdr))
+        return -1;
+
+    void *map = mmap(NULL, (size_t) st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED)
+        return -1;
+
+    int total = 0;
+    int n = parse_dt_needed_mapped((const uint8_t *) map, (size_t) st.st_size, out_names, max_out, &total);
     munmap(map, (size_t)st.st_size);
-    return found;
+
+    if (n < 0)
+        return -1;
+    return (total > max_out) ? -total : n;
 }
 
 /* Build per-lib adjacency list: for each lib, record indices of its
