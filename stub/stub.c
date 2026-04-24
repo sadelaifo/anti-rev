@@ -2040,11 +2040,23 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                                 if (dst >= 0) {
                                     char cpbuf[8192];
                                     ssize_t cpn;
-                                    while ((cpn = read(src, cpbuf,
-                                                       sizeof(cpbuf))) > 0)
-                                        write(dst, cpbuf, (size_t)cpn);
+                                    int cp_ok = 1;
+                                    while ((cpn = read(src, cpbuf, sizeof(cpbuf))) > 0) {
+                                        ssize_t off = 0;
+                                        while (off < cpn) {
+                                            ssize_t w = write(dst, cpbuf + off, (size_t) (cpn - off));
+                                            if (w <= 0) {
+                                                cp_ok = 0;
+                                                break;
+                                            }
+                                            off += w;
+                                        }
+                                        if (!cp_ok)
+                                            break;
+                                    }
                                     close(dst);
-                                    cached = 1;
+                                    if (cp_ok && cpn == 0)
+                                        cached = 1;
                                 }
                                 close(src);
                             }

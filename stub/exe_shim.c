@@ -122,6 +122,42 @@ static void resolve_libc_realpath(void)
     g_libc_realpath_chk = dlsym(RTLD_NEXT, "__realpath_chk");
 }
 
+/* Rebuild the colon-separated env var `varname`, dropping any entry
+ * that starts with `prefix`.  Unsets the var if nothing remains.
+ * Used during constructor-time env hygiene so children inherit a
+ * clean LD_PRELOAD / LD_LIBRARY_PATH when we decide they shouldn't
+ * see our shim fds / temp dirs. */
+static void strip_env_path_entries(const char *varname, const char *prefix) {
+    const char *val = getenv(varname);
+    if (!val || !strstr(val, prefix))
+        return;
+
+    size_t plen = strlen(prefix);
+    char buf[8192];
+    size_t off = 0;
+    const char *p = val;
+    while (*p) {
+        const char *end = p;
+        while (*end && *end != ':')
+            end++;
+        size_t seg = (size_t) (end - p);
+        if (seg > 0 && strncmp(p, prefix, plen) != 0) {
+            if (off + seg + 2 >= sizeof(buf))
+                break;
+            if (off > 0)
+                buf[off++] = ':';
+            memcpy(buf + off, p, seg);
+            off += seg;
+        }
+        p = (*end == ':') ? end + 1 : end;
+    }
+    buf[off] = '\0';
+    if (off > 0)
+        setenv(varname, buf, 1);
+    else
+        unsetenv(varname);
+}
+
 __attribute__((constructor))
 static void restore_identity(void)
 {
@@ -180,60 +216,14 @@ static void restore_identity(void)
 
     if (!is_owner) {
         /* Non-owner child process (e.g., WAE.elf loaded by helf loadpg).
-         * Clean up anti-rev env vars to prevent dlopen_shim from
-         * redirecting dlopen calls via ANTIREV_FD_MAP, and to prevent
-         * LD_LIBRARY_PATH from pointing to anti-rev's symlink dir. */
+         * Scrub any antirev env that would otherwise confuse the child:
+         * ANTIREV_FD_MAP would make dlopen_shim redirect dlopen calls,
+         * and antirev-owned entries on LD_PRELOAD / LD_LIBRARY_PATH
+         * would keep our shim fds + symlink dir visible. */
         unsetenv("ANTIREV_FD_MAP");
         unsetenv("ANTIREV_REAL_EXE");
-
-        /* Remove anti-rev /proc/self/fd/ entries from LD_PRELOAD,
-         * keeping any user-specified preloads intact. */
-        const char *preload = getenv("LD_PRELOAD");
-        if (preload && strstr(preload, "/proc/self/fd/") != NULL) {
-            char clean[4096];
-            int off = 0;
-            const char *p = preload;
-            while (*p) {
-                const char *end = p;
-                while (*end && *end != ':') end++;
-                size_t len = (size_t)(end - p);
-                if (len > 0 && strncmp(p, "/proc/self/fd/", 14) != 0) {
-                    if (off > 0) clean[off++] = ':';
-                    memcpy(clean + off, p, len);
-                    off += (int)len;
-                }
-                p = (*end == ':') ? end + 1 : end;
-            }
-            clean[off] = '\0';
-            if (off > 0)
-                setenv("LD_PRELOAD", clean, 1);
-            else
-                unsetenv("LD_PRELOAD");
-        }
-
-        /* Remove anti-rev /tmp/antirev_ dir from LD_LIBRARY_PATH */
-        const char *ldpath = getenv("LD_LIBRARY_PATH");
-        if (ldpath && strstr(ldpath, "/tmp/antirev_") != NULL) {
-            char clean_path[8192];
-            int poff = 0;
-            const char *lp = ldpath;
-            while (*lp) {
-                const char *lend = lp;
-                while (*lend && *lend != ':') lend++;
-                size_t llen = (size_t)(lend - lp);
-                if (llen > 0 && strncmp(lp, "/tmp/antirev_", 13) != 0) {
-                    if (poff > 0) clean_path[poff++] = ':';
-                    memcpy(clean_path + poff, lp, llen);
-                    poff += (int)llen;
-                }
-                lp = (*lend == ':') ? lend + 1 : lend;
-            }
-            clean_path[poff] = '\0';
-            if (poff > 0)
-                setenv("LD_LIBRARY_PATH", clean_path, 1);
-            else
-                unsetenv("LD_LIBRARY_PATH");
-        }
+        strip_env_path_entries("LD_PRELOAD", "/proc/self/fd/");
+        strip_env_path_entries("LD_LIBRARY_PATH", "/tmp/antirev_");
 
 #if !defined(__aarch64__)
         /* Suppress the x86 lazy re-probe: we've already decided this is
@@ -275,66 +265,18 @@ static void restore_identity(void)
     unsetenv("ANTIREV_CLOSE_FDS");
 
 #if defined(__aarch64__)
-    /* aarch64: clean anti-rev entries from LD_PRELOAD / LD_LIBRARY_PATH /
-     * ANTIREV_FD_MAP in the owner too.  The shims are already loaded in
-     * memory, so stripping them from env prevents children (popen, system,
-     * etc.) from inheriting /proc/self/fd/N paths that may become invalid
-     * if the app closes those fds.
+    /* aarch64 owner scrub: the shims are already mapped into this
+     * process, so stripping the entries from env keeps children
+     * (popen / system / fork+exec) from inheriting /proc/self/fd/N
+     * preloads that could break if the app closes those fds.
      *
-     * x86 deliberately does NOT do this — its test suite relies on a
-     * protected parent's fork+exec child still seeing ANTIREV_FD_MAP and
-     * the shim LD_PRELOAD entries so the child can dlopen encrypted libs
-     * via the daemon (see test_fork_same_lib).  The aarch64 side runs a
-     * different business stack where the owner scrub is required. */
-    {
-        const char *preload = getenv("LD_PRELOAD");
-        if (preload && strstr(preload, "/proc/self/fd/") != NULL) {
-            char clean[4096];
-            int coff = 0;
-            const char *p = preload;
-            while (*p) {
-                const char *end = p;
-                while (*end && *end != ':') end++;
-                size_t slen = (size_t)(end - p);
-                if (slen > 0 && strncmp(p, "/proc/self/fd/", 14) != 0) {
-                    if (coff > 0) clean[coff++] = ':';
-                    memcpy(clean + coff, p, slen);
-                    coff += (int)slen;
-                }
-                p = (*end == ':') ? end + 1 : end;
-            }
-            clean[coff] = '\0';
-            if (coff > 0)
-                setenv("LD_PRELOAD", clean, 1);
-            else
-                unsetenv("LD_PRELOAD");
-        }
-
-        const char *ldpath = getenv("LD_LIBRARY_PATH");
-        if (ldpath && strstr(ldpath, "/tmp/antirev_") != NULL) {
-            char clean_path[8192];
-            int poff = 0;
-            const char *lp = ldpath;
-            while (*lp) {
-                const char *lend = lp;
-                while (*lend && *lend != ':') lend++;
-                size_t llen = (size_t)(lend - lp);
-                if (llen > 0 && strncmp(lp, "/tmp/antirev_", 13) != 0) {
-                    if (poff > 0) clean_path[poff++] = ':';
-                    memcpy(clean_path + poff, lp, llen);
-                    poff += (int)llen;
-                }
-                lp = (*lend == ':') ? lend + 1 : lend;
-            }
-            clean_path[poff] = '\0';
-            if (poff > 0)
-                setenv("LD_LIBRARY_PATH", clean_path, 1);
-            else
-                unsetenv("LD_LIBRARY_PATH");
-        }
-
-        unsetenv("ANTIREV_FD_MAP");
-    }
+     * x86 deliberately does NOT do this — its test matrix relies on a
+     * protected parent's fork+exec child still seeing ANTIREV_FD_MAP
+     * and the shim LD_PRELOAD entries so the child can dlopen
+     * encrypted libs through the daemon (see test_fork_same_lib). */
+    strip_env_path_entries("LD_PRELOAD", "/proc/self/fd/");
+    strip_env_path_entries("LD_LIBRARY_PATH", "/tmp/antirev_");
+    unsetenv("ANTIREV_FD_MAP");
 #endif
 
     const char *base = strrchr(real, '/');
