@@ -57,7 +57,7 @@ extern char *program_invocation_short_name;
  * to what's been field-tested on ARM). */
 static pid_t g_owner_pid = 0;
 #if !defined(__aarch64__)
-static int   g_owner_checked = 0;  /* 1 once constructor or lazy probe decided */
+static int g_owner_checked = 0; /* 1 once constructor or lazy probe decided */
 #endif
 
 static int is_owner_process(void)
@@ -74,12 +74,11 @@ static int is_owner_process(void)
     if (!getenv("ANTIREV_REAL_EXE"))
         return 0;
     char exe_buf[256];
-    ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
-                                 "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    ssize_t n = (ssize_t) syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
     if (n > 0) {
         exe_buf[n] = '\0';
         if (strstr(exe_buf, "memfd:") != NULL) {
-            g_owner_pid     = getpid();
+            g_owner_pid = getpid();
             g_owner_checked = 1;
             return 1;
         }

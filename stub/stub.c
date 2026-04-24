@@ -70,10 +70,10 @@
  * hijack + popen/pclose override) is kept separate so x86 builds don't
  * pull in any of its code. */
 #if defined(__aarch64__)
-#  include "antirev_shim_blob_aarch64.h"   /* antirev_shim_blob,  antirev_shim_blob_len  */
-#  include "aarch64_extend_shim_blob.h"    /* aarch64_extend_shim_blob,  aarch64_extend_shim_blob_len */
+#include "aarch64_extend_shim_blob.h" /* aarch64_extend_shim_blob,  aarch64_extend_shim_blob_len */
+#include "antirev_shim_blob_aarch64.h" /* antirev_shim_blob,  antirev_shim_blob_len  */
 #else
-#  include "antirev_shim_blob.h"
+#include "antirev_shim_blob.h"
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -92,7 +92,7 @@
 /*  Per-file metadata collected during header scan (Phase 1)          */
 /* ------------------------------------------------------------------ */
 typedef struct {
-    char     name[MAX_NAME + 1];
+    char name[MAX_NAME + 1];
     uint8_t  iv[IV_SIZE];
     uint8_t  tag[TAG_SIZE];
     uint64_t ct_size;
@@ -137,8 +137,8 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
     return 0;
 }
 
-#define BFLAG_HAS_MAIN     0x01  /* one encrypted main entry follows the header */
-#define BFLAG_DAEMON_LIBS  0x02  /* libs served by external daemon */
+#define BFLAG_HAS_MAIN 0x01 /* one encrypted main entry follows the header */
+#define BFLAG_DAEMON_LIBS 0x02 /* libs served by external daemon */
 
 /* ------------------------------------------------------------------ */
 /*  Daemon protocol v2                                                  */
@@ -1241,14 +1241,15 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     uint8_t tmp[2 + MAX_NAME + 1 + IV_SIZE + TAG_SIZE + 8]; /* max header */
 
     /* Read bundle_flags (1 byte) */
-    if (pread(self, tmp, 1, (off_t)bundle_off) != 1) {
-        perror("pread bundle_flags"); return 1;
+    if (pread(self, tmp, 1, (off_t) bundle_off) != 1) {
+        perror("pread bundle_flags");
+        return 1;
     }
     uint8_t bundle_flags = tmp[0];
 
     file_entry_t main_entry;
     int have_main = (bundle_flags & BFLAG_HAS_MAIN) != 0;
-    off_t scan = (off_t)bundle_off + 1;
+    off_t scan = (off_t) bundle_off + 1;
 
     if (have_main) {
         file_entry_t *e = &main_entry;
@@ -1269,9 +1270,9 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         }
         memcpy(e->name, tmp, nlen);
         e->name[nlen]  = '\0';
-        memcpy(e->iv,  tmp + nlen,                     IV_SIZE);
-        memcpy(e->tag, tmp + nlen + IV_SIZE,           TAG_SIZE);
-        e->ct_size     = u64le(tmp + nlen + IV_SIZE + TAG_SIZE);
+        memcpy(e->iv, tmp + nlen, IV_SIZE);
+        memcpy(e->tag, tmp + nlen + IV_SIZE, TAG_SIZE);
+        e->ct_size = u64le(tmp + nlen + IV_SIZE + TAG_SIZE);
         scan          += hdr_rest;
 
         e->ct_offset   = (uint64_t)scan;
@@ -1602,9 +1603,14 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * one LD_PRELOAD entry.  The aarch64 extend shim stays separate and
      * is materialised below only when building for __aarch64__. */
     int antirev_shim_fd = make_memfd("antirev_shim.so");
-    if (antirev_shim_fd < 0) return 1;
-    if (write_chunk(antirev_shim_fd, antirev_shim_blob, antirev_shim_blob_len) != 0) return 1;
-    if (lseek(antirev_shim_fd, 0, SEEK_SET) < 0) { perror("lseek antirev_shim"); return 1; }
+    if (antirev_shim_fd < 0)
+        return 1;
+    if (write_chunk(antirev_shim_fd, antirev_shim_blob, antirev_shim_blob_len) != 0)
+        return 1;
+    if (lseek(antirev_shim_fd, 0, SEEK_SET) < 0) {
+        perror("lseek antirev_shim");
+        return 1;
+    }
 
     /* aarch64_extend_shim is aarch64-only — houses ANTI_LoadProcess
      * interception and the popen/pclose workaround for glibc's
@@ -1819,9 +1825,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     char *ld_preload_entry = malloc(preload_len);
     if (!ld_preload_entry) { perror("malloc ld_preload"); return 1; }
 
-    int off = snprintf(ld_preload_entry, preload_len,
-                       "LD_PRELOAD=/proc/self/fd/%d",
-                       antirev_shim_fd);
+    int off = snprintf(ld_preload_entry, preload_len, "LD_PRELOAD=/proc/self/fd/%d", antirev_shim_fd);
     if (aarch64_extend_shim_fd >= 0) {
         off += snprintf(ld_preload_entry + off, preload_len - (size_t)off,
                         ":/proc/self/fd/%d", aarch64_extend_shim_fd);
