@@ -46,12 +46,46 @@ extern char *program_invocation_short_name;
 /* PID of the process that was actually protected by antirev.
  * Child processes inherit LD_PRELOAD but should NOT have their
  * /proc/self/exe, realpath, etc. intercepted — they are different
- * binaries and ANTIREV_REAL_EXE refers to the parent. */
+ * binaries and ANTIREV_REAL_EXE refers to the parent.
+ *
+ * On x86_64, ownership is detected lazily: interceptor calls that
+ * arrive before the shim's constructor (e.g. from a C++ global
+ * static initializer in a DT_NEEDED lib) fall into the lazy path
+ * and probe /proc/self/exe themselves.  On aarch64 we keep master's
+ * constructor-only detection (the ARM build has never needed the
+ * lazy path in practice and this keeps the runtime code identical
+ * to what's been field-tested on ARM). */
 static pid_t g_owner_pid = 0;
+#if !defined(__aarch64__)
+static int   g_owner_checked = 0;  /* 1 once constructor or lazy probe decided */
+#endif
 
 static int is_owner_process(void)
 {
+#if defined(__aarch64__)
     return g_owner_pid != 0 && getpid() == g_owner_pid;
+#else
+    if (g_owner_checked)
+        return g_owner_pid != 0 && getpid() == g_owner_pid;
+
+    /* Constructor hasn't decided yet — probe /proc/self/exe on the fly.
+     * Required when DT_NEEDED libs have C++ static initializers that
+     * call readlink/realpath/getauxval before restore_identity() runs. */
+    if (!getenv("ANTIREV_REAL_EXE"))
+        return 0;
+    char exe_buf[256];
+    ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
+                                 "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    if (n > 0) {
+        exe_buf[n] = '\0';
+        if (strstr(exe_buf, "memfd:") != NULL) {
+            g_owner_pid     = getpid();
+            g_owner_checked = 1;
+            return 1;
+        }
+    }
+    return 0;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -202,10 +236,19 @@ static void restore_identity(void)
                 unsetenv("LD_LIBRARY_PATH");
         }
 
+#if !defined(__aarch64__)
+        /* Suppress the x86 lazy re-probe: we've already decided this is
+         * a non-owner child, no point walking /proc/self/exe again on
+         * every intercepted call. */
+        g_owner_checked = 1;
+#endif
         return;
     }
 
     g_owner_pid = getpid();
+#if !defined(__aarch64__)
+    g_owner_checked = 1;
+#endif
 
     /* Close DT_NEEDED memfds now that glibc's dynamic linker has finished
      * mapping them.  The fds are pure bookkeeping at this point — the
@@ -232,10 +275,18 @@ static void restore_identity(void)
     }
     unsetenv("ANTIREV_CLOSE_FDS");
 
-    /* Clean up anti-rev entries from LD_PRELOAD and LD_LIBRARY_PATH even
-     * for the owner process. The shims are already loaded in memory —
-     * removing them from env prevents children (popen, system, etc.) from
-     * inheriting /proc/self/fd/N paths that may become invalid. */
+#if defined(__aarch64__)
+    /* aarch64: clean anti-rev entries from LD_PRELOAD / LD_LIBRARY_PATH /
+     * ANTIREV_FD_MAP in the owner too.  The shims are already loaded in
+     * memory, so stripping them from env prevents children (popen, system,
+     * etc.) from inheriting /proc/self/fd/N paths that may become invalid
+     * if the app closes those fds.
+     *
+     * x86 deliberately does NOT do this — its test suite relies on a
+     * protected parent's fork+exec child still seeing ANTIREV_FD_MAP and
+     * the shim LD_PRELOAD entries so the child can dlopen encrypted libs
+     * via the daemon (see test_fork_same_lib).  The aarch64 side runs a
+     * different business stack where the owner scrub is required. */
     {
         const char *preload = getenv("LD_PRELOAD");
         if (preload && strstr(preload, "/proc/self/fd/") != NULL) {
@@ -285,6 +336,7 @@ static void restore_identity(void)
 
         unsetenv("ANTIREV_FD_MAP");
     }
+#endif
 
     const char *base = strrchr(real, '/');
     base = base ? base + 1 : real;
