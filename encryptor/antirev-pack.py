@@ -196,38 +196,6 @@ def compile_blacklist(raw: list[str]) -> list[tuple[str, str]]:
     return compiled
 
 
-def _build_ldconfig_cache() -> dict:
-    """Parse ldconfig -p to build soname → path mapping.
-
-    Also indexes LD_LIBRARY_PATH entries so that libs in custom
-    directories (not registered in ldconfig) are discoverable.
-    """
-    cache = {}
-    # LD_LIBRARY_PATH first — gives precedence to custom dirs, same
-    # priority order as the runtime dynamic linker.
-    for d in os.environ.get('LD_LIBRARY_PATH', '').split(':'):
-        if not d or not os.path.isdir(d):
-            continue
-        try:
-            for name in os.listdir(d):
-                if '.so' in name and name not in cache:
-                    cache[name] = os.path.join(d, name)
-        except OSError:
-            pass
-    # ldconfig cache (lower priority — don't overwrite LD_LIBRARY_PATH hits).
-    try:
-        result = subprocess.run(
-            ['ldconfig', '-p'], capture_output=True, text=True, timeout=10
-        )
-        for line in result.stdout.splitlines():
-            m = re.match(r'\s+(\S+)\s+\(.*\)\s+=>\s+(\S+)', line)
-            if m and m.group(1) not in cache:
-                cache[m.group(1)] = m.group(2)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return cache
-
-
 def _parse_readelf_dynamic(path: Path) -> list[str]:
     """Run readelf -d and return raw output lines."""
     try:
@@ -321,16 +289,24 @@ def get_dt_soname(path: Path) -> str:
     return ''
 
 
-def build_soname_maps(lib_files: list, cache: _ElfCache) -> tuple[dict, dict]:
-    """Build bidirectional soname <-> filename mappings for encrypted libs.
+def build_soname_maps(lib_files: list, plain_libs: list,
+                      cache: _ElfCache) -> tuple[dict, dict]:
+    """Build soname <-> filename mappings used by the closure walk.
 
     Uses *cache* (pre-populated via bulk_parse) so no subprocess calls.
 
-    Returns (soname_to_filename, lib_by_lookup) where lib_by_lookup maps
-    both sonames and filenames to the source Path for DT_NEEDED traversal.
+    Returns (soname_to_filename, lib_by_lookup):
+      soname_to_filename — soname → encrypted filename, used to test
+        whether a DT_NEEDED soname references one of our encrypted libs.
+        Only encrypted libs go in this map.
+      lib_by_lookup — soname-or-filename → Path for any *project-tree*
+        lib (encrypted or plain).  This is the closure walk's reachability
+        set: any name not in here is treated as a system lib and not
+        traversed, so packer-host ldconfig state can't leak into the
+        closure (see get_transitive_needed).
     """
-    soname_to_filename = {}   # soname -> filename
-    lib_by_lookup = {}        # soname or filename -> Path
+    soname_to_filename = {}
+    lib_by_lookup = {}
 
     for src in lib_files:
         fname = src.name
@@ -341,26 +317,37 @@ def build_soname_maps(lib_files: list, cache: _ElfCache) -> tuple[dict, dict]:
             soname_to_filename[soname] = fname
             lib_by_lookup[soname] = src
 
+    for src in plain_libs:
+        fname = src.name
+        if fname not in lib_by_lookup:
+            lib_by_lookup[fname] = src
+        soname = cache.get_soname(src)
+        if soname and soname not in lib_by_lookup:
+            lib_by_lookup[soname] = src
+
     return soname_to_filename, lib_by_lookup
 
 
 def get_transitive_needed(path: Path, encrypted_names: set[str],
                           soname_to_filename: dict[str, str],
                           lib_by_lookup: dict[str, 'Path'],
-                          cache: _ElfCache,
-                          ldcache: dict) -> list[str]:
+                          cache: _ElfCache) -> list[str]:
     """Get transitive closure of encrypted libs needed by an ELF binary.
 
-    Phase 1: BFS from path's DT_NEEDED, following through ALL libs —
-    including unencrypted intermediaries — to discover every encrypted
-    lib reachable from this exe.
+    Phase 1: BFS from path's DT_NEEDED, walking through any *project-tree*
+    lib (encrypted or plain) reachable in lib_by_lookup.  System libs
+    not in the project tree are treated as opaque leaves — the walk
+    deliberately does NOT follow their DT_NEEDED via the host's
+    ldconfig, because that would mix the packer host's library graph
+    into the closure: same input, different host arch, different output.
+    Worse, host system libs can DT_NEED a soname that collides with one
+    of the project's own encrypted libs, dragging it into the closure
+    spuriously and flipping dlopen_shim into lazy-mode at runtime.
 
-    Phase 2: Build a dependency graph among those encrypted libs and
-    topologically sort (Kahn's algorithm) so leaf dependencies come
-    first.  This ensures correct LD_PRELOAD ordering: when glibc loads
-    each entry, its DT_NEEDED are already available.
+    Phase 2: Build a dependency graph among encrypted libs and topo-sort
+    (Kahn's algorithm) so leaf dependencies come first.
 
-    Previous approach (BFS-reverse) failed for diamond dependencies:
+    Previous diamond-dep failure mode (BFS-reverse): for
         exe -> A -> B, exe -> C -> D -> B
     BFS-reverse gave D,B,C,A — D before its dep B.  Topo sort gives
     B,D,A,C (or B,D,C,A) — B always before D and A.
@@ -377,20 +364,14 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
         visited.add(name)
 
         filename = soname_to_filename.get(name, name)
-
         if filename in encrypted_names:
             encrypted_needed.add(filename)
-            lib_path = lib_by_lookup.get(name) or lib_by_lookup.get(filename)
-            if lib_path:
-                for dep in cache.get_needed(lib_path):
-                    if dep not in visited:
-                        queue.append(dep)
-        else:
-            lib_path = ldcache.get(name)
-            if lib_path:
-                for dep in cache.get_needed(lib_path):
-                    if dep not in visited:
-                        queue.append(dep)
+
+        lib_path = lib_by_lookup.get(name) or lib_by_lookup.get(filename)
+        if lib_path:
+            for dep in cache.get_needed(lib_path):
+                if dep not in visited:
+                    queue.append(dep)
 
     if not encrypted_needed:
         return []
@@ -788,7 +769,9 @@ def main():
         if exe_daemon_libs and encrypted_names:
             # Parallel bulk-parse: one readelf per ELF, all in parallel
             elf_cache = _ElfCache()
-            all_parse = [src for src in lib_files] + [src for _, _, src in exe_files]
+            all_parse = ([src for src in lib_files]
+                         + [src for src in plain_libs]
+                         + [src for _, _, src in exe_files])
             t0 = time.monotonic()
             print("[pack] Parsing {} ELFs in parallel...".format(len(all_parse)))
             elf_cache.bulk_parse(all_parse)
@@ -796,16 +779,15 @@ def main():
 
             print("[pack] Building soname map for encrypted libs...")
             soname_to_filename, lib_by_lookup = build_soname_maps(
-                lib_files, elf_cache)
+                lib_files, plain_libs, elf_cache)
             if soname_to_filename:
                 for sn, fn in soname_to_filename.items():
                     print("[pack]   soname {} -> {}".format(sn, fn))
-            ldcache = _build_ldconfig_cache()
             print("[pack] Analyzing DT_NEEDED per executable (transitive)...")
             for rel, arch, src in exe_files:
                 needed = get_transitive_needed(
                     src, encrypted_names, soname_to_filename, lib_by_lookup,
-                    elf_cache, ldcache)
+                    elf_cache)
                 exe_needed[rel] = needed
 
         with ProcessPoolExecutor(max_workers=workers) as pool:
