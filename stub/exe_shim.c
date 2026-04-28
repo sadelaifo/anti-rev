@@ -32,6 +32,7 @@
 #include <sys/prctl.h>
 #include <sys/auxv.h>
 #include <fcntl.h>
+#include <dirent.h>
 
 #include <dlfcn.h>
 
@@ -276,6 +277,50 @@ static void restore_process_name(const char *real) {
 /*    - x86 deliberately skips that scrub — test_fork_same_lib needs a  */
 /*      fork+exec child to inherit the daemon-backed shim env.          */
 /* ------------------------------------------------------------------ */
+/* Captured at constructor time so the atexit handler still has the
+ * path even if something in the protected exe later unsets the env
+ * var.  Also lets us own the lifetime exactly: registered iff we're
+ * the owner. */
+static char g_symlink_dir[256] = {0};
+
+/* atexit handler: rm -rf the symlink dir we (the owner stub) created.
+ * Runs LIFO with respect to other atexit handlers; since exe_shim's
+ * ctor runs very early, this fires very late — after most shutdown
+ * work that might still walk the dir.
+ *
+ * Doesn't fire on _exit / SIGKILL / segfault — that's the daemon's
+ * sweep_dead_symlink_dirs job. */
+static void cleanup_symlink_dir(void)
+{
+    if (!is_owner_process()) return;
+    if (!g_symlink_dir[0]) return;
+
+    DIR *dp = opendir(g_symlink_dir);
+    if (dp) {
+        struct dirent *de;
+        while ((de = readdir(dp)) != NULL) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                continue;
+            char path[512];
+            snprintf(path, sizeof(path), "%.255s/%.255s", g_symlink_dir, de->d_name);
+            unlink(path);
+        }
+        closedir(dp);
+    }
+    rmdir(g_symlink_dir);
+}
+
+/* Capture the symlink dir path and register the atexit handler.
+ * Idempotent — safe to call from both arch-specific ctor branches. */
+static void register_symlink_dir_cleanup(void)
+{
+    const char *dir = getenv("ANTIREV_SYMLINK_DIR");
+    if (!dir || !*dir) return;
+    if (g_symlink_dir[0]) return; /* already registered */
+    snprintf(g_symlink_dir, sizeof(g_symlink_dir), "%s", dir);
+    atexit(cleanup_symlink_dir);
+}
+
 #if defined(__aarch64__)
 __attribute__((constructor)) static void restore_identity(void) {
     resolve_libc_realpath();
@@ -291,6 +336,11 @@ __attribute__((constructor)) static void restore_identity(void) {
 
     g_owner_pid = getpid();
     close_dt_needed_fds();
+
+    /* Capture the symlink dir BEFORE the owner-scrub strips
+     * /tmp/antirev_* entries from LD_LIBRARY_PATH (and before
+     * anything else might unset the env var). */
+    register_symlink_dir_cleanup();
 
     /* aarch64-only owner scrub — see comment above. */
     strip_env_path_entries("LD_PRELOAD", "/proc/self/fd/");
@@ -317,6 +367,7 @@ __attribute__((constructor)) static void restore_identity(void) {
     g_owner_checked = 1;
 
     close_dt_needed_fds();
+    register_symlink_dir_cleanup();
     restore_process_name(real);
 }
 #endif

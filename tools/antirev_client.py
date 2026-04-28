@@ -34,9 +34,11 @@ Key source discovery for activate():
 """
 
 import array
+import atexit
 import ctypes as ct
 import ctypes.util
 import os
+import shutil
 import socket
 import struct
 import sys
@@ -310,7 +312,12 @@ class AntirevClient:
         self._key = _load_key(Path(key_source))
         self._libs = {}
         self._loaded = set()   # tracks libs processed by _ensure_loaded
-        self._link_dir = tempfile.mkdtemp(prefix="antirev_")
+        # PID-tagged prefix matches the C stub's format so the daemon's
+        # sweep_dead_symlink_dirs reaper can identify and clean stale
+        # dirs from crashed Python processes.  The atexit hook handles
+        # the normal-exit case.
+        self._link_dir = tempfile.mkdtemp(prefix=f"antirev_{os.getpid()}_")
+        atexit.register(self._cleanup_link_dir)
         # Escape hatch, same semantics as dlopen_shim's ANTIREV_NO_PRELOAD:
         # when set, _ensure_loaded / _ensure_deps still materialize the
         # soname symlinks and recurse through the DT_NEEDED chain, but
@@ -333,6 +340,20 @@ class AntirevClient:
         os.environ['LD_LIBRARY_PATH'] = self._link_dir + (':' + ld_path if ld_path else '')
         self._connect()
         self._build_soname_map()
+
+    def _cleanup_link_dir(self):
+        """atexit hook: remove the symlink dir on normal Python exit.
+
+        The fds backing the symlinks are pinned by the kernel mappings
+        of the libs we loaded, so removing the symlinks doesn't affect
+        any already-loaded module.  Fired LIFO with respect to other
+        atexit handlers; AntirevClient is typically constructed early
+        so this fires late, after most teardown that might still walk
+        the dir."""
+        try:
+            shutil.rmtree(self._link_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     def _connect(self):
         sock_name = _compute_sock_name(self._key)

@@ -54,17 +54,28 @@ function(make_blob_header OUTPUT INPUT VARNAME DEP)
 endfunction()
 
 # ═══════════════════════════════════════════════════════════════════════
-#  antirev_shim.so — combined exe + dlopen interceptors
+#  antirev_shim.so — single shipping shim DSO
 # ═══════════════════════════════════════════════════════════════════════
-# exe_shim.c's identity interceptors (readlink / realpath / getauxval)
-# and dlopen_shim.c's dlopen interceptor ride in one DSO: they're always
-# LD_PRELOAD'd together, have disjoint symbol exports, and carry
-# independent file-scope state.  One .so = one memfd, one LD_PRELOAD
-# entry.  The aarch64-specific extend shim stays a separate .so.
-add_library(antirev_shim SHARED
+# All LD_PRELOAD-able interceptors live in one DSO:
+#
+#   exe_shim.c             — readlink / realpath / getauxval identity hide
+#   dlopen_shim.c          — dlopen redirect to /proc/self/fd/N
+#   aarch64_extend_shim.c  — ANTI_LoadProcess hijack + popen/pclose
+#                             (aarch64 only — file is empty TU on x86)
+#   daemon_client.c        — shared daemon-protocol client (socket fd,
+#                             ANTIREV_FD_MAP / ANTIREV_ENC_LIBS state,
+#                             send/recv helpers used by both shims)
+#
+# One .so = one memfd, one LD_PRELOAD entry, regardless of arch.
+set(ANTIREV_SHIM_SOURCES
     stub/exe_shim.c
     stub/dlopen_shim.c
+    stub/daemon_client.c
 )
+if(TARGET_ARCH STREQUAL "aarch64")
+    list(APPEND ANTIREV_SHIM_SOURCES stub/aarch64_extend_shim.c)
+endif()
+add_library(antirev_shim SHARED ${ANTIREV_SHIM_SOURCES})
 set_target_properties(antirev_shim PROPERTIES
     OUTPUT_NAME "antirev_shim${ARCH_SUFFIX}"
     PREFIX ""                             # no "lib" prefix
@@ -72,6 +83,7 @@ set_target_properties(antirev_shim PROPERTIES
     C_VISIBILITY_PRESET hidden
 )
 target_compile_options(antirev_shim PRIVATE -O2)
+target_include_directories(antirev_shim PRIVATE "${CMAKE_SOURCE_DIR}/stub")
 if(TARGET_ARCH STREQUAL "aarch64")
     target_compile_options(antirev_shim PRIVATE -march=armv8-a+crypto)
 endif()
@@ -87,28 +99,6 @@ endif()
 make_blob_header("${ANTIREV_SHIM_BLOB_H}" "$<TARGET_FILE:antirev_shim>"
                  "antirev_shim_blob" antirev_shim)
 add_custom_target(antirev_shim_blob_h DEPENDS "${ANTIREV_SHIM_BLOB_H}")
-
-# ═══════════════════════════════════════════════════════════════════════
-#  aarch64_extend_shim.so  (aarch64 only)
-# ═══════════════════════════════════════════════════════════════════════
-if(TARGET_ARCH STREQUAL "aarch64")
-    add_library(aarch64_extend_shim SHARED stub/aarch64_extend_shim.c)
-    set_target_properties(aarch64_extend_shim PROPERTIES
-        OUTPUT_NAME "aarch64_extend_shim"
-        PREFIX ""
-        POSITION_INDEPENDENT_CODE ON
-        C_VISIBILITY_PRESET hidden
-    )
-    target_compile_options(aarch64_extend_shim PRIVATE -O2 -march=armv8-a+crypto)
-    target_link_libraries(aarch64_extend_shim PRIVATE dl pthread)
-
-    set(AARCH64_EXTEND_SHIM_BLOB_H "${CMAKE_BINARY_DIR}/aarch64_extend_shim_blob.h")
-    make_blob_header("${AARCH64_EXTEND_SHIM_BLOB_H}"
-                     "$<TARGET_FILE:aarch64_extend_shim>"
-                     "aarch64_extend_shim_blob" aarch64_extend_shim)
-    add_custom_target(aarch64_extend_shim_blob_h
-                      DEPENDS "${AARCH64_EXTEND_SHIM_BLOB_H}")
-endif()
 
 # ═══════════════════════════════════════════════════════════════════════
 #  stub executable
@@ -135,9 +125,6 @@ endif()
 # compile until they exist.  Declare both as OBJECT_DEPENDS and wire a
 # phony target dependency so parallel builds stay correct.
 set(STUB_BLOB_HEADERS "${ANTIREV_SHIM_BLOB_H}")
-if(TARGET_ARCH STREQUAL "aarch64")
-    list(APPEND STUB_BLOB_HEADERS "${AARCH64_EXTEND_SHIM_BLOB_H}")
-endif()
 add_custom_target(stub_blob_headers DEPENDS ${STUB_BLOB_HEADERS})
 add_dependencies(${STUB_NAME} stub_blob_headers)
 set_source_files_properties(stub/stub.c PROPERTIES
@@ -262,6 +249,10 @@ function(daemon_test TEST_NAME CLIENT_BIN COMMENT_STR)
     set(_TD "${CMAKE_BINARY_DIR}/daemon_${TEST_NAME}")
     add_custom_target(${TEST_NAME}
         COMMAND ${CMAKE_COMMAND} -E echo "=== ${TEST_NAME} ==="
+        # Pre-run cleanup: if a previous run left a daemon alive, SIGTERM
+        # it before the protect-daemon step tries to overwrite the binary.
+        COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD}
+                -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD}"
         COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
                 --key        "${_TD}/test.key"
@@ -402,6 +393,8 @@ add_custom_target(dlopen_transitive_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_tran
 set(_TD_TRANS "${CMAKE_BINARY_DIR}/daemon_test_dlopen_transitive")
 add_custom_target(test_dlopen_transitive
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_transitive ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_TRANS}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_TRANS}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
             --key        "${_TD_TRANS}/test.key"
@@ -458,6 +451,8 @@ add_custom_target(dlopen_dt_needed_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_dt_ne
 set(_TD_DTN "${CMAKE_BINARY_DIR}/daemon_test_dlopen_dt_needed")
 add_custom_target(test_dlopen_dt_needed
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_dt_needed ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_DTN}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_DTN}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_DTN}/enc_disk"
     # Encrypted copies on disk at enc_disk/; the daemon recursively scans
@@ -511,6 +506,8 @@ add_custom_target(dlopen_reload_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_reload")
 set(_TD_RELOAD "${CMAKE_BINARY_DIR}/daemon_test_dlopen_reload")
 add_custom_target(test_dlopen_reload
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_reload ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_RELOAD}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_RELOAD}"
     COMMAND ${CMAKE_COMMAND} -E remove -f /tmp/test_dlopen_reload.log
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
@@ -599,6 +596,8 @@ add_custom_target(dlopen_interpose_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_inter
 set(_TD_INTER "${CMAKE_BINARY_DIR}/daemon_test_dlopen_interpose")
 add_custom_target(test_dlopen_interpose
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_interpose ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_INTER}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_INTER}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
             --key        "${_TD_INTER}/test.key"
@@ -1202,6 +1201,8 @@ add_custom_target(fork_same_child DEPENDS "${CMAKE_BINARY_DIR}/fork_same_child")
 set(_TD_FSL "${CMAKE_BINARY_DIR}/daemon_test_fork_same_lib")
 add_custom_target(test_fork_same_lib
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_fork_same_lib ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_FSL}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_FSL}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
             --key        "${_TD_FSL}/test.key"
@@ -1248,6 +1249,8 @@ add_custom_target(fork_diff_child DEPENDS "${CMAKE_BINARY_DIR}/fork_diff_child")
 set(_TD_FDL "${CMAKE_BINARY_DIR}/daemon_test_fork_diff_lib")
 add_custom_target(test_fork_diff_lib
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_fork_diff_lib ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_FDL}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_FDL}/parent" "${_TD_FDL}/child"
     # Daemon + client for parent (libparent.so)
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
@@ -1314,6 +1317,8 @@ add_custom_target(proc_b DEPENDS "${CMAKE_BINARY_DIR}/proc_b")
 set(_TD_SMB "${CMAKE_BINARY_DIR}/daemon_test_script_multi_bin")
 add_custom_target(test_script_multi_bin
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_script_multi_bin ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_SMB}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_SMB}"
     # One daemon serves all libs (same key for both clients)
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib

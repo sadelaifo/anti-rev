@@ -598,9 +598,22 @@ def main():
 
     if not install_dir.exists():
         sys.exit(f"[error] install_dir not found: {install_dir}")
-    for arch, stub in stubs.items():
+
+    # If a configured stub is missing on disk, drop that arch from the
+    # mapping rather than aborting the whole pack.  The existing
+    # "unsupported arch" fallback then catches every ELF of that arch
+    # below (copied verbatim with a per-arch WARNING summary).  Lets
+    # you ship an x86-only or aarch64-only build without rebuilding
+    # the YAML.
+    for arch in list(stubs.keys()):
+        stub = stubs[arch]
         if not stub.exists():
-            sys.exit(f"[error] stub not found for {arch}: {stub}")
+            print(f"[pack] WARNING: stub for {arch} not found at {stub} "
+                  f"— skipping {arch} packing (ELFs of this arch will be "
+                  f"copied as plaintext)", file=sys.stderr)
+            del stubs[arch]
+    if not stubs:
+        sys.exit("[error] no usable stub: every configured stub was missing")
 
     key = load_or_create_key(key_path)
     copylist = compile_blacklist(cfg.get('copy', []))

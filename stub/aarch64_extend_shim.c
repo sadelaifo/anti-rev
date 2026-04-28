@@ -20,13 +20,8 @@
  *      Previously lived in exe_shim.c; moved here so exe_shim stays
  *      arch-neutral.
  *
- * The shim resolves encrypted .elf names against the same
- * ANTIREV_ENC_LIBS environment variable dlopen_shim uses (.elf and .so
- * basenames coexist without collision).  It talks to the same daemon
- * over ANTIREV_LIBD_SOCK using OP_GET_LIB (single name → single fd).
- *
- * Eager mode (no daemon) is also supported via ANTIREV_FD_MAP, so
- * legacy bundled stubs work without a daemon.
+ * Daemon I/O (socket fd, encrypted-name set, ANTIREV_FD_MAP) is
+ * handled by the shared daemon_client module — see daemon_client.h.
  */
 
 #if !defined(__aarch64__)
@@ -37,6 +32,8 @@ typedef int _aarch64_extend_shim_empty;
 #else
 
 #define _GNU_SOURCE
+#include "daemon_client.h"
+
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,21 +48,7 @@ typedef int _aarch64_extend_shim_empty;
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
-#include <sys/uio.h>
 #include <sys/wait.h>
-
-/* ------------------------------------------------------------------ */
-/*  Protocol constants (must match stub.c)                              */
-/* ------------------------------------------------------------------ */
-
-#define MAX_NAME       255
-#define MAX_FILES      1024
-#define SCM_BATCH      250
-
-#define OP_GET_LIB     0x02u
-#define OP_LIB         0x83u
-
-#define ST_OK          0u
 
 /* ------------------------------------------------------------------ */
 /*  Owner-process detection (independent copy — exe_shim is a sibling  */
@@ -83,17 +66,6 @@ static int is_owner_process(void)
 /*  State                                                              */
 /* ------------------------------------------------------------------ */
 
-/* Daemon (lazy) mode */
-static int g_sock = -1;
-
-/* Eager mode */
-static const char *g_fd_map = NULL;
-
-/* Encrypted-name set (shared with dlopen_shim via ANTIREV_ENC_LIBS).
- * Used to decide whether an ANTI_LoadProcess basename needs daemon lookup. */
-static char g_enc_names[MAX_FILES][MAX_NAME + 1];
-static int  g_enc_count = 0;
-
 /* Cache of pgName → (memfd fd, stable "/proc/self/fd/N" string).
  *
  * Pinned for process lifetime on both axes:
@@ -106,9 +78,9 @@ static int  g_enc_count = 0;
  *     memfd mapping itself is pinned by the loader's mmap on top of
  *     it independently of our fd. */
 #define FD_PATH_MAX 32   /* "/proc/self/fd/2147483647" + NUL fits in ~25 */
-static char g_cache_names[MAX_FILES][MAX_NAME + 1];
-static int  g_cache_fds[MAX_FILES];
-static char g_cache_paths[MAX_FILES][FD_PATH_MAX];
+static char g_cache_names[DC_MAX_FILES][DC_MAX_NAME + 1];
+static int  g_cache_fds[DC_MAX_FILES];
+static char g_cache_paths[DC_MAX_FILES][FD_PATH_MAX];
 static int  g_cache_count = 0;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -121,11 +93,6 @@ static FILE *g_log = NULL;
 /*  Little-endian helpers                                              */
 /* ------------------------------------------------------------------ */
 
-static inline void put_u32le(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)v;         p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
-}
 static inline void put_u16le(uint8_t *p, uint16_t v)
 {
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
@@ -137,106 +104,8 @@ static inline uint32_t u32le(const uint8_t *p)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Minimal v2 protocol client                                          */
-/* ------------------------------------------------------------------ */
-
-static int recv_full(int sock, void *buf, size_t len)
-{
-    size_t got = 0;
-    while (got < len) {
-        ssize_t n = recv(sock, (uint8_t *)buf + got, len - got, 0);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
-            return -1;
-        }
-        got += (size_t)n;
-    }
-    return 0;
-}
-
-static int send_msg(int sock, uint32_t op, const void *payload, uint32_t plen)
-{
-    uint8_t hdr[8];
-    put_u32le(hdr, op);
-    put_u32le(hdr + 4, plen);
-    struct iovec iov[2] = {
-        { hdr, sizeof(hdr) },
-        { (void *)payload, plen },
-    };
-    struct msghdr msg = {0};
-    msg.msg_iov    = iov;
-    msg.msg_iovlen = (plen > 0) ? 2 : 1;
-    size_t total = 8 + (size_t)plen;
-    ssize_t n = sendmsg(sock, &msg, 0);
-    if (n < 0) return -1;
-    if ((size_t)n == total) return 0;
-    size_t sent = (size_t)n;
-    if (sent < 8) {
-        if (send(sock, hdr + sent, 8 - sent, 0) != (ssize_t)(8 - sent)) return -1;
-        sent = 8;
-    }
-    size_t prem = total - sent;
-    if (prem > 0) {
-        if (send(sock, (const uint8_t *)payload + (sent - 8), prem, 0)
-            != (ssize_t)prem) return -1;
-    }
-    return 0;
-}
-
-static int recv_msg(int sock, uint32_t *op,
-                    uint8_t *payload, uint32_t *plen, uint32_t max_payload,
-                    int *fds, int *nfds, int max_fds)
-{
-    *nfds = 0;
-    uint8_t hdr[8];
-    struct iovec iov = { hdr, sizeof(hdr) };
-    char cmsg_buf[CMSG_SPACE(SCM_BATCH * sizeof(int))];
-    memset(cmsg_buf, 0, sizeof(cmsg_buf));
-    struct msghdr msg = {0};
-    msg.msg_iov        = &iov;
-    msg.msg_iovlen     = 1;
-    msg.msg_control    = cmsg_buf;
-    msg.msg_controllen = sizeof(cmsg_buf);
-
-    ssize_t got = recvmsg(sock, &msg, 0);
-    if (got <= 0) return -1;
-
-    for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm)) {
-        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
-            int n = (int)((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
-            if (n > max_fds) {
-                int *src = (int *)CMSG_DATA(cm);
-                for (int k = 0; k < n; k++) close(src[k]);
-                return -1;
-            }
-            memcpy(fds, CMSG_DATA(cm), (size_t)n * sizeof(int));
-            *nfds = n;
-        }
-    }
-    if (got < (ssize_t)sizeof(hdr)) {
-        if (recv_full(sock, hdr + got, sizeof(hdr) - (size_t)got) < 0)
-            return -1;
-    }
-    *op = u32le(hdr);
-    uint32_t p = u32le(hdr + 4);
-    if (p > max_payload) return -1;
-    *plen = p;
-    if (p > 0) {
-        if (recv_full(sock, payload, p) < 0) return -1;
-    }
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
 /*  Lookups                                                             */
 /* ------------------------------------------------------------------ */
-
-static int is_encrypted(const char *base)
-{
-    for (int i = 0; i < g_enc_count; i++)
-        if (strcmp(g_enc_names[i], base) == 0) return 1;
-    return 0;
-}
 
 static int cache_find(const char *base)
 {
@@ -245,57 +114,48 @@ static int cache_find(const char *base)
     return -1;
 }
 
-/* Eager-mode FD_MAP lookup: parse "name=fd,name=fd,..." for `base`. */
-static int eager_lookup_fd(const char *base)
-{
-    if (!g_fd_map) return -1;
-    const char *p = g_fd_map;
-    size_t blen = strlen(base);
-    while (*p) {
-        const char *eq = strchr(p, '=');
-        if (!eq) break;
-        size_t name_len = (size_t)(eq - p);
-        if (name_len == blen && memcmp(p, base, blen) == 0)
-            return atoi(eq + 1);
-        const char *comma = strchr(eq, ',');
-        if (!comma) break;
-        p = comma + 1;
-    }
-    return -1;
-}
-
 /* Ask the daemon for `base` and return the received fd, or -1 on failure.
  * Caller must hold g_lock. */
 static int fetch_one(const char *base)
 {
-    if (g_sock < 0) return -1;
+    if (daemon_client_sock() < 0) return -1;
     uint16_t nlen = (uint16_t)strlen(base);
-    if (nlen == 0 || nlen > MAX_NAME) return -1;
+    if (nlen == 0 || nlen > DC_MAX_NAME) return -1;
 
-    uint8_t req[2 + MAX_NAME];
+    uint8_t req[2 + DC_MAX_NAME];
     put_u16le(req, nlen);
     memcpy(req + 2, base, nlen);
-    if (send_msg(g_sock, OP_GET_LIB, req, (uint32_t)(2 + nlen)) < 0) {
-        LOG("  send OP_GET_LIB(%s) failed\n", base);
-        return -1;
-    }
 
-    uint32_t op, plen;
+    uint32_t op = 0, plen = 0;
     uint8_t  payload[16];
     int      fds[1];
     int      nfds = 0;
-    if (recv_msg(g_sock, &op, payload, &plen, sizeof(payload),
-                 fds, &nfds, 1) < 0) {
+    int      send_ok, recv_ok;
+
+    /* Hold the daemon-client IO lock across send + recv so a concurrent
+     * dlopen_shim::fetch_closure on the same socket can't steal our
+     * reply. */
+    daemon_client_io_lock();
+    send_ok = (daemon_client_send(DC_OP_GET_LIB, req, (uint32_t)(2 + nlen)) == 0);
+    recv_ok = send_ok && (daemon_client_recv(&op, payload, &plen, sizeof(payload),
+                                              fds, &nfds, 1) == 0);
+    daemon_client_io_unlock();
+
+    if (!send_ok) {
+        LOG("  send OP_GET_LIB(%s) failed\n", base);
+        return -1;
+    }
+    if (!recv_ok) {
         LOG("  recv OP_LIB(%s) failed\n", base);
         return -1;
     }
-    if (op != OP_LIB || plen < 4) {
+    if (op != DC_OP_LIB || plen < 4) {
         LOG("  bad reply for %s: op=0x%x plen=%u\n", base, op, plen);
         for (int i = 0; i < nfds; i++) close(fds[i]);
         return -1;
     }
     uint32_t status = u32le(payload);
-    if (status != ST_OK || nfds != 1) {
+    if (status != DC_ST_OK || nfds != 1) {
         LOG("  daemon status=%u nfds=%d for %s\n", status, nfds, base);
         for (int i = 0; i < nfds; i++) close(fds[i]);
         return -1;
@@ -326,17 +186,26 @@ static const char *resolve_path(const char *base)
     }
 
     int fd = -1;
+    /* Track whether this fd is one we own (received fresh via SCM_RIGHTS
+     * from the daemon and must close ourselves on overflow) or one we
+     * merely looked up in ANTIREV_FD_MAP (still referenced by the env
+     * var and the stub's symlink dir — closing it would invalidate the
+     * /proc/self/fd/N path for every other consumer). */
+    int fd_is_owned = 0;
 
     /* Eager path first (stub pre-populated fd map). */
-    if (g_fd_map) {
-        fd = eager_lookup_fd(base);
+    if (daemon_client_have_fd_map()) {
+        fd = daemon_client_eager_lookup_fd(base);
         if (fd >= 0) LOG("  eager-hit %s -> fd=%d\n", base, fd);
     }
 
     /* Daemon path. */
-    if (fd < 0 && g_sock >= 0 && is_encrypted(base)) {
+    if (fd < 0 && daemon_client_sock() >= 0 && daemon_client_is_encrypted(base)) {
         fd = fetch_one(base);
-        if (fd >= 0) LOG("  daemon-hit %s -> fd=%d\n", base, fd);
+        if (fd >= 0) {
+            LOG("  daemon-hit %s -> fd=%d\n", base, fd);
+            fd_is_owned = 1;
+        }
     }
 
     if (fd < 0) {
@@ -345,16 +214,22 @@ static const char *resolve_path(const char *base)
     }
 
     const char *out = NULL;
-    if (g_cache_count < MAX_FILES) {
+    int stored = 0;
+    if (g_cache_count < DC_MAX_FILES) {
         size_t bl = strlen(base);
-        if (bl <= MAX_NAME) {
+        if (bl <= DC_MAX_NAME) {
             memcpy(g_cache_names[g_cache_count], base, bl + 1);
             g_cache_fds[g_cache_count] = fd;
             snprintf(g_cache_paths[g_cache_count], FD_PATH_MAX,
                      "/proc/self/fd/%d", fd);
             out = g_cache_paths[g_cache_count];
             g_cache_count++;
+            stored = 1;
         }
+    }
+    if (!stored && fd_is_owned) {
+        LOG("  cache full / name too long, closing fresh daemon fd=%d\n", fd);
+        close(fd);
     }
 
     pthread_mutex_unlock(&g_lock);
@@ -393,33 +268,11 @@ static void init_aarch64_extend_shim(void)
 
     LOG("[aarch64_extend_shim] ctor pid=%d owner=%d\n", getpid(), is_owner);
 
-    g_fd_map = getenv("ANTIREV_FD_MAP");
+    daemon_client_init();
 
-    const char *sock_str = getenv("ANTIREV_LIBD_SOCK");
-    if (sock_str) {
-        int fd = atoi(sock_str);
-        if (fd > 2) g_sock = fd;
-    }
-
-    const char *enc = getenv("ANTIREV_ENC_LIBS");
-    if (enc && *enc) {
-        char *buf = strdup(enc);
-        if (buf) {
-            char *save = NULL;
-            for (char *tok = strtok_r(buf, ",", &save);
-                 tok && g_enc_count < MAX_FILES;
-                 tok = strtok_r(NULL, ",", &save)) {
-                size_t len = strlen(tok);
-                if (len == 0 || len > MAX_NAME) continue;
-                memcpy(g_enc_names[g_enc_count], tok, len + 1);
-                g_enc_count++;
-            }
-            free(buf);
-        }
-    }
-
-    LOG("[aarch64_extend_shim] sock=%d fd_map=%s enc_count=%d\n",
-        g_sock, g_fd_map ? "yes" : "no", g_enc_count);
+    LOG("[aarch64_extend_shim] sock=%d fd_map=%s\n",
+        daemon_client_sock(),
+        daemon_client_have_fd_map() ? "yes" : "no");
 }
 
 /* ------------------------------------------------------------------ */
@@ -568,8 +421,8 @@ static void resolve_real_io_funcs(void)
  * unredirected. */
 static int name_is_known_elf_asset(const char *base)
 {
-    if (is_encrypted(base)) return 1;
-    if (g_fd_map && eager_lookup_fd(base) >= 0) return 1;
+    if (daemon_client_is_encrypted(base)) return 1;
+    if (daemon_client_have_fd_map() && daemon_client_eager_lookup_fd(base) >= 0) return 1;
     return 0;
 }
 
@@ -800,8 +653,27 @@ FILE *popen(const char *command, const char *type)
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
 
-        unsetenv("ANTIREV_FD_MAP");
-        unsetenv("ANTIREV_REAL_EXE");
+        /* Scrub every ANTIREV_* env var so the popen child doesn't
+         * disclose internals via /proc/PID/environ and so descendant
+         * Python tools (e.g. antirev_client.py) don't pick up stale
+         * daemon fds / lib lists.  Iterate environ once and collect
+         * names — unsetenv(3) shifts the array in-place so we can't
+         * unset while iterating.  Cap is generous vs. today's ~10
+         * ANTIREV_* vars; anything beyond the cap stays (best-effort
+         * scrub, never a security boundary). */
+        extern char **environ;
+        char names[32][64];
+        int  n_names = 0;
+        for (char **e = environ; *e && n_names < 32; e++) {
+            if (strncmp(*e, "ANTIREV_", 8) != 0) continue;
+            const char *eq = strchr(*e, '=');
+            size_t nlen = eq ? (size_t)(eq - *e) : strlen(*e);
+            if (nlen >= sizeof(names[0])) continue;
+            memcpy(names[n_names], *e, nlen);
+            names[n_names][nlen] = '\0';
+            n_names++;
+        }
+        for (int i = 0; i < n_names; i++) unsetenv(names[i]);
         unsetenv("LD_PRELOAD");
 
         execl("/bin/sh", "sh", "-c", command, (char *)NULL);
