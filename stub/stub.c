@@ -226,6 +226,17 @@ static int recv_full(int sock, void *buf, size_t len)
     return 0;
 }
 
+/* Drain all SCM_RIGHTS fds we've already accepted into the caller's
+ * array — used to clean up when a recv aborts mid-message after
+ * cmsg unpacking succeeded.  Without this, callers see a -1 return
+ * and assume nothing arrived; the fds end up stranded until process
+ * exit reaps them. */
+static void close_received_fds(int *fds, int *nfds)
+{
+    for (int i = 0; i < *nfds; i++) close(fds[i]);
+    *nfds = 0;
+}
+
 /* Send one v2 message with optional ancillary fds.
  * Writes [u32 op | u32 plen | payload bytes] and, if nfds > 0,
  * attaches SCM_RIGHTS on the first sendmsg.
@@ -322,17 +333,25 @@ static int recv_msg(int sock, uint32_t *op,
 
     /* Finish reading the header if we got fewer than 8 bytes. */
     if (got < (ssize_t)sizeof(hdr)) {
-        if (recv_full(sock, hdr + got, sizeof(hdr) - (size_t)got) < 0)
+        if (recv_full(sock, hdr + got, sizeof(hdr) - (size_t)got) < 0) {
+            close_received_fds(fds, nfds);
             return -1;
+        }
     }
 
     *op = u32le(hdr);
     uint32_t p = u32le(hdr + 4);
-    if (p > max_payload) return -1;
+    if (p > max_payload) {
+        close_received_fds(fds, nfds);
+        return -1;
+    }
     *plen = p;
 
     if (p > 0) {
-        if (recv_full(sock, payload, p) < 0) return -1;
+        if (recv_full(sock, payload, p) < 0) {
+            close_received_fds(fds, nfds);
+            return -1;
+        }
     }
     return 0;
 }
@@ -720,22 +739,46 @@ static int daemon_request_libs(int sd,
             return -1;
 
         if (op == OP_END) break;
-        if (op != OP_BATCH) return -1;
-        if (plen < 4) return -1;
+        /* Any framing / parse failure below this point must close
+         * the fds we already accepted via SCM_RIGHTS, otherwise they
+         * leak when daemon_connect_and_fetch closes the socket and
+         * returns.  out_fds aliases recvd_fds after the memcpy below
+         * (same int values, no kernel ref bump), so closing recvd_fds
+         * is sufficient. */
+        if (op != OP_BATCH) {
+            close_received_fds(recvd_fds, &nrecvd);
+            return -1;
+        }
+        if (plen < 4) {
+            close_received_fds(recvd_fds, &nrecvd);
+            return -1;
+        }
 
         uint32_t nl = u32le(payload);
-        if ((int)nl != nrecvd) return -1;
-        if (*out_nlibs + (int)nl > MAX_FILES) return -1;
+        if ((int)nl != nrecvd) {
+            close_received_fds(recvd_fds, &nrecvd);
+            return -1;
+        }
+        if (*out_nlibs + (int)nl > MAX_FILES) {
+            close_received_fds(recvd_fds, &nrecvd);
+            return -1;
+        }
 
         memcpy(out_fds + *out_nlibs, recvd_fds, (size_t)nl * sizeof(int));
 
         size_t poff = 4;
         for (uint32_t i = 0; i < nl; i++) {
-            if (poff + 2 > plen) return -1;
+            if (poff + 2 > plen) {
+                close_received_fds(recvd_fds, &nrecvd);
+                return -1;
+            }
             uint16_t nlen;
             memcpy(&nlen, payload + poff, 2);
             poff += 2;
-            if (nlen > MAX_NAME || poff + nlen > plen) return -1;
+            if (nlen > MAX_NAME || poff + nlen > plen) {
+                close_received_fds(recvd_fds, &nrecvd);
+                return -1;
+            }
             memcpy(out_names[*out_nlibs + (int)i], payload + poff, nlen);
             out_names[*out_nlibs + (int)i][nlen] = '\0';
             poff += nlen;
@@ -804,9 +847,15 @@ static int daemon_request_one(int sd, const char *name)
     if (recv_msg(sd, &op, payload, &plen, sizeof(payload),
                  recvd_fds, &nrecvd, 1) < 0)
         return -1;
-    if (op != OP_LIB || plen < 4) return -1;
+    if (op != OP_LIB || plen < 4) {
+        close_received_fds(recvd_fds, &nrecvd);
+        return -1;
+    }
     uint32_t status = u32le(payload);
-    if (status != ST_OK || nrecvd != 1) return -1;
+    if (status != ST_OK || nrecvd != 1) {
+        close_received_fds(recvd_fds, &nrecvd);
+        return -1;
+    }
     return recvd_fds[0];
 }
 
