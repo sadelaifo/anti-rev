@@ -23,6 +23,8 @@
  */
 
 #define _GNU_SOURCE
+#include "daemon_client.h"
+
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,18 +34,6 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
-#include <sys/socket.h>
-#include <sys/uio.h>
-
-/* Must match stub.c */
-#define MAX_NAME       255
-#define MAX_FILES      1024
-#define SCM_BATCH      250
-#define MAX_PAYLOAD    (4u + SCM_BATCH * (2u + MAX_NAME))
-
-#define OP_GET_CLOSURE 0x05u
-#define OP_BATCH       0x81u
-#define OP_END         0x82u
 
 /* ------------------------------------------------------------------ */
 /*  State                                                              */
@@ -51,19 +41,11 @@
 
 static void *(*real_dlopen_fn)(const char *, int) = NULL;
 
-/* Eager-mode ANTIREV_FD_MAP string (legacy path). */
-static const char *g_fd_map = NULL;
-
-/* Lazy mode. */
-static int  g_sock = -1;
 static char g_symlink_dir[256] = {0};
 
-static char g_enc_names[MAX_FILES][MAX_NAME + 1];
-static int  g_enc_count = 0;
-
 /* Cache of libs we have already fetched lazily (names + fds held open). */
-static char g_cache_names[MAX_FILES][MAX_NAME + 1];
-static int  g_cache_fds[MAX_FILES];
+static char g_cache_names[DC_MAX_FILES][DC_MAX_NAME + 1];
+static int  g_cache_fds[DC_MAX_FILES];
 static int  g_cache_count = 0;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -93,126 +75,16 @@ static FILE *g_log = NULL;
 #define LOG(...) do { if (g_log) { fprintf(g_log, __VA_ARGS__); fflush(g_log); } } while (0)
 
 /* ------------------------------------------------------------------ */
-/*  Little-endian helpers                                              */
+/*  Little-endian helper                                               */
 /* ------------------------------------------------------------------ */
-static inline void put_u32le(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)(v);      p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
-}
 static inline void put_u16le(uint8_t *p, uint16_t v)
 {
     p[0] = (uint8_t)(v); p[1] = (uint8_t)(v >> 8);
 }
-static inline uint32_t u32le(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
-         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
 
 /* ------------------------------------------------------------------ */
-/*  Minimal v2 protocol client                                         */
+/*  Cache lookup                                                       */
 /* ------------------------------------------------------------------ */
-
-static int recv_full(int sock, void *buf, size_t len)
-{
-    size_t got = 0;
-    while (got < len) {
-        ssize_t n = recv(sock, (uint8_t *)buf + got, len - got, 0);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
-            return -1;
-        }
-        got += (size_t)n;
-    }
-    return 0;
-}
-
-static int send_msg(int sock, uint32_t op, const void *payload, uint32_t plen)
-{
-    uint8_t hdr[8];
-    put_u32le(hdr, op);
-    put_u32le(hdr + 4, plen);
-    struct iovec iov[2] = {
-        { hdr, sizeof(hdr) },
-        { (void *)payload, plen },
-    };
-    struct msghdr msg = {0};
-    msg.msg_iov    = iov;
-    msg.msg_iovlen = (plen > 0) ? 2 : 1;
-    size_t total = 8 + (size_t)plen;
-    ssize_t n = sendmsg(sock, &msg, 0);
-    if (n < 0) return -1;
-    if ((size_t)n == total) return 0;
-    /* partial */
-    size_t sent = (size_t)n;
-    if (sent < 8) {
-        if (send(sock, hdr + sent, 8 - sent, 0) != (ssize_t)(8 - sent)) return -1;
-        sent = 8;
-    }
-    size_t prem = total - sent;
-    if (prem > 0) {
-        if (send(sock, (const uint8_t *)payload + (sent - 8), prem, 0)
-            != (ssize_t)prem) return -1;
-    }
-    return 0;
-}
-
-static int recv_msg(int sock, uint32_t *op,
-                    uint8_t *payload, uint32_t *plen, uint32_t max_payload,
-                    int *fds, int *nfds, int max_fds)
-{
-    *nfds = 0;
-    uint8_t hdr[8];
-    struct iovec iov = { hdr, sizeof(hdr) };
-    char cmsg_buf[CMSG_SPACE(SCM_BATCH * sizeof(int))];
-    memset(cmsg_buf, 0, sizeof(cmsg_buf));
-    struct msghdr msg = {0};
-    msg.msg_iov        = &iov;
-    msg.msg_iovlen     = 1;
-    msg.msg_control    = cmsg_buf;
-    msg.msg_controllen = sizeof(cmsg_buf);
-
-    ssize_t got = recvmsg(sock, &msg, 0);
-    if (got <= 0) return -1;
-
-    for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm; cm = CMSG_NXTHDR(&msg, cm)) {
-        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
-            int n = (int)((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
-            if (n > max_fds) {
-                int *src = (int *)CMSG_DATA(cm);
-                for (int k = 0; k < n; k++) close(src[k]);
-                return -1;
-            }
-            memcpy(fds, CMSG_DATA(cm), (size_t)n * sizeof(int));
-            *nfds = n;
-        }
-    }
-    if (got < (ssize_t)sizeof(hdr)) {
-        if (recv_full(sock, hdr + got, sizeof(hdr) - (size_t)got) < 0)
-            return -1;
-    }
-    *op = u32le(hdr);
-    uint32_t p = u32le(hdr + 4);
-    if (p > max_payload) return -1;
-    *plen = p;
-    if (p > 0) {
-        if (recv_full(sock, payload, p) < 0) return -1;
-    }
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Cache + set lookups                                                */
-/* ------------------------------------------------------------------ */
-
-static int is_encrypted(const char *base)
-{
-    for (int i = 0; i < g_enc_count; i++) {
-        if (strcmp(g_enc_names[i], base) == 0) return 1;
-    }
-    return 0;
-}
 
 static int cache_find(const char *base)
 {
@@ -230,13 +102,13 @@ static int cache_find(const char *base)
  * -1 on name-length / send failure. */
 static int send_closure_request(const char *base) {
     uint16_t nlen = (uint16_t)strlen(base);
-    if (nlen == 0 || nlen > MAX_NAME)
+    if (nlen == 0 || nlen > DC_MAX_NAME)
         return -1;
 
-    uint8_t req[2 + MAX_NAME];
+    uint8_t req[2 + DC_MAX_NAME];
     put_u16le(req, nlen);
     memcpy(req + 2, base, nlen);
-    if (send_msg(g_sock, OP_GET_CLOSURE, req, (uint32_t)(2 + nlen)) < 0) {
+    if (daemon_client_send(DC_OP_GET_CLOSURE, req, (uint32_t)(2 + nlen)) < 0) {
         LOG("  send OP_GET_CLOSURE failed\n");
         return -1;
     }
@@ -254,7 +126,7 @@ static int install_closure_member(const char *name, size_t nlen, int fd) {
         close(fd);
         return 0;
     }
-    if (g_cache_count >= MAX_FILES) {
+    if (g_cache_count >= DC_MAX_FILES) {
         close(fd);
         return 0;
     }
@@ -283,10 +155,13 @@ static int install_closure_member(const char *name, size_t nlen, int fd) {
  * Returns 0 on success, -1 on wire-format error (caller disconnects).
  * Any fd not consumed by install_closure_member is closed. */
 static int process_closure_batch(const uint8_t *payload, uint32_t plen, int *fds, int nf,
-                                 char (*new_names)[MAX_NAME + 1], int *new_count, int *n_received) {
+                                 char (*new_names)[DC_MAX_NAME + 1], int *new_count, int *n_received) {
     if (plen < 4)
         goto wire_error;
-    uint32_t nl = u32le(payload);
+    uint32_t nl = (uint32_t)payload[0]
+                | ((uint32_t)payload[1] << 8)
+                | ((uint32_t)payload[2] << 16)
+                | ((uint32_t)payload[3] << 24);
     if ((int) nl != nf)
         goto wire_error;
 
@@ -296,17 +171,17 @@ static int process_closure_batch(const uint8_t *payload, uint32_t plen, int *fds
             goto wire_error_from_i;
         uint16_t l = (uint16_t) payload[poff] | ((uint16_t) payload[poff + 1] << 8);
         poff += 2;
-        if (l == 0 || l > MAX_NAME || poff + l > plen)
+        if (l == 0 || l > DC_MAX_NAME || poff + l > plen)
             goto wire_error_from_i;
 
-        char name[MAX_NAME + 1];
+        char name[DC_MAX_NAME + 1];
         memcpy(name, payload + poff, l);
         name[l] = '\0';
         poff += l;
 
         (*n_received)++;
         int added = install_closure_member(name, l, fds[i]);
-        if (added == 1 && *new_count < MAX_FILES) {
+        if (added == 1 && *new_count < DC_MAX_FILES) {
             memcpy(new_names[*new_count], name, (size_t) l + 1);
             (*new_count)++;
         }
@@ -328,19 +203,19 @@ wire_error:
 /* Drain OP_BATCH messages until OP_END.  Populates new_names with the
  * libs newly added to the cache (in daemon-returned topological order)
  * and returns the total count received.  Negative return on error. */
-static int recv_closure(char (*new_names)[MAX_NAME + 1], int *new_count) {
+static int recv_closure(char (*new_names)[DC_MAX_NAME + 1], int *new_count) {
     int n_received = 0;
     for (;;) {
         uint32_t op, plen;
-        uint8_t  payload[MAX_PAYLOAD];
-        int      fds[SCM_BATCH];
+        uint8_t  payload[DC_MAX_PAYLOAD];
+        int      fds[DC_SCM_BATCH];
         int      nf = 0;
-        if (recv_msg(g_sock, &op, payload, &plen, MAX_PAYLOAD,
-                     fds, &nf, SCM_BATCH) < 0)
+        if (daemon_client_recv(&op, payload, &plen, DC_MAX_PAYLOAD,
+                               fds, &nf, DC_SCM_BATCH) < 0)
             return -1;
-        if (op == OP_END)
+        if (op == DC_OP_END)
             return n_received;
-        if (op != OP_BATCH) {
+        if (op != DC_OP_BATCH) {
             for (int i = 0; i < nf; i++)
                 close(fds[i]);
             return -1;
@@ -369,7 +244,7 @@ static int recv_closure(char (*new_names)[MAX_NAME + 1], int *new_count) {
  * tables in separate symbol scopes, both ctors' call_once fire, and
  * libprotobuf sees duplicate registrations.  RTLD_GLOBAL lets the
  * first-loaded copy interpose, matching plaintext load-time semantics. */
-static void preload_closure_deps(const char *base, const char (*new_names)[MAX_NAME + 1], int new_count) {
+static void preload_closure_deps(const char *base, const char (*new_names)[DC_MAX_NAME + 1], int new_count) {
     for (int i = 0; i < new_count; i++) {
         if (strcmp(new_names[i], base) == 0) {
             LOG("    skip-root %s\n", new_names[i]);
@@ -400,15 +275,15 @@ static void fetch_closure(const char *base) {
         LOG("  cache-hit %s\n", base);
         return;
     }
-    if (g_sock < 0 || !g_symlink_dir[0]) {
-        LOG("  no-sock (sock=%d dir='%s')\n", g_sock, g_symlink_dir);
+    if (daemon_client_sock() < 0 || !g_symlink_dir[0]) {
+        LOG("  no-sock (sock=%d dir='%s')\n", daemon_client_sock(), g_symlink_dir);
         return;
     }
 
     if (send_closure_request(base) < 0)
         return;
 
-    char new_names[MAX_FILES][MAX_NAME + 1];
+    char new_names[DC_MAX_FILES][DC_MAX_NAME + 1];
     int new_count = 0;
     int n_received = recv_closure(new_names, &new_count);
     if (n_received < 0)
@@ -441,34 +316,11 @@ static void init_shim(void)
         }
     }
 
-    g_fd_map = getenv("ANTIREV_FD_MAP");
-
-    const char *sock_str = getenv("ANTIREV_LIBD_SOCK");
-    if (sock_str) {
-        int fd = atoi(sock_str);
-        if (fd > 2) g_sock = fd;
-    }
+    daemon_client_init();
 
     const char *dir = getenv("ANTIREV_SYMLINK_DIR");
     if (dir && *dir) {
         snprintf(g_symlink_dir, sizeof(g_symlink_dir), "%s", dir);
-    }
-
-    const char *enc = getenv("ANTIREV_ENC_LIBS");
-    if (enc && *enc) {
-        char *buf = strdup(enc);
-        if (buf) {
-            char *save = NULL;
-            for (char *tok = strtok_r(buf, ",", &save);
-                 tok && g_enc_count < MAX_FILES;
-                 tok = strtok_r(NULL, ",", &save)) {
-                size_t len = strlen(tok);
-                if (len == 0 || len > MAX_NAME) continue;
-                memcpy(g_enc_names[g_enc_count], tok, len + 1);
-                g_enc_count++;
-            }
-            free(buf);
-        }
     }
 
     const char *npe = getenv("ANTIREV_NO_PRELOAD");
@@ -476,33 +328,9 @@ static void init_shim(void)
         g_no_preload = 1;
     }
 
-    LOG("[dlopen_shim] sock=%d dir=%s enc_count=%d fd_map=%s no_preload=%d\n",
-        g_sock, g_symlink_dir, g_enc_count,
-        g_fd_map ? "yes" : "no", g_no_preload);
-}
-
-/* ------------------------------------------------------------------ */
-/*  Eager-mode FD_MAP lookup (legacy path)                             */
-/* ------------------------------------------------------------------ */
-
-static int eager_lookup(const char *base, char *out_path, size_t out_sz)
-{
-    if (!g_fd_map) return 0;
-    const char *p = g_fd_map;
-    while (*p) {
-        const char *eq = strchr(p, '=');
-        if (!eq) break;
-        size_t name_len = (size_t)(eq - p);
-        if (name_len == strlen(base) && memcmp(p, base, name_len) == 0) {
-            int fd = atoi(eq + 1);
-            snprintf(out_path, out_sz, "/proc/self/fd/%d", fd);
-            return 1;
-        }
-        const char *comma = strchr(eq, ',');
-        if (!comma) break;
-        p = comma + 1;
-    }
-    return 0;
+    LOG("[dlopen_shim] sock=%d dir=%s fd_map=%s no_preload=%d\n",
+        daemon_client_sock(), g_symlink_dir,
+        daemon_client_have_fd_map() ? "yes" : "no", g_no_preload);
 }
 
 /* ------------------------------------------------------------------ */
@@ -522,17 +350,18 @@ void *dlopen(const char *filename, int flags)
     base = base ? base + 1 : filename;
 
     /* Legacy eager path: everything pre-fetched, just redirect. */
-    if (g_fd_map) {
+    if (daemon_client_have_fd_map()) {
         char redir[64];
-        if (eager_lookup(base, redir, sizeof(redir)))
+        if (daemon_client_eager_lookup_path(base, redir, sizeof(redir)))
             return real_dlopen_fn(redir, flags);
         return real_dlopen_fn(filename, flags);
     }
 
     /* Lazy path. */
-    if (g_sock < 0 || g_enc_count == 0 || !is_encrypted(base)) {
+    int enc = daemon_client_is_encrypted(base);
+    if (daemon_client_sock() < 0 || !enc) {
         LOG("dlopen(%s) flags=0x%x -> passthrough (enc=%d)\n",
-            filename, flags, is_encrypted(base));
+            filename, flags, enc);
         return real_dlopen_fn(filename, flags);
     }
 
