@@ -1336,7 +1336,14 @@ static void derive_daemon_path(const char *real_exe, char *out, size_t out_sz) {
 
 /* Fork the daemon binary if it's on disk; parent waits for the daemon
  * to self-daemonize (it _exit(0)s the launching process).  Returns 1
- * if launched, 0 otherwise. */
+ * if launched, 0 otherwise.
+ *
+ * The launching parent's exit status reflects whether the daemon got
+ * far enough to fork its serving child.  127 = execve failure.  1 =
+ * daemon setup error (e.g. bind() collision when an impostor squats
+ * our abstract socket name).  Anything non-zero means no serving
+ * daemon is up; returning 0 lets fetch_libs_from_daemon retry-then-
+ * fail rather than spin against a dead spawn for 50 attempts. */
 static int spawn_local_daemon(const char *real_exe, char *const *envp) {
     char path[4096];
     derive_daemon_path(real_exe, path, sizeof(path));
@@ -1352,7 +1359,14 @@ static int spawn_local_daemon(const char *real_exe, char *const *envp) {
     if (pid < 0)
         return 0;
     int st;
-    waitpid(pid, &st, 0);
+    if (waitpid(pid, &st, 0) < 0)
+        return 0;
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        fprintf(stderr, "[antirev] daemon launch failed (exit=%d signal=%d)\n",
+                WIFEXITED(st) ? WEXITSTATUS(st) : -1,
+                WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+        return 0;
+    }
     return 1;
 }
 
@@ -1388,6 +1402,26 @@ static int daemon_connect_and_fetch(const struct sockaddr_un *addr, socklen_t ad
     if (connect(sd, (struct sockaddr *) addr, addr_len) != 0) {
         close(sd);
         return -2;
+    }
+
+    /* Verify the daemon is owned by our uid before exchanging any
+     * data.  The abstract socket name is derived from a hash of the
+     * AES key, which is plaintext in the daemon binary's trailer —
+     * any uid that can read the binary can compute the name and
+     * pre-bind it to MitM us.  The daemon already verifies clients
+     * via SO_PEERCRED on accept; this is the symmetric check on
+     * connect.  Return -1 (terminal) so the retry loop doesn't spin:
+     * if the wrong uid is squatting the name, our spawn_local_daemon
+     * can't bind it either, and retrying just delays the failure. */
+    struct ucred cred;
+    socklen_t clen = sizeof(cred);
+    if (getsockopt(sd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0
+        || cred.uid != getuid()) {
+        fprintf(stderr,
+                "[antirev] daemon impostor detected (peer uid %u, expected %u)\n",
+                (unsigned)cred.uid, (unsigned)getuid());
+        close(sd);
+        return -1;
     }
 
     /* Step 1: full name list, no fds. */
