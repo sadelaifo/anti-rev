@@ -15,6 +15,7 @@
 #include "daemon_client.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +33,9 @@ static const char *g_fd_map      = NULL;
 
 static char g_enc_names[DC_MAX_FILES][DC_MAX_NAME + 1];
 static int  g_enc_count = 0;
+
+/* Serializes send/recv pairs on g_sock — see daemon_client_io_lock(). */
+static pthread_mutex_t g_io_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ------------------------------------------------------------------ */
 /*  Little-endian helpers                                              */
@@ -177,6 +181,16 @@ int daemon_client_send(uint32_t op, const void *payload, uint32_t plen)
     return 0;
 }
 
+/* Close every fd we've received via SCM_RIGHTS into the caller's array
+ * and reset the count.  Used to drain a partially-completed recv when
+ * we're about to return -1 — without it, fds are stranded (caller sees
+ * -1 and assumes nothing arrived). */
+static void close_received_fds(int *fds, int *nfds)
+{
+    for (int i = 0; i < *nfds; i++) close(fds[i]);
+    *nfds = 0;
+}
+
 int daemon_client_recv(uint32_t *op,
                        uint8_t *payload, uint32_t *plen, uint32_t max_payload,
                        int *fds, int *nfds, int max_fds)
@@ -210,15 +224,30 @@ int daemon_client_recv(uint32_t *op,
         }
     }
     if (got < (ssize_t)sizeof(hdr)) {
-        if (recv_full(g_sock, hdr + got, sizeof(hdr) - (size_t)got) < 0)
+        if (recv_full(g_sock, hdr + got, sizeof(hdr) - (size_t)got) < 0) {
+            close_received_fds(fds, nfds);
             return -1;
+        }
     }
     *op = u32le(hdr);
     uint32_t p = u32le(hdr + 4);
-    if (p > max_payload) return -1;
+    if (p > max_payload) {
+        close_received_fds(fds, nfds);
+        return -1;
+    }
     *plen = p;
     if (p > 0) {
-        if (recv_full(g_sock, payload, p) < 0) return -1;
+        if (recv_full(g_sock, payload, p) < 0) {
+            close_received_fds(fds, nfds);
+            return -1;
+        }
     }
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/*  IO lock                                                             */
+/* ------------------------------------------------------------------ */
+
+void daemon_client_io_lock(void)   { pthread_mutex_lock(&g_io_lock); }
+void daemon_client_io_unlock(void) { pthread_mutex_unlock(&g_io_lock); }

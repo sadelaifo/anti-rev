@@ -125,17 +125,27 @@ static int fetch_one(const char *base)
     uint8_t req[2 + DC_MAX_NAME];
     put_u16le(req, nlen);
     memcpy(req + 2, base, nlen);
-    if (daemon_client_send(DC_OP_GET_LIB, req, (uint32_t)(2 + nlen)) < 0) {
-        LOG("  send OP_GET_LIB(%s) failed\n", base);
-        return -1;
-    }
 
-    uint32_t op, plen;
+    uint32_t op = 0, plen = 0;
     uint8_t  payload[16];
     int      fds[1];
     int      nfds = 0;
-    if (daemon_client_recv(&op, payload, &plen, sizeof(payload),
-                           fds, &nfds, 1) < 0) {
+    int      send_ok, recv_ok;
+
+    /* Hold the daemon-client IO lock across send + recv so a concurrent
+     * dlopen_shim::fetch_closure on the same socket can't steal our
+     * reply. */
+    daemon_client_io_lock();
+    send_ok = (daemon_client_send(DC_OP_GET_LIB, req, (uint32_t)(2 + nlen)) == 0);
+    recv_ok = send_ok && (daemon_client_recv(&op, payload, &plen, sizeof(payload),
+                                              fds, &nfds, 1) == 0);
+    daemon_client_io_unlock();
+
+    if (!send_ok) {
+        LOG("  send OP_GET_LIB(%s) failed\n", base);
+        return -1;
+    }
+    if (!recv_ok) {
         LOG("  recv OP_LIB(%s) failed\n", base);
         return -1;
     }
@@ -643,8 +653,27 @@ FILE *popen(const char *command, const char *type)
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
 
-        unsetenv("ANTIREV_FD_MAP");
-        unsetenv("ANTIREV_REAL_EXE");
+        /* Scrub every ANTIREV_* env var so the popen child doesn't
+         * disclose internals via /proc/PID/environ and so descendant
+         * Python tools (e.g. antirev_client.py) don't pick up stale
+         * daemon fds / lib lists.  Iterate environ once and collect
+         * names — unsetenv(3) shifts the array in-place so we can't
+         * unset while iterating.  Cap is generous vs. today's ~10
+         * ANTIREV_* vars; anything beyond the cap stays (best-effort
+         * scrub, never a security boundary). */
+        extern char **environ;
+        char names[32][64];
+        int  n_names = 0;
+        for (char **e = environ; *e && n_names < 32; e++) {
+            if (strncmp(*e, "ANTIREV_", 8) != 0) continue;
+            const char *eq = strchr(*e, '=');
+            size_t nlen = eq ? (size_t)(eq - *e) : strlen(*e);
+            if (nlen >= sizeof(names[0])) continue;
+            memcpy(names[n_names], *e, nlen);
+            names[n_names][nlen] = '\0';
+            n_names++;
+        }
+        for (int i = 0; i < n_names; i++) unsetenv(names[i]);
         unsetenv("LD_PRELOAD");
 
         execl("/bin/sh", "sh", "-c", command, (char *)NULL);

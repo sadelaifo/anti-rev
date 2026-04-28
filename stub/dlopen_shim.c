@@ -280,12 +280,17 @@ static void fetch_closure(const char *base) {
         return;
     }
 
-    if (send_closure_request(base) < 0)
-        return;
-
+    /* Hold the daemon-client IO lock across the whole send + multi-batch
+     * recv so an aarch64_extend_shim ANTI_LoadProcess request can't
+     * interleave on the same socket and steal our reply (or vice
+     * versa). */
     char new_names[DC_MAX_FILES][DC_MAX_NAME + 1];
     int new_count = 0;
-    int n_received = recv_closure(new_names, &new_count);
+    int n_received = -1;
+    daemon_client_io_lock();
+    if (send_closure_request(base) == 0)
+        n_received = recv_closure(new_names, &new_count);
+    daemon_client_io_unlock();
     if (n_received < 0)
         return;
     LOG("  closure for %s: %d libs total\n", base, n_received);
@@ -340,8 +345,15 @@ static void init_shim(void)
 __attribute__((visibility("default")))
 void *dlopen(const char *filename, int flags)
 {
-    if (!real_dlopen_fn)
+    if (!real_dlopen_fn) {
         real_dlopen_fn = dlsym(RTLD_NEXT, "dlopen");
+        if (!real_dlopen_fn) {
+            /* RTLD_NEXT lookup failed — no real dlopen below us in the
+             * link order.  Bail rather than NULL-deref. */
+            errno = ENOSYS;
+            return NULL;
+        }
+    }
 
     if (!filename)
         return real_dlopen_fn(filename, flags);

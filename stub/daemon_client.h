@@ -64,10 +64,29 @@ int  daemon_client_send(uint32_t op, const void *payload, uint32_t plen);
 
 /* Receive one framed reply on the daemon socket.  *nfds is set to the
  * number of fds received via SCM_RIGHTS (0 if none).  Returns 0 on
- * success, -1 on wire / framing error or oversize payload. */
+ * success, -1 on wire / framing error or oversize payload — any fds
+ * already consumed during the failed recv are closed before return,
+ * so callers do not need to clean up on failure. */
 int  daemon_client_recv(uint32_t *op,
                         uint8_t *payload, uint32_t *plen, uint32_t max_payload,
                         int *fds, int *nfds, int max_fds);
+
+/* Serialize an entire request+reply sequence on the daemon socket.
+ *
+ * Both shims (dlopen_shim, aarch64_extend_shim) talk to the same
+ * daemon over a single fd.  Each shim already serializes its own
+ * concurrent callers via its per-shim mutex, but those mutexes are
+ * independent — without a shared lock, dlopen_shim's send + multi-
+ * batch recv could interleave on the wire with aarch64_extend_shim's
+ * send + recv and either side would read the wrong reply.  Callers
+ * MUST bracket their request+reply with these calls.
+ *
+ * Lock order (top-down): per-shim mutex → daemon_client_io_lock.
+ * daemon_client never reaches back into shim-owned state, so this
+ * order is deadlock-free as long as callers don't acquire shim
+ * mutexes while holding the IO lock. */
+void daemon_client_io_lock(void);
+void daemon_client_io_unlock(void);
 
 #ifdef __cplusplus
 }
