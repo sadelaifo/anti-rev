@@ -326,6 +326,9 @@ static const char *resolve_path(const char *base)
     }
 
     int fd = -1;
+    int fd_owned = 0;  /* daemon-fetched fds are ours to close on overflow;
+                        * eager-mode fds are borrowed from the parent stub
+                        * and closing them would corrupt parent fd tracking. */
 
     /* Eager path first (stub pre-populated fd map). */
     if (g_fd_map) {
@@ -336,7 +339,10 @@ static const char *resolve_path(const char *base)
     /* Daemon path. */
     if (fd < 0 && g_sock >= 0 && is_encrypted(base)) {
         fd = fetch_one(base);
-        if (fd >= 0) LOG("  daemon-hit %s -> fd=%d\n", base, fd);
+        if (fd >= 0) {
+            fd_owned = 1;
+            LOG("  daemon-hit %s -> fd=%d\n", base, fd);
+        }
     }
 
     if (fd < 0) {
@@ -345,16 +351,21 @@ static const char *resolve_path(const char *base)
     }
 
     const char *out = NULL;
-    if (g_cache_count < MAX_FILES) {
-        size_t bl = strlen(base);
-        if (bl <= MAX_NAME) {
-            memcpy(g_cache_names[g_cache_count], base, bl + 1);
-            g_cache_fds[g_cache_count] = fd;
-            snprintf(g_cache_paths[g_cache_count], FD_PATH_MAX,
-                     "/proc/self/fd/%d", fd);
-            out = g_cache_paths[g_cache_count];
-            g_cache_count++;
-        }
+    size_t bl = strlen(base);
+    if (g_cache_count < MAX_FILES && bl <= MAX_NAME) {
+        memcpy(g_cache_names[g_cache_count], base, bl + 1);
+        g_cache_fds[g_cache_count] = fd;
+        snprintf(g_cache_paths[g_cache_count], FD_PATH_MAX,
+                 "/proc/self/fd/%d", fd);
+        out = g_cache_paths[g_cache_count];
+        g_cache_count++;
+    } else if (fd_owned) {
+        /* Cache full or basename too long.  We own this fd (daemon path)
+         * and won't be holding a reference, so close it.  Eager fds are
+         * left alone — they're the parent stub's. */
+        LOG("  cache full or name too long, closing daemon fd=%d for %s\n",
+            fd, base);
+        close(fd);
     }
 
     pthread_mutex_unlock(&g_lock);

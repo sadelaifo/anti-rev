@@ -32,6 +32,7 @@ set(TESTS
     test_wrong_key        # wrong key -> clean failure
     test_tamper           # bit-flipped ciphertext -> clean failure
     test_missing_syms     # missing_syms.py: missing DT_NEEDED + circular deps
+    test_aarch64_extend   # aarch64_extend_shim: ANTI_LoadProcess hijack + popen relocation (aarch64 only; auto-skipped elsewhere)
 )
 
 # Tests disabled — need further work:

@@ -169,6 +169,52 @@ if(AARCH64_GCC)
         COMMENT "Building hello_aarch64 test binary"
     )
     add_custom_target(hello_aarch64 ALL DEPENDS "${CMAKE_BINARY_DIR}/hello_aarch64")
+
+    # ── aarch64_extend_shim end-to-end test ─────────────────────────────
+    # Driver + libreal_anti.so providing the "real" ANTI_LoadProcess that
+    # dlsym(RTLD_NEXT) inside the shim resolves to.  The driver exercises
+    # both the ANTI_LoadProcess hijack and the popen/pclose relocation.
+    add_custom_command(
+        OUTPUT  "${CMAKE_BINARY_DIR}/libreal_anti.so"
+        COMMAND "${AARCH64_GCC}" -shared -fPIC -O2
+                -o "${CMAKE_BINARY_DIR}/libreal_anti.so"
+                "${CMAKE_SOURCE_DIR}/tests/aarch64_extend/libreal_anti.c"
+        DEPENDS "${CMAKE_SOURCE_DIR}/tests/aarch64_extend/libreal_anti.c"
+        COMMENT "Building libreal_anti.so (aarch64_extend test stand-in)"
+    )
+    add_custom_target(libreal_anti ALL DEPENDS "${CMAKE_BINARY_DIR}/libreal_anti.so")
+
+    add_custom_command(
+        OUTPUT  "${CMAKE_BINARY_DIR}/test_aarch64_extend_bin"
+        COMMAND "${AARCH64_GCC}" -O2
+                -o "${CMAKE_BINARY_DIR}/test_aarch64_extend_bin"
+                "${CMAKE_SOURCE_DIR}/tests/aarch64_extend/main.c"
+                -L "${CMAKE_BINARY_DIR}" -Wl,-rpath,'$$ORIGIN'
+                -lreal_anti
+        DEPENDS "${CMAKE_SOURCE_DIR}/tests/aarch64_extend/main.c"
+                "${CMAKE_BINARY_DIR}/libreal_anti.so"
+        COMMENT "Building test_aarch64_extend_bin"
+    )
+    add_custom_target(test_aarch64_extend_bin ALL
+                      DEPENDS "${CMAKE_BINARY_DIR}/test_aarch64_extend_bin")
+
+    add_custom_target(test_aarch64_extend
+        COMMAND ${CMAKE_COMMAND} -E echo "=== aarch64_extend_shim test ==="
+        COMMAND bash "${CMAKE_SOURCE_DIR}/tests/aarch64_extend/run_test.sh"
+                     "${CMAKE_BINARY_DIR}"
+        DEPENDS test_aarch64_extend_bin libreal_anti aarch64_extend_shim
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "Running aarch64_extend_shim end-to-end test"
+        USES_TERMINAL
+    )
+else()
+    # Stub the target on non-aarch64 hosts so run_all_tests.cmake doesn't
+    # fail with "no rule to make target".  Skipping is also enforced
+    # inside run_test.sh via uname -m.
+    add_custom_target(test_aarch64_extend
+        COMMAND ${CMAKE_COMMAND} -E echo
+                "[test_aarch64_extend] AARCH64_GCC not set on this host — skipped"
+    )
 endif()
 
 # ═══════════════════════════════════════════════════════════════════════
