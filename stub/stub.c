@@ -568,7 +568,6 @@ static void daemon_serve(int listen_fd, int shutdown_efd, const int *lib_fds,
                          const char (*lib_names)[MAX_NAME + 1], int nlibs)
 {
     uid_t my_uid = getuid();
-    signal(SIGPIPE, SIG_IGN);
 
     int ep = epoll_create1(EPOLL_CLOEXEC);
     if (ep < 0) return;
@@ -670,6 +669,16 @@ static void *daemon_serve_thread(void *arg)
 {
     struct daemon_serve_args *a = (struct daemon_serve_args *)arg;
     daemon_serve(a->listen_fd, a->shutdown_efd, a->lib_fds, a->lib_names, a->nlibs);
+    /* If daemon_serve returned (setup error like epoll_create1
+     * failure, or normal shutdown after the eventfd fired), make
+     * sure the main thread's sigwait() also wakes — otherwise on
+     * a worker setup failure the daemon would hang forever waiting
+     * for an external signal.  kill(getpid(), SIGTERM) queues a
+     * process-targeted signal; SIGTERM is blocked in both threads
+     * so it lands wherever sigwait is parked.  Redundant on the
+     * normal-shutdown path (main is no longer in sigwait by then),
+     * harmless either way. */
+    kill(getpid(), SIGTERM);
     return NULL;
 }
 
@@ -1853,11 +1862,14 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
 
-    /* Block shutdown signals process-wide BEFORE creating the worker
-     * thread so the worker inherits the block.  If any signal stayed
-     * unblocked in the worker, the kernel could deliver it there
-     * instead of to our sigwait, leaving the main thread parked
-     * forever. */
+    /* Process-wide before any thread spawns: ignore SIGPIPE (writes
+     * to a closed client socket should EPIPE, not kill us) and
+     * register the shutdown-signal mask so both the main thread
+     * and the worker inherit it.  Doing this before pthread_create
+     * eliminates the race where a fast-arriving SIGPIPE could
+     * terminate the process between create and install. */
+    signal(SIGPIPE, SIG_IGN);
+
     sigset_t shutdown_sigs;
     sigemptyset(&shutdown_sigs);
     sigaddset(&shutdown_sigs, SIGTERM);
