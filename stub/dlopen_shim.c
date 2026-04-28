@@ -132,7 +132,10 @@ static int install_closure_member(const char *name, size_t nlen, int fd) {
     }
 
     char lpath[512], target[64];
-    snprintf(lpath, sizeof(lpath), "%s/%s", g_symlink_dir, name);
+    /* Bound %s widths so fortify can prove no truncation — see
+     * preload_closure_deps for the rationale.  Output max:
+     * 255 + 1 + 255 + 1 = 512 bytes, fits exactly. */
+    snprintf(lpath, sizeof(lpath), "%.255s/%.255s", g_symlink_dir, name);
     snprintf(target, sizeof(target), "/proc/self/fd/%d", fd);
 
     /* Overwrite any stale symlink that points at a closed fd (e.g., a
@@ -251,7 +254,13 @@ static void preload_closure_deps(const char *base, const char (*new_names)[DC_MA
             continue;
         }
         char spath[512];
-        snprintf(spath, sizeof(spath), "%s/%s", g_symlink_dir, new_names[i]);
+        /* Bound each %s to 255 chars so glibc's _FORTIFY_SOURCE can
+         * prove the output fits.  Both inputs are declared as
+         * char[256] (NUL-terminated), but the compiler treats %s as
+         * potentially unbounded and warns regardless of buffer size.
+         * %.255s caps the directive itself: 255 + 1 + 255 + 1 = 512,
+         * which fits exactly. */
+        snprintf(spath, sizeof(spath), "%.255s/%.255s", g_symlink_dir, new_names[i]);
         void *h = real_dlopen_fn(spath, RTLD_LAZY | RTLD_GLOBAL);
         if (!h) {
             const char *err = dlerror();
@@ -385,9 +394,10 @@ void *dlopen(const char *filename, int flags)
     pthread_mutex_unlock(&g_lock);
 
     /* Resolve via the symlink dir so glibc sees a stable on-disk path
-     * and its DT_NEEDED search finds sibling encrypted deps too. */
+     * and its DT_NEEDED search finds sibling encrypted deps too.
+     * %.255s bounds each directive — see preload_closure_deps. */
     char spath[512];
-    snprintf(spath, sizeof(spath), "%s/%s", g_symlink_dir, base);
+    snprintf(spath, sizeof(spath), "%.255s/%.255s", g_symlink_dir, base);
     void *h = real_dlopen_fn(spath, flags);
     if (!h) {
         const char *err = dlerror();
