@@ -33,6 +33,7 @@ typedef int _aarch64_extend_shim_empty;
 
 #define _GNU_SOURCE
 #include "daemon_client.h"
+#include "obf.h"
 
 #include <dlfcn.h>
 #include <stdlib.h>
@@ -221,7 +222,7 @@ static const char *resolve_path(const char *base)
             memcpy(g_cache_names[g_cache_count], base, bl + 1);
             g_cache_fds[g_cache_count] = fd;
             snprintf(g_cache_paths[g_cache_count], FD_PATH_MAX,
-                     "/proc/self/fd/%d", fd);
+                     OBF(FMT_PROC_SELF_FD_D), fd);
             out = g_cache_paths[g_cache_count];
             g_cache_count++;
             stored = 1;
@@ -243,7 +244,7 @@ static const char *resolve_path(const char *base)
 __attribute__((constructor))
 static void init_aarch64_extend_shim(void)
 {
-    const char *logpath = getenv("ANTIREV_AARCH64_EXTEND_LOG");
+    const char *logpath = getenv(OBF(ENV_AARCH64_EXTEND_LOG));
     if (logpath && *logpath) {
         g_log = fopen(logpath, "w");
         if (g_log) setvbuf(g_log, NULL, _IOLBF, 0);
@@ -254,15 +255,15 @@ static void init_aarch64_extend_shim(void)
      * that merely inherited LD_PRELOAD see a normal path. */
     char exe_buf[256];
     ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
-                                 "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+                                 OBF(PATH_PROC_SELF_EXE), exe_buf, sizeof(exe_buf) - 1);
     int is_owner = 0;
     if (n > 0) {
         exe_buf[n] = '\0';
-        if (strstr(exe_buf, "memfd:") != NULL) is_owner = 1;
+        if (strstr(exe_buf, OBF(MEMFD_NEEDLE)) != NULL) is_owner = 1;
     }
     if (!is_owner) {
         /* QEMU fallback: trust ANTIREV_MAIN_FD's presence. */
-        if (getenv("ANTIREV_MAIN_FD")) is_owner = 1;
+        if (getenv(OBF(ENV_MAIN_FD))) is_owner = 1;
     }
     if (is_owner) g_owner_pid = getpid();
 
@@ -432,7 +433,7 @@ static const char *maybe_rewrite_elf_path(const char *pathname)
     if (!is_owner_process())     return NULL;
 
     /* Don't recurse on our own rewritten paths. */
-    if (strncmp(pathname, "/proc/self/fd/", 14) == 0) return NULL;
+    if (strncmp(pathname, OBF(PATH_PROC_SELF_FD_DIR), 14) == 0) return NULL;
 
     const char *base = strrchr(pathname, '/');
     base = base ? base + 1 : pathname;
@@ -665,7 +666,7 @@ FILE *popen(const char *command, const char *type)
         char names[32][64];
         int  n_names = 0;
         for (char **e = environ; *e && n_names < 32; e++) {
-            if (strncmp(*e, "ANTIREV_", 8) != 0) continue;
+            if (strncmp(*e, OBF(ENV_PREFIX_ANTIREV), 8) != 0) continue;
             const char *eq = strchr(*e, '=');
             size_t nlen = eq ? (size_t)(eq - *e) : strlen(*e);
             if (nlen >= sizeof(names[0])) continue;
@@ -674,7 +675,7 @@ FILE *popen(const char *command, const char *type)
             n_names++;
         }
         for (int i = 0; i < n_names; i++) unsetenv(names[i]);
-        unsetenv("LD_PRELOAD");
+        unsetenv(OBF(ENV_LD_PRELOAD));
 
         execl("/bin/sh", "sh", "-c", command, (char *)NULL);
         _exit(127);

@@ -13,6 +13,7 @@
 
 #define _GNU_SOURCE
 #include "daemon_client.h"
+#include "obf.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -61,15 +62,15 @@ void daemon_client_init(void)
     if (g_initialized) return;
     g_initialized = 1;
 
-    g_fd_map = getenv("ANTIREV_FD_MAP");
+    g_fd_map = getenv(OBF(ENV_FD_MAP));
 
-    const char *sock_str = getenv("ANTIREV_LIBD_SOCK");
+    const char *sock_str = getenv(OBF(ENV_LIBD_SOCK));
     if (sock_str) {
         int fd = atoi(sock_str);
         if (fd > 2) g_sock = fd;
     }
 
-    const char *enc = getenv("ANTIREV_ENC_LIBS");
+    const char *enc = getenv(OBF(ENV_ENC_LIBS));
     if (enc && *enc) {
         char *buf = strdup(enc);
         if (buf) {
@@ -128,7 +129,7 @@ int daemon_client_eager_lookup_path(const char *base, char *out_path, size_t out
 {
     int fd = daemon_client_eager_lookup_fd(base);
     if (fd < 0) return 0;
-    snprintf(out_path, out_sz, "/proc/self/fd/%d", fd);
+    snprintf(out_path, out_sz, OBF(FMT_PROC_SELF_FD_D), fd);
     return 1;
 }
 

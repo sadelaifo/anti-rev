@@ -76,9 +76,14 @@
 #include "antirev_shim_blob.h"
 #endif
 
+#include "obf.h"
+
 /* ------------------------------------------------------------------ */
 
-#define MAGIC        "ANTREV01"
+/* Magic bytes — decoded on use via the obfuscation layer.  Keeping the
+ * MAGIC_LEN as a separate compile-time constant lets the surrounding
+ * code stay unchanged where it sizes header buffers / offsets. */
+#define MAGIC        OBF(MAGIC_HEADER)
 #define MAGIC_LEN    8
 #define KEY_SIZE     32   /* AES-256 */
 #define IV_SIZE      12   /* GCM nonce */
@@ -885,7 +890,7 @@ static socklen_t make_sock_addr(struct sockaddr_un *addr,
     addr->sun_family = AF_UNIX;
     /* Abstract socket: sun_path[0] = '\0' (already zeroed), name follows */
     snprintf(addr->sun_path + 1, sizeof(addr->sun_path) - 1,
-             "antirev_%s", hex);
+             "%s%s", OBF(PREFIX_LOWER_ANTIREV), hex);
 
     explicit_bzero(&tmp, sizeof(tmp));
 
@@ -1373,14 +1378,14 @@ static void derive_daemon_path(const char *real_exe, char *out, size_t out_sz) {
         memcpy(out, real_exe, dirlen);
     }
 #if defined(__x86_64__) || defined(__i386__)
-    snprintf(out + dirlen, out_sz - dirlen, "/.antirev-libd-x86_64");
+    snprintf(out + dirlen, out_sz - dirlen, "%s", OBF(DAEMON_BIN_NAME_X86));
 #elif defined(__aarch64__)
-    snprintf(out + dirlen, out_sz - dirlen, "/.antirev-libd-aarch64");
+    snprintf(out + dirlen, out_sz - dirlen, "%s", OBF(DAEMON_BIN_NAME_ARM));
 #else
-    snprintf(out + dirlen, out_sz - dirlen, "/.antirev-libd");
+    snprintf(out + dirlen, out_sz - dirlen, "%s", OBF(DAEMON_BIN_NAME));
 #endif
     if (access(out, X_OK) != 0)
-        snprintf(out + dirlen, out_sz - dirlen, "/.antirev-libd");
+        snprintf(out + dirlen, out_sz - dirlen, "%s", OBF(DAEMON_BIN_NAME));
 }
 
 /* Fork the daemon binary if it's on disk; parent waits for the daemon
@@ -1573,17 +1578,22 @@ typedef struct {
  * cause a cascading double-load of the shims. */
 static void filter_inherited_ld_preload(char *const *envp, int envc, char *buf, size_t buf_sz) {
     buf[0] = '\0';
+    const char *ld_preload_name = OBF(ENV_LD_PRELOAD);
+    size_t ld_preload_nlen = strlen(ld_preload_name);
+    const char *fd_dir = OBF(PATH_PROC_SELF_FD_DIR);
+    size_t fd_dir_len = strlen(fd_dir);
     for (int j = 0; j < envc; j++) {
-        if (strncmp(envp[j], "LD_PRELOAD=", 11) != 0)
+        if (strncmp(envp[j], ld_preload_name, ld_preload_nlen) != 0
+            || envp[j][ld_preload_nlen] != '=')
             continue;
-        const char *src = envp[j] + 11;
+        const char *src = envp[j] + ld_preload_nlen + 1;
         size_t off = 0;
         while (*src) {
             const char *end = src;
             while (*end && *end != ':')
                 end++;
             size_t tlen = (size_t) (end - src);
-            if (tlen > 0 && strncmp(src, "/proc/self/fd/", 14) != 0) {
+            if (tlen > 0 && strncmp(src, fd_dir, fd_dir_len) != 0) {
                 if (off > 0 && off + 1 < buf_sz)
                     buf[off++] = ':';
                 if (off + tlen < buf_sz) {
@@ -1598,27 +1608,31 @@ static void filter_inherited_ld_preload(char *const *envp, int envc, char *buf, 
     }
 }
 
-/* Look up an existing env var's value in the envp array, returning
- * the pointer past the "NAME=" prefix, or NULL if not found. */
-static const char *find_env_value(char *const *envp, int envc, const char *name_eq, size_t name_eq_len) {
+/* Look up an existing env var's value in the envp array.  `name` is the
+ * bare variable name (no '='); the function appends the '=' check
+ * itself so callers don't need to keep a "NAME=" literal in .rodata. */
+static const char *find_env_value(char *const *envp, int envc, const char *name) {
+    size_t nlen = strlen(name);
     for (int j = 0; j < envc; j++) {
-        if (strncmp(envp[j], name_eq, name_eq_len) == 0)
-            return envp[j] + name_eq_len;
+        if (strncmp(envp[j], name, nlen) == 0 && envp[j][nlen] == '=')
+            return envp[j] + nlen + 1;
     }
     return NULL;
 }
 
 /* "LD_LIBRARY_PATH=<link_dir>[:<existing>]", heap-allocated. */
 static char *build_ld_library_path(char *const *envp, int envc, const char *link_dir) {
-    const char *existing = find_env_value(envp, envc, "LD_LIBRARY_PATH=", 16);
-    size_t need = 17 + strlen(link_dir) + (existing ? 1 + strlen(existing) : 0);
+    const char *libpath_name = OBF(ENV_LD_LIBRARY_PATH);
+    const char *existing = find_env_value(envp, envc, libpath_name);
+    size_t need = strlen(libpath_name) + 2 + strlen(link_dir)
+                + (existing ? 1 + strlen(existing) : 0);
     char *out = malloc(need);
     if (!out)
         return NULL;
     if (existing && *existing)
-        snprintf(out, need, "LD_LIBRARY_PATH=%s:%s", link_dir, existing);
+        snprintf(out, need, "%s=%s:%s", libpath_name, link_dir, existing);
     else
-        snprintf(out, need, "LD_LIBRARY_PATH=%s", link_dir);
+        snprintf(out, need, "%s=%s", libpath_name, link_dir);
     return out;
 }
 
@@ -1647,10 +1661,13 @@ static char *build_ld_preload(int antirev_shim_fd, int compat_preload, int n_dt_
     char *out = malloc(need);
     if (!out)
         return NULL;
-    int off = snprintf(out, need, "LD_PRELOAD=/proc/self/fd/%d", antirev_shim_fd);
+    int off = snprintf(out, need, "%s=%s%d",
+                       OBF(ENV_LD_PRELOAD), OBF(PATH_PROC_SELF_FD_DIR),
+                       antirev_shim_fd);
     if (compat_preload) {
         for (int j = 0; j < n_dt_needed; j++)
-            off += snprintf(out + off, need - (size_t) off, ":/proc/self/fd/%d", dt_needed_fds[j]);
+            off += snprintf(out + off, need - (size_t) off, ":%s%d",
+                            OBF(PATH_PROC_SELF_FD_DIR), dt_needed_fds[j]);
     }
     if (existing_preload)
         snprintf(out + off, need - (size_t) off, ":%s", existing_preload);
@@ -1663,7 +1680,7 @@ static char *build_antirev_fd_map(int n_fdmap, const char (*fdmap_names)[MAX_NAM
     char *out = malloc(need);
     if (!out)
         return NULL;
-    int off = snprintf(out, need, "ANTIREV_FD_MAP=");
+    int off = snprintf(out, need, "%s=", OBF(ENV_FD_MAP));
     for (int j = 0; j < n_fdmap; j++) {
         if (j > 0)
             out[off++] = ',';
@@ -1680,7 +1697,7 @@ static char *build_enc_libs(int n_all_enc, const char (*all_enc_names)[MAX_NAME 
     char *out = malloc(need);
     if (!out)
         return NULL;
-    int off = snprintf(out, need, "ANTIREV_ENC_LIBS=");
+    int off = snprintf(out, need, "%s=", OBF(ENV_ENC_LIBS));
     for (int j = 0; j < n_all_enc; j++) {
         if (j > 0)
             out[off++] = ',';
@@ -1696,12 +1713,12 @@ static void build_lazy_env(int daemon_sd, const char *link_dir_ptr, const char *
                            const char (*all_enc_names)[MAX_NAME + 1], char **out_sock, char **out_sym, char **out_enc) {
     *out_sock = malloc(48);
     if (*out_sock)
-        snprintf(*out_sock, 48, "ANTIREV_LIBD_SOCK=%d", daemon_sd);
+        snprintf(*out_sock, 48, "%s=%d", OBF(ENV_LIBD_SOCK), daemon_sd);
 
     if (link_dir_ptr) {
         *out_sym = malloc(64);
         if (*out_sym)
-            snprintf(*out_sym, 64, "ANTIREV_SYMLINK_DIR=%s", link_dir);
+            snprintf(*out_sym, 64, "%s=%s", OBF(ENV_SYMLINK_DIR), link_dir);
     } else {
         *out_sym = NULL;
     }
@@ -1718,7 +1735,7 @@ static char *build_close_fds(int n_dt_needed, const int *dt_needed_fds) {
     char *out = malloc(need);
     if (!out)
         return NULL;
-    int off = snprintf(out, need, "ANTIREV_CLOSE_FDS=");
+    int off = snprintf(out, need, "%s=", OBF(ENV_CLOSE_FDS));
     for (int j = 0; j < n_dt_needed; j++) {
         if (j > 0)
             out[off++] = ',';
@@ -1728,24 +1745,27 @@ static char *build_close_fds(int n_dt_needed, const int *dt_needed_fds) {
 }
 
 /* True for env entries we're about to rewrite — skipped when copying
- * the inherited env forward. */
+ * the inherited env forward.  Names come from OBF() so the variable
+ * names never appear as "FOO=" literals in .rodata. */
 static int env_is_antirev_managed(const char *e) {
-    static const char *const prefixes[] = {
-            "LD_PRELOAD=",
-            "LD_LIBRARY_PATH=",
-            "ANTIREV_REAL_EXE=",
-            "ANTIREV_MAIN_FD=",
-            "ANTIREV_FD_MAP=",
-            "ANTIREV_CLOSE_FDS=",
-            "ANTIREV_LIBD_SOCK=",
-            "ANTIREV_ENC_LIBS=",
-            "ANTIREV_SYMLINK_DIR=",
-            "ANTIREV_NO_PRELOAD=",
+    const char *names[] = {
+            OBF(ENV_LD_PRELOAD),
+            OBF(ENV_LD_LIBRARY_PATH),
+            OBF(ENV_REAL_EXE),
+            OBF(ENV_MAIN_FD),
+            OBF(ENV_FD_MAP),
+            OBF(ENV_CLOSE_FDS),
+            OBF(ENV_LIBD_SOCK),
+            OBF(ENV_ENC_LIBS),
+            OBF(ENV_SYMLINK_DIR),
+            OBF(ENV_NO_PRELOAD),
             NULL,
     };
-    for (int i = 0; prefixes[i]; i++)
-        if (strncmp(e, prefixes[i], strlen(prefixes[i])) == 0)
+    for (int i = 0; names[i]; i++) {
+        size_t nl = strlen(names[i]);
+        if (strncmp(e, names[i], nl) == 0 && e[nl] == '=')
             return 1;
+    }
     return 0;
 }
 
@@ -1781,8 +1801,8 @@ static char **build_exec_env(const exec_env_cfg_t *cfg) {
         free(out);
         return NULL;
     }
-    snprintf(real_exe_entry, 4096 + 32, "ANTIREV_REAL_EXE=%s", cfg->real_exe);
-    snprintf(main_fd_entry, 32, "ANTIREV_MAIN_FD=%d", cfg->main_fd);
+    snprintf(real_exe_entry, 4096 + 32, "%s=%s", OBF(ENV_REAL_EXE), cfg->real_exe);
+    snprintf(main_fd_entry, 32, "%s=%d", OBF(ENV_MAIN_FD), cfg->main_fd);
 
     int compat_preload = !cfg->has_needed_section && cfg->nlibs > 0;
     char *ld_preload_entry = build_ld_preload(cfg->antirev_shim_fd, compat_preload,
@@ -1806,7 +1826,7 @@ static char **build_exec_env(const exec_env_cfg_t *cfg) {
     if (!symlink_dir && cfg->link_dir_ptr) {
         symlink_dir = malloc(64);
         if (symlink_dir)
-            snprintf(symlink_dir, 64, "ANTIREV_SYMLINK_DIR=%s", cfg->link_dir);
+            snprintf(symlink_dir, 64, "%s=%s", OBF(ENV_SYMLINK_DIR), cfg->link_dir);
     }
 
     char *close_fds = (cfg->has_needed_section && cfg->n_dt_needed > 0)
@@ -1834,8 +1854,13 @@ static char **build_exec_env(const exec_env_cfg_t *cfg) {
         out[ei++] = enc_libs;
     if (symlink_dir)
         out[ei++] = symlink_dir;
-    if (force_no_preload)
-        out[ei++] = "ANTIREV_NO_PRELOAD=1";
+    char *no_preload_entry = NULL;
+    if (force_no_preload) {
+        no_preload_entry = malloc(64);
+        if (no_preload_entry)
+            snprintf(no_preload_entry, 64, "%s=1", OBF(ENV_NO_PRELOAD));
+        out[ei++] = no_preload_entry;
+    }
     out[ei] = NULL;
     return out;
 }
@@ -1863,14 +1888,16 @@ static void sweep_dead_symlink_dirs(void) {
     DIR *dp = opendir("/tmp");
     if (!dp) return;
 
+    const char *anti_prefix = OBF(PREFIX_LOWER_ANTIREV);
+    size_t anti_prefix_len = strlen(anti_prefix);
     struct dirent *de;
     while ((de = readdir(dp)) != NULL) {
-        if (strncmp(de->d_name, "antirev_", 8) != 0) continue;
+        if (strncmp(de->d_name, anti_prefix, anti_prefix_len) != 0) continue;
 
         /* Parse "antirev_<pid>_<rand>" — accept the legacy
          * "antirev_<rand>" form too by skipping it (no PID = can't
          * decide ownership safely). */
-        const char *p = de->d_name + 8;
+        const char *p = de->d_name + anti_prefix_len;
         char *endp;
         long pid = strtol(p, &endp, 10);
         if (endp == p || *endp != '_' || pid <= 0) continue;
@@ -1905,10 +1932,11 @@ static void sweep_dead_symlink_dirs(void) {
     closedir(dp);
 }
 
-/* Scan /tmp/antirev-deps.log-style graph dump so it's reachable when
- * the daemon's stderr is closed (e.g., launched from sysmgr). */
+/* Daemon graph dump path — kept generic so it doesn't leak via `strings`.
+ * Only relevant for debugging; production logs land in the daemon's
+ * stderr / journal. */
 static void dump_deps_graph_log(const char (*lib_names)[MAX_NAME + 1], int nlibs) {
-    FILE *lf = fopen("/tmp/antirev-deps.log", "w");
+    FILE *lf = fopen("/tmp/.dl-graph.log", "w");
     if (!lf)
         return;
     fprintf(lf, "# antirev deps graph (%d libs)\n", nlibs);
@@ -2225,7 +2253,7 @@ static void exec_target(int main_fd, char *const *argv, char **new_env, const ch
         orig_argc++;
 
     char fd_path[32];
-    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", main_fd);
+    snprintf(fd_path, sizeof(fd_path), OBF(FMT_PROC_SELF_FD_D), main_fd);
 
     char **qemu_argv = build_qemu_argv(binname, fd_path, argv, orig_argc);
     if (qemu_argv) {
@@ -2255,14 +2283,14 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     char real_exe[4096];
     {
         ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
-                                     "/proc/self/exe", real_exe, sizeof(real_exe) - 1);
-        if (n <= 0) { perror("readlink /proc/self/exe"); return 1; }
+                                     OBF(PATH_PROC_SELF_EXE), real_exe, sizeof(real_exe) - 1);
+        if (n <= 0) { perror("readlink"); return 1; }
         real_exe[n] = '\0';
     }
 
     /* 2. Open /proc/self/exe and read the 48-byte trailer */
-    int self = open("/proc/self/exe", O_RDONLY);
-    if (self < 0) { perror("open /proc/self/exe"); return 1; }
+    int self = open(OBF(PATH_PROC_SELF_EXE), O_RDONLY);
+    if (self < 0) { perror("open"); return 1; }
 
     off_t fsize = lseek(self, 0, SEEK_END);
     if (fsize < 48) {
@@ -2438,13 +2466,13 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * / realpath / getauxval …) and the dlopen interceptor — one memfd,
      * one LD_PRELOAD entry.  The aarch64 extend shim stays separate and
      * is materialised below only when building for __aarch64__. */
-    int antirev_shim_fd = make_memfd("antirev_shim.so");
+    int antirev_shim_fd = make_memfd(OBF(SHIM_MEMFD_NAME));
     if (antirev_shim_fd < 0)
         return 1;
     if (write_chunk(antirev_shim_fd, antirev_shim_blob, antirev_shim_blob_len) != 0)
         return 1;
     if (lseek(antirev_shim_fd, 0, SEEK_SET) < 0) {
-        perror("lseek antirev_shim");
+        perror("lseek");
         return 1;
     }
 
@@ -2524,14 +2552,15 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * that exe_shim's atexit handler can't.  mkdtemp replaces the
      * trailing XXXXXX with random chars and chmods the dir to 0700. */
     char link_dir[64];
-    snprintf(link_dir, sizeof(link_dir), "/tmp/antirev_%d_XXXXXX", (int)getpid());
+    snprintf(link_dir, sizeof(link_dir), "%s%d_XXXXXX",
+             OBF(PREFIX_SYMLINK_DIR), (int)getpid());
     char *link_dir_ptr = mkdtemp(link_dir);
     if (link_dir_ptr) {
         for (int j = 0; j < n_dt_needed; j++) {
             char lpath[sizeof(link_dir) + MAX_NAME + 2];
             char target[64];
             snprintf(lpath, sizeof(lpath), "%s/%s", link_dir, dt_needed_names[j]);
-            snprintf(target, sizeof(target), "/proc/self/fd/%d", dt_needed_fds[j]);
+            snprintf(target, sizeof(target), OBF(FMT_PROC_SELF_FD_D), dt_needed_fds[j]);
             if (symlink(target, lpath) < 0)
                 perror("[antirev] symlink");
         }
@@ -2539,7 +2568,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             char lpath[sizeof(link_dir) + MAX_NAME + 2];
             char target[64];
             snprintf(lpath, sizeof(lpath), "%s/%s", link_dir, fdmap_names[j]);
-            snprintf(target, sizeof(target), "/proc/self/fd/%d", fdmap_fds[j]);
+            snprintf(target, sizeof(target), OBF(FMT_PROC_SELF_FD_D), fdmap_fds[j]);
             if (symlink(target, lpath) < 0)
                 perror("[antirev] symlink");
         }

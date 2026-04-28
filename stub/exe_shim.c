@@ -36,6 +36,8 @@
 
 #include <dlfcn.h>
 
+#include "obf.h"
+
 /* glibc globals — declared in <errno.h> with _GNU_SOURCE */
 extern char *program_invocation_name;
 extern char *program_invocation_short_name;
@@ -72,13 +74,13 @@ static int is_owner_process(void)
     /* Constructor hasn't decided yet — probe /proc/self/exe on the fly.
      * Required when DT_NEEDED libs have C++ static initializers that
      * call readlink/realpath/getauxval before restore_identity() runs. */
-    if (!getenv("ANTIREV_REAL_EXE"))
+    if (!getenv(OBF(ENV_REAL_EXE)))
         return 0;
     char exe_buf[256];
-    ssize_t n = (ssize_t) syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    ssize_t n = (ssize_t) syscall(SYS_readlinkat, AT_FDCWD, OBF(PATH_PROC_SELF_EXE), exe_buf, sizeof(exe_buf) - 1);
     if (n > 0) {
         exe_buf[n] = '\0';
-        if (strstr(exe_buf, "memfd:") != NULL) {
+        if (strstr(exe_buf, OBF(MEMFD_NEEDLE)) != NULL) {
             g_owner_pid = getpid();
             g_owner_checked = 1;
             return 1;
@@ -179,22 +181,22 @@ static void strip_env_path_entries(const char *varname, const char *prefix) {
 static int detect_owner(void) {
     int is_owner = 0;
     char exe_buf[256];
-    ssize_t n = (ssize_t) syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    ssize_t n = (ssize_t) syscall(SYS_readlinkat, AT_FDCWD, OBF(PATH_PROC_SELF_EXE), exe_buf, sizeof(exe_buf) - 1);
     if (n > 0) {
         exe_buf[n] = '\0';
-        if (strstr(exe_buf, "memfd:") != NULL)
+        if (strstr(exe_buf, OBF(MEMFD_NEEDLE)) != NULL)
             is_owner = 1;
     }
 
     if (!is_owner) {
-        const char *main_fd_str = getenv("ANTIREV_MAIN_FD");
+        const char *main_fd_str = getenv(OBF(ENV_MAIN_FD));
         if (main_fd_str) {
             char fd_link[64], fd_target[256];
-            snprintf(fd_link, sizeof(fd_link), "/proc/self/fd/%s", main_fd_str);
+            snprintf(fd_link, sizeof(fd_link), OBF(FMT_PROC_SELF_FD_S), main_fd_str);
             ssize_t fn = (ssize_t) syscall(SYS_readlinkat, AT_FDCWD, fd_link, fd_target, sizeof(fd_target) - 1);
             if (fn > 0) {
                 fd_target[fn] = '\0';
-                if (strstr(fd_target, "memfd:") != NULL)
+                if (strstr(fd_target, OBF(MEMFD_NEEDLE)) != NULL)
                     is_owner = 1;
             }
             /* QEMU: readlinkat didn't confirm "memfd:" — trust presence alone. */
@@ -203,7 +205,7 @@ static int detect_owner(void) {
         }
     }
 
-    unsetenv("ANTIREV_MAIN_FD");
+    unsetenv(OBF(ENV_MAIN_FD));
     return is_owner;
 }
 
@@ -212,10 +214,10 @@ static int detect_owner(void) {
  * redirect dlopen calls; antirev entries on LD_PRELOAD /
  * LD_LIBRARY_PATH would keep our shim fds + symlink dir visible. */
 static void scrub_nonowner_env(void) {
-    unsetenv("ANTIREV_FD_MAP");
-    unsetenv("ANTIREV_REAL_EXE");
-    strip_env_path_entries("LD_PRELOAD", "/proc/self/fd/");
-    strip_env_path_entries("LD_LIBRARY_PATH", "/tmp/antirev_");
+    unsetenv(OBF(ENV_FD_MAP));
+    unsetenv(OBF(ENV_REAL_EXE));
+    strip_env_path_entries(OBF(ENV_LD_PRELOAD), OBF(PATH_PROC_SELF_FD_DIR));
+    strip_env_path_entries(OBF(ENV_LD_LIBRARY_PATH), OBF(PREFIX_SYMLINK_DIR));
 }
 
 /* Close DT_NEEDED memfds now that glibc's dynamic linker has finished
@@ -228,7 +230,7 @@ static void scrub_nonowner_env(void) {
  * Set by stub.c only on the symlink-dir code path (has_needed_section).
  * Unset immediately so fork()ed children don't misinterpret stale fds. */
 static void close_dt_needed_fds(void) {
-    const char *close_list = getenv("ANTIREV_CLOSE_FDS");
+    const char *close_list = getenv(OBF(ENV_CLOSE_FDS));
     if (close_list && *close_list) {
         const char *p = close_list;
         while (*p) {
@@ -243,7 +245,7 @@ static void close_dt_needed_fds(void) {
             p = end + 1;
         }
     }
-    unsetenv("ANTIREV_CLOSE_FDS");
+    unsetenv(OBF(ENV_CLOSE_FDS));
 }
 
 /* Restore /proc/self/comm (ps -o comm) and the glibc
@@ -314,7 +316,7 @@ static void cleanup_symlink_dir(void)
  * Idempotent — safe to call from both arch-specific ctor branches. */
 static void register_symlink_dir_cleanup(void)
 {
-    const char *dir = getenv("ANTIREV_SYMLINK_DIR");
+    const char *dir = getenv(OBF(ENV_SYMLINK_DIR));
     if (!dir || !*dir) return;
     if (g_symlink_dir[0]) return; /* already registered */
     snprintf(g_symlink_dir, sizeof(g_symlink_dir), "%s", dir);
@@ -325,7 +327,7 @@ static void register_symlink_dir_cleanup(void)
 __attribute__((constructor)) static void restore_identity(void) {
     resolve_libc_realpath();
 
-    const char *real = getenv("ANTIREV_REAL_EXE");
+    const char *real = getenv(OBF(ENV_REAL_EXE));
     if (!real)
         return;
 
@@ -343,9 +345,9 @@ __attribute__((constructor)) static void restore_identity(void) {
     register_symlink_dir_cleanup();
 
     /* aarch64-only owner scrub — see comment above. */
-    strip_env_path_entries("LD_PRELOAD", "/proc/self/fd/");
-    strip_env_path_entries("LD_LIBRARY_PATH", "/tmp/antirev_");
-    unsetenv("ANTIREV_FD_MAP");
+    strip_env_path_entries(OBF(ENV_LD_PRELOAD), OBF(PATH_PROC_SELF_FD_DIR));
+    strip_env_path_entries(OBF(ENV_LD_LIBRARY_PATH), OBF(PREFIX_SYMLINK_DIR));
+    unsetenv(OBF(ENV_FD_MAP));
 
     restore_process_name(real);
 }
@@ -353,7 +355,7 @@ __attribute__((constructor)) static void restore_identity(void) {
 __attribute__((constructor)) static void restore_identity(void) {
     resolve_libc_realpath();
 
-    const char *real = getenv("ANTIREV_REAL_EXE");
+    const char *real = getenv(OBF(ENV_REAL_EXE));
     if (!real)
         return;
 
@@ -380,7 +382,7 @@ static int is_self_exe(const char *path)
 {
     if (!is_owner_process())
         return 0;
-    if (strcmp(path, "/proc/self/exe") == 0)
+    if (strcmp(path, OBF(PATH_PROC_SELF_EXE)) == 0)
         return 1;
     char pidpath[64];
     snprintf(pidpath, sizeof(pidpath), "/proc/%d/exe", (int)getpid());
@@ -395,7 +397,7 @@ __attribute__((visibility("default")))
 ssize_t readlink(const char *path, char *buf, size_t bufsiz)
 {
     if (is_self_exe(path)) {
-        const char *real = getenv("ANTIREV_REAL_EXE");
+        const char *real = getenv(OBF(ENV_REAL_EXE));
         if (real) {
             size_t len = strlen(real);
             if (len > bufsiz) len = bufsiz;
@@ -410,7 +412,7 @@ __attribute__((visibility("default")))
 ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)
 {
     if (is_self_exe(path)) {
-        const char *real = getenv("ANTIREV_REAL_EXE");
+        const char *real = getenv(OBF(ENV_REAL_EXE));
         if (real) {
             size_t len = strlen(real);
             if (len > bufsiz) len = bufsiz;
@@ -447,7 +449,7 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf,
 
 static char *fill_real_exe(char *resolved)
 {
-    const char *real = getenv("ANTIREV_REAL_EXE");
+    const char *real = getenv(OBF(ENV_REAL_EXE));
     if (!real)
         return NULL;
     size_t len = strlen(real);
@@ -492,7 +494,7 @@ __attribute__((visibility("default")))
 char *__realpath_chk(const char *path, char *resolved, size_t resolved_len)
 {
     if (path && is_self_exe(path)) {
-        const char *real = getenv("ANTIREV_REAL_EXE");
+        const char *real = getenv(OBF(ENV_REAL_EXE));
         if (real && resolved && strlen(real) >= resolved_len)
             return NULL;
         return fill_real_exe(resolved);
@@ -515,13 +517,13 @@ __attribute__((visibility("default")))
 unsigned long getauxval(unsigned long type)
 {
     if (type == AT_EXECFN && is_owner_process()) {
-        const char *real = getenv("ANTIREV_REAL_EXE");
+        const char *real = getenv(OBF(ENV_REAL_EXE));
         if (real)
             return (unsigned long)real;
     }
 
     /* Fallthrough: read /proc/self/auxv via raw syscall */
-    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/auxv", O_RDONLY);
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, OBF(PATH_PROC_SELF_AUXV), O_RDONLY);
     if (fd < 0)
         return 0;
 

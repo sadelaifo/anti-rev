@@ -11,6 +11,49 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # inspection, goto-definition, and completion didn't work on them.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# ── Stub-protection Layer 1: symbol-table hygiene ─────────────────────
+# Compile/link flags applied to the stub executable and antirev_shim DSO
+# to strip every project symbol name that doesn't have to be exported,
+# remove unwind tables / build-id / dead sections, and (for the DSO)
+# block static-linked helper symbols from leaking into .dynsym.  Source
+# files are already audited: every helper is `static`, every interceptor
+# is explicitly `__attribute__((visibility("default")))`.
+#
+# These are listed once and applied to both targets below.  See CLAUDE.md
+# "Stub-protection roadmap" for context and the rest of the plan.
+set(ANTIREV_HARDEN_COMPILE_OPTS
+    -fvisibility=hidden
+    -fno-asynchronous-unwind-tables
+    -fno-unwind-tables
+    -fdata-sections
+    -ffunction-sections
+)
+set(ANTIREV_HARDEN_LINK_OPTS
+    "-Wl,--gc-sections"
+    "-Wl,--strip-all"
+    "-Wl,--build-id=none"
+)
+set(ANTIREV_HARDEN_DSO_LINK_OPTS
+    "-Wl,--exclude-libs,ALL"
+    "-Wl,-Bsymbolic"
+)
+
+# ── Stub-protection Layer 2: string obfuscation ───────────────────────
+# tools/gen_obf.py emits a header with XOR-encoded byte arrays + lengths
+# for every sensitive string in the project.  stub/obf.h includes that
+# header and provides the OBF(NAME) macro callers use in place of the
+# raw literal.  Runs once per CMake configure step (or whenever
+# gen_obf.py changes), so each build gets a fresh XOR key.
+set(ANTIREV_OBF_STRINGS_HEADER "${CMAKE_BINARY_DIR}/obf_strings_data.h")
+add_custom_command(
+    OUTPUT  "${ANTIREV_OBF_STRINGS_HEADER}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/tools/gen_obf.py"
+                    "${ANTIREV_OBF_STRINGS_HEADER}"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tools/gen_obf.py"
+    COMMENT "Generating obfuscated-string header"
+)
+add_custom_target(obf_strings_data_h DEPENDS "${ANTIREV_OBF_STRINGS_HEADER}")
+
 # ── Native-only build ────────────────────────────────────────────────
 # Build only for the host architecture: aarch64 host → aarch64, x86_64
 # host → x86_64.  Cross-compilation is not supported.
@@ -81,13 +124,36 @@ set_target_properties(antirev_shim PROPERTIES
     PREFIX ""                             # no "lib" prefix
     POSITION_INDEPENDENT_CODE ON
     C_VISIBILITY_PRESET hidden
+    NO_SONAME ON                          # no DT_SONAME entry — the DSO is
+                                          # loaded by path (memfd / preload)
+                                          # so the soname is dead weight that
+                                          # only leaks the file basename
 )
-target_compile_options(antirev_shim PRIVATE -O2)
-target_include_directories(antirev_shim PRIVATE "${CMAKE_SOURCE_DIR}/stub")
+target_compile_options(antirev_shim PRIVATE -O2 ${ANTIREV_HARDEN_COMPILE_OPTS})
+target_link_options(antirev_shim PRIVATE
+    ${ANTIREV_HARDEN_LINK_OPTS}
+    ${ANTIREV_HARDEN_DSO_LINK_OPTS}
+)
+target_include_directories(antirev_shim PRIVATE
+    "${CMAKE_SOURCE_DIR}/stub"
+    "${CMAKE_BINARY_DIR}"  # generated obf_strings_data.h
+)
+add_dependencies(antirev_shim obf_strings_data_h)
 if(TARGET_ARCH STREQUAL "aarch64")
     target_compile_options(antirev_shim PRIVATE -march=armv8-a+crypto)
 endif()
 target_link_libraries(antirev_shim PRIVATE dl pthread)
+
+# Strip the shim DSO post-link (matches the stub's strip step).  --strip-all
+# at link time covers most of it, but a separate strip pass also removes
+# the .symtab section explicitly on toolchains where ld leaves it, plus
+# the toolchain-version banner in .comment.
+add_custom_command(TARGET antirev_shim POST_BUILD
+    COMMAND ${CMAKE_STRIP} --strip-all --strip-unneeded
+            --remove-section=.comment
+            $<TARGET_FILE:antirev_shim>
+    COMMENT "Stripping $<TARGET_FILE_NAME:antirev_shim>"
+)
 
 # stub.c #includes this file — aarch64 looks for the suffixed name,
 # x86 looks for the plain one.  Keep both conventions.
@@ -108,7 +174,9 @@ target_include_directories(${STUB_NAME} PRIVATE
     "${CMAKE_BINARY_DIR}"        # generated blob headers
     "${CMAKE_SOURCE_DIR}/stub"   # crypto.h
 )
-target_compile_options(${STUB_NAME} PRIVATE -O2 -Wall -Wextra)
+target_compile_options(${STUB_NAME} PRIVATE -O2 -Wall -Wextra
+    ${ANTIREV_HARDEN_COMPILE_OPTS})
+target_link_options(${STUB_NAME} PRIVATE ${ANTIREV_HARDEN_LINK_OPTS})
 target_link_libraries(${STUB_NAME} PRIVATE pthread)
 
 if(TARGET_ARCH STREQUAL "aarch64")
@@ -124,16 +192,20 @@ endif()
 # stub.c #includes the generated blob headers — the object file can't
 # compile until they exist.  Declare both as OBJECT_DEPENDS and wire a
 # phony target dependency so parallel builds stay correct.
-set(STUB_BLOB_HEADERS "${ANTIREV_SHIM_BLOB_H}")
+set(STUB_BLOB_HEADERS "${ANTIREV_SHIM_BLOB_H}" "${ANTIREV_OBF_STRINGS_HEADER}")
 add_custom_target(stub_blob_headers DEPENDS ${STUB_BLOB_HEADERS})
 add_dependencies(${STUB_NAME} stub_blob_headers)
 set_source_files_properties(stub/stub.c PROPERTIES
     OBJECT_DEPENDS "${STUB_BLOB_HEADERS}"
 )
 
-# Match the old pipeline's artefact size — strip after link.
+# Match the old pipeline's artefact size — strip after link.  Also remove
+# the .comment section (toolchain-version banner) and any lingering
+# .symtab/.strtab leftover that --strip-all at link time didn't catch.
 add_custom_command(TARGET ${STUB_NAME} POST_BUILD
-    COMMAND ${CMAKE_STRIP} -s $<TARGET_FILE:${STUB_NAME}>
+    COMMAND ${CMAKE_STRIP} --strip-all --strip-unneeded
+            --remove-section=.comment
+            $<TARGET_FILE:${STUB_NAME}>
     COMMENT "Stripping $<TARGET_FILE_NAME:${STUB_NAME}>"
 )
 

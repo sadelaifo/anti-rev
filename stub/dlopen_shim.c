@@ -24,6 +24,7 @@
 
 #define _GNU_SOURCE
 #include "daemon_client.h"
+#include "obf.h"
 
 #include <dlfcn.h>
 #include <stdlib.h>
@@ -136,7 +137,7 @@ static int install_closure_member(const char *name, size_t nlen, int fd) {
      * preload_closure_deps for the rationale.  Output max:
      * 255 + 1 + 255 + 1 = 512 bytes, fits exactly. */
     snprintf(lpath, sizeof(lpath), "%.255s/%.255s", g_symlink_dir, name);
-    snprintf(target, sizeof(target), "/proc/self/fd/%d", fd);
+    snprintf(target, sizeof(target), OBF(FMT_PROC_SELF_FD_D), fd);
 
     /* Overwrite any stale symlink that points at a closed fd (e.g., a
      * DT_NEEDED lib whose stub-era fd was reaped by exe_shim).  The
@@ -307,7 +308,7 @@ static void fetch_closure(const char *base) {
     /* Escape hatch — see g_no_preload.  Skip the loop entirely when
      * the user wants plaintext-equivalent natural-load semantics. */
     if (g_no_preload) {
-        LOG("  preload skipped (ANTIREV_NO_PRELOAD=1)\n");
+        LOG("  preload skipped (%s=1)\n", OBF(ENV_NO_PRELOAD));
         return;
     }
 
@@ -321,7 +322,7 @@ static void fetch_closure(const char *base) {
 __attribute__((constructor))
 static void init_shim(void)
 {
-    const char *logpath = getenv("ANTIREV_DLOPEN_LOG");
+    const char *logpath = getenv(OBF(ENV_DLOPEN_LOG));
     if (logpath && *logpath) {
         g_log = fopen(logpath, "w");
         if (g_log) {
@@ -332,12 +333,12 @@ static void init_shim(void)
 
     daemon_client_init();
 
-    const char *dir = getenv("ANTIREV_SYMLINK_DIR");
+    const char *dir = getenv(OBF(ENV_SYMLINK_DIR));
     if (dir && *dir) {
         snprintf(g_symlink_dir, sizeof(g_symlink_dir), "%s", dir);
     }
 
-    const char *npe = getenv("ANTIREV_NO_PRELOAD");
+    const char *npe = getenv(OBF(ENV_NO_PRELOAD));
     if (npe && *npe && strcmp(npe, "0") != 0) {
         g_no_preload = 1;
     }
