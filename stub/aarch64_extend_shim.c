@@ -176,6 +176,12 @@ static const char *resolve_path(const char *base)
     }
 
     int fd = -1;
+    /* Track whether this fd is one we own (received fresh via SCM_RIGHTS
+     * from the daemon and must close ourselves on overflow) or one we
+     * merely looked up in ANTIREV_FD_MAP (still referenced by the env
+     * var and the stub's symlink dir — closing it would invalidate the
+     * /proc/self/fd/N path for every other consumer). */
+    int fd_is_owned = 0;
 
     /* Eager path first (stub pre-populated fd map). */
     if (daemon_client_have_fd_map()) {
@@ -186,7 +192,10 @@ static const char *resolve_path(const char *base)
     /* Daemon path. */
     if (fd < 0 && daemon_client_sock() >= 0 && daemon_client_is_encrypted(base)) {
         fd = fetch_one(base);
-        if (fd >= 0) LOG("  daemon-hit %s -> fd=%d\n", base, fd);
+        if (fd >= 0) {
+            LOG("  daemon-hit %s -> fd=%d\n", base, fd);
+            fd_is_owned = 1;
+        }
     }
 
     if (fd < 0) {
@@ -195,6 +204,7 @@ static const char *resolve_path(const char *base)
     }
 
     const char *out = NULL;
+    int stored = 0;
     if (g_cache_count < DC_MAX_FILES) {
         size_t bl = strlen(base);
         if (bl <= DC_MAX_NAME) {
@@ -204,7 +214,12 @@ static const char *resolve_path(const char *base)
                      "/proc/self/fd/%d", fd);
             out = g_cache_paths[g_cache_count];
             g_cache_count++;
+            stored = 1;
         }
+    }
+    if (!stored && fd_is_owned) {
+        LOG("  cache full / name too long, closing fresh daemon fd=%d\n", fd);
+        close(fd);
     }
 
     pthread_mutex_unlock(&g_lock);
