@@ -46,6 +46,7 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <elf.h>
 #include <dirent.h>
@@ -553,27 +554,42 @@ static int daemon_handle_request(int client, const int *lib_fds,
     return -1;
 }
 
-/* Single-threaded epoll-based daemon. Keeps per-client sockets alive
- * for as long as the client wants; same-uid check enforced at accept. */
-static void daemon_serve(int listen_fd, const int *lib_fds,
+/* Single-threaded epoll-based serve loop.  Runs as the daemon's worker
+ * thread (see run_daemon_forever); the main thread parks in sigwait()
+ * and writes to shutdown_efd on SIGTERM/INT/HUP/QUIT.  When the worker
+ * sees the eventfd fire it returns, the main thread then joins and
+ * tears down everything passed in.
+ *
+ * Same-uid check enforced at accept.  Client fds are tracked in a
+ * fixed-size table so they can all be closed when the loop exits. */
+#define DAEMON_MAX_CLIENTS 256
+
+static void daemon_serve(int listen_fd, int shutdown_efd, const int *lib_fds,
                          const char (*lib_names)[MAX_NAME + 1], int nlibs)
 {
     uid_t my_uid = getuid();
     signal(SIGPIPE, SIG_IGN);
-    close(STDIN_FILENO);
-    close(STDOUT_FILENO);
-    close(STDERR_FILENO);
 
     int ep = epoll_create1(EPOLL_CLOEXEC);
     if (ep < 0) return;
 
-    struct epoll_event lev;
-    lev.events  = EPOLLIN;
-    lev.data.fd = listen_fd;
-    if (epoll_ctl(ep, EPOLL_CTL_ADD, listen_fd, &lev) < 0) return;
+    struct epoll_event lev = { .events = EPOLLIN, .data.fd = listen_fd };
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, listen_fd, &lev) < 0) {
+        close(ep);
+        return;
+    }
+    struct epoll_event sev = { .events = EPOLLIN, .data.fd = shutdown_efd };
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, shutdown_efd, &sev) < 0) {
+        close(ep);
+        return;
+    }
 
+    int clients[DAEMON_MAX_CLIENTS];
+    for (int i = 0; i < DAEMON_MAX_CLIENTS; i++) clients[i] = -1;
+
+    int running = 1;
     struct epoll_event evs[32];
-    for (;;) {
+    while (running) {
         int n = epoll_wait(ep, evs, 32, -1);
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -582,6 +598,11 @@ static void daemon_serve(int listen_fd, const int *lib_fds,
 
         for (int i = 0; i < n; i++) {
             int fd = evs[i].data.fd;
+
+            if (fd == shutdown_efd) {
+                running = 0;
+                break;
+            }
 
             if (fd == listen_fd) {
                 int client = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
@@ -595,11 +616,15 @@ static void daemon_serve(int listen_fd, const int *lib_fds,
                     continue;
                 }
 
-                struct epoll_event cev;
-                cev.events  = EPOLLIN | EPOLLRDHUP;
-                cev.data.fd = client;
+                struct epoll_event cev = { .events = EPOLLIN | EPOLLRDHUP, .data.fd = client };
                 if (epoll_ctl(ep, EPOLL_CTL_ADD, client, &cev) < 0) {
                     close(client);
+                    continue;
+                }
+                /* Track for shutdown close.  Overflow → still served,
+                 * just not tracked; the kernel reaps it on _exit. */
+                for (int k = 0; k < DAEMON_MAX_CLIENTS; k++) {
+                    if (clients[k] == -1) { clients[k] = client; break; }
                 }
                 continue;
             }
@@ -607,6 +632,9 @@ static void daemon_serve(int listen_fd, const int *lib_fds,
             if (evs[i].events & (EPOLLHUP | EPOLLRDHUP | EPOLLERR)) {
                 epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
                 close(fd);
+                for (int k = 0; k < DAEMON_MAX_CLIENTS; k++) {
+                    if (clients[k] == fd) { clients[k] = -1; break; }
+                }
                 continue;
             }
 
@@ -614,10 +642,35 @@ static void daemon_serve(int listen_fd, const int *lib_fds,
                 if (daemon_handle_request(fd, lib_fds, lib_names, nlibs) < 0) {
                     epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
                     close(fd);
+                    for (int k = 0; k < DAEMON_MAX_CLIENTS; k++) {
+                        if (clients[k] == fd) { clients[k] = -1; break; }
+                    }
                 }
             }
         }
     }
+
+    /* Shutdown: close every fd we created internally.  listen_fd,
+     * shutdown_efd, and lib_fds belong to the caller and are torn
+     * down by the main thread after pthread_join. */
+    for (int i = 0; i < DAEMON_MAX_CLIENTS; i++)
+        if (clients[i] >= 0) close(clients[i]);
+    close(ep);
+}
+
+struct daemon_serve_args {
+    int listen_fd;
+    int shutdown_efd;
+    const int *lib_fds;
+    const char (*lib_names)[MAX_NAME + 1];
+    int nlibs;
+};
+
+static void *daemon_serve_thread(void *arg)
+{
+    struct daemon_serve_args *a = (struct daemon_serve_args *)arg;
+    daemon_serve(a->listen_fd, a->shutdown_efd, a->lib_fds, a->lib_names, a->nlibs);
+    return NULL;
 }
 
 /* Client-side helper: send OP_INIT (optionally with a filter list),
@@ -1761,8 +1814,16 @@ static void build_and_log_deps_graph(int *lib_fds, const char (*lib_names)[MAX_N
 }
 
 /* Run as Mode A: decrypt own libs, build deps graph, daemonize, serve
- * lib fds forever.  Returns to the caller only on failure (parent
- * daemonized process _exit's directly; child loops in daemon_serve). */
+ * lib fds with clean shutdown on SIGTERM/INT/HUP/QUIT.
+ *
+ * Daemon process layout (after the daemonising fork):
+ *   - Main thread: blocks shutdown signals and sigwait()s; on signal
+ *     it pokes the eventfd, joins the worker, closes resources, exits.
+ *   - Worker thread: runs the epoll serve loop.  Wakes when the
+ *     eventfd fires, returns from daemon_serve.
+ *
+ * Returns to the caller only on setup failure; on the success path
+ * the main thread _exit(0)s after the worker is joined. */
 static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, char (*lib_names)[MAX_NAME + 1],
                               int *nlibs) {
     raise_fd_limit();
@@ -1786,10 +1847,67 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
     if (pid > 0)
         _exit(0); /* parent: daemon is running */
 
-    /* child */
+    /* === child (long-lived daemon) === */
     setsid();
-    daemon_serve(listen_sd, lib_fds, lib_names, *nlibs);
-    _exit(0); /* unreachable */
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+
+    /* Block shutdown signals process-wide BEFORE creating the worker
+     * thread so the worker inherits the block.  If any signal stayed
+     * unblocked in the worker, the kernel could deliver it there
+     * instead of to our sigwait, leaving the main thread parked
+     * forever. */
+    sigset_t shutdown_sigs;
+    sigemptyset(&shutdown_sigs);
+    sigaddset(&shutdown_sigs, SIGTERM);
+    sigaddset(&shutdown_sigs, SIGINT);
+    sigaddset(&shutdown_sigs, SIGHUP);
+    sigaddset(&shutdown_sigs, SIGQUIT);
+    if (pthread_sigmask(SIG_BLOCK, &shutdown_sigs, NULL) != 0)
+        _exit(1);
+
+    int shutdown_efd = eventfd(0, EFD_CLOEXEC);
+    if (shutdown_efd < 0) {
+        close(listen_sd);
+        _exit(1);
+    }
+
+    struct daemon_serve_args args = {
+        .listen_fd    = listen_sd,
+        .shutdown_efd = shutdown_efd,
+        .lib_fds      = lib_fds,
+        .lib_names    = lib_names,
+        .nlibs        = *nlibs,
+    };
+
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, daemon_serve_thread, &args) != 0) {
+        close(shutdown_efd);
+        close(listen_sd);
+        _exit(1);
+    }
+
+    /* Park the main thread until a shutdown signal arrives. */
+    int sig = 0;
+    sigwait(&shutdown_sigs, &sig);
+
+    /* Wake the worker.  An eventfd write of 8 bytes is atomic and
+     * cannot partial-write; the worker doesn't read the payload, it
+     * only needs the fd to become readable. */
+    uint64_t one = 1;
+    ssize_t  ew  = write(shutdown_efd, &one, sizeof(one));
+    (void)ew;
+
+    pthread_join(worker, NULL);
+
+    /* Tear down everything that crossed the thread boundary. */
+    close(listen_sd);
+    close(shutdown_efd);
+    for (int i = 0; i < *nlibs; i++)
+        if (lib_fds[i] >= 0) close(lib_fds[i]);
+
+    _exit(0);
 }
 
 /* ------------------------------------------------------------------ */

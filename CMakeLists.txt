@@ -249,6 +249,10 @@ function(daemon_test TEST_NAME CLIENT_BIN COMMENT_STR)
     set(_TD "${CMAKE_BINARY_DIR}/daemon_${TEST_NAME}")
     add_custom_target(${TEST_NAME}
         COMMAND ${CMAKE_COMMAND} -E echo "=== ${TEST_NAME} ==="
+        # Pre-run cleanup: if a previous run left a daemon alive, SIGTERM
+        # it before the protect-daemon step tries to overwrite the binary.
+        COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD}
+                -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD}"
         COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
                 --key        "${_TD}/test.key"
@@ -389,6 +393,8 @@ add_custom_target(dlopen_transitive_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_tran
 set(_TD_TRANS "${CMAKE_BINARY_DIR}/daemon_test_dlopen_transitive")
 add_custom_target(test_dlopen_transitive
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_transitive ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_TRANS}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_TRANS}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
             --key        "${_TD_TRANS}/test.key"
@@ -445,6 +451,8 @@ add_custom_target(dlopen_dt_needed_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_dt_ne
 set(_TD_DTN "${CMAKE_BINARY_DIR}/daemon_test_dlopen_dt_needed")
 add_custom_target(test_dlopen_dt_needed
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_dt_needed ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_DTN}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_DTN}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_DTN}/enc_disk"
     # Encrypted copies on disk at enc_disk/; the daemon recursively scans
@@ -498,6 +506,8 @@ add_custom_target(dlopen_reload_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_reload")
 set(_TD_RELOAD "${CMAKE_BINARY_DIR}/daemon_test_dlopen_reload")
 add_custom_target(test_dlopen_reload
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_reload ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_RELOAD}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_RELOAD}"
     COMMAND ${CMAKE_COMMAND} -E remove -f /tmp/test_dlopen_reload.log
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
@@ -586,6 +596,8 @@ add_custom_target(dlopen_interpose_bin DEPENDS "${CMAKE_BINARY_DIR}/dlopen_inter
 set(_TD_INTER "${CMAKE_BINARY_DIR}/daemon_test_dlopen_interpose")
 add_custom_target(test_dlopen_interpose
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_interpose ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_INTER}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_INTER}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
             --key        "${_TD_INTER}/test.key"
@@ -1189,6 +1201,8 @@ add_custom_target(fork_same_child DEPENDS "${CMAKE_BINARY_DIR}/fork_same_child")
 set(_TD_FSL "${CMAKE_BINARY_DIR}/daemon_test_fork_same_lib")
 add_custom_target(test_fork_same_lib
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_fork_same_lib ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_FSL}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_FSL}"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
             --key        "${_TD_FSL}/test.key"
@@ -1235,6 +1249,8 @@ add_custom_target(fork_diff_child DEPENDS "${CMAKE_BINARY_DIR}/fork_diff_child")
 set(_TD_FDL "${CMAKE_BINARY_DIR}/daemon_test_fork_diff_lib")
 add_custom_target(test_fork_diff_lib
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_fork_diff_lib ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_FDL}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_FDL}/parent" "${_TD_FDL}/child"
     # Daemon + client for parent (libparent.so)
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
@@ -1301,6 +1317,8 @@ add_custom_target(proc_b DEPENDS "${CMAKE_BINARY_DIR}/proc_b")
 set(_TD_SMB "${CMAKE_BINARY_DIR}/daemon_test_script_multi_bin")
 add_custom_target(test_script_multi_bin
     COMMAND ${CMAKE_COMMAND} -E echo "=== test_script_multi_bin ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_SMB}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_SMB}"
     # One daemon serves all libs (same key for both clients)
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
