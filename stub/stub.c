@@ -1800,6 +1800,15 @@ static char **build_exec_env(const exec_env_cfg_t *cfg) {
         build_lazy_env(cfg->daemon_sd, cfg->link_dir_ptr, cfg->link_dir, cfg->n_all_enc, cfg->all_enc_names, &libd_sock,
                        &symlink_dir, &enc_libs);
 
+    /* Always emit ANTIREV_SYMLINK_DIR when we have a dir, not just in
+     * lazy mode — exe_shim's atexit handler reads it to remove the
+     * dir on normal process exit. */
+    if (!symlink_dir && cfg->link_dir_ptr) {
+        symlink_dir = malloc(64);
+        if (symlink_dir)
+            snprintf(symlink_dir, 64, "ANTIREV_SYMLINK_DIR=%s", cfg->link_dir);
+    }
+
     char *close_fds = (cfg->has_needed_section && cfg->n_dt_needed > 0)
                               ? build_close_fds(cfg->n_dt_needed, cfg->dt_needed_fds)
                               : NULL;
@@ -1834,6 +1843,67 @@ static char **build_exec_env(const exec_env_cfg_t *cfg) {
 /* ------------------------------------------------------------------ */
 /*  Mode A: lightweight lib daemon                                      */
 /* ------------------------------------------------------------------ */
+
+/* Reap stale /tmp/antirev_<pid>_XXXXXX dirs whose owner PID is dead.
+ *
+ * Each protected exe creates one of these on launch as its symlink
+ * dir (Phase 4c).  exe_shim's atexit handler removes it on normal
+ * exit; this sweep handles the SIGKILL / segfault / hard-crash case
+ * that atexit can't.  The PID tag encodes ownership so we can decide
+ * safely without coordinating with active exes.
+ *
+ * Called twice in the daemon's lifecycle: once at startup (catches
+ * anything from prior crashed runs) and once on shutdown (catches
+ * any of our session's exes that crashed before atexit could fire).
+ *
+ * Safe under PID reuse: in the unlikely case a recycled PID matches
+ * a stale dir name, the new PID has nothing to do with that dir, so
+ * removing it harms nothing. */
+static void sweep_dead_symlink_dirs(void) {
+    DIR *dp = opendir("/tmp");
+    if (!dp) return;
+
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        if (strncmp(de->d_name, "antirev_", 8) != 0) continue;
+
+        /* Parse "antirev_<pid>_<rand>" — accept the legacy
+         * "antirev_<rand>" form too by skipping it (no PID = can't
+         * decide ownership safely). */
+        const char *p = de->d_name + 8;
+        char *endp;
+        long pid = strtol(p, &endp, 10);
+        if (endp == p || *endp != '_' || pid <= 0) continue;
+
+        if (kill((pid_t)pid, 0) == 0 || errno != ESRCH)
+            continue; /* owner still alive — leave it */
+
+        char dir[128];
+        snprintf(dir, sizeof(dir), "/tmp/%.120s", de->d_name);
+
+        /* Walk + unlink the dir's contents (all symlinks).  Use a
+         * second opendir rather than openat-style iteration to keep
+         * this short.  rmdir at the end. */
+        DIR *sub = opendir(dir);
+        if (sub) {
+            struct dirent *se;
+            while ((se = readdir(sub)) != NULL) {
+                if (strcmp(se->d_name, ".") == 0 || strcmp(se->d_name, "..") == 0)
+                    continue;
+                /* %.* widths bound each directive so fortify can prove
+                 * no truncation — see dlopen_shim's preload helper. */
+                char path[256];
+                snprintf(path, sizeof(path), "%.127s/%.127s", dir, se->d_name);
+                unlink(path);
+            }
+            closedir(sub);
+        }
+        if (rmdir(dir) == 0)
+            fprintf(stderr, "[antirev] reaped stale symlink dir %s (pid %ld dead)\n",
+                    dir, pid);
+    }
+    closedir(dp);
+}
 
 /* Scan /tmp/antirev-deps.log-style graph dump so it's reachable when
  * the daemon's stderr is closed (e.g., launched from sysmgr). */
@@ -1920,6 +1990,11 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
                               int *nlibs) {
     raise_fd_limit();
 
+    /* Startup sweep: reap any /tmp/antirev_<pid>_* dirs whose owner
+     * is dead.  Catches dirs left behind by protected exes that
+     * crashed before exe_shim's atexit could fire. */
+    sweep_dead_symlink_dirs();
+
     if (decrypt_own_libs(real_exe, key, lib_fds, lib_names, nlibs) < 0)
         return 1;
 
@@ -2001,6 +2076,10 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
     close(shutdown_efd);
     for (int i = 0; i < *nlibs; i++)
         if (lib_fds[i] >= 0) close(lib_fds[i]);
+
+    /* Shutdown sweep: catches any dirs whose owner exe crashed
+     * during this daemon's session before its atexit could fire. */
+    sweep_dead_symlink_dirs();
 
     _exit(0);
 }
@@ -2438,7 +2517,14 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * preserving the original symbol lookup order.  For FD_MAP (dlopen'd)
      * libs, the symlinks serve as a fallback when the lib's own DT_NEEDED
      * chain references other encrypted libs. */
-    char link_dir[] = "/tmp/antirev_XXXXXX";
+    /* PID-tagged template lets the daemon's startup/shutdown sweep
+     * identify which symlink dirs are owned by which protected exe.
+     * If our PID is dead by the time the daemon next sweeps, the dir
+     * gets reaped — covers the SIGKILL / segfault / hard-crash path
+     * that exe_shim's atexit handler can't.  mkdtemp replaces the
+     * trailing XXXXXX with random chars and chmods the dir to 0700. */
+    char link_dir[64];
+    snprintf(link_dir, sizeof(link_dir), "/tmp/antirev_%d_XXXXXX", (int)getpid());
     char *link_dir_ptr = mkdtemp(link_dir);
     if (link_dir_ptr) {
         for (int j = 0; j < n_dt_needed; j++) {
