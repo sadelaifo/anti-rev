@@ -31,16 +31,20 @@
 
 static int test_obfstr_roundtrip(void)
 {
+    /* Reference literals are wrapped in OBFSTR too — otherwise the
+     * cleartext "antirev_secret_marker" sits in .rodata at the strcmp
+     * call site, the (B)-phase strings scan finds it, and the test
+     * fails for a reason unrelated to the encoder/decoder. */
     const char *p = OBFSTR("antirev_secret_marker");
     EXPECT(p != NULL, "OBFSTR returned NULL");
-    EXPECT(strcmp(p, "antirev_secret_marker") == 0,
+    EXPECT(strcmp(p, OBFSTR("antirev_secret_marker")) == 0,
            "OBFSTR did not round-trip the literal");
 
     /* Same call site twice — encrypted bytes must not be mutated by the
      * decode loop (volatile-protected from compiler folding, but we want
      * to catch a stray write or off-by-one too). */
     const char *q = OBFSTR("antirev_secret_marker");
-    EXPECT(strcmp(q, "antirev_secret_marker") == 0,
+    EXPECT(strcmp(q, OBFSTR("antirev_secret_marker")) == 0,
            "OBFSTR second call yielded different bytes");
     return 0;
 }
@@ -59,7 +63,7 @@ static int test_osnprintf(void)
     char buf[64];
     int n = OSNPRINTF(buf, sizeof(buf), "antirev_secret_fmt=%d/%s", 7, "x");
     EXPECT(n > 0 && (size_t)n < sizeof(buf), "OSNPRINTF length wrong");
-    EXPECT(strcmp(buf, "antirev_secret_fmt=7/x") == 0,
+    EXPECT(strcmp(buf, OBFSTR("antirev_secret_fmt=7/x")) == 0,
            "OSNPRINTF output mismatch");
     return 0;
 }
