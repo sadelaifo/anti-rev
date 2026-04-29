@@ -67,17 +67,32 @@
 /* Decode `__VA_ARGS__` (a comma-separated list of encrypted bytes
  * produced by the codegen) back to a NUL-terminated string on the
  * caller's stack.  Yields a `const char *` that's valid until the
- * enclosing function returns. */
+ * enclosing FUNCTION returns.
+ *
+ * Why __builtin_alloca instead of `char buf[N]`: GCC's lifetime rule
+ * for variables declared inside a statement-expression `({...})` is
+ * not consistently the enclosing function — depending on version the
+ * storage may be released the moment the SE ends, after which a
+ * subsequent SE can reuse the slot for *its* own encrypted byte
+ * array.  Caller code that held the pointer (`p = OBFSTR("a"); ...
+ * q = OBFSTR("b"); strcmp(p, "a")`) then reads the second call's
+ * ciphertext through the first call's pointer — strcmp returns
+ * non-zero, the test reports "second call yielded different bytes",
+ * and from outside it looks like the decoder is broken.  alloca'd
+ * memory survives the SE because it lives on the caller's frame, not
+ * inside the SE block. */
 #define _OBF(...)                                                         \
     ({                                                                    \
         const volatile uint8_t _antirev_obf_e[] = { __VA_ARGS__ };        \
-        char _antirev_obf_buf[sizeof(_antirev_obf_e) + 1];                \
+        size_t _antirev_obf_n = sizeof(_antirev_obf_e);                   \
+        char *_antirev_obf_buf =                                          \
+            (char *)__builtin_alloca(_antirev_obf_n + 1);                 \
         for (size_t _antirev_obf_i = 0;                                   \
-             _antirev_obf_i < sizeof(_antirev_obf_e); _antirev_obf_i++)   \
+             _antirev_obf_i < _antirev_obf_n; _antirev_obf_i++)           \
             _antirev_obf_buf[_antirev_obf_i] =                            \
                 (char)(_antirev_obf_e[_antirev_obf_i]                     \
                        ^ _OBF_K(_antirev_obf_i));                         \
-        _antirev_obf_buf[sizeof(_antirev_obf_e)] = '\0';                  \
+        _antirev_obf_buf[_antirev_obf_n] = '\0';                          \
         (const char *)_antirev_obf_buf;                                   \
     })
 
