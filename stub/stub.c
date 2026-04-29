@@ -1729,19 +1729,30 @@ static char *build_close_fds(int n_dt_needed, const int *dt_needed_fds) {
 }
 
 /* True for env entries we're about to rewrite — skipped when copying
- * the inherited env forward. */
+ * the inherited env forward.
+ *
+ * The prefix list used to be `static const char *const prefixes[] =
+ * {...}` but that's an array initializer of string literals, which
+ * obfstr_gen.py doesn't transform (it only catches function-call
+ * arguments).  The names landed in .rodata cleartext and `strings`
+ * happily printed them.  Build the list locally per-call instead — the
+ * OBFSTR rewrites land as encrypted bytes at the call site, decoded on
+ * the function's stack via __builtin_alloca and freed when this
+ * function returns.  build_exec_env calls us once per inherited env
+ * entry, so the per-call rebuild cost is ~10 alloca + ~150B XOR per
+ * env var, well below the noise floor for one-shot launch logic. */
 static int env_is_antirev_managed(const char *e) {
-    static const char *const prefixes[] = {
-            "LD_PRELOAD=",
-            "LD_LIBRARY_PATH=",
-            "ANTIREV_REAL_EXE=",
-            "ANTIREV_MAIN_FD=",
-            "ANTIREV_FD_MAP=",
-            "ANTIREV_CLOSE_FDS=",
-            "ANTIREV_LIBD_SOCK=",
-            "ANTIREV_ENC_LIBS=",
-            "ANTIREV_SYMLINK_DIR=",
-            "ANTIREV_NO_PRELOAD=",
+    const char *prefixes[] = {
+            OBFSTR("LD_PRELOAD="),
+            OBFSTR("LD_LIBRARY_PATH="),
+            OBFSTR("ANTIREV_REAL_EXE="),
+            OBFSTR("ANTIREV_MAIN_FD="),
+            OBFSTR("ANTIREV_FD_MAP="),
+            OBFSTR("ANTIREV_CLOSE_FDS="),
+            OBFSTR("ANTIREV_LIBD_SOCK="),
+            OBFSTR("ANTIREV_ENC_LIBS="),
+            OBFSTR("ANTIREV_SYMLINK_DIR="),
+            OBFSTR("ANTIREV_NO_PRELOAD="),
             NULL,
     };
     for (int i = 0; prefixes[i]; i++)
@@ -1835,8 +1846,14 @@ static char **build_exec_env(const exec_env_cfg_t *cfg) {
         out[ei++] = enc_libs;
     if (symlink_dir)
         out[ei++] = symlink_dir;
-    if (force_no_preload)
-        out[ei++] = "ANTIREV_NO_PRELOAD=1";
+    if (force_no_preload) {
+        /* OBFSTR's alloca buffer dies when this function returns, but
+         * the env array gets handed to fexecve from the *caller's*
+         * frame — so the pointer would dangle.  strdup the decoded
+         * string into the heap; fexecve replaces the address space
+         * either way, so the small leak is irrelevant. */
+        out[ei++] = strdup(OBFSTR("ANTIREV_NO_PRELOAD=1"));
+    }
     out[ei] = NULL;
     return out;
 }

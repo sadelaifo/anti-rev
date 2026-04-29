@@ -58,6 +58,18 @@ TRANSFORM_MACROS = (
     'strncmp',
     'strstr',
     'fopen',
+    'open',
+    'openat',
+    # syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", ...) etc — many
+    # call sites have a literal /proc/self/* path argument that leaks
+    # the antirev memfd-based identity-hide design.
+    'syscall',
+    # Custom helpers in stub/ that take literal env-var-name / path-
+    # prefix arguments.  Adding them here keeps callers idiomatic
+    # (`strip_env_path_entries("LD_PRELOAD", "/proc/self/fd/")`) without
+    # forcing manual OBFSTR() at every call site.
+    'strip_env_path_entries',
+    'find_env_value',
 )
 
 # ---------------------------------------------------------------------
