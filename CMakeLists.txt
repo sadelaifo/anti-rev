@@ -158,6 +158,64 @@ if(AARCH64_GCC)
     add_custom_target(hello_aarch64 ALL DEPENDS "${CMAKE_BINARY_DIR}/hello_aarch64")
 endif()
 
+# ── obfstr smoke test (codegen pipeline + runtime decoder) ─────────────
+# Exercises tools/obfstr_gen.py end-to-end:
+#   1. generate the rewritten main.c into ${BUILD}/obf/test_obfstr_main.c
+#   2. compile that against stub/obfstr.h
+#   3. run the binary; tests/obfstr/run_test.sh additionally `strings`-
+#      scans the binary to confirm no cleartext marker survived.
+# Picks any available native compiler — this test is arch-agnostic.
+if(X86_GCC OR AARCH64_GCC)
+    set(_OBFSTR_TEST_CC "${X86_GCC}")
+    if(NOT _OBFSTR_TEST_CC)
+        set(_OBFSTR_TEST_CC "${AARCH64_GCC}")
+    endif()
+
+    add_custom_command(
+        OUTPUT  "${CMAKE_BINARY_DIR}/obf/test_obfstr_main.c"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/obf"
+        COMMAND python3 "${CMAKE_SOURCE_DIR}/tools/obfstr_gen.py"
+                --out-dir "${CMAKE_BINARY_DIR}/obf"
+                "${CMAKE_SOURCE_DIR}/tests/obfstr/main.c"
+        # Rename the codegen output to a unique name so it doesn't
+        # collide with other transformed main.c's down the line.
+        COMMAND ${CMAKE_COMMAND} -E copy
+                "${CMAKE_BINARY_DIR}/obf/main.c"
+                "${CMAKE_BINARY_DIR}/obf/test_obfstr_main.c"
+        DEPENDS "${CMAKE_SOURCE_DIR}/tests/obfstr/main.c"
+                "${CMAKE_SOURCE_DIR}/tools/obfstr_gen.py"
+        COMMENT "Codegen-rewriting tests/obfstr/main.c"
+    )
+
+    add_custom_command(
+        OUTPUT  "${CMAKE_BINARY_DIR}/test_obfstr_bin"
+        COMMAND "${_OBFSTR_TEST_CC}" -O2 -Wall -Wextra
+                -I "${CMAKE_SOURCE_DIR}/stub"
+                -o "${CMAKE_BINARY_DIR}/test_obfstr_bin"
+                "${CMAKE_BINARY_DIR}/obf/test_obfstr_main.c"
+        DEPENDS "${CMAKE_BINARY_DIR}/obf/test_obfstr_main.c"
+                "${CMAKE_SOURCE_DIR}/stub/obfstr.h"
+        COMMENT "Building test_obfstr_bin (with codegen-obfuscated literals)"
+    )
+    add_custom_target(test_obfstr_bin ALL
+                      DEPENDS "${CMAKE_BINARY_DIR}/test_obfstr_bin")
+
+    add_custom_target(test_obfstr
+        COMMAND ${CMAKE_COMMAND} -E echo "=== obfstr codegen + runtime test ==="
+        COMMAND bash "${CMAKE_SOURCE_DIR}/tests/obfstr/run_test.sh"
+                     "${CMAKE_BINARY_DIR}"
+        DEPENDS test_obfstr_bin
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "Running obfstr smoke test"
+        USES_TERMINAL
+    )
+else()
+    add_custom_target(test_obfstr
+        COMMAND ${CMAKE_COMMAND} -E echo
+                "[test_obfstr] no native compiler detected — skipped"
+    )
+endif()
+
 # ═══════════════════════════════════════════════════════════════════════
 #  End-to-end tests
 # ═══════════════════════════════════════════════════════════════════════

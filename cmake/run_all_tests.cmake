@@ -32,6 +32,7 @@ set(TESTS
     test_wrong_key        # wrong key -> clean failure
     test_tamper           # bit-flipped ciphertext -> clean failure
     test_missing_syms     # missing_syms.py: missing DT_NEEDED + circular deps
+    test_obfstr           # OBFSTR codegen + runtime decoder smoke test
 )
 
 # Tests disabled — need further work:
