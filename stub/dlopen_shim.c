@@ -24,6 +24,7 @@
 
 #define _GNU_SOURCE
 #include "daemon_client.h"
+#include "obfstr.h"     /* compile-time string-literal obfuscation */
 
 #include <dlfcn.h>
 #include <stdlib.h>

@@ -13,6 +13,7 @@
 
 #define _GNU_SOURCE
 #include "daemon_client.h"
+#include "obfstr.h"     /* compile-time string-literal obfuscation */
 
 #include <errno.h>
 #include <pthread.h>

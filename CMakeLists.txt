@@ -53,6 +53,43 @@ function(make_blob_header OUTPUT INPUT VARNAME DEP)
     )
 endfunction()
 
+# ── Helper: route a list of stub/* sources through tools/obfstr_gen.py ─
+# Compile-time string-literal obfuscation pass: takes paths relative to
+# the source tree (e.g. "stub/stub.c"), writes the rewritten copies to
+# ${BUILD}/obf/<basename>, and yields the rewritten paths into OUT_VAR.
+# The caller passes OUT to add_executable / add_library so the actual
+# compile happens against the obfuscated source — every fprintf /
+# snprintf / dlsym / getenv / strncmp literal in the original ends up as
+# encrypted bytes in the binary's .rodata.
+#
+# Codegen for each unique basename is declared exactly once (guarded via
+# a global property) so multiple targets can share the same source file
+# without CMake complaining about duplicate add_custom_command outputs.
+function(obfstr_codegen_sources OUT_VAR)
+    set(_obfd "")
+    foreach(_src ${ARGN})
+        get_filename_component(_name "${_src}" NAME)
+        set(_out "${CMAKE_BINARY_DIR}/obf/${_name}")
+        get_property(_already GLOBAL PROPERTY _OBFSTR_DONE_${_name})
+        if(NOT _already)
+            add_custom_command(
+                OUTPUT  "${_out}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/obf"
+                COMMAND python3 "${CMAKE_SOURCE_DIR}/tools/obfstr_gen.py"
+                        --out-dir "${CMAKE_BINARY_DIR}/obf"
+                        "${CMAKE_SOURCE_DIR}/${_src}"
+                DEPENDS "${CMAKE_SOURCE_DIR}/${_src}"
+                        "${CMAKE_SOURCE_DIR}/tools/obfstr_gen.py"
+                        "${CMAKE_SOURCE_DIR}/stub/obfstr.h"
+                COMMENT "obfstr-codegen ${_name}"
+            )
+            set_property(GLOBAL PROPERTY _OBFSTR_DONE_${_name} TRUE)
+        endif()
+        list(APPEND _obfd "${_out}")
+    endforeach()
+    set(${OUT_VAR} "${_obfd}" PARENT_SCOPE)
+endfunction()
+
 # ═══════════════════════════════════════════════════════════════════════
 #  antirev_shim.so — single shipping shim DSO
 # ═══════════════════════════════════════════════════════════════════════
@@ -75,7 +112,8 @@ set(ANTIREV_SHIM_SOURCES
 if(TARGET_ARCH STREQUAL "aarch64")
     list(APPEND ANTIREV_SHIM_SOURCES stub/aarch64_extend_shim.c)
 endif()
-add_library(antirev_shim SHARED ${ANTIREV_SHIM_SOURCES})
+obfstr_codegen_sources(ANTIREV_SHIM_SOURCES_OBF ${ANTIREV_SHIM_SOURCES})
+add_library(antirev_shim SHARED ${ANTIREV_SHIM_SOURCES_OBF})
 set_target_properties(antirev_shim PROPERTIES
     OUTPUT_NAME "antirev_shim${ARCH_SUFFIX}"
     PREFIX ""                             # no "lib" prefix
@@ -103,10 +141,11 @@ add_custom_target(antirev_shim_blob_h DEPENDS "${ANTIREV_SHIM_BLOB_H}")
 # ═══════════════════════════════════════════════════════════════════════
 #  stub executable
 # ═══════════════════════════════════════════════════════════════════════
-add_executable(${STUB_NAME} stub/stub.c stub/crypto.c)
+obfstr_codegen_sources(STUB_SOURCES_OBF stub/stub.c stub/crypto.c)
+add_executable(${STUB_NAME} ${STUB_SOURCES_OBF})
 target_include_directories(${STUB_NAME} PRIVATE
     "${CMAKE_BINARY_DIR}"        # generated blob headers
-    "${CMAKE_SOURCE_DIR}/stub"   # crypto.h
+    "${CMAKE_SOURCE_DIR}/stub"   # crypto.h, obfstr.h
 )
 target_compile_options(${STUB_NAME} PRIVATE -O2 -Wall -Wextra)
 target_link_libraries(${STUB_NAME} PRIVATE pthread)
@@ -123,11 +162,13 @@ endif()
 
 # stub.c #includes the generated blob headers — the object file can't
 # compile until they exist.  Declare both as OBJECT_DEPENDS and wire a
-# phony target dependency so parallel builds stay correct.
+# phony target dependency so parallel builds stay correct.  After the
+# obfstr codegen pass, the actual file fed to gcc is the rewritten copy
+# under ${BUILD}/obf/, so the property has to attach there.
 set(STUB_BLOB_HEADERS "${ANTIREV_SHIM_BLOB_H}")
 add_custom_target(stub_blob_headers DEPENDS ${STUB_BLOB_HEADERS})
 add_dependencies(${STUB_NAME} stub_blob_headers)
-set_source_files_properties(stub/stub.c PROPERTIES
+set_source_files_properties("${CMAKE_BINARY_DIR}/obf/stub.c" PROPERTIES
     OBJECT_DEPENDS "${STUB_BLOB_HEADERS}"
 )
 

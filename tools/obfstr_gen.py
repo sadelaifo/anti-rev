@@ -31,11 +31,33 @@ import sys
 # obfuscates BOTH the format and the string passed via %s, which is
 # what we want for "tier 3 — no literal survives in rodata".
 TRANSFORM_MACROS = (
+    # Antirev-internal macros — wrappers around printf / perror /
+    # snprintf / dlsym, defined in stub/obfstr.h.
     'OBFSTR',
     'LOG_ERR',
     'PERR',
     'OSNPRINTF',
     'ODLSYM',
+    # Per-shim debug logger.  Has identical shape (fmt, ...) so codegen
+    # transforms its first arg the same way as LOG_ERR.
+    'LOG',
+    # libc functions whose literal arguments are antirev architecture
+    # markers we want to hide.  Non-literal arguments are passed
+    # through untouched, so it's safe to scan every call site of these.
+    # Adding the bare libc names (fprintf, snprintf, perror, …) means
+    # legacy calls that haven't been migrated to LOG_ERR/PERR/OSNPRINTF
+    # still get their format/message strings obfuscated automatically.
+    'fprintf',
+    'snprintf',
+    'perror',
+    'dlsym',
+    'getenv',
+    'setenv',
+    'unsetenv',
+    'strcmp',
+    'strncmp',
+    'strstr',
+    'fopen',
 )
 
 # ---------------------------------------------------------------------

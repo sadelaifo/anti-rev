@@ -23,6 +23,7 @@
  */
 
 #define _GNU_SOURCE
+#include "obfstr.h"     /* compile-time string-literal obfuscation */
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
