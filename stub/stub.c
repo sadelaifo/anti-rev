@@ -1625,9 +1625,14 @@ static char *build_ld_library_path(char *const *envp, int envc, const char *link
 
 /* True if `exe_basename` needs ANTIREV_NO_PRELOAD=1 — add names here
  * for exes whose dlopen'd libs have implicit inter-lib symbol deps
- * that break when constructors run in per-dep isolation. */
+ * that break when constructors run in per-dep isolation.
+ *
+ * Built locally per-call so each entry goes through OBFSTR — a
+ * `static const char *blacklist[] = {"GUI", NULL}` initializer would
+ * leave each entry sitting in .rodata as cleartext, which obfstr_gen
+ * doesn't transform (array initializers aren't function-call args). */
 static int exe_is_no_preload_blacklisted(const char *exe_basename) {
-    static const char *blacklist[] = {"GUI", NULL};
+    const char *blacklist[] = {OBFSTR("GUI"), NULL};
     for (int k = 0; blacklist[k]; k++)
         if (strcmp(exe_basename, blacklist[k]) == 0)
             return 1;
@@ -2140,10 +2145,17 @@ static char **build_qemu_argv(const char *binname, const char *fd_path, char *co
 }
 
 /* Try each well-known QEMU path in order; execve on the first hit.
- * Returns only on failure (execve on success never returns). */
+ * Returns only on failure (execve on success never returns).
+ *
+ * Same per-call-rebuild trick as the no-preload blacklist above: a
+ * static initializer of literal paths would land in .rodata cleartext
+ * (array initializers aren't function-call args) and `strings` would
+ * happily print every QEMU path the stub knows about, which is a
+ * dead-giveaway that this binary launches under QEMU user-mode. */
 static void try_exec_known_qemu(char **qemu_argv, char **new_env) {
-    static const char *qemu_candidates[] = {"/tmp/.antirev-qemu-aarch64", "/usr/bin/qemu-aarch64-static",
-                                            "/usr/bin/qemu-aarch64", NULL};
+    const char *qemu_candidates[] = {OBFSTR("/tmp/.antirev-qemu-aarch64"),
+                                     OBFSTR("/usr/bin/qemu-aarch64-static"),
+                                     OBFSTR("/usr/bin/qemu-aarch64"), NULL};
     for (int qi = 0; qemu_candidates[qi]; qi++) {
         struct stat st;
         if (stat(qemu_candidates[qi], &st) == 0)

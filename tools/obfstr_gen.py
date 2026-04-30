@@ -64,12 +64,25 @@ TRANSFORM_MACROS = (
     # call sites have a literal /proc/self/* path argument that leaks
     # the antirev memfd-based identity-hide design.
     'syscall',
+    # exec family — execl("/bin/sh", ...) on the aarch64 popen
+    # replacement leaks the shell-spawn path; execve / execvp call
+    # sites that take a literal qemu / interpreter path leak the
+    # under-QEMU launch design.
+    'execl',
+    'execlp',
+    'execle',
+    'execv',
+    'execvp',
+    'execve',
+    'execvpe',
+    'fexecve',
     # Custom helpers in stub/ that take literal env-var-name / path-
-    # prefix arguments.  Adding them here keeps callers idiomatic
-    # (`strip_env_path_entries("LD_PRELOAD", "/proc/self/fd/")`) without
-    # forcing manual OBFSTR() at every call site.
+    # prefix / sentinel-string arguments.  Adding them here keeps
+    # callers idiomatic without forcing manual OBFSTR() at every call
+    # site.
     'strip_env_path_entries',
     'find_env_value',
+    'make_memfd',
 )
 
 # ---------------------------------------------------------------------
