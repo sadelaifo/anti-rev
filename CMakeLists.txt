@@ -119,6 +119,14 @@ set_target_properties(antirev_shim PROPERTIES
     PREFIX ""                             # no "lib" prefix
     POSITION_INDEPENDENT_CODE ON
     C_VISIBILITY_PRESET hidden
+    # Suppress DT_SONAME — the shim is embedded into stub.c as a byte
+    # blob and loaded via fexecve-inherited memfd, never resolved
+    # through the dynamic linker's SONAME machinery.  Letting the
+    # linker write `antirev_shim_<arch>.so` as DT_SONAME means
+    # `strings stub` finds the literal string in the embedded blob,
+    # leaking the LD_PRELOAD shim's name.  NO_SONAME=TRUE drops the
+    # DT_SONAME entry entirely.
+    NO_SONAME TRUE
 )
 target_compile_options(antirev_shim PRIVATE -O2)
 target_include_directories(antirev_shim PRIVATE "${CMAKE_SOURCE_DIR}/stub")
