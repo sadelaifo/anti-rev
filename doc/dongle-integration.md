@@ -102,9 +102,9 @@ dd if=stub.protected bs=1 skip=$((filesize - 40)) count=32 2>/dev/null | xxd
 
 | 你可能以为 | 实际是 |
 |---------|------|
-| 出货侧要"持有 K_master 才能加密 patch" | 出货侧**插着一支装有 K_master 的狗**，软件本身不持有 K_master |
+| build side 要"持有 K_master 才能加密 patch" | build side **插着一支装有 K_master 的狗**，软件本身不持有 K_master |
 | pack 工具读 K_master 做 AES 加密 | pack 工具把 K_file_i 发给狗，狗内部做 AES，pack 工具只看到密文输出 |
-| 多客户多 K_master 意味着出货侧软件要管多份密钥字节 | 多客户对应**多支狗 / 多 HSM 槽位**，软件只管"调哪支狗"，不管字节本身 |
+| 多客户多 K_master 意味着 build side 软件要管多份密钥字节 | 多客户对应**多支狗 / 多 HSM 槽位**，软件只管"调哪支狗"，不管字节本身 |
 | 工厂"复制" K_master 时 K_master 短暂在工厂软件里 | 工厂烧录流水线临时生成 K_master 字节 → 烧入 N 支狗 → **当场抹掉**，之后这把 K_master 只在那 N 支狗的硅片里 |
 
 每次"用 K_master 做事"都是"调狗的 SDK API"：
@@ -786,13 +786,13 @@ daemon 重新 open 设备 → AUTH → 进入服务
 6. 业务平滑切换
 ```
 
-**关键约束**：patch 的 wrap 操作必须**由一支持有"现网相同 K_master"的狗完成**（出货侧母狗 / HSM 槽位，详见 §1.3.1）。注意"持有"指狗硬件内部含有该 K_master，软件依然不接触字节。所以**生产 K_master 永远不能换**（除非接受全量升级）。
+**关键约束**：patch 的 wrap 操作必须**由一支持有"现网相同 K_master"的狗完成**（build side 的 build dongle / HSM 槽位，详见 §1.3.1）。注意"持有"指狗硬件内部含有该 K_master，软件依然不接触字节。所以**生产 K_master 永远不能换**（除非接受全量升级）。
 
 ### 6.10 跨机器部署
 
 每台部署机都需要一个加密狗（同 K_master）。狗的复制：
 
-- 厂商提供"克隆"工具：用一个母狗写多个子狗
+- 厂商提供"克隆"工具：用一支已烧录 K_master 的狗作为模板，写多支同 K_master 的deploy dongle
 - 或厂商发货时按订单数量出狗
 - **不能**远程 / 软件复制（K_master 从不出狗，没法拷贝）
 
@@ -835,7 +835,7 @@ x86_64 和 aarch64 的加密 lib **同 K_master**（密钥与 arch 无关）。�
    a. 客户运维或 antirev 团队（看分工）
    b. 用厂商工具把随机 K_master 烧录进 N 支狗（量产烧录设备临时生成
       K_master 字节 → 烧入硬件 → 抹掉烧录端的字节）
-   c. N 支狗中: 部分给客户 (deploy dongle), 部分留出货侧用于发版/patch (build dongle)
+   c. N 支狗中: 部分给客户 (deploy dongle), 部分留 build side 用于发版/patch (build dongle)
    d. 用 build dongle 把发货 lib 包装好 — 全程 K_master 字节不在任何软件里
 6. 出货: daemon binary + 加密 lib + 加密狗
 7. 客户上电跑通
@@ -988,10 +988,10 @@ client 第二次 dlopen libfoo:
 
 | 术语 | 含义 |
 |-----|-----|
-| **出货侧** | 厂商研发总部 / CI 机房 / 出版本+加密 patch 的地方。装 build dongle，做 wrap 操作。**业内英文叫 HQ (headquarters) 或 release engineering**。 |
-| **客户侧** | 客户部署生产业务的机器。装 deploy dongle，做 unwrap 操作（runtime 解密）。 |
-| build dongle / 母狗 | 出货侧用的加密狗，含 K_master，用于打包时 wrap 各文件的 K_file_i |
-| deploy dongle / 部署狗 / 子狗 | 客户侧用的加密狗，含同样的 K_master，runtime unwrap |
+| **build side** | 厂商研发总部 / CI 机房 / 出版本 + 加密 patch 的地方。装 build dongle，做 wrap 操作。也叫 release engineering。 |
+| **deploy side** | 客户部署生产业务的机器。装 deploy dongle，做 unwrap 操作（runtime 解密）。 |
+| **build dongle** | build side 用的加密狗，含 K_master，用于打包时 wrap 各文件的 K_file_i |
+| **deploy dongle** | deploy side 用的加密狗，含同样的 K_master，runtime unwrap |
 | KEK | Key Encryption Key — 加密"别的密钥"用的密钥（这里是 K_master）|
 | DEK | Data Encryption Key — 加密"实际数据"用的密钥（这里是 K_file_i）|
 | Wrap / Unwrap | 用 KEK 加密 / 解密 DEK 的操作 |
