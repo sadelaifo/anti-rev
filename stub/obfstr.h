@@ -1,144 +1,169 @@
 /*
  * obfstr.h — string-literal obfuscation for antirev components.
  *
- * ─── 威胁模型 ─────────────────────────────────────────────────────────
+ * ─── Threat model ─────────────────────────────────────────────────────
  *
- * antirev 把磁盘上的保护二进制加密了.  但 stub 启动时把它解到 memfd,
- * memfd 立刻被映射进进程地址空间 -- 这时 `strings /proc/<PID>/maps`
- * (或对 memfd 文件本身 strings) 能看到源码里所有的字符串字面量:
+ * antirev keeps the protected binary encrypted at rest.  But the
+ * moment the stub decrypts it into a memfd the memfd is mapped into
+ * the process address space, and `strings /proc/<PID>/maps` (or
+ * `strings` on the memfd file itself) reveals every string literal
+ * the source code referenced:
  *
- *      printf 格式串       "[antirev] failed to connect to lib daemon"
- *      perror 错误消息     "memfd_create"
- *      env-var 名          "ANTIREV_LIBD_SOCK="  "ANTIREV_FD_MAP="
- *      dlsym 符号名        "ANTI_LoadProcess"  "popen"  "openat"
- *      路径模板            "/proc/self/fd/%d"  "/tmp/.antirev-..."
- *      socket 名前缀       "antirev_%s"
+ *      printf format strings   "[antirev] failed to connect to lib daemon"
+ *      perror messages         "memfd_create"
+ *      env-var names           "ANTIREV_LIBD_SOCK="  "ANTIREV_FD_MAP="
+ *      dlsym symbol names      "ANTI_LoadProcess"  "popen"  "openat"
+ *      path templates          "/proc/self/fd/%d"  "/tmp/.antirev-..."
+ *      socket name prefix      "antirev_%s"
  *
- * 整套反逆向架构特征对静态分析者裸奔.  obfstr 让这些字面量在 .rodata
- * 里也以异或后的密文存在, 仅在调用时短暂解到栈上一份明文.
+ * The whole defensive design is in the clear.  obfstr keeps these
+ * literals as XOR-encrypted bytes in .rodata and only briefly decodes
+ * them onto the caller's stack at the moment of use.
  *
- * ─── 整体架构 (两阶段) ─────────────────────────────────────────────────
+ * ─── Two-stage architecture ───────────────────────────────────────────
  *
- *      源码 (stub/*.c)
+ *      source (stub/*.c)
  *          │   perror("memfd_create");
  *          │   fprintf(stderr, "[antirev] failed");
  *          │   dlsym(RTLD_NEXT, "ANTI_LoadProcess");
  *          ▼
- *      [1] tools/obfstr_gen.py            ← 编译期, gcc 之前跑
- *          │   扫描调用, 识别字面量参数, 异或加密
+ *      [1] tools/obfstr_gen.py        ← compile-time, runs before gcc
+ *          │   scan call sites, encrypt literal arguments
  *          ▼
- *      build/obf/*.c (rewrite 后的源码)
+ *      build/obf/*.c (rewritten source)
  *          │   perror(_OBF(0x3a, 0x2b, 0x2c, ...));
  *          │   fprintf(stderr, _OBF(0x0c, 0x2f, ...));
  *          │   dlsym(RTLD_NEXT, _OBF(0x16, 0x00, ...));
  *          ▼
- *      [2] gcc 编译  +  本头文件 (运行时解码)
- *          │   密文字节进 .rodata (volatile 防折叠回明文)
+ *      [2] gcc compile  +  this header (runtime decoder)
+ *          │   ciphertext bytes land in .rodata (volatile prevents
+ *          │   the compiler folding them back to cleartext)
  *          ▼
- *      最终二进制 — strings 看到的是噪声字节
+ *      final binary — `strings` only sees noise bytes
  *
- * ─── 阶段 1: tools/obfstr_gen.py ──────────────────────────────────────
+ * ─── Stage 1: tools/obfstr_gen.py ─────────────────────────────────────
  *
- * CMake 在编译每个 stub/*.c 之前先跑这个 Python 脚本, 输出 rewrite 版
- * 到 build/obf/<basename>.  脚本对一组已知函数/宏做模式扫描:
+ * CMake runs this Python pass before compiling each stub/*.c, writing
+ * the rewritten source to build/obf/<basename>.  The scanner pattern-
+ * matches calls to a fixed set of functions/macros:
  *
- *      antirev 包装宏:    OBFSTR LOG_ERR PERR OSNPRINTF ODLSYM LOG
- *      libc print:        fprintf snprintf perror
- *      libc 符号/环境:    dlsym getenv setenv unsetenv
- *      libc 字符串比较:   strcmp strncmp strstr
- *      libc 文件/exec:    fopen open openat syscall execl/execve/...
- *      项目内 helper:     strip_env_path_entries find_env_value make_memfd
+ *      antirev wrappers:   OBFSTR LOG_ERR PERR OSNPRINTF ODLSYM LOG
+ *      libc print:         fprintf snprintf perror
+ *      libc symbol/env:    dlsym getenv setenv unsetenv
+ *      libc strcmp/like:   strcmp strncmp strstr
+ *      libc file/exec:     fopen open openat syscall execl/execve/...
+ *      project helpers:    strip_env_path_entries find_env_value make_memfd
  *
- * 对每个调用站点:
- *   - 解析参数列表 (处理嵌套括号, 字符串拼接 "a" "b", 转义 \n \xNN \ooo)
- *   - 任何纯字符串字面量参数被替换为 _OBF(0xNN, 0xNN, ...)
- *   - 非字面量参数 (变量, 表达式) 原封不动放过
+ * For each match the scanner:
+ *   - parses the argument list (handling nested parens, concatenated
+ *     literals "a" "b", escape sequences \n \xNN \ooo)
+ *   - replaces every pure string-literal argument with
+ *     _OBF(0xNN, 0xNN, ...)
+ *   - leaves non-literal arguments (variables, expressions) alone
  *
- * 加密公式 (obf_key(i) in obfstr_gen.py):
+ * Encryption formula (obf_key(i) in obfstr_gen.py):
  *
  *      key(i) = 0x5a XOR (((i * 7) + 13) & 0xff)
  *
- * 位置敏感: 第 i 个字节用第 i 个 key 异或.  encode/decode 用同一公式
- * 所以 codegen 时编码的密文运行时能准确还原.
+ * Position-dependent: byte i is XORed with key(i).  encode and decode
+ * use the same formula so the codegen-time ciphertext decodes cleanly
+ * at runtime.
  *
- * 注意: codegen 只识别 "函数调用参数" 位置的字面量.  以下模式它
- * "看不到", 必须靠源码改造:
+ * Caveat: the scanner only recognises literals in *function-call
+ * argument* position.  These patterns are invisible to it and must be
+ * refactored at the source:
  *
- *      static const char *arr[] = {"X", NULL};       // 数组初始化器
- *      const char *p = "X";                          // 全局/局部变量初始化
- *      struct s = {.name = "X"};                     // struct 初始化
- *      out[i] = "X";                                 // 裸赋值
- *      #define MACRO "X"                             // 宏内字面量
+ *      static const char *arr[] = {"X", NULL};   // array initializer
+ *      const char *p = "X";                      // var initializer
+ *      struct s = {.name = "X"};                 // struct initializer
+ *      out[i] = "X";                             // bare assignment
+ *      #define MACRO "X"                         // macro-internal literal
  *
- * 项目里这种点都已经手动 wrap 成 OBFSTR("X") (function-call 位置, 被
- * codegen 识别) 或 strdup(OBFSTR("X")) (跨函数边界场景).
+ * In this codebase such sites have been hand-wrapped as OBFSTR("X")
+ * (which IS a function-call position the scanner sees) or
+ * strdup(OBFSTR("X")) when the decoded buffer must outlive the
+ * function that built it.
  *
- * ─── 阶段 2: 运行时解码 (本头文件) ─────────────────────────────────────
+ * ─── Stage 2: runtime decoder (this header) ───────────────────────────
  *
- * _OBF(...) 是个 GCC statement expression, 详见下方实现.  两个关键
- * 设计选择:
+ * _OBF(...) is a GCC statement expression — see the implementation
+ * below.  Two non-obvious design choices, both load-bearing:
  *
- *   ① const volatile uint8_t _e[] -- volatile 是命脉.
- *      没有 volatile, gcc -O2 直接看穿异或、把整个解码循环在编译期
- *      算掉、把明文塞回 .rodata, 整个保护就废了.  volatile 强制每个
- *      字节从内存 load 一次, 禁止 const-folding.
+ *   ① `const volatile uint8_t _e[]` — volatile is *mandatory*.
+ *      Without it gcc -O2 sees through the XOR, computes the entire
+ *      decode loop at compile time, and writes the cleartext back
+ *      into .rodata, defeating the whole protection.  volatile
+ *      forces a real memory load per byte and blocks const-folding.
  *
- *   ② __builtin_alloca 分配解码缓冲.
- *      早期版本用 char buf[N] 在 statement expression 块里声明,
- *      老 GCC 在 SE 边界就把这个 buf 标 "作废", 下一次 OBFSTR 调用的
- *      密文数组就把同一栈槽覆盖了 -- 调用方握的指针读到的是别人的
- *      密文.  __builtin_alloca 分配在 *调用函数的栈帧* 上, 跨 SE
- *      边界稳定有效, 函数 return 前都活着.
+ *   ② `__builtin_alloca` for the decoded buffer.
+ *      An earlier draft used `char buf[N]` declared inside the
+ *      statement-expression block.  Older GCC marks that buf
+ *      "destroyed" at the SE boundary, after which a *subsequent*
+ *      OBFSTR's encrypted byte array can reuse the same stack slot —
+ *      a caller that held the first pointer then reads the second
+ *      call's ciphertext through it.  __builtin_alloca allocates on
+ *      the *calling function's* frame, so the buffer survives the
+ *      SE and stays alive until that function returns.
  *
- * 生命周期约束: 解码 buffer 跟着 *调用函数* 走, 函数 return 前都有效.
+ * Lifetime: the decoded buffer's lifetime is the *calling function*.
+ * It dies when that function returns.
  *
- *      fprintf(stderr, OBFSTR("hello"));           ✅ 安全
- *      printf(LOG_ERR_arg, ...);                   ✅ 调用瞬间消费完
- *      const char *p = OBFSTR("x"); later_call(p); ❌ UB — buffer 已死
- *      static const char *p = OBFSTR("x");         ❌ UB — alloca 不能 static
+ *      fprintf(stderr, OBFSTR("hello"));           ✅ safe
+ *      printf(LOG_ERR_arg, ...);                   ✅ consumed inline
+ *      const char *p = OBFSTR("x"); later_call(p); ❌ UB — buffer dead
+ *      static const char *p = OBFSTR("x");         ❌ UB — alloca can't
+ *                                                       outlive the call
  *
- * 不要把 OBFSTR 的返回指针存到 static / 全局, 也不要跨函数边界传递.
+ * Don't stash the OBFSTR pointer in static/global storage, and don't
+ * pass it across a function-return boundary.  If you need the string
+ * to survive that long, copy it (`strdup(OBFSTR(...))` or memcpy into
+ * a caller-owned buffer).
  *
- * ─── 包装宏 (用着方便) ────────────────────────────────────────────────
+ * ─── Convenience wrappers ─────────────────────────────────────────────
  *
- * 提供几个语义清晰的宏:
+ * A few macros wrap the most common patterns with cleaner names:
  *
  *      LOG_ERR(fmt, ...)            → fprintf(stderr, fmt, ...)
  *      PERR(msg)                    → "msg: <strerror>\n" to stderr
  *      OSNPRINTF(buf, n, fmt, ...)  → snprintf with obfuscated fmt
  *      ODLSYM(handle, name)         → dlsym(handle, name)
  *
- * 但实际上你不一定要用它们 -- fprintf / snprintf / perror / dlsym
- * 本身就在 codegen 列表, 现存代码不改也能加密.  这些封装只是给后续
- * 新代码一个语义友好的入口.
+ * They're optional — fprintf / snprintf / perror / dlsym are already
+ * in the codegen scanner list, so existing call sites get encrypted
+ * literals without any source change.  The wrappers exist as a
+ * semantically nicer entry point for new code.
  *
- * ─── 攻击面覆盖 ────────────────────────────────────────────────────────
+ * ─── Attack-surface coverage ──────────────────────────────────────────
  *
- * 能挡:
- *   ✓ 攻击者拿到磁盘上加密 binary, 离线 strings 找信息
- *   ✓ 解密后的 memfd 文件复制出来再 strings
- *   ✓ 进程 core dump 静态分析
- *   ✓ /proc/<PID>/maps 里 .rodata 段做静态 dump
+ * Defended:
+ *   ✓ offline `strings` on the encrypted on-disk binary
+ *   ✓ `strings` on a copied-out memfd file
+ *   ✓ static analysis of a process core dump
+ *   ✓ static dump of the .rodata mapping in /proc/<PID>/maps
  *
- * 挡不了:
- *   ✗ 攻击者已经能 ptrace 业务进程, 等到 printf 那一刻 dump 栈
- *     (OBFSTR 解出来的瞬间, 明文在 alloca 栈 buffer 里数微秒到数毫秒)
- *   ✗ /proc/<PID>/mem 高频抓快照 -- 同上, 撞上调用瞬间能抓到
- *   ✗ printf 的输出本身 (stdout/stderr/syslog 的 sink)
- *   ✗ 链进来的第三方库 (glibc 错误消息表等) -- 不在我们源码里
- *   ✗ 导出符号名 (ANTI_LoadProcess 等) -- LD_PRELOAD 拦截要求 .dynsym
- *     里必须出现这个名字, 否则链接器找不到拦截入口
- *   ✗ 编译器/链接器自动注入的字符串 (.comment GCC 版本, build-id 等)
+ * NOT defended:
+ *   ✗ ptrace-attached attacker watching during a printf — the OBFSTR
+ *     output spends microseconds-to-milliseconds in the alloca'd
+ *     stack buffer, long enough to catch with the right timing
+ *   ✗ /proc/<PID>/mem high-frequency snapshotting — same window
+ *   ✗ the printf output itself (stdout / stderr / syslog sinks)
+ *   ✗ third-party libs linked in (glibc's error-message table, etc.)
+ *     — they're not part of our source so the codegen never sees them
+ *   ✗ exported symbol names (ANTI_LoadProcess and friends) — LD_PRELOAD
+ *     interposition requires those names in .dynsym, otherwise the
+ *     dynamic linker can't find the interception entry point
+ *   ✗ compiler/linker-injected strings (.comment GCC version, build-id)
  *
- * 即第一档 (离线静态分析) 完全挡死, 第二档 (running ptrace 攻击者)
- * 提高代价但挡不死, 第三档 (输出/外部) 不在保护范围.
+ * In short: tier-1 (offline static analysis) is fully blocked, tier-2
+ * (live ptrace attacker) is raised in cost but not blocked, tier-3
+ * (output sinks / linked-in third party) is out of scope.
  *
- * ─── 性能 ──────────────────────────────────────────────────────────────
+ * ─── Performance ──────────────────────────────────────────────────────
  *
- * 每次 _OBF 调用 = 1 次 alloca + N 字节 XOR 循环.  典型字符串 N≈30,
- * 一次解码大约 10-30ns.  日志/错误路径完全不在乎.  不要在每秒百万
- * 次调用的 hot loop 里用 OBFSTR -- 那个场景下 alloca + 循环的开销
- * 会被放大.
+ * Each _OBF call = one alloca + an N-byte XOR loop.  For typical
+ * strings (N ≈ 30) one decode is ~10-30 ns.  Negligible on log/error
+ * paths.  Avoid OBFSTR inside million-call-per-second hot loops —
+ * the alloca + loop overhead amplifies there.
  */
 
 #ifndef ANTIREV_OBFSTR_H
