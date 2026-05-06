@@ -464,7 +464,10 @@ def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
 
     # Check if SONAME is missing (.so only — .elf files don't need one).
     if not is_elf_asset and not get_dt_soname(src_p):
-        tmp_dir = tempfile.mkdtemp(prefix="antirev_patch_")
+        # Pack-time only — runs on the build machine, not deployed.
+        # Still rename to avoid the "antirev_" brand showing up in
+        # /tmp/ during builds shared with other tools/users.
+        tmp_dir = tempfile.mkdtemp(prefix=".lrx_patch_")
         patched = Path(tmp_dir) / src_p.name
         shutil.copy2(src_p, patched)
         try:

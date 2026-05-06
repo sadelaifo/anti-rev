@@ -885,9 +885,16 @@ static socklen_t make_sock_addr(struct sockaddr_un *addr,
 
     memset(addr, 0, sizeof(*addr));
     addr->sun_family = AF_UNIX;
-    /* Abstract socket: sun_path[0] = '\0' (already zeroed), name follows */
-    snprintf(addr->sun_path + 1, sizeof(addr->sun_path) - 1,
-             "antirev_%s", hex);
+    /* Abstract socket: sun_path[0] = '\0' (already zeroed), name follows.
+     *
+     * Just the 16 hex chars — no "antirev_" prefix.  Old code used
+     * "antirev_<hex>" which made `cat /proc/net/unix | grep antirev_`
+     * a one-step fingerprint of the daemon's presence on the host.
+     * The hex itself is already deterministically derived from
+     * K_master (via AES_K(0^128)[0:8]), so a bare 16-hex name is
+     * still unique per key and trivially reproducible by both sides.
+     * Python client (_abstract_socket_name) MUST stay in sync. */
+    snprintf(addr->sun_path + 1, sizeof(addr->sun_path) - 1, "%s", hex);
 
     explicit_bzero(&tmp, sizeof(tmp));
 

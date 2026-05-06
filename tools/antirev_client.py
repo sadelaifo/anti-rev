@@ -212,9 +212,17 @@ def _compute_sock_name(key):
     """Derive the daemon's abstract socket name from the key.
 
     Matches stub.c make_sock_addr(): AES_K(0^16)[0:8] → hex.
+
+    Just the 16 hex chars — the older "antirev_<hex>" prefix made
+    `cat /proc/net/unix | grep antirev_` a one-step fingerprint of
+    the daemon on the host.  The hex part is already keyed off
+    K_master so a bare hex name stays unique per key.  Both sides
+    (this module + stub.c make_sock_addr) MUST drop the prefix
+    together; mismatched prefixes leave the daemon listening on one
+    abstract name and clients trying to connect to another.
     """
     h = _aes256_ecb_block(key, b'\x00' * 16)
-    return "antirev_" + h[:8].hex()
+    return h[:8].hex()
 
 
 # ── Key loading ─────────────────────────────────────────────────────
