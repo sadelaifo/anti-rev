@@ -312,11 +312,21 @@ class AntirevClient:
         self._key = _load_key(Path(key_source))
         self._libs = {}
         self._loaded = set()   # tracks libs processed by _ensure_loaded
-        # PID-tagged prefix matches the C stub's format so the daemon's
-        # sweep_dead_symlink_dirs reaper can identify and clean stale
-        # dirs from crashed Python processes.  The atexit hook handles
-        # the normal-exit case.
-        self._link_dir = tempfile.mkdtemp(prefix=f"antirev_{os.getpid()}_")
+        # /tmp dir for the soname symlinks we create.  The prefix used
+        # to be a hard-coded "antirev_<pid>_" which leaked the brand
+        # to anyone running `ls /tmp/`.  Now we read it from
+        # ANTIREV_TMP_PREFIX (so a launcher can pin it to whatever the
+        # C daemon's per-build random is) and fall back to ".lrx_"
+        # — opaque, dot-hidden, distinct from the C side but at least
+        # not fingerprintable as antirev.
+        #
+        # Cleanup: atexit handles normal exit.  On hard crash the dir
+        # lingers in /tmp; the C daemon's sweep_dead_symlink_dirs no
+        # longer catches Python dirs (different prefix scheme), so a
+        # cron / boot-time `find /tmp -name '.lrx_*' -mtime +1` is the
+        # belt-and-suspenders option.
+        _tmp_pfx = os.environ.get('ANTIREV_TMP_PREFIX', '.lrx_')
+        self._link_dir = tempfile.mkdtemp(prefix=f"{_tmp_pfx}{os.getpid()}_")
         atexit.register(self._cleanup_link_dir)
         # Escape hatch, same semantics as dlopen_shim's ANTIREV_NO_PRELOAD:
         # when set, _ensure_loaded / _ensure_deps still materialize the
