@@ -68,7 +68,15 @@ endfunction()
 function(obfstr_codegen_sources OUT_VAR)
     set(_obfd "")
     foreach(_src ${ARGN})
-        get_filename_component(_name "${_src}" NAME)
+        # Source paths can be either source-tree-relative (e.g.
+        # "stub/stub.c") or absolute (e.g. ${CMAKE_BINARY_DIR}/runtime_paths.c
+        # for configure-generated files).  Normalise to a full path.
+        if(IS_ABSOLUTE "${_src}")
+            set(_full "${_src}")
+        else()
+            set(_full "${CMAKE_SOURCE_DIR}/${_src}")
+        endif()
+        get_filename_component(_name "${_full}" NAME)
         set(_out "${CMAKE_BINARY_DIR}/obf/${_name}")
         get_property(_already GLOBAL PROPERTY _OBFSTR_DONE_${_name})
         if(NOT _already)
@@ -77,8 +85,8 @@ function(obfstr_codegen_sources OUT_VAR)
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/obf"
                 COMMAND python3 "${CMAKE_SOURCE_DIR}/tools/obfstr_gen.py"
                         --out-dir "${CMAKE_BINARY_DIR}/obf"
-                        "${CMAKE_SOURCE_DIR}/${_src}"
-                DEPENDS "${CMAKE_SOURCE_DIR}/${_src}"
+                        "${_full}"
+                DEPENDS "${_full}"
                         "${CMAKE_SOURCE_DIR}/tools/obfstr_gen.py"
                         "${CMAKE_SOURCE_DIR}/stub/obfstr.h"
                 COMMENT "obfstr-codegen ${_name}"
@@ -89,6 +97,25 @@ function(obfstr_codegen_sources OUT_VAR)
     endforeach()
     set(${OUT_VAR} "${_obfd}" PARENT_SCOPE)
 endfunction()
+
+# ── Per-build random /tmp prefix ──────────────────────────────────────
+# Replaces the old hard-coded "antirev_" prefix that was trivially
+# fingerprintable from `ls /tmp/`.  Every fresh `cmake ..` rotates the
+# value, so a dump of one build's runtime fingerprint doesn't carry
+# over to the next release.  Set ANTIREV_TMP_PREFIX externally for a
+# repeatable build (e.g. -DANTIREV_TMP_PREFIX=.foo_).
+if(NOT DEFINED ANTIREV_TMP_PREFIX OR ANTIREV_TMP_PREFIX STREQUAL "")
+    string(RANDOM LENGTH 8 ALPHABET "0123456789abcdef" _antirev_rand_hex)
+    set(ANTIREV_TMP_PREFIX ".${_antirev_rand_hex}_" CACHE STRING
+        "Per-build random prefix for /tmp dirs antirev creates at runtime"
+        FORCE)
+endif()
+message(STATUS "antirev runtime tmp prefix: ${ANTIREV_TMP_PREFIX}")
+configure_file(
+    "${CMAKE_SOURCE_DIR}/cmake/runtime_paths.c.in"
+    "${CMAKE_BINARY_DIR}/runtime_paths.c"
+    @ONLY
+)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  antirev_shim.so — single shipping shim DSO
@@ -112,6 +139,10 @@ set(ANTIREV_SHIM_SOURCES
 if(TARGET_ARCH STREQUAL "aarch64")
     list(APPEND ANTIREV_SHIM_SOURCES stub/aarch64_extend_shim.c)
 endif()
+# Configure-generated runtime_paths.c lives in BUILD dir; pass an
+# absolute path so obfstr_codegen_sources's source-tree-relative
+# fallback isn't tried.
+list(APPEND ANTIREV_SHIM_SOURCES "${CMAKE_BINARY_DIR}/runtime_paths.c")
 obfstr_codegen_sources(ANTIREV_SHIM_SOURCES_OBF ${ANTIREV_SHIM_SOURCES})
 add_library(antirev_shim SHARED ${ANTIREV_SHIM_SOURCES_OBF})
 set_target_properties(antirev_shim PROPERTIES
@@ -149,7 +180,11 @@ add_custom_target(antirev_shim_blob_h DEPENDS "${ANTIREV_SHIM_BLOB_H}")
 # ═══════════════════════════════════════════════════════════════════════
 #  stub executable
 # ═══════════════════════════════════════════════════════════════════════
-obfstr_codegen_sources(STUB_SOURCES_OBF stub/stub.c stub/crypto.c)
+obfstr_codegen_sources(STUB_SOURCES_OBF
+    stub/stub.c
+    stub/crypto.c
+    "${CMAKE_BINARY_DIR}/runtime_paths.c"   # configure-generated
+)
 add_executable(${STUB_NAME} ${STUB_SOURCES_OBF})
 target_include_directories(${STUB_NAME} PRIVATE
     "${CMAKE_BINARY_DIR}"        # generated blob headers

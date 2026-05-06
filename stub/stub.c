@@ -32,7 +32,8 @@
  */
 
 #define _GNU_SOURCE
-#include "obfstr.h"     /* compile-time string-literal obfuscation */
+#include "obfstr.h"        /* compile-time string-literal obfuscation */
+#include "runtime_paths.h" /* per-build-random /tmp prefix accessors  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1867,7 +1868,7 @@ static char **build_exec_env(const exec_env_cfg_t *cfg) {
 /*  Mode A: lightweight lib daemon                                      */
 /* ------------------------------------------------------------------ */
 
-/* Reap stale /tmp/antirev_<pid>_XXXXXX dirs whose owner PID is dead.
+/* Reap stale /tmp/<rand><pid>_XXXXXX dirs whose owner PID is dead.
  *
  * Each protected exe creates one of these on launch as its symlink
  * dir (Phase 4c).  exe_shim's atexit handler removes it on normal
@@ -1881,22 +1882,19 @@ static char **build_exec_env(const exec_env_cfg_t *cfg) {
  *
  * Safe under PID reuse: in the unlikely case a recycled PID matches
  * a stale dir name, the new PID has nothing to do with that dir, so
- * removing it harms nothing. */
+ * removing it harms nothing.
+ *
+ * The "<rand>" prefix is rotated per-build (see runtime_paths.h /
+ * cmake/runtime_paths.c.in) — antirev_dir_name_matches_us() hides
+ * the actual literal so this loop doesn't need to know it. */
 static void sweep_dead_symlink_dirs(void) {
     DIR *dp = opendir("/tmp");
     if (!dp) return;
 
     struct dirent *de;
     while ((de = readdir(dp)) != NULL) {
-        if (strncmp(de->d_name, "antirev_", 8) != 0) continue;
-
-        /* Parse "antirev_<pid>_<rand>" — accept the legacy
-         * "antirev_<rand>" form too by skipping it (no PID = can't
-         * decide ownership safely). */
-        const char *p = de->d_name + 8;
-        char *endp;
-        long pid = strtol(p, &endp, 10);
-        if (endp == p || *endp != '_' || pid <= 0) continue;
+        int pid;
+        if (!antirev_dir_name_matches_us(de->d_name, &pid)) continue;
 
         if (kill((pid_t)pid, 0) == 0 || errno != ESRCH)
             continue; /* owner still alive — leave it */
@@ -1928,10 +1926,15 @@ static void sweep_dead_symlink_dirs(void) {
     closedir(dp);
 }
 
-/* Scan /tmp/antirev-deps.log-style graph dump so it's reachable when
- * the daemon's stderr is closed (e.g., launched from sysmgr). */
+/* Dump the deps graph to a debug log under /tmp so it's reachable
+ * when the daemon's stderr is closed (e.g., launched from sysmgr).
+ * The log path uses the per-build-random prefix (see runtime_paths.h)
+ * so the file is at /tmp/<rand>deps.log, not the old fingerprintable
+ * /tmp/antirev-deps.log. */
 static void dump_deps_graph_log(const char (*lib_names)[MAX_NAME + 1], int nlibs) {
-    FILE *lf = fopen("/tmp/antirev-deps.log", "w");
+    char log_path[64];
+    antirev_make_deps_log_path(log_path, sizeof(log_path));
+    FILE *lf = fopen(log_path, "w");
     if (!lf)
         return;
     fprintf(lf, "# antirev deps graph (%d libs)\n", nlibs);
@@ -2013,7 +2016,7 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
                               int *nlibs) {
     raise_fd_limit();
 
-    /* Startup sweep: reap any /tmp/antirev_<pid>_* dirs whose owner
+    /* Startup sweep: reap any /tmp/<rand><pid>_* dirs whose owner
      * is dead.  Catches dirs left behind by protected exes that
      * crashed before exe_shim's atexit could fire. */
     sweep_dead_symlink_dirs();
@@ -2540,21 +2543,23 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     }
 
     /* Phase 4c. Create symlink dir for ALL encrypted libs (DT_NEEDED + FD_MAP):
-     *   /tmp/antirev_XXXXXX/libfoo.so → /proc/self/fd/N
+     *   /tmp/<rand><pid>_<XXXXXX>/libfoo.so → /proc/self/fd/N
      *
      * This dir is prepended to LD_LIBRARY_PATH.  For DT_NEEDED libs, this
      * is the PRIMARY resolution mechanism — glibc's BFS finds them here,
      * preserving the original symbol lookup order.  For FD_MAP (dlopen'd)
      * libs, the symlinks serve as a fallback when the lib's own DT_NEEDED
-     * chain references other encrypted libs. */
-    /* PID-tagged template lets the daemon's startup/shutdown sweep
-     * identify which symlink dirs are owned by which protected exe.
-     * If our PID is dead by the time the daemon next sweeps, the dir
-     * gets reaped — covers the SIGKILL / segfault / hard-crash path
-     * that exe_shim's atexit handler can't.  mkdtemp replaces the
-     * trailing XXXXXX with random chars and chmods the dir to 0700. */
+     * chain references other encrypted libs.
+     *
+     * The "<rand>" segment is the per-build-random prefix from
+     * runtime_paths.h, so this dir name doesn't fingerprint as antirev's
+     * across releases.  PID is included so the daemon's stale-dir
+     * sweep can decide ownership without coordinating with active exes
+     * (covers the SIGKILL / segfault / hard-crash path that exe_shim's
+     * atexit can't).  mkdtemp fills the trailing XXXXXX with random
+     * chars and chmods the dir to 0700. */
     char link_dir[64];
-    snprintf(link_dir, sizeof(link_dir), "/tmp/antirev_%d_XXXXXX", (int)getpid());
+    antirev_make_link_dir_template(link_dir, sizeof(link_dir), (int)getpid());
     char *link_dir_ptr = mkdtemp(link_dir);
     if (link_dir_ptr) {
         for (int j = 0; j < n_dt_needed; j++) {

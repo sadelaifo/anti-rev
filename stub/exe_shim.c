@@ -23,7 +23,8 @@
  */
 
 #define _GNU_SOURCE
-#include "obfstr.h"     /* compile-time string-literal obfuscation */
+#include "obfstr.h"        /* compile-time string-literal obfuscation */
+#include "runtime_paths.h" /* per-build-random /tmp prefix accessors  */
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
@@ -216,7 +217,15 @@ static void scrub_nonowner_env(void) {
     unsetenv("ANTIREV_FD_MAP");
     unsetenv("ANTIREV_REAL_EXE");
     strip_env_path_entries("LD_PRELOAD", "/proc/self/fd/");
-    strip_env_path_entries("LD_LIBRARY_PATH", "/tmp/antirev_");
+
+    /* Strip our per-build-random /tmp prefix from inherited
+     * LD_LIBRARY_PATH.  Old code hard-coded "/tmp/antirev_" here,
+     * which both (a) leaked the antirev brand to anyone running
+     * `strings` on the shim and (b) couldn't track the new per-build
+     * prefix scheme. */
+    char tmp_prefix[40];
+    antirev_get_tmp_dir_prefix(tmp_prefix, sizeof(tmp_prefix));
+    strip_env_path_entries("LD_LIBRARY_PATH", tmp_prefix);
 }
 
 /* Close DT_NEEDED memfds now that glibc's dynamic linker has finished
@@ -338,14 +347,18 @@ __attribute__((constructor)) static void restore_identity(void) {
     g_owner_pid = getpid();
     close_dt_needed_fds();
 
-    /* Capture the symlink dir BEFORE the owner-scrub strips
-     * /tmp/antirev_* entries from LD_LIBRARY_PATH (and before
-     * anything else might unset the env var). */
+    /* Capture the symlink dir BEFORE the owner-scrub strips our
+     * /tmp/<rand>* entries from LD_LIBRARY_PATH (and before anything
+     * else might unset the env var). */
     register_symlink_dir_cleanup();
 
     /* aarch64-only owner scrub — see comment above. */
     strip_env_path_entries("LD_PRELOAD", "/proc/self/fd/");
-    strip_env_path_entries("LD_LIBRARY_PATH", "/tmp/antirev_");
+    {
+        char tmp_prefix[40];
+        antirev_get_tmp_dir_prefix(tmp_prefix, sizeof(tmp_prefix));
+        strip_env_path_entries("LD_LIBRARY_PATH", tmp_prefix);
+    }
     unsetenv("ANTIREV_FD_MAP");
 
     restore_process_name(real);

@@ -1,0 +1,58 @@
+/* AUTO-GENERATED from cmake/runtime_paths.c.in by `cmake ..`.
+ * DO NOT EDIT — re-run cmake to regenerate.
+ *
+ * `@ANTIREV_TMP_PREFIX@` is rotated on every configure (string(RANDOM)
+ * in CMakeLists.txt) so each release build leaves a different runtime
+ * fingerprint in /tmp.  Each literal goes through OBFSTR (via the
+ * snprintf / OBFSTR scanner in tools/obfstr_gen.py) so even the
+ * per-build prefix lives in .rodata as ciphertext, not cleartext.
+ *
+ * Key implementation detail: every literal here MUST sit at the
+ * top-level argument position of a function obfstr_gen.py recognises
+ * (snprintf, OBFSTR, …).  Wrapping a literal in OBFSTR(...) inside
+ * another scanned call (e.g. snprintf(buf, sz, OBFSTR("..."), x))
+ * would NOT be obfuscated — the codegen consumes snprintf's args
+ * once and doesn't recurse into nested macro calls.
+ *
+ * See stub/runtime_paths.h for the interface contract. */
+
+#include "obfstr.h"
+#include "runtime_paths.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+void antirev_make_link_dir_template(char *buf, size_t sz, int pid) {
+    /* snprintf's literal arg is caught by obfstr_gen and rewritten
+     * to _OBF(0x..., 0x..., ...) — the cleartext prefix never lands
+     * in .rodata. */
+    snprintf(buf, sz, "/tmp/@ANTIREV_TMP_PREFIX@%d_XXXXXX", pid);
+}
+
+void antirev_get_tmp_dir_prefix(char *buf, size_t sz) {
+    snprintf(buf, sz, "/tmp/@ANTIREV_TMP_PREFIX@");
+}
+
+int antirev_dir_name_matches_us(const char *name, int *out_pid) {
+    /* OBFSTR is the top-level call here — not nested in snprintf —
+     * so obfstr_gen DOES rewrite it to _OBF(...). */
+    const char *prefix = OBFSTR("@ANTIREV_TMP_PREFIX@");
+    size_t plen = strlen(prefix);
+    if (strncmp(name, prefix, plen) != 0) return 0;
+
+    /* "<rand><pid>_<chars>" — parse the pid that follows the prefix.
+     * Reject the legacy "<rand><chars>" form (no pid) since we can't
+     * decide ownership safely without it. */
+    const char *p = name + plen;
+    char *endp;
+    long pid = strtol(p, &endp, 10);
+    if (endp == p || *endp != '_' || pid <= 0) return 0;
+
+    *out_pid = (int)pid;
+    return 1;
+}
+
+void antirev_make_deps_log_path(char *buf, size_t sz) {
+    snprintf(buf, sz, "/tmp/@ANTIREV_TMP_PREFIX@deps.log");
+}
