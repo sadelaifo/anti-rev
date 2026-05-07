@@ -41,6 +41,11 @@ TRANSFORM_MACROS = (
     # Per-shim debug logger.  Has identical shape (fmt, ...) so codegen
     # transforms its first arg the same way as LOG_ERR.
     'LOG',
+    # ANTIREV_LOG-gated stderr loggers in stub.c.  Default-off; user
+    # opts in via the env var.  Same shape as fprintf/perror — codegen
+    # treats arg 0 as the literal to obfuscate.
+    'LOG_INFO',
+    'PERR_INFO',
     # libc functions whose literal arguments are antirev architecture
     # markers we want to hide.  Non-literal arguments are passed
     # through untouched, so it's safe to scan every call site of these.

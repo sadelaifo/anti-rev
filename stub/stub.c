@@ -91,6 +91,38 @@
 #define SCM_BATCH    250  /* max fds per SCM_RIGHTS (kernel SCM_MAX_FD = 253) */
 
 /* ------------------------------------------------------------------ */
+/*  Diagnostic-log gate (controlled by ANTIREV_LOG env var)             */
+/* ------------------------------------------------------------------ */
+/* Default behaviour is total silence on stderr — production deploys
+ * shouldn't ship `[antirev] decrypted: foo.so` chatter to whoever's
+ * watching stdout/stderr (systemd journal, a tee, a log scraper, etc.).
+ *
+ *   ANTIREV_LOG unset / =0 / =false / =no  → silent (default)
+ *   ANTIREV_LOG anything else              → all info + errors to stderr
+ *
+ * Both LOG_INFO (status) and PERR_INFO (errno wrapper) are routed
+ * through the same gate.  init_log_gate() must be the first thing
+ * main() does so that the very first perror at /proc/self/exe open
+ * already respects the user's choice. */
+static FILE *g_stub_log = NULL;
+
+static void init_log_gate(void) {
+    const char *e = getenv("ANTIREV_LOG");
+    if (!e || !*e) return;
+    /* Treat 0 / false / no / off / disabled as "silent" too — common
+     * shell idioms.  Anything else turns logging on. */
+    if (e[0] == '0' && e[1] == '\0') return;
+    if (e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N') return;
+    g_stub_log = stderr;
+}
+
+#define LOG_INFO(...) \
+    do { if (g_stub_log) fprintf(g_stub_log, __VA_ARGS__); } while (0)
+
+#define PERR_INFO(s) \
+    do { if (g_stub_log) perror(s); } while (0)
+
+/* ------------------------------------------------------------------ */
 /*  Per-file metadata collected during header scan (Phase 1)          */
 /* ------------------------------------------------------------------ */
 typedef struct {
@@ -125,7 +157,7 @@ static inline uint64_t u64le(const uint8_t *p)
 static int make_memfd(const char *name)
 {
     int fd = (int)syscall(__NR_memfd_create, name, 0 /* no MFD_CLOEXEC */);
-    if (fd < 0) { perror("memfd_create"); return -1; }
+    if (fd < 0) { PERR_INFO("memfd_create"); return -1; }
     return fd;
 }
 
@@ -133,7 +165,7 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 {
     for (size_t w = 0; w < len; ) {
         ssize_t n = write(fd, data + w, len - w);
-        if (n < 0) { perror("write memfd"); return -1; }
+        if (n < 0) { PERR_INFO("write memfd"); return -1; }
         w += (size_t)n;
     }
     return 0;
@@ -1062,7 +1094,7 @@ static void build_deps_graph(const int *lib_fds,
              * dep will send glibc to disk at load time and abort
              * with "invalid elf header".  Bump the cap and rebuild. */
             int total = -n_dt;
-            fprintf(stderr, "[antirev] WARNING: %s has %d DT_NEEDED "
+            LOG_INFO("[antirev] WARNING: %s has %d DT_NEEDED "
                     "entries, only %d captured (MAX_DEPS_PER_LIB=%d). "
                     "Increase the cap.\n",
                     lib_names[i], total, MAX_DEPS_PER_LIB,
@@ -1342,7 +1374,7 @@ static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
             lib_fds[*nlibs] = jobs[i].fd;
             memcpy(lib_names[*nlibs], jobs[i].name, MAX_NAME + 1);
             (*nlibs)++;
-            fprintf(stderr, "[antirev] decrypted: %s\n", jobs[i].name);
+            LOG_INFO("[antirev] decrypted: %s\n", jobs[i].name);
         }
     }
 
@@ -1425,7 +1457,7 @@ static int spawn_local_daemon(const char *real_exe, char *const *envp) {
     if (waitpid(pid, &st, 0) < 0)
         return 0;
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
-        fprintf(stderr, "[antirev] daemon launch failed (exit=%d signal=%d)\n",
+        LOG_INFO("[antirev] daemon launch failed (exit=%d signal=%d)\n",
                 WIFEXITED(st) ? WEXITSTATUS(st) : -1,
                 WIFSIGNALED(st) ? WTERMSIG(st) : 0);
         return 0;
@@ -1480,7 +1512,7 @@ static int daemon_connect_and_fetch(const struct sockaddr_un *addr, socklen_t ad
     socklen_t clen = sizeof(cred);
     if (getsockopt(sd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0
         || cred.uid != getuid()) {
-        fprintf(stderr,
+        LOG_INFO(
                 "[antirev] daemon impostor detected (peer uid %u, expected %u)\n",
                 (unsigned)cred.uid, (unsigned)getuid());
         close(sd);
@@ -1538,7 +1570,7 @@ static int fetch_libs_from_daemon(const char *real_exe, char *const *envp, const
         int rc = daemon_connect_and_fetch(&addr, addr_len, has_needed_section, n_needed, needed_names, lib_fds,
                                           lib_names, nlibs, all_enc_names, n_all_enc, daemon_sd);
         if (rc == 0) {
-            fprintf(stderr,
+            LOG_INFO(
                     "[antirev] daemon: %d enc libs total, "
                     "%d eagerly fetched (DT_NEEDED)\n",
                     *n_all_enc, *nlibs);
@@ -1552,7 +1584,7 @@ static int fetch_libs_from_daemon(const char *real_exe, char *const *envp, const
 
         usleep(100000);
     }
-    fprintf(stderr, "[antirev] failed to connect to lib daemon\n");
+    LOG_INFO("[antirev] failed to connect to lib daemon\n");
     return -1;
 }
 
@@ -1932,7 +1964,7 @@ static void sweep_dead_symlink_dirs(void) {
             closedir(sub);
         }
         if (rmdir(dir) == 0)
-            fprintf(stderr, "[antirev] reaped stale symlink dir %s (pid %ld dead)\n",
+            LOG_INFO("[antirev] reaped stale symlink dir %s (pid %ld dead)\n",
                     dir, pid);
     }
     closedir(dp);
@@ -1942,8 +1974,11 @@ static void sweep_dead_symlink_dirs(void) {
  * when the daemon's stderr is closed (e.g., launched from sysmgr).
  * The log path uses the per-build-random prefix (see runtime_paths.h)
  * so the file is at /tmp/<rand>deps.log, not the old fingerprintable
- * /tmp/antirev-deps.log. */
+ * /tmp/antirev-deps.log.  Gated on ANTIREV_LOG — production deploys
+ * shouldn't accumulate a deps-graph file in /tmp on every daemon
+ * start. */
 static void dump_deps_graph_log(const char (*lib_names)[MAX_NAME + 1], int nlibs) {
+    if (!g_stub_log) return;          /* ANTIREV_LOG not set */
     char log_path[64];
     antirev_make_deps_log_path(log_path, sizeof(log_path));
     FILE *lf = fopen(log_path, "w");
@@ -1967,11 +2002,11 @@ static int daemon_open_listen_socket(const uint8_t *key) {
 
     int sd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sd < 0) {
-        perror("socket");
+        PERR_INFO("socket");
         return -1;
     }
     if (bind(sd, (struct sockaddr *) &addr, addr_len) < 0) {
-        perror("[antirev] daemon bind");
+        PERR_INFO("[antirev] daemon bind");
         close(sd);
         return -1;
     }
@@ -1986,12 +2021,12 @@ static int decrypt_own_libs(const char *real_exe, const uint8_t *key, int *lib_f
     clock_gettime(CLOCK_MONOTONIC, &t_start);
     scan_encrypted_libs(real_exe, key, lib_fds, lib_names, nlibs);
     if (*nlibs == 0) {
-        fprintf(stderr, "[antirev] no main binary and no libs found\n");
+        LOG_INFO("[antirev] no main binary and no libs found\n");
         return -1;
     }
     clock_gettime(CLOCK_MONOTONIC, &t_end);
     double elapsed = (double) (t_end.tv_sec - t_start.tv_sec) + (double) (t_end.tv_nsec - t_start.tv_nsec) / 1e9;
-    fprintf(stderr, "[antirev] decrypted %d libs in %.1fs\n", *nlibs, elapsed);
+    LOG_INFO("[antirev] decrypted %d libs in %.1fs\n", *nlibs, elapsed);
     return 0;
 }
 
@@ -2006,7 +2041,7 @@ static void build_and_log_deps_graph(int *lib_fds, const char (*lib_names)[MAX_N
         if (g_deps_count[i] == 0)
             zero++;
     }
-    fprintf(stderr,
+    LOG_INFO(
             "[antirev] deps graph: %d libs, %d edges, "
             "%d libs with 0 deps\n",
             nlibs, total_edges, zero);
@@ -2042,11 +2077,11 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
     explicit_bzero(key, KEY_SIZE);
     if (listen_sd < 0)
         return 1;
-    fprintf(stderr, "[antirev] lib daemon ready (%d libs)\n", *nlibs);
+    LOG_INFO("[antirev] lib daemon ready (%d libs)\n", *nlibs);
 
     pid_t pid = fork();
     if (pid < 0) {
-        perror("fork");
+        PERR_INFO("fork");
         return 1;
     }
     if (pid > 0)
@@ -2294,6 +2329,11 @@ static void exec_target(int main_fd, char *const *argv, char **new_env, const ch
 /* ------------------------------------------------------------------ */
 int main(int argc __attribute__((unused)), char *argv[], char *envp[])
 {
+    /* Gate stderr diagnostics on ANTIREV_LOG env.  MUST happen before
+     * any LOG_INFO / PERR_INFO call so the very first error path
+     * (open /proc/self/exe) already respects the user's preference. */
+    init_log_gate();
+
     /* 1. Capture real exe path before fexecve replaces /proc/self/exe.
      *    Use raw syscall to bypass any inherited LD_PRELOAD exe_shim from
      *    a parent protected binary — we need the true kernel-level path. */
@@ -2301,27 +2341,27 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     {
         ssize_t n = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD,
                                      "/proc/self/exe", real_exe, sizeof(real_exe) - 1);
-        if (n <= 0) { perror("readlink /proc/self/exe"); return 1; }
+        if (n <= 0) { PERR_INFO("readlink /proc/self/exe"); return 1; }
         real_exe[n] = '\0';
     }
 
     /* 2. Open /proc/self/exe and read the 48-byte trailer */
     int self = open("/proc/self/exe", O_RDONLY);
-    if (self < 0) { perror("open /proc/self/exe"); return 1; }
+    if (self < 0) { PERR_INFO("open /proc/self/exe"); return 1; }
 
     off_t fsize = lseek(self, 0, SEEK_END);
     if (fsize < 48) {
-        fprintf(stderr, "[antirev] binary too small\n");
+        LOG_INFO("[antirev] binary too small\n");
         return 1;
     }
 
     /* Trailer layout: [bundle_offset:8B][key:32B][magic:8B] = 48 bytes */
     uint8_t trailer[48];
     if (pread(self, trailer, 48, fsize - 48) != 48) {
-        perror("pread trailer"); return 1;
+        PERR_INFO("pread trailer"); return 1;
     }
     if (memcmp(trailer + 40, MAGIC, MAGIC_LEN) != 0) {
-        fprintf(stderr, "[antirev] not a protected binary (magic not found)\n");
+        LOG_INFO("[antirev] not a protected binary (magic not found)\n");
         return 1;
     }
 
@@ -2340,7 +2380,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
 
     /* Read bundle_flags (1 byte) */
     if (pread(self, tmp, 1, (off_t) bundle_off) != 1) {
-        perror("pread bundle_flags");
+        PERR_INFO("pread bundle_flags");
         return 1;
     }
     uint8_t bundle_flags = tmp[0];
@@ -2353,10 +2393,10 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         file_entry_t *e = &main_entry;
 
         /* name_len (2 bytes) */
-        if (pread(self, tmp, 2, scan) != 2) { perror("pread name_len"); return 1; }
+        if (pread(self, tmp, 2, scan) != 2) { PERR_INFO("pread name_len"); return 1; }
         uint16_t nlen = u16le(tmp);
         if (nlen > MAX_NAME) {
-            fprintf(stderr, "[antirev] name too long in bundle\n");
+            LOG_INFO("[antirev] name too long in bundle\n");
             return 1;
         }
         scan += 2;
@@ -2364,7 +2404,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         /* name + iv + tag + ct_size */
         ssize_t hdr_rest = nlen + IV_SIZE + TAG_SIZE + 8;
         if (pread(self, tmp, (size_t)hdr_rest, scan) != hdr_rest) {
-            perror("pread file header"); return 1;
+            PERR_INFO("pread file header"); return 1;
         }
         memcpy(e->name, tmp, nlen);
         e->name[nlen]  = '\0';
@@ -2378,7 +2418,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
 
         /* Sanity: ciphertext must not overlap the trailer */
         if (e->ct_offset + e->ct_size > (uint64_t)(fsize - 48)) {
-            fprintf(stderr, "[antirev] bundle extends past trailer\n");
+            LOG_INFO("[antirev] bundle extends past trailer\n");
             return 1;
         }
     }
@@ -2416,7 +2456,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * Peak user-space heap: one CHUNK_SIZE buffer.
      * ---------------------------------------------------------------- */
     uint8_t *chunk = malloc(CHUNK_SIZE);
-    if (!chunk) { perror("malloc chunk"); return 1; }
+    if (!chunk) { PERR_INFO("malloc chunk"); return 1; }
 
     int main_fd = -1;
     int lib_fds[MAX_FILES];
@@ -2437,19 +2477,19 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         while (remaining > 0) {
             size_t  to_read = (remaining < CHUNK_SIZE) ? (size_t)remaining : CHUNK_SIZE;
             ssize_t got     = pread(self, chunk, to_read, pos);
-            if (got != (ssize_t)to_read) { perror("pread ciphertext"); return 1; }
+            if (got != (ssize_t)to_read) { PERR_INFO("pread ciphertext"); return 1; }
             aes256gcm_onepass(&ctx, chunk, chunk, to_read);
             if (write_chunk(fd, chunk, to_read) != 0) return 1;
             pos       += (off_t)to_read;
             remaining -= to_read;
         }
         if (aes256gcm_ghash_verify(&ctx, e->tag) != 0) {
-            fprintf(stderr, "[antirev] decryption failed for '%s'\n", e->name);
+            LOG_INFO("[antirev] decryption failed for '%s'\n", e->name);
             if (ftruncate(fd, 0)) { /* wipe plaintext */ }
             close(fd);
             return 1;
         }
-        if (lseek(fd, 0, SEEK_SET) < 0) { perror("lseek memfd"); return 1; }
+        if (lseek(fd, 0, SEEK_SET) < 0) { PERR_INFO("lseek memfd"); return 1; }
 
         main_fd = fd;
     }
@@ -2489,7 +2529,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
     if (write_chunk(antirev_shim_fd, antirev_shim_blob, antirev_shim_blob_len) != 0)
         return 1;
     if (lseek(antirev_shim_fd, 0, SEEK_SET) < 0) {
-        perror("lseek antirev_shim");
+        PERR_INFO("lseek antirev_shim");
         return 1;
     }
 
@@ -2537,11 +2577,11 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 n_fdmap++;
             }
         }
-        fprintf(stderr, "[antirev] split: %d via symlinks, %d on FD_MAP "
+        LOG_INFO("[antirev] split: %d via symlinks, %d on FD_MAP "
                 "(needed=%d, daemon=%d)\n",
                 n_dt_needed, n_fdmap, n_needed, nlibs);
         for (int k = 0; k < n_dt_needed; k++)
-            fprintf(stderr, "[antirev]   DT_NEEDED: %s (fd %d)\n",
+            LOG_INFO("[antirev]   DT_NEEDED: %s (fd %d)\n",
                     dt_needed_names[k], dt_needed_fds[k]);
     } else {
         /* No needed list — all libs go on LD_PRELOAD (backward compat).
@@ -2550,7 +2590,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         n_dt_needed = nlibs;
         memcpy(dt_needed_fds, lib_fds, (size_t)nlibs * sizeof(int));
         memcpy(dt_needed_names, lib_names, (size_t)nlibs * (MAX_NAME + 1));
-        fprintf(stderr, "[antirev] backward compat: all %d libs on LD_PRELOAD\n",
+        LOG_INFO("[antirev] backward compat: all %d libs on LD_PRELOAD\n",
                 nlibs);
     }
 
@@ -2580,7 +2620,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             snprintf(lpath, sizeof(lpath), "%s/%s", link_dir, dt_needed_names[j]);
             snprintf(target, sizeof(target), "/proc/self/fd/%d", dt_needed_fds[j]);
             if (symlink(target, lpath) < 0)
-                perror("[antirev] symlink");
+                PERR_INFO("[antirev] symlink");
         }
         for (int j = 0; j < n_fdmap; j++) {
             char lpath[sizeof(link_dir) + MAX_NAME + 2];
@@ -2588,9 +2628,9 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             snprintf(lpath, sizeof(lpath), "%s/%s", link_dir, fdmap_names[j]);
             snprintf(target, sizeof(target), "/proc/self/fd/%d", fdmap_fds[j]);
             if (symlink(target, lpath) < 0)
-                perror("[antirev] symlink");
+                PERR_INFO("[antirev] symlink");
         }
-        fprintf(stderr, "[antirev] symlink dir: %s (%d links)\n",
+        LOG_INFO("[antirev] symlink dir: %s (%d links)\n",
                 link_dir, n_dt_needed + n_fdmap);
     }
 
@@ -2614,12 +2654,12 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
             .link_dir = link_dir,
     });
     if (!new_env) {
-        perror("malloc env");
+        PERR_INFO("malloc env");
         return 1;
     }
 
     /* Phase 6. Replace this process with the decrypted binary. */
     exec_target(main_fd, argv, new_env, real_exe);
-    perror("fexecve");
+    PERR_INFO("fexecve");
     return 1;
 }
