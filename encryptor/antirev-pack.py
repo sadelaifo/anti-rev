@@ -455,15 +455,25 @@ def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
     runtime.  .elf PG binaries are looked up by basename at runtime
     (aarch64_extend_shim → OP_GET_LIB), never go through DT_NEEDED resolution,
     and usually have no SONAME — skip patchelf for them.
+
+    .debug files (separate-debug-info ELFs produced by `objcopy
+    --only-keep-debug`, e.g. libfoo.so.debug) are not loaded as
+    runtime shared libs at all — they live next to the stripped .so
+    and gdb pulls them in via .gnu_debuglink.  patchelf chokes on
+    them ("strange: no string table") because the dynsym/dynstr
+    sections are gutted by the strip.  Skip patchelf for them; the
+    encryption itself still runs if the user listed them.
     """
     src_p, dst_p = Path(src), Path(dst)
     patched = None
     soname_note = ""
 
     is_elf_asset = src_p.name.endswith('.elf')
+    is_debug_file = src_p.suffix == '.debug'
 
-    # Check if SONAME is missing (.so only — .elf files don't need one).
-    if not is_elf_asset and not get_dt_soname(src_p):
+    # Check if SONAME is missing (.so only — .elf and .debug files
+    # don't need one and would crash patchelf).
+    if not is_elf_asset and not is_debug_file and not get_dt_soname(src_p):
         # Pack-time only — runs on the build machine, not deployed.
         # Still rename to avoid the "antirev_" brand showing up in
         # /tmp/ during builds shared with other tools/users.
