@@ -8,6 +8,38 @@
  * client state.
  *
  * Init is idempotent and safe to call from any number of constructors.
+ *
+ * ─── Stub→shim env-var name map ─────────────────────────────────────
+ *
+ * The stub passes runtime context to the LD_PRELOAD'd shim through a
+ * fixed set of env vars.  Their names used to be ANTIREV_*; renamed
+ * to opaque __r_* tokens so `cat /proc/<PID>/environ` no longer
+ * fingerprints the protected process as antirev.  Keep this table
+ * in sync with stub.c's env_is_antirev_managed() prefix list and
+ * with tools/antirev_client.py if/when it grows env-var awareness.
+ *
+ *   ┌─────────────────────┬────────┐
+ *   │         OLD          │  NEW  │
+ *   ├─────────────────────┼────────┤
+ *   │ ANTIREV_REAL_EXE    │ __r_RE │  real on-disk path of protected exe
+ *   │ ANTIREV_MAIN_FD     │ __r_MF │  memfd fd of decrypted main exe
+ *   │ ANTIREV_FD_MAP      │ __r_FM │  comma list  name=fd  for enc libs
+ *   │ ANTIREV_CLOSE_FDS   │ __r_CF │  comma list of fds the shim ctor closes
+ *   │ ANTIREV_LIBD_SOCK   │ __r_LS │  inherited daemon socket fd
+ *   │ ANTIREV_ENC_LIBS    │ __r_EL │  comma list of encrypted lib basenames
+ *   │ ANTIREV_SYMLINK_DIR │ __r_SD │  /tmp/<rand><pid>_XXXXXX symlink dir
+ *   │ ANTIREV_NO_PRELOAD  │ __r_NP │  escape hatch — disable per-dep preload
+ *   └─────────────────────┴────────┘
+ *
+ * Vars that intentionally KEEP their ANTIREV_* names — they're either
+ * user-facing knobs or opt-in debug switches and any leak only
+ * happens when the user explicitly sets them:
+ *
+ *   ANTIREV_LOG                 stderr gate for stub.c
+ *   ANTIREV_DLOPEN_LOG          dlopen_shim debug log path
+ *   ANTIREV_AARCH64_EXTEND_LOG  aarch64_extend_shim debug log path
+ *   ANTIREV_KEY / ANTIREV_KEY_FD  Python client key discovery
+ *   ANTIREV_TMP_PREFIX          CMake build-time + Python tmp prefix override
  */
 
 #ifndef ANTIREV_DAEMON_CLIENT_H
