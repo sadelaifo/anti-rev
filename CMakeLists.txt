@@ -1012,6 +1012,38 @@ add_custom_target(test_proc_self_exe
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_memfd_name — every decrypted memfd (exe, shim, daemon-served libs)
+#  must appear in /proc/self/fd as "memfd:<random-hex> (deleted)" rather
+#  than carrying the source artifact's basename.  Without the rename,
+#  /proc/<pid>/fd readlinks would identify which encrypted blob each fd
+#  holds; with a per-process random hex name they don't.
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/memfd_name_test"
+    COMMAND gcc -O2
+            -o "${CMAKE_BINARY_DIR}/memfd_name_test"
+            "${CMAKE_SOURCE_DIR}/tests/memfd_name/main.c"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/memfd_name/main.c"
+    COMMENT "Building test binary: memfd_name_test"
+)
+add_custom_target(memfd_name_test DEPENDS "${CMAKE_BINARY_DIR}/memfd_name_test")
+
+add_custom_target(test_memfd_name
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_memfd_name ==="
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/memfd_name_test"
+            --key    "${CMAKE_BINARY_DIR}/memfd_name.key"
+            --output "${CMAKE_BINARY_DIR}/memfd_name_test.protected"
+    COMMAND "${CMAKE_BINARY_DIR}/memfd_name_test.protected"
+    DEPENDS stub memfd_name_test
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "memfd name obfuscation test (per-process random hex name)"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_ctor_readlink — readlink("/proc/self/exe") called from a C++
 #  global static initializer in a DT_NEEDED library (before exe_shim's
 #  constructor) must return the real path, not memfd.

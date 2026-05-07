@@ -120,10 +120,46 @@ static inline uint64_t u64le(const uint8_t *p)
 
 /* ------------------------------------------------------------------ */
 /*  Write bytes to a new memfd (no O_CLOEXEC — must survive fexecve)  */
+/*                                                                    */
+/*  Memfd name is a per-process random hex string, lazily generated   */
+/*  on first call and reused for every memfd in this process.  The    */
+/*  same string is shared by exe / lib / shim memfds so /proc/<pid>/  */
+/*  fd readlinks can't distinguish them.  Random (vs. a fixed string  */
+/*  like "antirev") avoids leaving a static project marker that an    */
+/*  attacker could grep /proc for across hosts.                       */
 /* ------------------------------------------------------------------ */
-static int make_memfd(const char *name)
+static const char *memfd_name(void)
 {
-    int fd = (int)syscall(__NR_memfd_create, name, 0 /* no MFD_CLOEXEC */);
+    static char gen[16] = { 0 };
+    if (gen[0])
+        return gen;
+
+    uint8_t rnd[6];
+    int got = 0;
+    int rfd = open("/dev/urandom", O_RDONLY);
+    if (rfd >= 0) {
+        if (read(rfd, rnd, sizeof(rnd)) == (ssize_t)sizeof(rnd))
+            got = 1;
+        close(rfd);
+    }
+    if (got) {
+        static const char hex[] = "0123456789abcdef";
+        for (int i = 0; i < (int)sizeof(rnd); i++) {
+            gen[i * 2]     = hex[rnd[i] >> 4];
+            gen[i * 2 + 1] = hex[rnd[i] & 0xf];
+        }
+        gen[sizeof(rnd) * 2] = '\0';
+    } else {
+        /* Fallback: PID-derived; /dev/urandom open should never fail in
+         * practice but we still need a non-empty name for memfd_create. */
+        snprintf(gen, sizeof(gen), "x%d", (int)getpid());
+    }
+    return gen;
+}
+
+static int make_memfd(void)
+{
+    int fd = (int)syscall(__NR_memfd_create, memfd_name(), 0 /* no MFD_CLOEXEC */);
     if (fd < 0) { perror("memfd_create"); return -1; }
     return fd;
 }
@@ -1163,10 +1199,7 @@ static int decrypt_enc_file(const char *path, const uint8_t *key,
     uint64_t ct_size = (uint64_t)(fsize - ct_off);
     if (ct_size == 0) { close(fd); return -1; }
 
-    const char *bname = strrchr(path, '/');
-    bname = bname ? bname + 1 : path;
-
-    int mfd = make_memfd(bname);
+    int mfd = make_memfd();
     if (mfd < 0) { close(fd); return -1; }
 
     aes256gcm_ctx ctx;
@@ -2413,7 +2446,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         aes256gcm_ctx ctx;
 
         /* Single pass: GHASH + CTR simultaneously (halves I/O) */
-        int fd = make_memfd(e->name);
+        int fd = make_memfd();
         if (fd < 0) return 1;
 
         aes256gcm_init(&ctx, key, e->iv);
@@ -2468,7 +2501,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
      * / realpath / getauxval …) and the dlopen interceptor — one memfd,
      * one LD_PRELOAD entry.  The aarch64 extend shim stays separate and
      * is materialised below only when building for __aarch64__. */
-    int antirev_shim_fd = make_memfd("antirev_shim.so");
+    int antirev_shim_fd = make_memfd();
     if (antirev_shim_fd < 0)
         return 1;
     if (write_chunk(antirev_shim_fd, antirev_shim_blob, antirev_shim_blob_len) != 0)
