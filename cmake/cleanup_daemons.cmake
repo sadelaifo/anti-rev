@@ -6,14 +6,14 @@
 # Usage: cmake -DTEST_DIR=<path> -P cleanup_daemons.cmake
 #
 # Without this, test reruns hit:
-#   OSError: [Errno 26] Text file busy: '.../.antirev-libd'
+#   OSError: [Errno 26] Text file busy: '.../.lrxd'
 
 if(NOT TEST_DIR)
     return()
 endif()
 
 execute_process(
-    COMMAND pkill -TERM -f "${TEST_DIR}.*antirev-libd"
+    COMMAND pkill -TERM -f "${TEST_DIR}.*lrxd"
     RESULT_VARIABLE _PKILL
     OUTPUT_QUIET ERROR_QUIET
 )

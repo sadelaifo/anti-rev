@@ -11,7 +11,7 @@ Binary protection system that encrypts executables and shared libraries, then ru
 
     Each source file keeps its own concern (identity, dlopen, ARM-only, daemon transport) with disjoint symbol exports and independent file-scope state where it makes sense to stay isolated (per-shim caches, mutexes, log files).
 - **encryptor** (`protect.py`, `antirev-pack.py`): Python tools that encrypt and bundle binaries with AES-256-GCM
-- **daemon mode** (`.antirev-libd`): a lightweight lib-server process that scans its directory for encrypted `.so` files, decrypts them into memfds, and serves the fds to client processes via SCM_RIGHTS
+- **daemon mode** (`.lrxd`): a lightweight lib-server process that scans its directory for encrypted `.so` files, decrypts them into memfds, and serves the fds to client processes via SCM_RIGHTS.  (Filename was `.antirev-libd` historically; renamed to drop the antirev brand from `ls` / `ps aux`.)
 - **antirev_client.py**: Python client that connects to the daemon, receives decrypted lib memfds via SCM_RIGHTS, and patches `import` + `ctypes.CDLL` to transparently load encrypted libs. Handles dependency ordering via `_ensure_loaded()` which recursively preloads transitive DT_NEEDED deps with `RTLD_GLOBAL`.
 - **build.py**: compiles/obfuscates Python source files via Cython, Nuitka, or PyArmor
 

@@ -13,10 +13,10 @@ Topology:
                          ↓
                      libtee.so  (encrypted)
 
-Assumes antirev-libd is already running with the encrypted libs decrypted.
+Assumes the lib daemon (.lrxd) is already running with the encrypted libs decrypted.
 
 Usage:
-    python3 demo.py [path-to-.antirev-libd-or-key]
+    python3 demo.py [path-to-.lrxd-or-key]
 """
 
 import sys

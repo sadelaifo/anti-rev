@@ -403,7 +403,7 @@ function(daemon_test TEST_NAME CLIENT_BIN COMMENT_STR)
         COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
                 --stub   "${CMAKE_BINARY_DIR}/stub"
                 --key    "${_TD}/test.key"
-                --output "${_TD}/.antirev-libd"
+                --output "${_TD}/.lrxd"
         COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
                 --stub   "${CMAKE_BINARY_DIR}/stub"
                 --main   "${CLIENT_BIN}"
@@ -546,7 +546,7 @@ add_custom_target(test_dlopen_transitive
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_TRANS}/test.key"
-            --output "${_TD_TRANS}/.antirev-libd"
+            --output "${_TD_TRANS}/.lrxd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/dlopen_transitive"
@@ -610,7 +610,7 @@ add_custom_target(test_dlopen_dt_needed
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_DTN}/test.key"
-            --output "${_TD_DTN}/.antirev-libd"
+            --output "${_TD_DTN}/.lrxd"
     # Protect exe
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
@@ -659,7 +659,7 @@ add_custom_target(test_dlopen_reload
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_RELOAD}/test.key"
-            --output "${_TD_RELOAD}/.antirev-libd"
+            --output "${_TD_RELOAD}/.lrxd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/dlopen_reload"
@@ -751,7 +751,7 @@ add_custom_target(test_dlopen_interpose
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_INTER}/test.key"
-            --output "${_TD_INTER}/.antirev-libd"
+            --output "${_TD_INTER}/.lrxd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/dlopen_interpose"
@@ -1353,7 +1353,7 @@ add_custom_target(test_fork_same_lib
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_FSL}/test.key"
-            --output "${_TD_FSL}/.antirev-libd"
+            --output "${_TD_FSL}/.lrxd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/fork_same_parent"
@@ -1402,7 +1402,7 @@ add_custom_target(test_fork_diff_lib
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_FDL}/parent/test.key"
-            --output "${_TD_FDL}/parent/.antirev-libd"
+            --output "${_TD_FDL}/parent/.lrxd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/fork_diff_parent"
@@ -1417,7 +1417,7 @@ add_custom_target(test_fork_diff_lib
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_FDL}/child/test.key"
-            --output "${_TD_FDL}/child/.antirev-libd"
+            --output "${_TD_FDL}/child/.lrxd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/fork_diff_child"
@@ -1472,7 +1472,7 @@ add_custom_target(test_script_multi_bin
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --key    "${_TD_SMB}/test.key"
-            --output "${_TD_SMB}/.antirev-libd"
+            --output "${_TD_SMB}/.lrxd"
     COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
             --stub   "${CMAKE_BINARY_DIR}/stub"
             --main   "${CMAKE_BINARY_DIR}/proc_a"

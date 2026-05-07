@@ -55,7 +55,7 @@ def pack(config, out_dir):
 
 def start_daemon(out_dir):
     """Start the daemon.  It daemonizes (parent exits, child serves)."""
-    daemon = os.path.join(DIR, out_dir, '.antirev-libd')
+    daemon = os.path.join(DIR, out_dir, '.lrxd')
     result = subprocess.run([daemon], capture_output=True, timeout=5)
     if result.returncode != 0:
         raise RuntimeError(
@@ -90,7 +90,7 @@ def run_scene(label, out_dir):
     pids = None
     try:
         pids = start_daemon(out_dir)
-        key_path = os.path.join(DIR, out_dir, '.antirev-libd')
+        key_path = os.path.join(DIR, out_dir, '.lrxd')
 
         # We need a fresh import each scene since activate() patches ctypes
         # globally. Fork a subprocess to isolate.

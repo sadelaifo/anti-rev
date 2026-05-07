@@ -290,7 +290,7 @@ content_slide(prs, "Core Components", [
     "Stub  --  C launcher: decrypts, creates memfds, fexecve",
     "exe_shim  --  LD_PRELOAD: hides memfd paths from /proc/self/exe",
     "dlopen_shim  --  LD_PRELOAD: redirects dlopen() to encrypted libs",
-    "Daemon (.antirev-libd)  --  Decrypt once, serve many via SCM_RIGHTS",
+    "Daemon (.lrxd)  --  Decrypt once, serve many via SCM_RIGHTS",
     "Encryptor (antirev-pack.py)  --  Batch encrypt & bundle with topology metadata",
     "",
     "Supporting components:",
@@ -499,7 +499,7 @@ section_slide(prs, 6, "Operational Modes",
               "Daemon + Client")
 
 content_slide(prs, "Deployment Model: Daemon + Client", [
-    "Lightweight daemon (.antirev-libd)",
+    "Lightweight daemon (.lrxd)",
     "  Scans its directory for encrypted .so files at startup",
     "  Decrypts 550+ libs once into memfds, serves via abstract socket",
     "  One daemon instance serves 100+ client processes",
@@ -518,7 +518,7 @@ section_slide(prs, 7, "Python Integration",
 
 content_slide(prs, "antirev_client.py (Python-level)", [
     "from antirev_client import activate",
-    "activate('/path/to/.antirev-libd')",
+    "activate('/path/to/.lrxd')",
     "",
     "Patches:",
     "  ctypes.CDLL -> load from memfd",

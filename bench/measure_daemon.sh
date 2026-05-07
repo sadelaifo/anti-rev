@@ -42,7 +42,7 @@ median() {
 }
 
 kill_daemons() {
-    pkill -x '.antirev-libd' 2>/dev/null || true
+    pkill -x '.lrxd' 2>/dev/null || true
     sleep 0.3
 }
 
@@ -203,7 +203,7 @@ key  = bytes.fromhex(open('$KEY_FILE').read().strip())
 bundle = struct.pack('<IB', 0, 0)
 offset = len(stub)
 trailer = struct.pack('<Q', offset) + key + b'ANTREV01'
-out = '$LIBS_DIR/.antirev-libd'
+out = '$LIBS_DIR/.lrxd'
 open(out, 'wb').write(stub + bundle + trailer)
 os.chmod(out, 0o755)
 "
@@ -232,7 +232,7 @@ for run in $(seq 1 $N_DAEMON_RUNS); do
     kill_daemons
 
     T_START=$(now_ns)
-    "$LIBS_DIR/.antirev-libd" 2>/tmp/antirev_bench_daemon.log
+    "$LIBS_DIR/.lrxd" 2>/tmp/antirev_bench_daemon.log
     T_END=$(now_ns)
 
     ms=$(elapsed_ms "$T_START" "$T_END")
@@ -253,7 +253,7 @@ echo ">>> [4/6] Measuring exe startup overhead..."
 
 # Ensure daemon is running
 kill_daemons
-"$LIBS_DIR/.antirev-libd" 2>/dev/null
+"$LIBS_DIR/.lrxd" 2>/dev/null
 sleep 0.5
 
 echo "    [4a] Protected noop exe (daemon mode, 0 DT_NEEDED on encrypted libs)..."
@@ -303,9 +303,9 @@ EXE_PROT_RSS=$(get_rss_kb "$OUT_DIR/exe_0001.protected")
 LINKED_PROT_RSS=$(get_rss_kb "$OUT_DIR/exe_linked.protected")
 
 kill_daemons
-"$LIBS_DIR/.antirev-libd" 2>/dev/null
+"$LIBS_DIR/.lrxd" 2>/dev/null
 sleep 0.5
-DAEMON_PID=$(pgrep -x '.antirev-libd' 2>/dev/null | head -1 || echo "")
+DAEMON_PID=$(pgrep -x '.lrxd' 2>/dev/null | head -1 || echo "")
 if [ -n "$DAEMON_PID" ]; then
     DAEMON_RSS=$(awk '/VmRSS/{print $2}' "/proc/$DAEMON_PID/status" 2>/dev/null || echo "?")
 else

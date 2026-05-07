@@ -1370,7 +1370,7 @@ static void raise_fd_limit(void) {
 /*  Phase 3 helpers: fetch encrypted lib fds from the libd daemon       */
 /* ------------------------------------------------------------------ */
 
-/* Write "<dir>/.antirev-libd[-arch]" to `out`, falling back to the
+/* Write "<dir>/.lrxd[-arch]" to `out`, falling back to the
  * arch-free name if the suffixed binary isn't present. */
 static void derive_daemon_path(const char *real_exe, char *out, size_t out_sz) {
     const char *slash = strrchr(real_exe, '/');
@@ -1381,15 +1381,20 @@ static void derive_daemon_path(const char *real_exe, char *out, size_t out_sz) {
     } else {
         memcpy(out, real_exe, dirlen);
     }
+    /* Daemon binary name was renamed from ".antirev-libd*" to ".lrxd*"
+     * to drop the antirev brand from `ls` / `ps aux` / customer start
+     * scripts.  Existing deployments must rename the file alongside
+     * an antirev upgrade — the stub no longer falls back to the old
+     * name (a fallback would defeat the point of removing the leak). */
 #if defined(__x86_64__) || defined(__i386__)
-    snprintf(out + dirlen, out_sz - dirlen, "/.antirev-libd-x86_64");
+    snprintf(out + dirlen, out_sz - dirlen, "/.lrxd-x86_64");
 #elif defined(__aarch64__)
-    snprintf(out + dirlen, out_sz - dirlen, "/.antirev-libd-aarch64");
+    snprintf(out + dirlen, out_sz - dirlen, "/.lrxd-aarch64");
 #else
-    snprintf(out + dirlen, out_sz - dirlen, "/.antirev-libd");
+    snprintf(out + dirlen, out_sz - dirlen, "/.lrxd");
 #endif
     if (access(out, X_OK) != 0)
-        snprintf(out + dirlen, out_sz - dirlen, "/.antirev-libd");
+        snprintf(out + dirlen, out_sz - dirlen, "/.lrxd");
 }
 
 /* Fork the daemon binary if it's on disk; parent waits for the daemon
