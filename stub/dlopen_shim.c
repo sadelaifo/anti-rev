@@ -3,16 +3,16 @@
  *
  * Two modes, selected by the environment the stub hands us:
  *
- *   1. Eager (legacy).  ANTIREV_FD_MAP="libfoo.so=5,libbar.so=6" — every
+ *   1. Eager (legacy).  __r_FM="libfoo.so=5,libbar.so=6" — every
  *      encrypted lib was fetched by the stub ahead of time; dlopen() just
  *      redirects matching calls to /proc/self/fd/N.
  *
- *   2. Lazy.  ANTIREV_LIBD_SOCK / ANTIREV_ENC_LIBS / ANTIREV_SYMLINK_DIR —
+ *   2. Lazy.  __r_LS / __r_EL / __r_SD —
  *      the stub fetched only the exe's DT_NEEDED libs eagerly and left
  *      the daemon socket open for us.  On each dlopen() for an encrypted
  *      basename we send OP_GET_CLOSURE, receive the lib plus its
  *      transitive encrypted DT_NEEDED deps in one batch, materialize
- *      symlinks in ANTIREV_SYMLINK_DIR, then call real_dlopen so glibc's
+ *      symlinks in __r_SD, then call real_dlopen so glibc's
  *      linker resolves the chain through the already-set LD_LIBRARY_PATH.
  *
  *      Per-lib fds returned by the daemon are cached for the process
@@ -51,7 +51,7 @@ static int  g_cache_count = 0;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Escape hatch: if ANTIREV_NO_PRELOAD is set in the environment, skip
+/* Escape hatch: if __r_NP is set in the environment, skip
  * the per-dep preload loop in fetch_closure and rely on glibc's normal
  * recursive DT_NEEDED walk (triggered by the caller's real_dlopen of
  * the root lib) to load the whole dependency tree in one atomic go.
@@ -308,7 +308,7 @@ static void fetch_closure(const char *base) {
     /* Escape hatch — see g_no_preload.  Skip the loop entirely when
      * the user wants plaintext-equivalent natural-load semantics. */
     if (g_no_preload) {
-        LOG("  preload skipped (ANTIREV_NO_PRELOAD=1)\n");
+        LOG("  preload skipped (__r_NP=1)\n");
         return;
     }
 
@@ -333,12 +333,12 @@ static void init_shim(void)
 
     daemon_client_init();
 
-    const char *dir = getenv("ANTIREV_SYMLINK_DIR");
+    const char *dir = getenv("__r_SD");
     if (dir && *dir) {
         snprintf(g_symlink_dir, sizeof(g_symlink_dir), "%s", dir);
     }
 
-    const char *npe = getenv("ANTIREV_NO_PRELOAD");
+    const char *npe = getenv("__r_NP");
     if (npe && *npe && strcmp(npe, "0") != 0) {
         g_no_preload = 1;
     }

@@ -1701,7 +1701,7 @@ static char *build_ld_library_path(char *const *envp, int envc, const char *link
     return out;
 }
 
-/* True if `exe_basename` needs ANTIREV_NO_PRELOAD=1 — add names here
+/* True if `exe_basename` needs __r_NP=1 — add names here
  * for exes whose dlopen'd libs have implicit inter-lib symbol deps
  * that break when constructors run in per-dep isolation.
  *
@@ -1741,13 +1741,13 @@ static char *build_ld_preload(int antirev_shim_fd, int compat_preload, int n_dt_
     return out;
 }
 
-/* "ANTIREV_FD_MAP=name1=fd1,name2=fd2,…" for dlopen'd libs. */
+/* "__r_FM=name1=fd1,name2=fd2,…" for dlopen'd libs. */
 static char *build_antirev_fd_map(int n_fdmap, const char (*fdmap_names)[MAX_NAME + 1], const int *fdmap_fds) {
     size_t need = 16 + (size_t) n_fdmap * (MAX_NAME + 16);
     char *out = malloc(need);
     if (!out)
         return NULL;
-    int off = snprintf(out, need, "ANTIREV_FD_MAP=");
+    int off = snprintf(out, need, "__r_FM=");
     for (int j = 0; j < n_fdmap; j++) {
         if (j > 0)
             out[off++] = ',';
@@ -1756,7 +1756,7 @@ static char *build_antirev_fd_map(int n_fdmap, const char (*fdmap_names)[MAX_NAM
     return out;
 }
 
-/* "ANTIREV_ENC_LIBS=name1,name2,…" — the full encrypted-lib set the
+/* "__r_EL=name1,name2,…" — the full encrypted-lib set the
  * daemon manages.  dlopen_shim checks incoming dlopen basenames
  * against this set before opening the socket. */
 static char *build_enc_libs(int n_all_enc, const char (*all_enc_names)[MAX_NAME + 1]) {
@@ -1764,7 +1764,7 @@ static char *build_enc_libs(int n_all_enc, const char (*all_enc_names)[MAX_NAME 
     char *out = malloc(need);
     if (!out)
         return NULL;
-    int off = snprintf(out, need, "ANTIREV_ENC_LIBS=");
+    int off = snprintf(out, need, "__r_EL=");
     for (int j = 0; j < n_all_enc; j++) {
         if (j > 0)
             out[off++] = ',';
@@ -1780,12 +1780,12 @@ static void build_lazy_env(int daemon_sd, const char *link_dir_ptr, const char *
                            const char (*all_enc_names)[MAX_NAME + 1], char **out_sock, char **out_sym, char **out_enc) {
     *out_sock = malloc(48);
     if (*out_sock)
-        snprintf(*out_sock, 48, "ANTIREV_LIBD_SOCK=%d", daemon_sd);
+        snprintf(*out_sock, 48, "__r_LS=%d", daemon_sd);
 
     if (link_dir_ptr) {
         *out_sym = malloc(64);
         if (*out_sym)
-            snprintf(*out_sym, 64, "ANTIREV_SYMLINK_DIR=%s", link_dir);
+            snprintf(*out_sym, 64, "__r_SD=%s", link_dir);
     } else {
         *out_sym = NULL;
     }
@@ -1793,7 +1793,7 @@ static void build_lazy_env(int daemon_sd, const char *link_dir_ptr, const char *
     *out_enc = build_enc_libs(n_all_enc, all_enc_names);
 }
 
-/* "ANTIREV_CLOSE_FDS=fd1,fd2,…" — exe_shim closes these in its ctor.
+/* "__r_CF=fd1,fd2,…" — exe_shim closes these in its ctor.
  * By that point glibc has already mmap'd every DT_NEEDED lib so the
  * fds are pure bookkeeping; freeing the slots helps select() callers
  * (FD_SETSIZE=1024). */
@@ -1802,7 +1802,7 @@ static char *build_close_fds(int n_dt_needed, const int *dt_needed_fds) {
     char *out = malloc(need);
     if (!out)
         return NULL;
-    int off = snprintf(out, need, "ANTIREV_CLOSE_FDS=");
+    int off = snprintf(out, need, "__r_CF=");
     for (int j = 0; j < n_dt_needed; j++) {
         if (j > 0)
             out[off++] = ',';
@@ -1828,14 +1828,14 @@ static int env_is_antirev_managed(const char *e) {
     const char *prefixes[] = {
             OBFSTR("LD_PRELOAD="),
             OBFSTR("LD_LIBRARY_PATH="),
-            OBFSTR("ANTIREV_REAL_EXE="),
-            OBFSTR("ANTIREV_MAIN_FD="),
-            OBFSTR("ANTIREV_FD_MAP="),
-            OBFSTR("ANTIREV_CLOSE_FDS="),
-            OBFSTR("ANTIREV_LIBD_SOCK="),
-            OBFSTR("ANTIREV_ENC_LIBS="),
-            OBFSTR("ANTIREV_SYMLINK_DIR="),
-            OBFSTR("ANTIREV_NO_PRELOAD="),
+            OBFSTR("__r_RE="),
+            OBFSTR("__r_MF="),
+            OBFSTR("__r_FM="),
+            OBFSTR("__r_CF="),
+            OBFSTR("__r_LS="),
+            OBFSTR("__r_EL="),
+            OBFSTR("__r_SD="),
+            OBFSTR("__r_NP="),
             NULL,
     };
     for (int i = 0; prefixes[i]; i++)
@@ -1876,8 +1876,8 @@ static char **build_exec_env(const exec_env_cfg_t *cfg) {
         free(out);
         return NULL;
     }
-    snprintf(real_exe_entry, 4096 + 32, "ANTIREV_REAL_EXE=%s", cfg->real_exe);
-    snprintf(main_fd_entry, 32, "ANTIREV_MAIN_FD=%d", cfg->main_fd);
+    snprintf(real_exe_entry, 4096 + 32, "__r_RE=%s", cfg->real_exe);
+    snprintf(main_fd_entry, 32, "__r_MF=%d", cfg->main_fd);
 
     int compat_preload = !cfg->has_needed_section && cfg->nlibs > 0;
     char *ld_preload_entry = build_ld_preload(cfg->antirev_shim_fd, compat_preload,
@@ -1895,13 +1895,13 @@ static char **build_exec_env(const exec_env_cfg_t *cfg) {
         build_lazy_env(cfg->daemon_sd, cfg->link_dir_ptr, cfg->link_dir, cfg->n_all_enc, cfg->all_enc_names, &libd_sock,
                        &symlink_dir, &enc_libs);
 
-    /* Always emit ANTIREV_SYMLINK_DIR when we have a dir, not just in
+    /* Always emit __r_SD when we have a dir, not just in
      * lazy mode — exe_shim's atexit handler reads it to remove the
      * dir on normal process exit. */
     if (!symlink_dir && cfg->link_dir_ptr) {
         symlink_dir = malloc(64);
         if (symlink_dir)
-            snprintf(symlink_dir, 64, "ANTIREV_SYMLINK_DIR=%s", cfg->link_dir);
+            snprintf(symlink_dir, 64, "__r_SD=%s", cfg->link_dir);
     }
 
     char *close_fds = (cfg->has_needed_section && cfg->n_dt_needed > 0)
@@ -1935,7 +1935,7 @@ static char **build_exec_env(const exec_env_cfg_t *cfg) {
          * frame — so the pointer would dangle.  strdup the decoded
          * string into the heap; fexecve replaces the address space
          * either way, so the small leak is irrelevant. */
-        out[ei++] = strdup(OBFSTR("ANTIREV_NO_PRELOAD=1"));
+        out[ei++] = strdup(OBFSTR("__r_NP=1"));
     }
     out[ei] = NULL;
     return out;
@@ -2566,14 +2566,14 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         return 1;
     }
 
-    /* Phase 4b. Split libs into DT_NEEDED (symlink dir) and rest (ANTIREV_FD_MAP).
+    /* Phase 4b. Split libs into DT_NEEDED (symlink dir) and rest (__r_FM).
      *
      * DT_NEEDED libs are resolved by glibc's normal BFS through the symlink
      * dir on LD_LIBRARY_PATH — preserving the original symbol lookup order.
      * They are NOT put on LD_PRELOAD (which would reorder them ahead of
      * unencrypted libs and change symbol resolution).
      *
-     * Remaining libs are available on-demand via dlopen_shim + ANTIREV_FD_MAP. */
+     * Remaining libs are available on-demand via dlopen_shim + __r_FM. */
     int dt_needed_fds[MAX_FILES];
     char dt_needed_names[MAX_FILES][MAX_NAME + 1];
     int n_dt_needed = 0;
@@ -2595,7 +2595,7 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
                 }
             }
         }
-        /* Remaining libs go to ANTIREV_FD_MAP for on-demand dlopen */
+        /* Remaining libs go to __r_FM for on-demand dlopen */
         for (int j = 0; j < nlibs; j++) {
             int is_needed = 0;
             for (int k = 0; k < n_needed; k++) {

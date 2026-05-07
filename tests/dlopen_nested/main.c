@@ -1,7 +1,7 @@
 /*
  * Nested dlopen test: main dlopen's libcaller.so, which internally
  * dlopen's libcallee.so.  Both libraries are protected and listed in
- * ANTIREV_FD_MAP.
+ * __r_FM.
  *
  * Verifies the shim intercepts dlopen calls from within shared
  * libraries, not just from the main binary.

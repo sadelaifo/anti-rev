@@ -1,8 +1,8 @@
 /*
  * antirev daemon-client — shared by dlopen_shim and aarch64_extend_shim.
  *
- * Owns the per-process daemon socket fd, the ANTIREV_FD_MAP env pointer,
- * and the parsed ANTIREV_ENC_LIBS basename set.  Provides accessors plus
+ * Owns the per-process daemon socket fd, the __r_FM env pointer,
+ * and the parsed __r_EL basename set.  Provides accessors plus
  * the framed send/recv protocol helpers so each shim talks to the daemon
  * through one set of functions instead of carrying its own duplicate
  * client state.
@@ -36,17 +36,17 @@
 extern "C" {
 #endif
 
-/* Read ANTIREV_LIBD_SOCK / ANTIREV_FD_MAP / ANTIREV_ENC_LIBS once and
+/* Read __r_LS / __r_FM / __r_EL once and
  * cache the results.  Subsequent calls are no-ops. */
 void daemon_client_init(void);
 
 /* Inherited daemon socket fd, or -1 if unset / disabled. */
 int  daemon_client_sock(void);
 
-/* True iff ANTIREV_FD_MAP was set in the environment. */
+/* True iff __r_FM was set in the environment. */
 int  daemon_client_have_fd_map(void);
 
-/* True iff `base` appears in the parsed ANTIREV_ENC_LIBS set. */
+/* True iff `base` appears in the parsed __r_EL set. */
 int  daemon_client_is_encrypted(const char *base);
 
 /* Eager-mode FD_MAP lookup.  On hit fills out_path with the canonical

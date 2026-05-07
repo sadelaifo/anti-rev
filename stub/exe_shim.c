@@ -2,10 +2,10 @@
  * antirev exe shim — loaded via LD_PRELOAD into the target binary.
  *
  * Intercepts:
- *   - readlink/readlinkat for "/proc/self/exe" → returns ANTIREV_REAL_EXE
+ *   - readlink/readlinkat for "/proc/self/exe" → returns __r_RE
  *   - __readlink_chk/__readlinkat_chk (fortified variants)
  *   - realpath/canonicalize_file_name for /proc/self/exe → returns real path
- *   - getauxval(AT_EXECFN)                     → returns ANTIREV_REAL_EXE
+ *   - getauxval(AT_EXECFN)                     → returns __r_RE
  *   - prctl(PR_SET_NAME) in constructor         → restores original process name
  *   - program_invocation_name/short_name        → patched in constructor
  *
@@ -49,7 +49,7 @@ extern char *program_invocation_short_name;
 /* PID of the process that was actually protected by antirev.
  * Child processes inherit LD_PRELOAD but should NOT have their
  * /proc/self/exe, realpath, etc. intercepted — they are different
- * binaries and ANTIREV_REAL_EXE refers to the parent.
+ * binaries and __r_RE refers to the parent.
  *
  * On x86_64, ownership is detected lazily: interceptor calls that
  * arrive before the shim's constructor (e.g. from a C++ global
@@ -74,7 +74,7 @@ static int is_owner_process(void)
     /* Constructor hasn't decided yet — probe /proc/self/exe on the fly.
      * Required when DT_NEEDED libs have C++ static initializers that
      * call readlink/realpath/getauxval before restore_identity() runs. */
-    if (!getenv("ANTIREV_REAL_EXE"))
+    if (!getenv("__r_RE"))
         return 0;
     char exe_buf[256];
     ssize_t n = (ssize_t) syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
@@ -169,14 +169,14 @@ static void strip_env_path_entries(const char *varname, const char *prefix) {
  *
  * Primary check: readlinkat("/proc/self/exe") contains "memfd:"
  *   — the normal kernel path.
- * Fallback: ANTIREV_MAIN_FD set with an fd that reads back as a memfd
+ * Fallback: __r_MF set with an fd that reads back as a memfd
  *   — covers QEMU user-mode where /proc/self/exe points to the QEMU
  *   binary instead of the guest memfd.  In QEMU even the fd link
- *   readlink may fail; presence of ANTIREV_MAIN_FD alone is trusted
+ *   readlink may fail; presence of __r_MF alone is trusted
  *   because the stub only ever injects it into the direct fexecve
  *   target, never into children.
  *
- * Consumes ANTIREV_MAIN_FD on return so forked+exec'd children never
+ * Consumes __r_MF on return so forked+exec'd children never
  * inherit the marker and false-positive as owner. */
 static int detect_owner(void) {
     int is_owner = 0;
@@ -189,7 +189,7 @@ static int detect_owner(void) {
     }
 
     if (!is_owner) {
-        const char *main_fd_str = getenv("ANTIREV_MAIN_FD");
+        const char *main_fd_str = getenv("__r_MF");
         if (main_fd_str) {
             char fd_link[64], fd_target[256];
             snprintf(fd_link, sizeof(fd_link), "/proc/self/fd/%s", main_fd_str);
@@ -205,17 +205,17 @@ static int detect_owner(void) {
         }
     }
 
-    unsetenv("ANTIREV_MAIN_FD");
+    unsetenv("__r_MF");
     return is_owner;
 }
 
 /* Scrub antirev env from a non-owner child (e.g. WAE.elf loaded by
- * helf loadpg).  ANTIREV_FD_MAP would otherwise make dlopen_shim
+ * helf loadpg).  __r_FM would otherwise make dlopen_shim
  * redirect dlopen calls; antirev entries on LD_PRELOAD /
  * LD_LIBRARY_PATH would keep our shim fds + symlink dir visible. */
 static void scrub_nonowner_env(void) {
-    unsetenv("ANTIREV_FD_MAP");
-    unsetenv("ANTIREV_REAL_EXE");
+    unsetenv("__r_FM");
+    unsetenv("__r_RE");
     strip_env_path_entries("LD_PRELOAD", "/proc/self/fd/");
 
     /* Strip our per-build-random /tmp prefix from inherited
@@ -238,7 +238,7 @@ static void scrub_nonowner_env(void) {
  * Set by stub.c only on the symlink-dir code path (has_needed_section).
  * Unset immediately so fork()ed children don't misinterpret stale fds. */
 static void close_dt_needed_fds(void) {
-    const char *close_list = getenv("ANTIREV_CLOSE_FDS");
+    const char *close_list = getenv("__r_CF");
     if (close_list && *close_list) {
         const char *p = close_list;
         while (*p) {
@@ -253,7 +253,7 @@ static void close_dt_needed_fds(void) {
             p = end + 1;
         }
     }
-    unsetenv("ANTIREV_CLOSE_FDS");
+    unsetenv("__r_CF");
 }
 
 /* Restore /proc/self/comm (ps -o comm) and the glibc
@@ -281,7 +281,7 @@ static void restore_process_name(const char *real) {
 /*  #ifdefs through a shared body.  The arch-specific differences are:  */
 /*    - x86 maintains g_owner_checked so the lazy probe in              */
 /*      is_owner_process() short-circuits once the constructor runs.    */
-/*    - aarch64 additionally scrubs ANTIREV_FD_MAP / LD_PRELOAD /       */
+/*    - aarch64 additionally scrubs __r_FM / LD_PRELOAD /       */
 /*      LD_LIBRARY_PATH in the owner (the ARM business stack closes     */
 /*      random fds; children inheriting /proc/self/fd/N preloads fail). */
 /*    - x86 deliberately skips that scrub — test_fork_same_lib needs a  */
@@ -324,7 +324,7 @@ static void cleanup_symlink_dir(void)
  * Idempotent — safe to call from both arch-specific ctor branches. */
 static void register_symlink_dir_cleanup(void)
 {
-    const char *dir = getenv("ANTIREV_SYMLINK_DIR");
+    const char *dir = getenv("__r_SD");
     if (!dir || !*dir) return;
     if (g_symlink_dir[0]) return; /* already registered */
     snprintf(g_symlink_dir, sizeof(g_symlink_dir), "%s", dir);
@@ -335,7 +335,7 @@ static void register_symlink_dir_cleanup(void)
 __attribute__((constructor)) static void restore_identity(void) {
     resolve_libc_realpath();
 
-    const char *real = getenv("ANTIREV_REAL_EXE");
+    const char *real = getenv("__r_RE");
     if (!real)
         return;
 
@@ -359,7 +359,7 @@ __attribute__((constructor)) static void restore_identity(void) {
         antirev_get_tmp_dir_prefix(tmp_prefix, sizeof(tmp_prefix));
         strip_env_path_entries("LD_LIBRARY_PATH", tmp_prefix);
     }
-    unsetenv("ANTIREV_FD_MAP");
+    unsetenv("__r_FM");
 
     restore_process_name(real);
 }
@@ -367,7 +367,7 @@ __attribute__((constructor)) static void restore_identity(void) {
 __attribute__((constructor)) static void restore_identity(void) {
     resolve_libc_realpath();
 
-    const char *real = getenv("ANTIREV_REAL_EXE");
+    const char *real = getenv("__r_RE");
     if (!real)
         return;
 
@@ -409,7 +409,7 @@ __attribute__((visibility("default")))
 ssize_t readlink(const char *path, char *buf, size_t bufsiz)
 {
     if (is_self_exe(path)) {
-        const char *real = getenv("ANTIREV_REAL_EXE");
+        const char *real = getenv("__r_RE");
         if (real) {
             size_t len = strlen(real);
             if (len > bufsiz) len = bufsiz;
@@ -424,7 +424,7 @@ __attribute__((visibility("default")))
 ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)
 {
     if (is_self_exe(path)) {
-        const char *real = getenv("ANTIREV_REAL_EXE");
+        const char *real = getenv("__r_RE");
         if (real) {
             size_t len = strlen(real);
             if (len > bufsiz) len = bufsiz;
@@ -461,7 +461,7 @@ ssize_t __readlinkat_chk(int dirfd, const char *path, char *buf,
 
 static char *fill_real_exe(char *resolved)
 {
-    const char *real = getenv("ANTIREV_REAL_EXE");
+    const char *real = getenv("__r_RE");
     if (!real)
         return NULL;
     size_t len = strlen(real);
@@ -506,7 +506,7 @@ __attribute__((visibility("default")))
 char *__realpath_chk(const char *path, char *resolved, size_t resolved_len)
 {
     if (path && is_self_exe(path)) {
-        const char *real = getenv("ANTIREV_REAL_EXE");
+        const char *real = getenv("__r_RE");
         if (real && resolved && strlen(real) >= resolved_len)
             return NULL;
         return fill_real_exe(resolved);
@@ -529,7 +529,7 @@ __attribute__((visibility("default")))
 unsigned long getauxval(unsigned long type)
 {
     if (type == AT_EXECFN && is_owner_process()) {
-        const char *real = getenv("ANTIREV_REAL_EXE");
+        const char *real = getenv("__r_RE");
         if (real)
             return (unsigned long)real;
     }

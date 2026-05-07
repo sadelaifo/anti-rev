@@ -20,7 +20,7 @@
  *      Previously lived in exe_shim.c; moved here so exe_shim stays
  *      arch-neutral.
  *
- * Daemon I/O (socket fd, encrypted-name set, ANTIREV_FD_MAP) is
+ * Daemon I/O (socket fd, encrypted-name set, __r_FM) is
  * handled by the shared daemon_client module — see daemon_client.h.
  */
 
@@ -189,7 +189,7 @@ static const char *resolve_path(const char *base)
     int fd = -1;
     /* Track whether this fd is one we own (received fresh via SCM_RIGHTS
      * from the daemon and must close ourselves on overflow) or one we
-     * merely looked up in ANTIREV_FD_MAP (still referenced by the env
+     * merely looked up in __r_FM (still referenced by the env
      * var and the stub's symlink dir — closing it would invalidate the
      * /proc/self/fd/N path for every other consumer). */
     int fd_is_owned = 0;
@@ -262,8 +262,8 @@ static void init_aarch64_extend_shim(void)
         if (strstr(exe_buf, "memfd:") != NULL) is_owner = 1;
     }
     if (!is_owner) {
-        /* QEMU fallback: trust ANTIREV_MAIN_FD's presence. */
-        if (getenv("ANTIREV_MAIN_FD")) is_owner = 1;
+        /* QEMU fallback: trust __r_MF's presence. */
+        if (getenv("__r_MF")) is_owner = 1;
     }
     if (is_owner) g_owner_pid = getpid();
 
@@ -388,7 +388,7 @@ int ANTI_LoadProcess(void *info_raw)
 /*                                                                      */
 /*  Scope:                                                              */
 /*   - owner process only (child processes see plaintext).              */
-/*   - basename must end in ".elf" AND be listed in ANTIREV_ENC_LIBS —  */
+/*   - basename must end in ".elf" AND be listed in __r_EL —  */
 /*     scoping to .elf keeps us out of dlopen's and glibc's internal    */
 /*     openat traffic on .so paths (handled by dlopen_shim).            */
 /*   - paths already under /proc/self/fd/ pass through untouched to    */
@@ -414,10 +414,10 @@ static void resolve_real_io_funcs(void)
 /* Return stable /proc/self/fd/N path if this pathname refers to an
  * encrypted .elf asset, else NULL (caller should pass through).
  *
- * The basename must be listed either in ANTIREV_ENC_LIBS (daemon /
- * lazy mode, dlopen_shim-style name list) OR in ANTIREV_FD_MAP
+ * The basename must be listed either in __r_EL (daemon /
+ * lazy mode, dlopen_shim-style name list) OR in __r_FM
  * (eager / bundled mode: name=fd pairs baked in by stub).  Mode B /
- * Mode A protect-exe paths never populate ANTIREV_ENC_LIBS, so
+ * Mode A protect-exe paths never populate __r_EL, so
  * checking only the name list missed them and left openat
  * unredirected. */
 static int name_is_known_elf_asset(const char *base)

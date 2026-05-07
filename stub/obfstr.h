@@ -11,7 +11,7 @@
  *
  *      printf format strings   "[antirev] failed to connect to lib daemon"
  *      perror messages         "memfd_create"
- *      env-var names           "ANTIREV_LIBD_SOCK="  "ANTIREV_FD_MAP="
+ *      env-var names           "__r_LS="  "__r_FM="
  *      dlsym symbol names      "ANTI_LoadProcess"  "popen"  "openat"
  *      path templates          "/proc/self/fd/%d"  "/tmp/.antirev-..."
  *      socket name prefix      "antirev_%s"

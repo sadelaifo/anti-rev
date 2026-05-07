@@ -127,7 +127,7 @@ configure_file(
 #   aarch64_extend_shim.c  — ANTI_LoadProcess hijack + popen/pclose
 #                             (aarch64 only — file is empty TU on x86)
 #   daemon_client.c        — shared daemon-protocol client (socket fd,
-#                             ANTIREV_FD_MAP / ANTIREV_ENC_LIBS state,
+#                             __r_FM / __r_EL state,
 #                             send/recv helpers used by both shims)
 #
 # One .so = one memfd, one LD_PRELOAD entry, regardless of arch.

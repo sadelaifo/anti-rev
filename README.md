@@ -83,7 +83,7 @@
             ▼
     ┌─────────────────────────────────────────────────────┐
     │ PHASE 5: build envp for child                       │
-    │   ANTIREV_FD_MAP=libfoo.so=6,libbar.so=7            │
+    │   __r_FM=libfoo.so=6,libbar.so=7            │
     │   LD_PRELOAD=/proc/self/fd/<exe_shim_fd>:           │
     │              /proc/self/fd/<dlopen_shim_fd>         │
     │   (strip any existing LD_PRELOAD/FD_MAP)            │
@@ -113,7 +113,7 @@
                       │
                       └─ dlopen("/abs/path/to/libbar.so")
                             → dlopen_shim intercepts, basename match
-                              in ANTIREV_FD_MAP → return fd
+                              in __r_FM → return fd
                             → ld.so opens memfd (RAM)
 
   Key properties visible in the flow:

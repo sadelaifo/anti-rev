@@ -336,7 +336,7 @@ class AntirevClient:
         _tmp_pfx = os.environ.get('ANTIREV_TMP_PREFIX', '.lrx_')
         self._link_dir = tempfile.mkdtemp(prefix=f"{_tmp_pfx}{os.getpid()}_")
         atexit.register(self._cleanup_link_dir)
-        # Escape hatch, same semantics as dlopen_shim's ANTIREV_NO_PRELOAD:
+        # Escape hatch, same semantics as dlopen_shim's __r_NP:
         # when set, _ensure_loaded / _ensure_deps still materialize the
         # soname symlinks and recurse through the DT_NEEDED chain, but
         # they do NOT call _Real(link, RTLD_GLOBAL) on each dep.  The
@@ -349,7 +349,7 @@ class AntirevClient:
         # DT_NEEDED edge between them — the per-dep RTLD_GLOBAL preload
         # runs each dep's ctors in isolation and crashes on lazy binds
         # across the implicit boundary).
-        npe = os.environ.get('ANTIREV_NO_PRELOAD', '')
+        npe = os.environ.get('__r_NP', '')
         self._no_preload = bool(npe) and npe != '0'
         # Prepend symlink dir to LD_LIBRARY_PATH so glibc's DT_NEEDED
         # resolution finds our soname symlinks (→ memfd) before any
@@ -716,7 +716,7 @@ def activate(key_source=None, preload='on_demand'):
                      dlopen other encrypted libs at init time.
 
     Environment:
-        ANTIREV_NO_PRELOAD=1 — escape hatch.  When set, disables the
+        __r_NP=1 — escape hatch.  When set, disables the
             per-dep RTLD_GLOBAL preload that _ensure_loaded /
             _ensure_deps normally does; soname symlinks are still
             materialized and the DT_NEEDED chain is still walked, but

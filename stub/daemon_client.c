@@ -62,15 +62,15 @@ void daemon_client_init(void)
     if (g_initialized) return;
     g_initialized = 1;
 
-    g_fd_map = getenv("ANTIREV_FD_MAP");
+    g_fd_map = getenv("__r_FM");
 
-    const char *sock_str = getenv("ANTIREV_LIBD_SOCK");
+    const char *sock_str = getenv("__r_LS");
     if (sock_str) {
         int fd = atoi(sock_str);
         if (fd > 2) g_sock = fd;
     }
 
-    const char *enc = getenv("ANTIREV_ENC_LIBS");
+    const char *enc = getenv("__r_EL");
     if (enc && *enc) {
         char *buf = strdup(enc);
         if (buf) {
@@ -104,7 +104,7 @@ int daemon_client_is_encrypted(const char *base)
 }
 
 /* ------------------------------------------------------------------ */
-/*  ANTIREV_FD_MAP lookup ("name=fd,name=fd,...")                      */
+/*  __r_FM lookup ("name=fd,name=fd,...")                      */
 /* ------------------------------------------------------------------ */
 
 int daemon_client_eager_lookup_fd(const char *base)

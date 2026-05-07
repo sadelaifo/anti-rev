@@ -1,6 +1,6 @@
 /*
  * multi_so test: loads TWO protected shared libraries via dlopen.
- * Both libraries are protected and their names are in ANTIREV_FD_MAP.
+ * Both libraries are protected and their names are in __r_FM.
  * The shim must redirect both dlopen calls correctly.
  */
 #define _GNU_SOURCE

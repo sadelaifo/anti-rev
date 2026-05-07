@@ -2,7 +2,7 @@
  * Outer library for nested dlopen test.
  * Calls dlopen("libcallee.so") internally to load another protected library.
  *
- * When both libcaller.so and libcallee.so are in ANTIREV_FD_MAP, the shim
+ * When both libcaller.so and libcallee.so are in __r_FM, the shim
  * must intercept dlopen calls originating from within a shared library,
  * not just from the main binary.
  */
