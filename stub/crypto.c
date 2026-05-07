@@ -11,6 +11,7 @@
  */
 
 #include "crypto.h"
+#include "obfstr.h"     /* compile-time string-literal obfuscation */
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
