@@ -26,7 +26,7 @@ Pipeline (top → bottom, fast → faster):
     JIT-compiled machine code (~10-50ns/call)
 
 CSE is a meaningful win for expressions where the same subterm
-(e.g. ``x*y``, ``erxg1**2``) appears in many places.  numba is a
+(e.g. ``x*y``, ``x**2``) appears in many places.  numba is a
 meaningful win for high-frequency calls; if you're calling once per
 batch on numpy arrays, prefer ``numexpr.evaluate`` instead — different
 optimisation regime.
@@ -132,10 +132,10 @@ def _demo() -> None:
     import random
     import time
 
-    expr = ("-.5e-12*erxg1**7*eryg1**2*nvgz + .18188888*erxg1 "
-            "+ 1.7e-9*erxg1**3*eryg1**3 - 0.001*erxg1*eryg1*nvgz "
-            "+ 4.2e-6*erxg1**2*nvgz**2 + 0.5e-3*eryg1**4")
-    params = ["erxg1", "eryg1", "nvgz"]
+    expr = ("-.5e-12*x**7*y**2*z + .18188888*x "
+            "+ 1.7e-9*x**3*y**3 - 0.001*x*y*z "
+            "+ 4.2e-6*x**2*z**2 + 0.5e-3*y**4")
+    params = ["x", "y", "z"]
 
     f_py = make_expr_func(expr, params, jit=False, debug=True)
     try:
