@@ -26,15 +26,167 @@ Pipeline (top → bottom, fast → faster):
     JIT-compiled machine code (~10-50ns/call)
 
 CSE is a meaningful win for expressions where the same subterm
-(e.g. ``x*y``, ``x**2``) appears in many places.  numba is a
-meaningful win for high-frequency calls; if you're calling once per
-batch on numpy arrays, prefer ``numexpr.evaluate`` instead — different
+(e.g. ``x*y``, ``x**2``) appears in many places.  numba is a meaningful
+win for high-frequency calls; if you're calling once per batch on
+numpy arrays, prefer ``numexpr.evaluate`` instead — different
 optimisation regime.
 
-Public API:
+──────────────────────────────────────────────────────────────────────
+                            API reference
+──────────────────────────────────────────────────────────────────────
 
-    f = make_expr_func("a*b + c**2", ["a", "b", "c"])
-    f(1.0, 2.0, 3.0)
+There are five public entry points, picked by how the formula reaches
+you:
+
+    in-memory string ──────────────► make_expr_func
+                                     make_expr_func_cached  (LRU)
+
+    one formula in a JSON file ────► make_expr_func_from_json
+
+    several formulas in a flat
+    or detailed JSON file ─────────► make_funcs_from_json
+
+    formulas scattered through
+    a heterogeneous JSON tree ─────► load_expressions_from_json
+                                     compile_expressions_in_data
+
+
+1. make_expr_func(expr_str, params, *, jit=True, fastmath=True,
+                  cache=True, debug=False)
+   ----------------------------------------------------------------
+   The core compiler.  Pass an expression and the positional
+   parameter list:
+
+       from expr_compiler import make_expr_func
+
+       f = make_expr_func("a*b + c**2", ["a", "b", "c"])
+       f(1.0, 2.0, 3.0)             # → 11.0
+
+   ``params=[]`` is allowed for a fully constant expression.
+   ``debug=True`` prints the generated Python source — useful when
+   inspecting CSE output or precision of constants.
+
+   Operators understood (anything Python's ``eval`` accepts on the
+   same string): ``+ - * / ** ()``, unary minus, scientific notation
+   (``1.5e-3``, ``-.5e12``), identifiers with digits / underscores
+   (``var1``, ``x_long_name``).  ``**`` is right-associative
+   (``2**3**2 == 512``) and binds tighter than ``*``.
+
+
+2. make_expr_func_cached(expr_str, params_tuple, *, jit, fastmath, cache)
+   ----------------------------------------------------------------
+   ``functools.lru_cache``-wrapped variant — re-compiling the same
+   ``(expr_str, params)`` pair returns the cached function instead
+   of paying sympify+cse+exec+numba again.  Note ``params`` must be a
+   *tuple* (hashable):
+
+       f = make_expr_func_cached("a*b", ("a", "b"))
+
+
+3. make_expr_func_from_json(json_path, expr_at, *,
+                            constants_at=None, subexprs_at=None,
+                            params_at=None, **compile_opts)
+   ----------------------------------------------------------------
+   Read one formula from a JSON config and compile it.  All path
+   arguments accept either a tuple of segments
+   (``("device", "transfer", "formula")``) or a dotted-with-bracket
+   string (``"device.transfer.formula"``, ``"schedule[0].value"``).
+
+   - ``expr_at`` (required): path to the formula string.
+   - ``constants_at``: path to a ``{name: number}`` dict.  Each entry
+     is *baked in* as a numeric literal at compile time, so it never
+     appears as a function argument.  JSON floats are loaded with
+     ``parse_float=str`` and forwarded to ``sp.Float`` as strings,
+     so a 12-digit value like ``0.833333333333`` survives verbatim
+     into the generated source (no rounding to default 15-dps).
+   - ``subexprs_at``: path to a ``{name: expr_string}`` dict.  Each
+     named sub-expression is inlined into the main formula via sympy
+     AST substitution; entries may reference each other or any
+     constant; cycles raise ``ValueError``.  Naming is purely an
+     input-side readability feature — sympy's CSE rediscovers any
+     common subterm so there's no runtime cost.
+   - ``params_at``: optional override for parameter order.  Pass a
+     single path or a list of paths, each pointing to a list of
+     strings; values are concatenated into the positional-argument
+     order.  Default (``None``) auto-detects the surviving free
+     symbols and sorts them alphabetically.
+
+   JSON shape this function expects::
+
+       {
+         "constants": {"k1": 6.5e-5, "k2": 0.001, "scale": 0.5},
+         "subexprs":  {"power": "v*i", "loss":  "k1*v**2 + k2*i**2"},
+         "formula":   "scale*power - loss"
+       }
+
+   Compile and call::
+
+       from expr_compiler import make_expr_func_from_json
+
+       f = make_expr_func_from_json(
+           "config.json",
+           expr_at      = "formula",
+           constants_at = "constants",
+           subexprs_at  = "subexprs",
+       )
+       f(1.5, 220.0)                # auto-detected order: i, v
+
+
+4. make_funcs_from_json(json_path, **compile_opts) -> {name: callable}
+   ----------------------------------------------------------------
+   Top-level JSON object whose keys *are* the formula names.  Two
+   per-entry shapes are supported and may be mixed::
+
+       {
+         "torque":  "0.5 * m * r**2 * omega",            # flat
+         "voltage": {                                     # detailed
+            "expr":   "I * R + L * dI_dt",
+            "params": ["I", "R", "L", "dI_dt"]
+         }
+       }
+
+   Use the detailed form when you need a non-alphabetical positional
+   order, or when a variable name collides with a sympy constant
+   (``E``, ``I``, ``pi``) and auto-detection would miss it.
+
+
+5. load_expressions_from_json(json_path, is_expr, **compile_opts)
+   compile_expressions_in_data(data, is_expr, **compile_opts)
+   ----------------------------------------------------------------
+   For files where formulas are *embedded* in an otherwise
+   heterogeneous tree.  The walker recurses through dicts and lists,
+   asks ``is_expr(path, value)`` at every leaf, and replaces only the
+   matched ones with compiled callables — everything else passes
+   through unchanged.
+
+   Common predicate shapes::
+
+       # Any string under a key named "formula" / "expr":
+       lambda p, v: isinstance(v, str) and p and p[-1] in ("formula", "expr")
+
+       # Specific path only:
+       lambda p, v: p == ("device", "transfer_func")
+
+       # Sentinel-prefix convention:
+       lambda p, v: isinstance(v, str) and v.startswith("=")
+
+
+Helper utilities
+----------------
+
+- ``get_at_path(data, path)`` — same path syntax as the loaders;
+  raises ``KeyError`` / ``IndexError`` / ``TypeError`` with the
+  failing segment named.  Useful for pulling unrelated fields out of
+  the same JSON file.
+
+CLI
+---
+
+Quick smoke check on a make_funcs_from_json-shaped file::
+
+    python3 expr_compiler.py path/to/formulas.json
+
+Prints one line per compiled formula with its argument names.
 
 This module is unrelated to antirev's runtime; it lives under tools/
 because that's where the project keeps general-purpose helpers.
@@ -572,57 +724,8 @@ def make_funcs_from_json(json_path: str | Path, **compile_opts) -> dict:
 
 
 # ---------------------------------------------------------------------
-# Demo / micro-benchmark when run as a script.
+# CLI: smoke-compile a make_funcs_from_json-shaped file.
 # ---------------------------------------------------------------------
-def _demo() -> None:
-    import random
-    import time
-
-    expr = ("-.5e-12*x**7*y**2*z + .18188888*x "
-            "+ 1.7e-9*x**3*y**3 - 0.001*x*y*z "
-            "+ 4.2e-6*x**2*z**2 + 0.5e-3*y**4")
-    params = ["x", "y", "z"]
-
-    f_py = make_expr_func(expr, params, jit=False, debug=True)
-    try:
-        f_jit = make_expr_func(expr, params, jit=True)
-    except ImportError:
-        print("(numba not installed — skipping JIT path)")
-        f_jit = None
-
-    # Correctness sanity check
-    if f_jit is not None:
-        f_jit(1.0, 2.0, 3.0)              # warm up the JIT compile
-        for _ in range(50):
-            a = random.uniform(0.1, 10)
-            b = random.uniform(0.1, 10)
-            c = random.uniform(0.1, 10)
-            v_py = f_py(a, b, c)
-            v_jit = f_jit(a, b, c)
-            assert abs(v_py - v_jit) < 1e-9 * (abs(v_py) + 1.0), \
-                f"py vs jit mismatch at ({a},{b},{c}): {v_py} vs {v_jit}"
-        print("correctness check: OK")
-
-    # Micro-benchmark
-    N = 1_000_000
-    t0 = time.perf_counter()
-    for _ in range(N):
-        f_py(1.0, 2.0, 3.0)
-    t_py = time.perf_counter() - t0
-
-    print(f"pure Python (exec'd): {t_py * 1e9 / N:8.1f} ns/call  "
-          f"({N / t_py / 1e6:.2f} M calls/s)")
-
-    if f_jit is not None:
-        t0 = time.perf_counter()
-        for _ in range(N):
-            f_jit(1.0, 2.0, 3.0)
-        t_jit = time.perf_counter() - t0
-        print(f"numba JIT:            {t_jit * 1e9 / N:8.1f} ns/call  "
-              f"({N / t_jit / 1e6:.2f} M calls/s)")
-        print(f"speedup:              {t_py / t_jit:.1f}x")
-
-
 def _compile_json_cli(json_path: str) -> None:
     """Compile every formula in a JSON file and print a summary.
     Useful as a sanity check before wiring the compiled funcs into a
@@ -640,7 +743,9 @@ def _compile_json_cli(json_path: str) -> None:
 
 if __name__ == '__main__':
     import sys
-    if len(sys.argv) > 1:
-        _compile_json_cli(sys.argv[1])
-    else:
-        _demo()
+    if len(sys.argv) != 2:
+        print("usage: python3 expr_compiler.py <formulas.json>", file=sys.stderr)
+        print("       (file shape: top-level dict of name -> expr-string or "
+              "{'expr': ..., 'params': [...]})", file=sys.stderr)
+        sys.exit(2)
+    _compile_json_cli(sys.argv[1])
