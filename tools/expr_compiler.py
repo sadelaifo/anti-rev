@@ -1107,7 +1107,8 @@ def make_expr_func_from_json(json_path, expr_at, *,
 
 def make_expr_funcs_from_json(json_path, exprs_at, *,
                               constants_at=None, subexprs_at=None,
-                              params_at=None, **compile_opts):
+                              params_at=None, progress=False,
+                              **compile_opts):
     """Plural version of :func:`make_expr_func_from_json`: compile
     *every* formula in the dict at ``exprs_at`` using one shared set
     of constants and sub-expressions.
@@ -1156,6 +1157,33 @@ def make_expr_funcs_from_json(json_path, exprs_at, *,
     listed name not used by a particular formula becomes an unused
     parameter of that function (handy when you want a uniform call
     signature across the batch).
+
+    Progress reporting
+    ------------------
+    For batches of hundreds of formulas the first run can take
+    minutes; pass ``progress=True`` to get a periodic stderr
+    dump showing throughput, cache hit rate, and ETA::
+
+        [expr_compiler] 1/247 (0%)   cache hits: 0/1   elapsed 0.4s   ETA 99s
+        [expr_compiler] 50/247 (20%) cache hits: 47/50 elapsed 1.2s   ETA 4.6s
+        [expr_compiler] 247/247 (100%) cache hits: 240/247 elapsed 4.3s ETA 0.0s
+
+    Pass a callable instead of ``True`` to log to your own sink —
+    it's invoked after each formula completes with a dict::
+
+        {
+          'name': <key>,
+          'done': <int>,    'total': <int>,
+          'elapsed': <s>,   'duration': <s>,
+          'cache_hit': <bool>, 'cache_hits': <int>,
+        }
+
+    Useful for capturing per-formula timings::
+
+        timings = []
+        funcs = make_expr_funcs_from_json(
+            ..., progress=lambda info: timings.append(info))
+        slowest = sorted(timings, key=lambda i: i['duration'])[-5:]
 
     ``compile_opts`` are forwarded to :func:`make_expr_func`
     (``jit``, ``fastmath``, ``cache``, ``debug``); they apply to
@@ -1212,12 +1240,30 @@ def make_expr_funcs_from_json(json_path, exprs_at, *,
     #      invocation pays the sympy cost.
     def _heavy():
         import sys
+        import time
         old_limit = sys.getrecursionlimit()
         if old_limit < 1_000_000:
             sys.setrecursionlimit(1_000_000)
         try:
             out: dict = {}
+            n_total = len(exprs)
+            n_done = 0
+            n_hit = 0
+            t_start = time.perf_counter()
+            t_last_log = t_start
+
             for name, formula in exprs.items():
+                t_entry = time.perf_counter()
+
+                # Cache-hit check before compiling so the progress
+                # report can show how much sympy work was actually
+                # done vs. saved.
+                cache_key = _compute_compile_key(
+                    formula, params_explicit, constants, subexprs)
+                was_hit = os.path.exists(_cache_path_for_key(cache_key))
+                if was_hit:
+                    n_hit += 1
+
                 out[name] = _compile_with_subst(
                     formula=formula,
                     params_explicit=params_explicit,
@@ -1225,6 +1271,39 @@ def make_expr_funcs_from_json(json_path, exprs_at, *,
                     subexprs=subexprs,
                     debug=debug,
                 )
+                n_done += 1
+
+                if progress:
+                    now = time.perf_counter()
+                    info = {
+                        'name':       name,
+                        'done':       n_done,
+                        'total':      n_total,
+                        'elapsed':    now - t_start,
+                        'duration':   now - t_entry,
+                        'cache_hit':  was_hit,
+                        'cache_hits': n_hit,
+                    }
+                    if callable(progress):
+                        progress(info)
+                    elif progress is True:
+                        # Throttle stderr to ~1 line/sec, but always
+                        # print first and last so short batches still
+                        # produce some output.
+                        if (now - t_last_log >= 1.0
+                                or n_done == 1
+                                or n_done == n_total):
+                            eta = (info['elapsed'] / n_done
+                                   * (n_total - n_done)
+                                   if n_done < n_total else 0.0)
+                            pct = n_done * 100.0 / n_total
+                            print(f"[expr_compiler] {n_done}/{n_total} "
+                                  f"({pct:.0f}%)  "
+                                  f"cache hits: {n_hit}/{n_done}  "
+                                  f"elapsed {info['elapsed']:.1f}s  "
+                                  f"ETA {eta:.1f}s",
+                                  file=sys.stderr, flush=True)
+                            t_last_log = now
             return out
         finally:
             sys.setrecursionlimit(old_limit)
@@ -1232,9 +1311,21 @@ def make_expr_funcs_from_json(json_path, exprs_at, *,
     pyfns = _run_in_big_stack(_heavy, stack_mb=256)
 
     if jit:
+        import sys as _sys
+        import time as _time
+        if progress is True:
+            print(f"[expr_compiler] applying numba JIT decoration to "
+                  f"{len(pyfns)} functions...",
+                  file=_sys.stderr, flush=True)
+        t_jit = _time.perf_counter()
         from numba import njit
         for name in list(pyfns):
             pyfns[name] = njit(cache=cache, fastmath=fastmath)(pyfns[name])
+        if progress is True:
+            print(f"[expr_compiler] JIT decoration done in "
+                  f"{_time.perf_counter() - t_jit:.2f}s "
+                  f"(actual machine-code compile is lazy on first call)",
+                  file=_sys.stderr, flush=True)
     return pyfns
 
 
