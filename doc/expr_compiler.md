@@ -157,13 +157,17 @@ JIT 编译的可调用对象 f(args) → float
 
 ## 九、运行时表现
 
-| 表达式规模 | 字符串长度 | 项数 | 编译时间 | JIT 后单次调用 |
-|---|---|---|---|---|
-| 中型 | ~5 KB | 几十–上百 | < 0.5s | ~10–50 ns |
-| 大型 | ~150 KB | 5000 | ~3s | ~50–200 ns |
-| 极大 | ~460 KB | 15000 | ~12s | ~100–500 ns |
+| 表达式规模 | 字符串长度 | 项数 | 首次编译 | **缓存命中** | JIT 后单次调用 |
+|---|---|---|---|---|---|
+| 中型 | ~5 KB | 几十–上百 | < 0.5s | < 0.02s | ~10–50 ns |
+| 大型 | ~150 KB | 5000 | ~3s | < 0.05s | ~50–200 ns |
+| 极大 | ~460 KB | 15000 | ~12s | < 0.1s | ~100–500 ns |
 
 编译时间随项数大致线性。运行时单次调用因为最终生成的是 LOAD_FAST + 浮点 ALU 序列，瓶颈是表达式总操作数。
+
+**磁盘缓存** — 编译产物按 `SHA-1(公式 + 常量 + 子表达式)` 落到 `<tempdir>/expr_compiler_gen/_expr_<hash>.py`。同一份 JSON 第二次跑命中缓存时**只剩 exec + numba 缓存查找**，不重做 sympy 任何工作（实测 25–400x 加速，取决于公式大小和 OS 文件缓存状态）。改任何一个输入（公式文本、常量值、子表达式定义）都会改变 hash 自动失效。
+
+**单次 sympify 流水线** — 早期版本走 `_expand_subexprs → str → _substitute_constants → str → sympify → cse` 的 3 次 sympify 链；现在改成一次 sympify 后 AST 层一次 xreplace 同时把 subexprs 和 constants 解析到不动点，**首次编译也快约 3x**。
 
 ## 十、API 一览
 
@@ -218,11 +222,13 @@ print(f"signature: {py_fn.__name__}({', '.join(names)})")
 - `run.py` — JSON 路径全套：常量 + 子表达式 + 变量自动检测 + 精度保留（4 组数值参考）
 - `test_syntax.py` — 19 个语法 / 优先级 case + 一个 15000 项 / 460 KB 的极限 case 走完整 `make_expr_func_from_json` 流程
 - `test_multi.py` — `make_expr_funcs_from_json` 批量编译路径：5 条公式（含不同变量集 / 纯常量公式）共享常量与子表达式，覆盖 `params_at` 统一签名 override
+- `test_cache.py` — 内容寻址磁盘缓存 hit / miss / 失效行为及加速比
 
 ```bash
 python3 tests/expr_compiler/run.py
 python3 tests/expr_compiler/test_syntax.py
 python3 tests/expr_compiler/test_multi.py
+python3 tests/expr_compiler/test_cache.py
 ```
 
 ## 十三、依赖

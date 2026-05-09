@@ -186,7 +186,10 @@ because that's where the project keeps general-purpose helpers.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 
 import sympy as sp
@@ -248,102 +251,197 @@ def make_expr_func(expr_str: str, params: list[str], *,
 
 
 def _compile_pyfunc(expr_str: str, params: list[str], *, debug: bool):
-    """The recursion-heavy part of make_expr_func, isolated so it can
-    run inside _run_in_big_stack.  Returns a plain Python function;
-    JIT decoration happens in the caller."""
-    import sys
-    old_limit = sys.getrecursionlimit()
-    if old_limit < 1_000_000:
-        sys.setrecursionlimit(1_000_000)
-    try:
-        # 1. sympify — bind variable names to sympy Symbols so they're
-        #    not misread as imports or function names.  Empty params
-        #    (a constant expression) is allowed; sp.symbols('') errors.
-        if params:
-            syms = sp.symbols(' '.join(params))
-            if not isinstance(syms, tuple):
-                syms = (syms,)
-        else:
-            syms = ()
-        expr = _sympify_chunked(expr_str, dict(zip(params, syms)))
-
-        # 2. CSE — find repeated subterms across the whole expression
-        #    and replace them with intermediates.  ``optimizations=
-        #    'basic'`` runs a couple of pre-CSE algebraic passes that
-        #    are O(N²)-ish on very wide Adds and dominate compile time
-        #    for 10k+ term inputs while finding little extra savings
-        #    on engineering polynomials.  Skip them past ~10k args.
-        opt_level = 'basic' if not (
-            isinstance(expr, sp.Add) and len(expr.args) > 10_000
-        ) else None
-        sub_exprs, [main] = sp.cse(expr, optimizations=opt_level)
-
-        # 3. Generate Python source.  Top-level Adds with many terms
-        #    are split into chunked partial sums so the final return's
-        #    AST stays shallow — cuts CPython's parse depth from O(N)
-        #    to O(sqrt(N)) on big polynomials.
-        lines = [f"def _expr({', '.join(params)}):"]
-        for tmp, val in sub_exprs:
-            lines.append(f"    {tmp} = {sp.pycode(val)}")
-
-        chunk_lines, final_pycode = _emit_chunked_main(main)
-        lines.extend(chunk_lines)
-        lines.append(f"    return {final_pycode}")
-        src = "\n".join(lines) + "\n"
-
-        if debug:
-            print("--- generated source ---")
-            print(src)
-            print(f"--- {len(sub_exprs)} CSE temps, "
-                  f"{len(chunk_lines)} chunk temps ---")
-
-        # 4. Write source to a real file before exec.  This solves
-        #    two problems at once:
-        #      a) numba's `cache=True` needs a locator for the
-        #         function's source file.  `exec(src, ns)` leaves
-        #         co_filename = "<string>", which numba rejects with
-        #         RuntimeError("cannot cache function: no locator
-        #         available for file '<string>'").
-        #      b) tracebacks in the compiled function become
-        #         readable — the line "0.5*v*i + ..." in the
-        #         traceback points at a real file you can open.
-        #    The file path is content-addressed (sha1 of src), so
-        #    re-compiling the same formula reuses the same file and
-        #    numba's on-disk cache hits.
-        src_file = _write_generated_source(src)
-        ns: dict = {'__file__': src_file}
-        code = compile(src, src_file, 'exec')
-        exec(code, ns)
-        return ns['_expr']
-    finally:
-        sys.setrecursionlimit(old_limit)
+    """Compile a Python function from `expr_str` with no
+    constant/subexpr substitutions.  Thin wrapper around
+    :func:`_compile_with_subst` for the case where substitutions have
+    already been applied or aren't needed (the make_expr_func entry
+    point)."""
+    return _compile_with_subst(expr_str, params, None, None, debug=debug)
 
 
-def _write_generated_source(src: str) -> str:
-    """Write ``src`` to a stable path under the system temp dir,
-    keyed by sha1 of the content.  Returns the path.
+def _compile_with_subst(formula: str, params_explicit, constants, subexprs,
+                        *, debug: bool):
+    """Single-pass compile with content-addressed caching.
 
-    Idempotent — concurrent calls with the same source land on the
-    same file via atomic ``os.replace``.  Cache files persist for
-    the lifetime of the temp dir (typically across processes within
-    the same OS session), so numba's ``cache=True`` actually pays
-    off across re-runs.
+    Cache key: SHA-1 of (formula + params_explicit + constants +
+    subexprs).  If a cache file with that key already exists on disk
+    under <tempdir>/expr_compiler_gen/, skip the entire sympy
+    pipeline and just exec the previously-generated source.
+
+    Cache miss: do the work in one pass — sympify the formula once,
+    apply both subexpr and constant substitutions in a single
+    xreplace, auto-detect parameters (or use the supplied list),
+    run CSE, generate source with chunked main, write to the cache
+    file, exec.
+
+    Why this is worth doing:
+
+      - Re-running the same JSON config skips ~15 seconds per
+        large formula (sympify is the dominant cost).
+      - Editing one formula in a file with hundreds of others only
+        recompiles the changed one; the rest cache-hit.
+      - The single-pass substitution avoids two str()→sympify round
+        trips that were happening across the
+        _expand_subexprs / _substitute_constants / _compile_pyfunc
+        chain — first-run compile is also ~3x faster.
+
+    Returns a plain Python function; JIT decoration happens in the
+    caller's process so numba's dispatcher state lives where the
+    user expects.
     """
-    import hashlib
-    import os
-    import tempfile
+    cache_key = _compute_compile_key(
+        formula, params_explicit, constants, subexprs,
+    )
+    src_file = _cache_path_for_key(cache_key)
 
-    cache_dir = os.path.join(tempfile.gettempdir(), 'expr_compiler_gen')
-    os.makedirs(cache_dir, exist_ok=True)
-
-    h = hashlib.sha1(src.encode('utf-8')).hexdigest()[:16]
-    path = os.path.join(cache_dir, f'_expr_{h}.py')
-    if not os.path.exists(path):
-        tmp = path + '.tmp'
+    if os.path.exists(src_file):
+        with open(src_file, 'r', encoding='utf-8') as f:
+            src = f.read()
+        if debug:
+            print(f"--- cache hit: {src_file} ---")
+            print(src)
+    else:
+        src = _generate_source_with_subst(
+            formula, params_explicit, constants, subexprs, debug,
+        )
+        tmp = src_file + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             f.write(src)
-        os.replace(tmp, path)
-    return path
+        os.replace(tmp, src_file)
+
+    code = compile(src, src_file, 'exec')
+    ns: dict = {'__file__': src_file}
+    exec(code, ns)
+    return ns['_expr']
+
+
+def _generate_source_with_subst(formula, params_explicit, constants,
+                                subexprs, debug):
+    """Single sympify pass: parse formula, apply subexpr + constant
+    substitutions at AST level (one xreplace, no string round
+    trips), run CSE, emit chunked Python source.  Returns the source
+    string.  Recursion-heavy — call from inside the big-stack
+    worker thread."""
+    expr = _sympify_chunked(formula)
+
+    # Build a unified xreplace dict: subexprs + constants, then
+    # resolve to a fixed point so each subexpr's value already has
+    # all referenced constants and other subexprs baked in.
+    #
+    # Why fixed-point: sympy's xreplace is a single-pass tree walk —
+    # when it replaces ``loss`` with ``k1*v**2 + k2*i**2``, the
+    # newly-substituted ``k1``/``k2`` are NOT re-visited.  If we
+    # didn't pre-resolve, those would survive as free symbols in
+    # the output even though the user gave numeric values for them.
+    sub_dict: dict = {}
+    if subexprs:
+        sub_dict.update({sp.Symbol(name): sp.sympify(s)
+                         for name, s in subexprs.items()})
+    if constants:
+        sub_dict.update({sp.Symbol(name): _to_sympy_constant(name, value)
+                         for name, value in constants.items()})
+
+    if sub_dict:
+        # Resolve to a fixed point.  Each iteration walks every
+        # entry's value and applies the current sub_dict once;
+        # numeric constants are no-ops, but subexpr values reduce
+        # toward fully-substituted form.
+        for _ in range(len(sub_dict) + 1):
+            changed = False
+            for sym, e in list(sub_dict.items()):
+                new = e.xreplace(sub_dict)
+                if new != e:
+                    sub_dict[sym] = new
+                    changed = True
+            if not changed:
+                break
+        # Cycle check — any value still referencing a sub_dict key
+        # after convergence is a circular reference (e.g. subexprs
+        # ``a -> b, b -> a`` settle at ``a -> a, b -> a``).
+        names = set(sub_dict)
+        for sym, e in sub_dict.items():
+            leftover = e.free_symbols & names
+            if leftover:
+                raise ValueError(
+                    f"substitution cycle: {sym} still depends on "
+                    f"{sorted(str(s) for s in leftover)} after resolution")
+
+        expr = expr.xreplace(sub_dict)
+
+    # Determine parameter list.
+    if params_explicit is not None:
+        params = list(params_explicit)
+    else:
+        params = sorted(str(s) for s in expr.free_symbols)
+
+    # CSE — drop 'basic' optimizations for very wide Adds (O(N²) and
+    # finds nothing on flat polynomials).
+    opt_level = 'basic' if not (
+        isinstance(expr, sp.Add) and len(expr.args) > 10_000
+    ) else None
+    sub_exprs, [main] = sp.cse(expr, optimizations=opt_level)
+
+    lines = [f"def _expr({', '.join(params)}):"]
+    for tmp, val in sub_exprs:
+        lines.append(f"    {tmp} = {sp.pycode(val)}")
+    chunk_lines, final_pycode = _emit_chunked_main(main)
+    lines.extend(chunk_lines)
+    lines.append(f"    return {final_pycode}")
+    src = "\n".join(lines) + "\n"
+
+    if debug:
+        print("--- generated source ---")
+        print(src)
+        print(f"--- {len(sub_exprs)} CSE temps, "
+              f"{len(chunk_lines)} chunk temps ---")
+    return src
+
+
+def _to_sympy_constant(name, value):
+    """Bool / str / float / int → sp.Float | sp.Integer.  String form
+    preserves the digit count exactly; floats preserve up to IEEE-754."""
+    if isinstance(value, bool):
+        raise TypeError(f"constant {name!r}: bool is not a numeric value")
+    if isinstance(value, str):
+        return sp.Float(value)
+    if isinstance(value, float):
+        return sp.Float(value)
+    if isinstance(value, int):
+        return sp.Integer(value)
+    raise TypeError(f"constant {name!r} must be int / float / "
+                    f"numeric-string, got {type(value).__name__}")
+
+
+def _compute_compile_key(formula, params_explicit, constants, subexprs):
+    """Stable SHA-1 hash of every input that affects the generated
+    code.  Two compiles with identical (formula, params, constants,
+    subexprs) produce the same key and reuse the same cache file —
+    that's how the second run becomes near-instant.
+
+    constants values are stringified before hashing because
+    parse_float=str gives us strings whereas Python ints stay ints;
+    the cache should hit regardless of which form the caller
+    supplies for the same numeric value.
+    """
+    payload = {
+        'formula': formula,
+        'params':  list(params_explicit) if params_explicit else None,
+        'constants': sorted(
+            (k, str(v)) for k, v in constants.items()
+        ) if constants else None,
+        'subexprs': sorted(subexprs.items()) if subexprs else None,
+    }
+    canonical = json.dumps(payload, sort_keys=True)
+    return hashlib.sha1(canonical.encode('utf-8')).hexdigest()[:16]
+
+
+def _cache_path_for_key(key: str) -> str:
+    """Disk path for cache key.  Persists for the lifetime of the
+    system temp dir (typically across processes within the same OS
+    session)."""
+    cache_dir = os.path.join(tempfile.gettempdir(), 'expr_compiler_gen')
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f'_expr_{key}.py')
 
 
 def _split_top_level_terms(s: str):
@@ -895,14 +993,13 @@ def make_expr_func_from_json(json_path, expr_at, *,
         if old_limit < 1_000_000:
             sys.setrecursionlimit(1_000_000)
         try:
-            e = expr_str
-            if subexprs is not None:
-                e = _expand_subexprs(e, subexprs)
-            if constants is not None:
-                e = _substitute_constants(e, constants)
-            p = (params_explicit if params_explicit is not None
-                 else _detect_params(e))
-            return _compile_pyfunc(e, p, debug=debug)
+            return _compile_with_subst(
+                formula=expr_str,
+                params_explicit=params_explicit,
+                constants=constants,
+                subexprs=subexprs,
+                debug=debug,
+            )
         finally:
             sys.setrecursionlimit(old_limit)
 
@@ -1015,7 +1112,10 @@ def make_expr_funcs_from_json(json_path, exprs_at, *,
                         f"{sorted(compile_opts)}")
 
     # ---- worker thread: compile every formula serially with one
-    #      stack/recursion setup
+    #      stack/recursion setup.  _compile_with_subst is content-
+    #      addressed-cached, so re-running with an unchanged JSON
+    #      hits the cache for every formula and only the first
+    #      invocation pays the sympy cost.
     def _heavy():
         import sys
         old_limit = sys.getrecursionlimit()
@@ -1024,14 +1124,13 @@ def make_expr_funcs_from_json(json_path, exprs_at, *,
         try:
             out: dict = {}
             for name, formula in exprs.items():
-                e = formula
-                if subexprs is not None:
-                    e = _expand_subexprs(e, subexprs)
-                if constants is not None:
-                    e = _substitute_constants(e, constants)
-                p = (params_explicit if params_explicit is not None
-                     else _detect_params(e))
-                out[name] = _compile_pyfunc(e, p, debug=debug)
+                out[name] = _compile_with_subst(
+                    formula=formula,
+                    params_explicit=params_explicit,
+                    constants=constants,
+                    subexprs=subexprs,
+                    debug=debug,
+                )
             return out
         finally:
             sys.setrecursionlimit(old_limit)
