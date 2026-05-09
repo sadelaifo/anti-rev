@@ -1,9 +1,11 @@
 {
-  "_comment": "Test fixture for tools/expr_compiler.py — constants are name:number pairs that get baked in as literals; variable names are NOT listed and are auto-detected from the formula's surviving free symbols. Includes a 12-digit constant (typical engineering value, well within IEEE-754) to verify no rounding happens through the sympy + pycode pipeline.",
+  "_comment": "Test fixture for tools/expr_compiler.py — constants split across two keys (physics_consts + calibration_consts) get merged at compile time. Variable names are NOT listed and are auto-detected from surviving free symbols. Includes a 12-digit constant to verify no rounding through sympy + pycode.",
 
-  "constants": {
+  "physics_consts": {
     "k1":    6.5e-5,
-    "k2":    0.001,
+    "k2":    0.001
+  },
+  "calibration_consts": {
     "bias":  12,
     "scale": 0.5,
     "third": 0.833333333333

@@ -379,6 +379,30 @@ def _normalize_paths(p):
                     f"got {type(p).__name__}")
 
 
+def _merge_dicts_at(data, path_or_paths, label: str) -> dict:
+    """Read one or more dicts from ``data`` (each at a path supplied
+    by ``path_or_paths``) and return a single merged dict.  Raises
+    ``ValueError`` if any key appears in more than one source — silent
+    overwrites would mask a real schema error.
+
+    ``label`` is just used in the error message ("constants" /
+    "subexprs") so the caller can tell which group complained.
+    """
+    merged: dict = {}
+    for path in _normalize_paths(path_or_paths):
+        chunk = get_at_path(data, path)
+        if not isinstance(chunk, dict):
+            raise TypeError(f"{label} at {path!r} must be a dict, "
+                            f"got {type(chunk).__name__}")
+        overlap = set(merged) & set(chunk)
+        if overlap:
+            raise ValueError(f"{label} name(s) {sorted(overlap)} appear "
+                             f"in multiple paths within {label}_at — "
+                             f"keep names disjoint across the sources")
+        merged.update(chunk)
+    return merged
+
+
 def _expand_subexprs(expr_str: str, subexprs: dict) -> str:
     """Resolve named sub-expressions into ``expr_str`` so the result is
     a single self-contained expression that :func:`make_expr_func` can
@@ -476,6 +500,15 @@ def make_expr_func_from_json(json_path, expr_at, *,
 
         "constants": {"k1": 6.5e-5, "k2": 0.001}
 
+    A *list* of paths is also accepted; each path's value is read as
+    its own ``{name: number}`` dict and they're merged.  Useful when
+    the schema splits constants across categories::
+
+        constants_at = ["physics_consts", "calibration_consts"]
+
+    Names must be disjoint across the merged sources — overlap raises
+    ``ValueError`` so silent overrides don't slip through.
+
     Sub-expressions
     ---------------
     ``subexprs_at`` points to a ``{name: expr_string}`` dict.  Each
@@ -483,6 +516,8 @@ def make_expr_func_from_json(json_path, expr_at, *,
     compilation.  Entries may reference each other and may reference
     constants defined in ``constants_at``; resolution is iterative,
     cycles are caught.
+
+    Same multi-path form is accepted as for ``constants_at``.
 
     Parameters (variables)
     ----------------------
@@ -542,10 +577,7 @@ def make_expr_func_from_json(json_path, expr_at, *,
     # Inline subexprs first — their resolved values may reference
     # constants, which then get substituted in the next step.
     if subexprs_at is not None:
-        subexprs = get_at_path(data, subexprs_at)
-        if not isinstance(subexprs, dict):
-            raise TypeError(f"subexprs at {subexprs_at!r} must be a dict, "
-                            f"got {type(subexprs).__name__}")
+        subexprs = _merge_dicts_at(data, subexprs_at, "subexprs")
         if not all(isinstance(k, str) and isinstance(v, str)
                    for k, v in subexprs.items()):
             raise TypeError(f"subexprs at {subexprs_at!r} must map "
@@ -553,10 +585,7 @@ def make_expr_func_from_json(json_path, expr_at, *,
         expr = _expand_subexprs(expr, subexprs)
 
     if constants_at is not None:
-        constants = get_at_path(data, constants_at)
-        if not isinstance(constants, dict):
-            raise TypeError(f"constants at {constants_at!r} must be a dict, "
-                            f"got {type(constants).__name__}")
+        constants = _merge_dicts_at(data, constants_at, "constants")
         expr = _substitute_constants(expr, constants)
 
     if params_at is not None:

@@ -55,7 +55,8 @@ def main() -> int:
     f_py = make_expr_func_from_json(
         CFG,
         expr_at      = "formula",
-        constants_at = "constants",
+        # constants split across two JSON keys — merged at compile time
+        constants_at = ["physics_consts", "calibration_consts"],
         subexprs_at  = "subexprs",
         jit          = False,
         debug        = True,
@@ -89,7 +90,7 @@ def main() -> int:
         f_jit = make_expr_func_from_json(
             CFG,
             expr_at      = "formula",
-            constants_at = "constants",
+            constants_at = ["physics_consts", "calibration_consts"],
             subexprs_at  = "subexprs",
             jit          = True,
         )
