@@ -1,0 +1,22 @@
+{
+  "_comment": "Test fixture for tools/expr_compiler.py — params split across two keys, plus a chain of named sub-expressions inlined into the main formula.",
+
+  "inputs":    ["v", "i"],
+  "constants": ["k1", "k2"],
+
+  "subexprs": {
+    "power":   "v * i",
+    "ohm":     "k1 * v**2",
+    "iron":    "k2 * i**2",
+    "loss":    "ohm + iron",
+    "scaled":  "0.5 * power"
+  },
+
+  "main": "scaled - loss",
+
+  "_other_field": "make sure unrelated keys don't get walked or compiled",
+  "schedule": [
+    { "label": "step1", "value": "v + i" },
+    { "label": "step2", "value": "v - i" }
+  ]
+}
