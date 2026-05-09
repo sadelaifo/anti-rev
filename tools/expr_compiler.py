@@ -212,33 +212,120 @@ def _parse_path_string(s: str):
     return tuple(out)
 
 
-def make_expr_func_from_json(json_path, expr_at, params_at, **compile_opts):
+def _normalize_paths(p):
+    """A single path (str or tuple) becomes ``[p]``; a list of paths is
+    returned unchanged.  See :func:`get_at_path` for path syntax.
+
+    Note the convention: a *tuple* of strings is one path with multiple
+    segments (``("formulas", "torque")``); a *list* of strings is
+    several single-segment paths (``["inputs", "constants"]``).
+    """
+    if isinstance(p, (str, tuple)):
+        return [p]
+    if isinstance(p, list):
+        if not all(isinstance(x, (str, tuple)) for x in p):
+            raise TypeError(f"list of paths must contain only str or tuple "
+                            f"elements, got {p!r}")
+        return p
+    raise TypeError(f"path argument must be str / tuple / list, "
+                    f"got {type(p).__name__}")
+
+
+def _expand_subexprs(expr_str: str, subexprs: dict) -> str:
+    """Resolve named sub-expressions into ``expr_str`` so the result is
+    a single self-contained expression that :func:`make_expr_func` can
+    compile.
+
+    ``subexprs`` is a ``{name: expression_str}`` dict; entries may
+    reference each other.  Substitution is done at the sympy AST level
+    (``xreplace``), not as text, so a name being a substring of another
+    identifier is not a hazard.
+
+    Iterate to a fixed point so chains like ``a -> b -> c`` resolve in
+    one call.  Cycles raise ``ValueError``.
+
+    Note: this is purely an *input-side* convenience — sympy's CSE
+    pass inside :func:`make_expr_func` will rediscover any common
+    subexpression in the inlined formula, so you pay no runtime cost
+    for naming them in JSON.
+    """
+    sub_dict = {sp.Symbol(name): sp.sympify(expr) for name, expr in subexprs.items()}
+
+    # Resolve sub_dict against itself — depth bounded by len(sub_dict),
+    # so a normal chain converges within that many iterations.
+    for _ in range(len(sub_dict) + 1):
+        changed = False
+        for sym, expr in list(sub_dict.items()):
+            new_expr = expr.xreplace(sub_dict)
+            if new_expr != expr:
+                sub_dict[sym] = new_expr
+                changed = True
+        if not changed:
+            break
+
+    # A cycle converges too — to a pathological state where some entry
+    # still resolves to one of the subexpr names (e.g. ``{a: b, b: a}``
+    # settles at ``a -> a, b -> a``).  Catch that by checking for any
+    # surviving subexpr-name references in the resolved values.
+    sub_names = set(sub_dict)
+    for sym, expr in sub_dict.items():
+        leftover = expr.free_symbols & sub_names
+        if leftover:
+            raise ValueError(
+                f"subexpression cycle: {sym} still depends on "
+                f"{sorted(str(s) for s in leftover)} after substitution")
+
+    return str(sp.sympify(expr_str).xreplace(sub_dict))
+
+
+def make_expr_func_from_json(json_path, expr_at, params_at,
+                             subexprs_at=None, **compile_opts):
     """One-shot: read an expression string at ``expr_at`` and a
     parameter-name list at ``params_at`` from the same JSON file,
     return the compiled callable.
 
-    Both ``expr_at`` and ``params_at`` accept the same path forms as
-    :func:`get_at_path` — tuples or dotted-with-bracket strings.
+    Path arguments accept the same forms as :func:`get_at_path` —
+    tuples or dotted-with-bracket strings.
 
-    Example.  Given ``config.json``::
-
-        {
-          "device": {
-            "transfer": {
-              "formula": "0.5*v*i + k*v**2",
-              "inputs":  ["v", "i", "k"]
-            }
-          }
-        }
-
-    compile with::
+    Multiple parameter sources
+    --------------------------
+    ``params_at`` may be a single path *or* a list of paths.  When it's
+    a list, each path's value is read as a list of strings and the
+    results are concatenated **in the order given** to form the final
+    positional-argument order.  Useful when the schema splits inputs
+    across keys (``inputs``, ``constants``, …)::
 
         f = make_expr_func_from_json(
             "config.json",
-            expr_at   = "device.transfer.formula",
-            params_at = "device.transfer.inputs",
+            expr_at   = "device.formula",
+            params_at = ["device.inputs", "device.constants"],
         )
-        result = f(220.0, 1.5, 1.2e-5)
+
+    Named sub-expressions
+    ---------------------
+    Optional ``subexprs_at`` points to a ``{name: expr_string}`` dict.
+    Each named expression is inlined into the main formula before
+    compilation; entries may reference each other and resolve in any
+    order::
+
+        {
+          "inputs":   ["v", "i"],
+          "constants":["k1", "k2"],
+          "subexprs": {"power": "v*i",
+                       "loss":  "k1*v**2 + k2*i**2"},
+          "main":     "0.5*power - loss"
+        }
+
+        f = make_expr_func_from_json(
+            "config.json",
+            expr_at     = "main",
+            params_at   = ["inputs", "constants"],
+            subexprs_at = "subexprs",
+        )
+
+    A name appearing in both ``params_at`` and ``subexprs_at`` is
+    treated as a sub-expression (the inlined definition wins) — keep
+    the namespaces disjoint.
 
     ``compile_opts`` are forwarded to :func:`make_expr_func`
     (``jit``, ``fastmath``, ``cache``, ``debug``).
@@ -251,11 +338,25 @@ def make_expr_func_from_json(json_path, expr_at, params_at, **compile_opts):
         raise TypeError(f"expr at {expr_at!r} must be a string, "
                         f"got {type(expr).__name__}")
 
-    params = get_at_path(data, params_at)
-    if not (isinstance(params, list)
-            and all(isinstance(p, str) for p in params)):
-        raise TypeError(f"params at {params_at!r} must be a list of strings, "
-                        f"got {type(params).__name__}")
+    params: list[str] = []
+    for path in _normalize_paths(params_at):
+        chunk = get_at_path(data, path)
+        if not (isinstance(chunk, list)
+                and all(isinstance(p, str) for p in chunk)):
+            raise TypeError(f"params at {path!r} must be a list of strings, "
+                            f"got {type(chunk).__name__}")
+        params.extend(chunk)
+
+    if subexprs_at is not None:
+        subexprs = get_at_path(data, subexprs_at)
+        if not isinstance(subexprs, dict):
+            raise TypeError(f"subexprs at {subexprs_at!r} must be a dict, "
+                            f"got {type(subexprs).__name__}")
+        if not all(isinstance(k, str) and isinstance(v, str)
+                   for k, v in subexprs.items()):
+            raise TypeError(f"subexprs at {subexprs_at!r} must map "
+                            f"str -> str")
+        expr = _expand_subexprs(expr, subexprs)
 
     return make_expr_func(expr, params, **compile_opts)
 
