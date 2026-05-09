@@ -619,6 +619,97 @@ def _reference_value_impl(formula, sample, constants, subexprs):
         sys.setrecursionlimit(old)
 
 
+def make_reference_func(formula, *, constants=None, subexprs=None):
+    """Build a sympy-backed reference evaluator for ``formula``.
+
+    The expensive part — sympify + applying constants / subexprs to
+    a fixed-point — runs **once** when this returns.  The returned
+    callable then evaluates the resulting expression at any sample
+    via a single ``xreplace`` + ``evalf``.  On a 450 KB single-
+    formula JSON, that's ~5 s up front and ~10 ms per call instead
+    of ~5 s every call (which is what a naive ``reference_value()``
+    in a loop costs).
+
+    Use this whenever you want to validate a compiled function at
+    many sample points::
+
+        ref = make_reference_func(
+            cfg["expr"]["f1"],
+            constants = cfg["constants"],
+            subexprs  = cfg["subexprs"],
+        )
+
+        for s in samples:
+            expected = ref(s)                              # ~10 ms each
+            actual   = f1(*[s[a] for a in ref.free_vars])
+            assert abs(actual - expected) < 1e-9 * (abs(expected) + 1)
+
+    The returned callable has a ``free_vars`` attribute listing
+    the variable names left in the post-substitution expression
+    (alphabetical), so you don't have to introspect ``f1``'s
+    parameter order separately.
+
+    Independent of the compile pipeline (no CSE, no pycode, no
+    exec) — agrees with the compiled function only if both parse
+    the same string the same way.  That property is what makes it
+    a useful oracle: if ``ref(s) == f1(*args)`` at all sample
+    points, the codegen path is preserving semantics.
+    """
+    expr = _run_in_big_stack(
+        lambda: _build_reference_expr(formula, constants, subexprs),
+        stack_mb=256,
+    )
+    free_vars = sorted(str(s) for s in expr.free_symbols)
+
+    def _evaluate(sample: dict) -> float:
+        missing = [v for v in free_vars if v not in sample]
+        if missing:
+            raise KeyError(
+                f"sample missing {missing}; free variables are {free_vars}")
+        var_dict = {sp.Symbol(n): sp.Float(str(sample[n]))
+                    for n in free_vars}
+        if not var_dict:
+            return float(expr.evalf())
+        return float(expr.xreplace(var_dict).evalf())
+
+    _evaluate.free_vars = free_vars
+    return _evaluate
+
+
+def _build_reference_expr(formula, constants, subexprs):
+    """Sympify formula and apply constants + subexprs to a fixed
+    point.  Result is the substituted sympy expression with only
+    the user's variables remaining as free symbols."""
+    import sys
+    old = sys.getrecursionlimit()
+    if old < 1_000_000:
+        sys.setrecursionlimit(1_000_000)
+    try:
+        expr = _sympify_chunked(formula)
+
+        sub_dict: dict = {}
+        if subexprs:
+            sub_dict.update({sp.Symbol(n): sp.sympify(s)
+                             for n, s in subexprs.items()})
+        if constants:
+            sub_dict.update({sp.Symbol(n): _to_sympy_constant(n, v)
+                             for n, v in constants.items()})
+        if sub_dict:
+            for _ in range(len(sub_dict) + 1):
+                changed = False
+                for sym, e in list(sub_dict.items()):
+                    new = e.xreplace(sub_dict)
+                    if new != e:
+                        sub_dict[sym] = new
+                        changed = True
+                if not changed:
+                    break
+            expr = expr.xreplace(sub_dict)
+        return expr
+    finally:
+        sys.setrecursionlimit(old)
+
+
 def verify(funcs, formulas, sample, *, constants=None, subexprs=None,
            eps: float = 1e-9, file=None):
     """Cross-check each compiled function against

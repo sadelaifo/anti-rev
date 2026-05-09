@@ -183,7 +183,8 @@ JIT 编译的可调用对象 f(args) → float
 | `cache_dir_path()` | 返回磁盘缓存目录路径，便于手动 `ls` / 清理 |
 | `clear_compile_cache(*, older_than_days=None)` | 清空磁盘缓存（可选只清比 N 天老的）；返回 `{removed_files, freed_bytes, cache_dir}` |
 | `describe(funcs, *, sample=None)` | 打印单个函数 / dict 的签名总览，可选传 `sample={var: val}` 顺便跑一遍验证数值 |
-| `reference_value(formula, sample, *, constants=None, subexprs=None)` | 用 sympy 直接算公式真值（不走 CSE / pycode / exec），用于核对编译产物 |
+| `reference_value(formula, sample, *, constants=None, subexprs=None)` | 用 sympy 直接算公式真值（不走 CSE / pycode / exec）— 每次都重新 sympify，单次调用 |
+| `make_reference_func(formula, *, constants=None, subexprs=None)` | sympify + 替换**只做一次**，返回的 callable 接受 `sample` dict，每次只剩 xreplace + evalf；450 KB 公式从每次 5s 降到 ~10 ms。`.free_vars` 列出剩下的变量名 |
 | `verify(funcs, formulas, sample, *, constants=None, subexprs=None, eps=1e-9)` | 把 `funcs` 跟 `reference_value` 在某个采样点对账，打印 OK/FAIL 列表，返回 records |
 
 `make_expr_funcs_from_json` 还接受 `progress` 参数。`progress=True` 让批量编译过程中向 stderr 周期性输出 `n/total / cache hits / elapsed / ETA`，配合首次跑长时间的场景。`progress=callable` 时每条公式编完回调一次，传入 `{name, done, total, elapsed, duration, cache_hit, cache_hits}`，方便存盘 / 自定义日志：
@@ -242,6 +243,7 @@ print(f"signature: {py_fn.__name__}({', '.join(names)})")
 - `test_multi.py` — `make_expr_funcs_from_json` 批量编译路径：5 条公式（含不同变量集 / 纯常量公式）共享常量与子表达式，覆盖 `params_at` 统一签名 override
 - `test_cache.py` — 内容寻址磁盘缓存 hit / miss / 失效行为及加速比
 - `test_boundary.py` — 用 `verify` + 手写 Python 参考实现做**三层对账**的边界采样 demo（10 个采样点 × 4 公式：零值 / 极小 / 极大 / 负值 / 极端温度 / 业务点）；**手写参考是关键** —— 仅用 sympy `reference_value` 对账抓不到 JSON 公式本身的语义错误，手写 Python 实现可以
+- `verify_one_template.py` — 单条公式多采样点对账模板。点对点拿 JSON 里某条公式（如 `expr.f1`），用 `make_reference_func` 一次性做 sympify+替换，再扫一组采样点跟编译函数对账。**这是 450KB 公式无法用 `eval` 时的标准方法**，把 `CONFIG_PATH` / `FORMULA_PATH` / `SAMPLES` 改成你自己的就能跑
 
 ```bash
 python3 tests/expr_compiler/run.py
