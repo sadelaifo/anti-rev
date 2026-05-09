@@ -30,7 +30,7 @@ CFG = HERE / "config.json"
 
 # Constants from config.json — duplicated here so the reference function
 # is independent of the loader under test.
-K1, K2, BIAS, SCALE = 6.5e-5, 0.001, 12, 0.5
+K1, K2, BIAS, SCALE, THIRD = 6.5e-5, 0.001, 12, 0.5, 0.833333333333
 
 
 def reference(i: float, v: float) -> float:
@@ -40,9 +40,9 @@ def reference(i: float, v: float) -> float:
         ohm   = K1 * v**2
         iron  = K2 * i**2
         loss  = ohm + iron
-        f     = SCALE*power - loss + BIAS
+        f     = SCALE*power - loss + BIAS + THIRD*v
     """
-    return SCALE * v * i - (K1 * v**2 + K2 * i**2) + BIAS
+    return SCALE * v * i - (K1 * v**2 + K2 * i**2) + BIAS + THIRD * v
 
 
 def near(a: float, b: float, eps: float = 1e-9) -> bool:
@@ -122,6 +122,32 @@ def main() -> int:
     other = get_at_path({"a": [{"b": 42}]}, "a[0].b")
     assert other == 42, other
     print(f"  get_at_path('a[0].b') = {other}")
+
+    # Precision check — feed the formula directly through
+    # _substitute_constants with the JSON-string form of the constant
+    # and verify the 12-digit value survives verbatim.  This is the
+    # exact path make_expr_func_from_json takes after parse_float=str
+    # turns "0.833333333333" into the string "0.833333333333".
+    baked = _substitute_constants(
+        "third * v",
+        {"third": "0.833333333333"},
+    )
+    if "0.833333333333" not in baked:
+        print(f"  PRECISION FAIL: 12-digit constant lost — got {baked!r}")
+        return 1
+    print(f"  precision: 12-digit constant kept verbatim — {baked!r}")
+
+    # 20-digit value, all significant (no redundant trailing zero):
+    # confirms the digits make it into the generated source even
+    # though Python's exec'd double rounds at runtime.  Note: a
+    # trailing redundant zero would be stripped by sympy's printer
+    # (numerically equivalent), so use a non-zero last digit.
+    twenty = "0.12345678901234567891"
+    baked20 = _substitute_constants("x * c", {"c": twenty})
+    if twenty not in baked20:
+        print(f"  PRECISION FAIL: 20-digit constant lost — got {baked20!r}")
+        return 1
+    print(f"  precision: 20-digit constant kept verbatim — {baked20!r}")
 
     print("[expr_compiler test] all checks passed.")
     return 0

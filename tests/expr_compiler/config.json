@@ -1,11 +1,12 @@
 {
-  "_comment": "Test fixture for tools/expr_compiler.py — constants are name:number pairs that get baked in as literals; variable names are NOT listed and are auto-detected from the formula's surviving free symbols. A few named sub-expressions exercise the inline path; one of them references a constant to cover the constant-inside-subexpr case.",
+  "_comment": "Test fixture for tools/expr_compiler.py — constants are name:number pairs that get baked in as literals; variable names are NOT listed and are auto-detected from the formula's surviving free symbols. Includes a 12-digit constant (typical engineering value, well within IEEE-754) to verify no rounding happens through the sympy + pycode pipeline.",
 
   "constants": {
-    "k1":  6.5e-5,
-    "k2":  0.001,
-    "bias": 12,
-    "scale": 0.5
+    "k1":    6.5e-5,
+    "k2":    0.001,
+    "bias":  12,
+    "scale": 0.5,
+    "third": 0.833333333333
   },
 
   "subexprs": {
@@ -15,7 +16,7 @@
     "loss":  "ohm + iron"
   },
 
-  "formula": "scale*power - loss + bias",
+  "formula": "scale*power - loss + bias + third*v",
 
   "_other_field": "unrelated keys are not walked or compiled"
 }

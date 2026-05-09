@@ -286,21 +286,27 @@ def _substitute_constants(expr_str: str, constants: dict) -> str:
     happens to be a substring of another identifier (e.g. constant
     ``k`` inside variable ``key``) is unaffected.
 
-    Floats become ``sp.Float`` (preserves the magnitude exactly,
-    including small values like ``6.5e-5`` that ``sp.Rational`` would
-    blow up into a giant fraction); ints become ``sp.Integer``.
+    Precision handling.  String-form values (``"0.833333333333"``) are
+    fed directly to ``sp.Float``, which picks an internal precision
+    matching the digit count — this is how :func:`make_expr_func_from_json`
+    avoids the IEEE-754 round trip when called via the
+    ``parse_float=str`` JSON loader.  Native float values are accepted
+    too but are bounded by Python's float precision (~15-17 sig figs).
+    Ints become ``sp.Integer``.
     """
     sub_dict: dict = {}
     for name, value in constants.items():
         if isinstance(value, bool):  # bool is an int subclass — exclude
             raise TypeError(f"constant {name!r}: bool is not a numeric value")
-        if isinstance(value, float):
+        if isinstance(value, str):
+            sub_dict[sp.Symbol(name)] = sp.Float(value)
+        elif isinstance(value, float):
             sub_dict[sp.Symbol(name)] = sp.Float(value)
         elif isinstance(value, int):
             sub_dict[sp.Symbol(name)] = sp.Integer(value)
         else:
-            raise TypeError(f"constant {name!r} must be int or float, "
-                            f"got {type(value).__name__}")
+            raise TypeError(f"constant {name!r} must be int / float / "
+                            f"numeric-string, got {type(value).__name__}")
     return str(sp.sympify(expr_str).xreplace(sub_dict))
 
 
@@ -363,11 +369,22 @@ def make_expr_func_from_json(json_path, expr_at, *,
     they overlap, sub-expression definitions win over constant values
     (subexprs are inlined first).
 
+    Precision
+    ---------
+    The JSON loader uses ``parse_float=str`` so floats arrive at
+    :func:`_substitute_constants` as their original textual form.
+    A constant written as ``0.833333333333`` (12 digits) is preserved
+    exactly through to the generated code, instead of being rounded
+    to Python's default 15-significant-digit display.  Beyond ~17
+    digits the runtime is still bounded by IEEE-754 doubles — the
+    digits past that survive in the generated source for traceability
+    but the executed computation is double-precision.
+
     ``compile_opts`` are forwarded to :func:`make_expr_func`
     (``jit``, ``fastmath``, ``cache``, ``debug``).
     """
     with Path(json_path).open(encoding='utf-8') as fh:
-        data = json.load(fh)
+        data = json.load(fh, parse_float=str)
 
     expr = get_at_path(data, expr_at)
     if not isinstance(expr, str):
