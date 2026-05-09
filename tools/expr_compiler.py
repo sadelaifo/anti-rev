@@ -179,15 +179,6 @@ Helper utilities
   failing segment named.  Useful for pulling unrelated fields out of
   the same JSON file.
 
-CLI
----
-
-Quick smoke check on a make_funcs_from_json-shaped file::
-
-    python3 expr_compiler.py path/to/formulas.json
-
-Prints one line per compiled formula with its argument names.
-
 This module is unrelated to antirev's runtime; it lives under tools/
 because that's where the project keeps general-purpose helpers.
 """
@@ -723,29 +714,3 @@ def make_funcs_from_json(json_path: str | Path, **compile_opts) -> dict:
     return funcs
 
 
-# ---------------------------------------------------------------------
-# CLI: smoke-compile a make_funcs_from_json-shaped file.
-# ---------------------------------------------------------------------
-def _compile_json_cli(json_path: str) -> None:
-    """Compile every formula in a JSON file and print a summary.
-    Useful as a sanity check before wiring the compiled funcs into a
-    real workload — a malformed expression / missing param will surface
-    here instead of mid-batch."""
-    funcs = make_funcs_from_json(json_path)
-    print(f"compiled {len(funcs)} formula(s) from {json_path}:")
-    for name, fn in funcs.items():
-        # Underlying compiled function lives at fn.py_func when JIT'd,
-        # otherwise just fn.  Reach for the param names via __code__.
-        py_fn = getattr(fn, 'py_func', fn)
-        names = list(py_fn.__code__.co_varnames[:py_fn.__code__.co_argcount])
-        print(f"  {name}({', '.join(names)})")
-
-
-if __name__ == '__main__':
-    import sys
-    if len(sys.argv) != 2:
-        print("usage: python3 expr_compiler.py <formulas.json>", file=sys.stderr)
-        print("       (file shape: top-level dict of name -> expr-string or "
-              "{'expr': ..., 'params': [...]})", file=sys.stderr)
-        sys.exit(2)
-    _compile_json_cli(sys.argv[1])
