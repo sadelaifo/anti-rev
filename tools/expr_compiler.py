@@ -538,6 +538,196 @@ def clear_compile_cache(*, older_than_days: float | None = None) -> dict:
     return report
 
 
+def reference_value(formula, sample, *, constants=None,
+                    subexprs=None) -> float:
+    """Compute ``formula(sample)`` using sympy's substitution engine —
+    independent of the compile pipeline (no CSE, no pycode, no exec).
+    Use it as a ground-truth reference when verifying a compiled
+    function on a huge formula where Python's ``eval()`` blows the
+    main-thread C-stack.
+
+    Args:
+        formula:   the original formula string from your JSON
+        sample:    ``{var_name: number}`` — values for every free
+                   variable in the formula
+        constants: same dict shape passed to make_expr_func_from_json;
+                   substituted into the formula before evaluation
+        subexprs:  same dict shape passed to make_expr_func_from_json
+
+    Returns:
+        Python float — the formula's value at ``sample``.
+
+    Slow.  Each call sympify-parses the full formula and runs
+    ``evalf()`` on the resolved tree; expect several seconds on
+    400 KB inputs.  Intended for verification, not hot paths.
+
+    Note that the constants / subexprs dicts must match what was
+    passed to the compiler, otherwise the reference will disagree
+    with the compiled function for reasons that have nothing to do
+    with bugs.  An easy way to keep them in sync is to load them
+    from the same JSON the compiler used::
+
+        with open("config.json") as fh:
+            cfg = json.load(fh, parse_float=str)
+        ref = reference_value(
+            cfg["expr"]["f1"], {"v": 220.0, "i": 1.5},
+            constants = cfg["constants"],
+            subexprs  = cfg["subexprs"],
+        )
+    """
+    return _run_in_big_stack(
+        lambda: _reference_value_impl(formula, sample, constants, subexprs),
+        stack_mb=256,
+    )
+
+
+def _reference_value_impl(formula, sample, constants, subexprs):
+    import sys
+    old = sys.getrecursionlimit()
+    if old < 1_000_000:
+        sys.setrecursionlimit(1_000_000)
+    try:
+        expr = _sympify_chunked(formula)
+
+        # Build merged substitution dict (mirrors _generate_source_with_subst).
+        sub_dict: dict = {}
+        if subexprs:
+            sub_dict.update({sp.Symbol(n): sp.sympify(s)
+                             for n, s in subexprs.items()})
+        if constants:
+            sub_dict.update({sp.Symbol(n): _to_sympy_constant(n, v)
+                             for n, v in constants.items()})
+        if sub_dict:
+            for _ in range(len(sub_dict) + 1):
+                changed = False
+                for sym, e in list(sub_dict.items()):
+                    new = e.xreplace(sub_dict)
+                    if new != e:
+                        sub_dict[sym] = new
+                        changed = True
+                if not changed:
+                    break
+            expr = expr.xreplace(sub_dict)
+
+        if sample:
+            var_dict = {sp.Symbol(n): sp.Float(str(v))
+                        for n, v in sample.items()}
+            expr = expr.xreplace(var_dict)
+
+        return float(expr.evalf())
+    finally:
+        sys.setrecursionlimit(old)
+
+
+def verify(funcs, formulas, sample, *, constants=None, subexprs=None,
+           eps: float = 1e-9, file=None):
+    """Cross-check each compiled function against
+    :func:`reference_value` at one sample point.
+
+    Args:
+        funcs:     either a single callable (paired with ``formulas``
+                   as a string) or a dict ``{name: callable}`` (paired
+                   with ``formulas`` as a dict ``{name: formula_str}``).
+        formulas:  the formula text(s); shape must match ``funcs``.
+        sample:    ``{var_name: number}`` — must contain values for
+                   every parameter of every function being checked.
+        constants, subexprs: as for :func:`make_expr_func_from_json`.
+        eps:       relative-error tolerance for the OK / FAIL verdict.
+        file:      where to print the report (default stdout).
+
+    Prints a per-formula line with the reference value, the compiled
+    value, and the relative error.  Returns a list of dicts so you
+    can post-process programmatically::
+
+        records = verify(funcs, formulas, sample, constants=...,
+                          subexprs=...)
+        worst = max(records, key=lambda r: r.get('rel_err') or 0)
+
+    A typical output::
+
+        Verifying 3 function(s) at sample {v=220.0, i=1.5}
+          [OK  ] f_power: ref=165         got=165         rel_err=0.00e+00
+          [OK  ] f_loss:  ref=3.14825     got=3.14825     rel_err=2.10e-16
+          [FAIL] f_temp:  ref=72.5872     got=72.5870     rel_err=2.76e-06
+        2/3 passed
+    """
+    import sys
+    if file is None:
+        file = sys.stdout
+
+    # Normalise to dicts internally.
+    if callable(funcs) and isinstance(formulas, str):
+        funcs    = {"<fn>": funcs}
+        formulas = {"<fn>": formulas}
+    elif isinstance(funcs, dict) and isinstance(formulas, dict):
+        pass
+    else:
+        raise TypeError(
+            "funcs and formulas must be both single (callable + str) or "
+            f"both dicts, got {type(funcs).__name__} and "
+            f"{type(formulas).__name__}")
+
+    sample_str = ", ".join(f"{k}={v}" for k, v in sample.items())
+    print(f"Verifying {len(funcs)} function(s) at sample {{{sample_str}}}",
+          file=file)
+
+    records: list = []
+    for name, fn in funcs.items():
+        record = {'name': name, 'sample': dict(sample),
+                  'ref': None, 'compiled': None, 'rel_err': None, 'ok': False}
+
+        if name not in formulas:
+            print(f"  [SKIP] {name}: no entry in `formulas`", file=file)
+            record['error'] = 'missing formula'
+            records.append(record)
+            continue
+
+        py_fn = getattr(fn, 'py_func', fn)
+        n_args = py_fn.__code__.co_argcount
+        args = list(py_fn.__code__.co_varnames[:n_args])
+        missing = [a for a in args if a not in sample]
+        if missing:
+            print(f"  [SKIP] {name}: sample missing {missing}", file=file)
+            record['error'] = f'sample missing {missing}'
+            records.append(record)
+            continue
+
+        try:
+            ref = reference_value(formulas[name], sample,
+                                  constants=constants, subexprs=subexprs)
+        except Exception as e:
+            print(f"  [ERR ] {name}: reference failed: "
+                  f"{type(e).__name__}: {e}", file=file)
+            record['error'] = f'reference: {e}'
+            records.append(record)
+            continue
+
+        try:
+            got = fn(*[sample[a] for a in args])
+        except Exception as e:
+            print(f"  [ERR ] {name}: compiled call failed: "
+                  f"{type(e).__name__}: {e}", file=file)
+            record['ref'] = float(ref)
+            record['error'] = f'compiled call: {e}'
+            records.append(record)
+            continue
+
+        diff = abs(float(got) - float(ref))
+        rel = diff / (abs(float(ref)) + 1e-300)
+        ok = rel < eps
+        status = 'OK  ' if ok else 'FAIL'
+        print(f"  [{status}] {name}: ref={float(ref):.6g}  "
+              f"got={float(got):.6g}  rel_err={rel:.2e}", file=file)
+
+        record.update({'ref': float(ref), 'compiled': float(got),
+                       'rel_err': rel, 'ok': ok})
+        records.append(record)
+
+    n_pass = sum(1 for r in records if r.get('ok'))
+    print(f"{n_pass}/{len(records)} passed", file=file)
+    return records
+
+
 def describe(funcs, *, sample=None, file=None):
     """Pretty-print compiled function(s) — names, signatures, JIT
     status, source file paths, and optionally evaluate each at a
