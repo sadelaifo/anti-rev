@@ -180,6 +180,8 @@ JIT 编译的可调用对象 f(args) → float
 | `make_funcs_from_json(...)` | JSON 顶层就是 `{name: 公式}`、无常量子表达式共存时用 |
 | `load_expressions_from_json(...)` | 公式散落在异构 JSON 树里，按谓词函数定位 |
 | `get_at_path(data, path)` | 通用路径取值工具 |
+| `cache_dir_path()` | 返回磁盘缓存目录路径，便于手动 `ls` / 清理 |
+| `clear_compile_cache(*, older_than_days=None)` | 清空磁盘缓存（可选只清比 N 天老的）；返回 `{removed_files, freed_bytes, cache_dir}` |
 
 ## 十一、调试 / 看生成代码
 

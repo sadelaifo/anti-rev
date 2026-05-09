@@ -435,13 +435,107 @@ def _compute_compile_key(formula, params_explicit, constants, subexprs):
     return hashlib.sha1(canonical.encode('utf-8')).hexdigest()[:16]
 
 
+def cache_dir_path() -> str:
+    """Path of the on-disk compile cache directory.
+
+    All generated source files (and numba's ``.nbi`` / ``.nbc`` next
+    to them in ``__pycache__/``) live here.  Useful for inspecting
+    the cache manually::
+
+        import os, expr_compiler
+        for f in os.listdir(expr_compiler.cache_dir_path()):
+            print(f)
+
+    The directory is created lazily on first compile.
+    """
+    return os.path.join(tempfile.gettempdir(), 'expr_compiler_gen')
+
+
 def _cache_path_for_key(key: str) -> str:
     """Disk path for cache key.  Persists for the lifetime of the
     system temp dir (typically across processes within the same OS
     session)."""
-    cache_dir = os.path.join(tempfile.gettempdir(), 'expr_compiler_gen')
+    cache_dir = cache_dir_path()
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, f'_expr_{key}.py')
+
+
+def clear_compile_cache(*, older_than_days: float | None = None) -> dict:
+    """Remove cached generated source files (and the numba ``.nbi`` /
+    ``.nbc`` next to them).  After this, the next compile pays the
+    full sympy + LLVM cost again — useful when you've upgraded
+    sympy / numba, suspect a corrupted cache, or just want a clean
+    slate before benchmarking.
+
+    Parameters
+    ----------
+    older_than_days : float, optional
+        If given, only remove files older than this many days
+        (by mtime).  Default ``None`` removes everything.  Useful for
+        a periodic cleanup that doesn't disturb hot entries::
+
+            clear_compile_cache(older_than_days=30)
+
+    Returns
+    -------
+    dict with keys::
+
+        {
+          'removed_files': int,   # how many files were deleted
+          'freed_bytes':   int,   # total bytes reclaimed
+          'cache_dir':     str,   # path that was cleaned
+        }
+
+    Safe to call when the cache directory doesn't exist (returns
+    ``removed_files=0``).  Concurrent compiles in another process
+    that race against this call may either succeed (the file they
+    wrote isn't deleted) or harmlessly recompile.
+    """
+    import shutil
+    import time
+
+    cache_dir = cache_dir_path()
+    report = {'removed_files': 0, 'freed_bytes': 0, 'cache_dir': cache_dir}
+
+    if not os.path.isdir(cache_dir):
+        return report
+
+    threshold = (time.time() - older_than_days * 86400.0
+                 if older_than_days is not None else None)
+
+    if threshold is None:
+        # Wholesale wipe — count first, then rmtree.
+        for root, _dirs, files in os.walk(cache_dir):
+            for name in files:
+                path = os.path.join(root, name)
+                try:
+                    report['freed_bytes'] += os.path.getsize(path)
+                    report['removed_files'] += 1
+                except OSError:
+                    pass
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        return report
+
+    # Age-filtered: walk and unlink old files, then prune empty dirs.
+    for root, _dirs, files in os.walk(cache_dir, topdown=False):
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                if os.path.getmtime(path) > threshold:
+                    continue
+                size = os.path.getsize(path)
+                os.unlink(path)
+                report['removed_files'] += 1
+                report['freed_bytes'] += size
+            except OSError:
+                pass
+        # Best-effort: remove now-empty subdirs (e.g. __pycache__/).
+        try:
+            if not os.listdir(root) and root != cache_dir:
+                os.rmdir(root)
+        except OSError:
+            pass
+    return report
 
 
 def _split_top_level_terms(s: str):

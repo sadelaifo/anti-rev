@@ -29,6 +29,8 @@ from expr_compiler import (              # noqa: E402
     make_expr_func_from_json,
     _compute_compile_key,
     _cache_path_for_key,
+    cache_dir_path,
+    clear_compile_cache,
 )
 
 
@@ -137,6 +139,34 @@ def main() -> int:
     if t_third >= t_first * 0.5:
         print(f"  [FAIL] cache not surviving across calls")
         return 1
+
+    # clear_compile_cache() should wipe the cache so a follow-up
+    # compile pays the full first-run cost again.
+    print(f"  cache dir: {cache_dir_path()}")
+    report = clear_compile_cache()
+    print(f"  clear_compile_cache(): removed {report['removed_files']} file(s), "
+          f"freed {report['freed_bytes']} bytes")
+    if not os.path.exists(src_file) and report['removed_files'] == 0:
+        print(f"  [WARN] cache file already gone before clear")
+    if os.path.exists(src_file):
+        print(f"  [FAIL] {src_file} should have been removed")
+        return 1
+    t_post_clear = _time_compile(p1)
+    print(f"  after clear, recompile:  {t_post_clear:.3f}s "
+          f"(should be slow again, cache was wiped)")
+    if t_post_clear < t_first * 0.5:
+        print(f"  [FAIL] post-clear compile too fast — cache wasn't actually "
+              f"cleared ({t_post_clear:.3f}s vs first-run {t_first:.3f}s)")
+        return 1
+
+    # clear_compile_cache(older_than_days=...) — re-running with a
+    # huge threshold should be a no-op (no files older than that).
+    report2 = clear_compile_cache(older_than_days=10_000)
+    if report2['removed_files'] != 0:
+        print(f"  [FAIL] age filter didn't protect fresh files "
+              f"(removed {report2['removed_files']})")
+        return 1
+    print(f"  clear_compile_cache(older_than_days=10000): kept fresh files (0 removed)")
 
     os.unlink(p1)
     print("[expr_compiler cache test] all checks passed.")
