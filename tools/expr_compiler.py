@@ -147,6 +147,119 @@ def _detect_params(expr_str: str) -> list[str]:
     return sorted(str(s) for s in sp.sympify(expr_str).free_symbols)
 
 
+def get_at_path(data, path):
+    """Navigate ``data`` (a nested dict / list structure) along ``path``
+    and return the value found there.
+
+    ``path`` accepts two equivalent forms:
+
+      1. Tuple / list of keys and indices, no ambiguity::
+
+             get_at_path(d, ("formulas", "torque", "inputs"))
+             get_at_path(d, ("schedule", 0, "value"))
+
+      2. Dotted-with-bracket string for convenience::
+
+             get_at_path(d, "formulas.torque.inputs")
+             get_at_path(d, "schedule[0].value")
+
+    Raises ``KeyError`` / ``IndexError`` / ``TypeError`` with a message
+    that names the offending segment, so failures point straight at
+    the wrong path component instead of leaving the caller to bisect.
+    """
+    if isinstance(path, str):
+        segments = _parse_path_string(path)
+    else:
+        segments = tuple(path)
+
+    cur = data
+    for i, seg in enumerate(segments):
+        try:
+            cur = cur[seg]
+        except (KeyError, IndexError, TypeError) as e:
+            crumb = '.'.join(repr(s) for s in segments[:i + 1])
+            raise type(e)(f"path lookup failed at segment {i} "
+                          f"({crumb!r}): {e}") from None
+    return cur
+
+
+def _parse_path_string(s: str):
+    """`"a.b[0].c"` → `("a", "b", 0, "c")`.  Tolerates absence of dot
+    before a bracket: `a[0][1].b` works."""
+    out: list = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i] == '.':
+            i += 1
+            continue
+        if s[i] == '[':
+            j = s.index(']', i)
+            tok = s[i + 1:j].strip()
+            if not tok or not (tok.lstrip('-').isdigit()):
+                raise ValueError(f"non-integer index in path: {s!r}")
+            out.append(int(tok))
+            i = j + 1
+            continue
+        # plain key — read up to next '.' or '['
+        j = i
+        while j < n and s[j] not in '.[':
+            j += 1
+        if j == i:
+            raise ValueError(f"empty segment in path: {s!r}")
+        out.append(s[i:j])
+        i = j
+    return tuple(out)
+
+
+def make_expr_func_from_json(json_path, expr_at, params_at, **compile_opts):
+    """One-shot: read an expression string at ``expr_at`` and a
+    parameter-name list at ``params_at`` from the same JSON file,
+    return the compiled callable.
+
+    Both ``expr_at`` and ``params_at`` accept the same path forms as
+    :func:`get_at_path` — tuples or dotted-with-bracket strings.
+
+    Example.  Given ``config.json``::
+
+        {
+          "device": {
+            "transfer": {
+              "formula": "0.5*v*i + k*v**2",
+              "inputs":  ["v", "i", "k"]
+            }
+          }
+        }
+
+    compile with::
+
+        f = make_expr_func_from_json(
+            "config.json",
+            expr_at   = "device.transfer.formula",
+            params_at = "device.transfer.inputs",
+        )
+        result = f(220.0, 1.5, 1.2e-5)
+
+    ``compile_opts`` are forwarded to :func:`make_expr_func`
+    (``jit``, ``fastmath``, ``cache``, ``debug``).
+    """
+    with Path(json_path).open(encoding='utf-8') as fh:
+        data = json.load(fh)
+
+    expr = get_at_path(data, expr_at)
+    if not isinstance(expr, str):
+        raise TypeError(f"expr at {expr_at!r} must be a string, "
+                        f"got {type(expr).__name__}")
+
+    params = get_at_path(data, params_at)
+    if not (isinstance(params, list)
+            and all(isinstance(p, str) for p in params)):
+        raise TypeError(f"params at {params_at!r} must be a list of strings, "
+                        f"got {type(params).__name__}")
+
+    return make_expr_func(expr, params, **compile_opts)
+
+
 def compile_expressions_in_data(data, is_expr, **compile_opts):
     """Walk a JSON-like nested structure (dicts, lists, primitives)
     and compile only the leaves identified by ``is_expr`` as math
