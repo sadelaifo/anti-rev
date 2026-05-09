@@ -368,9 +368,24 @@ def _generate_source_with_subst(formula, params_explicit, constants,
 
         expr = expr.xreplace(sub_dict)
 
-    # Determine parameter list.
+    # Determine parameter list.  When the caller supplies an
+    # explicit list, validate that it covers every free symbol left
+    # in the post-substitution expression — otherwise the generated
+    # ``def _expr(...)`` body references names that aren't function
+    # parameters, and the only signal is a NameError at *call* time
+    # (potentially long after compile).  Extras are OK (unused
+    # parameters), missing names are not.
     if params_explicit is not None:
         params = list(params_explicit)
+        actual = {str(s) for s in expr.free_symbols}
+        missing = actual - set(params)
+        if missing:
+            raise ValueError(
+                f"params is not a superset of the formula's free symbols: "
+                f"missing {sorted(missing)} from declared params "
+                f"{sorted(set(params))}.  After constant + subexpr "
+                f"substitution the formula still references "
+                f"{sorted(actual)}, all of which need entries in params.")
     else:
         params = sorted(str(s) for s in expr.free_symbols)
 
@@ -422,10 +437,16 @@ def _compute_compile_key(formula, params_explicit, constants, subexprs):
     parse_float=str gives us strings whereas Python ints stay ints;
     the cache should hit regardless of which form the caller
     supplies for the same numeric value.
+
+    Note: ``params_explicit is not None`` (not just truthiness) is
+    the right check because an empty list ``[]`` means "explicitly
+    no parameters" — semantically distinct from ``None`` which means
+    "auto-detect".  The two produce different generated code if the
+    formula has free symbols, so they must hash to different keys.
     """
     payload = {
         'formula': formula,
-        'params':  list(params_explicit) if params_explicit else None,
+        'params':  list(params_explicit) if params_explicit is not None else None,
         'constants': sorted(
             (k, str(v)) for k, v in constants.items()
         ) if constants else None,
@@ -814,8 +835,16 @@ def verify(funcs, formulas, sample, *, constants=None, subexprs=None,
                        'rel_err': rel, 'ok': ok})
         records.append(record)
 
-    n_pass = sum(1 for r in records if r.get('ok'))
-    print(f"{n_pass}/{len(records)} passed", file=file)
+    # Three-way tally: distinguishing real math mismatches (FAIL)
+    # from records that couldn't be checked (SKIP/ERR — sample
+    # missing arg, reference failed, compiled call threw, etc.)
+    # makes "5 OK / 0 FAIL / 2 SKIP" obviously fine while
+    # "5 OK / 2 FAIL / 0 SKIP" is obviously not.
+    n_ok   = sum(1 for r in records if r.get('ok'))
+    n_skip = sum(1 for r in records if r.get('error'))
+    n_fail = len(records) - n_ok - n_skip
+    print(f"{n_ok} OK / {n_fail} FAIL / {n_skip} SKIP "
+          f"(of {len(records)} total)", file=file)
     return records
 
 
