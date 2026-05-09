@@ -667,41 +667,73 @@ def make_expr_func_from_json(json_path, expr_at, *,
     ``compile_opts`` are forwarded to :func:`make_expr_func`
     (``jit``, ``fastmath``, ``cache``, ``debug``).
     """
+    # ---- main thread: cheap I/O, path lookups, dict merging, type checks
     with Path(json_path).open(encoding='utf-8') as fh:
         data = json.load(fh, parse_float=str)
 
-    expr = get_at_path(data, expr_at)
-    if not isinstance(expr, str):
+    expr_str = get_at_path(data, expr_at)
+    if not isinstance(expr_str, str):
         raise TypeError(f"expr at {expr_at!r} must be a string, "
-                        f"got {type(expr).__name__}")
+                        f"got {type(expr_str).__name__}")
 
-    # Inline subexprs first — their resolved values may reference
-    # constants, which then get substituted in the next step.
+    subexprs = None
     if subexprs_at is not None:
         subexprs = _merge_dicts_at(data, subexprs_at, "subexprs")
         if not all(isinstance(k, str) and isinstance(v, str)
                    for k, v in subexprs.items()):
             raise TypeError(f"subexprs at {subexprs_at!r} must map "
                             f"str -> str")
-        expr = _expand_subexprs(expr, subexprs)
 
+    constants = None
     if constants_at is not None:
         constants = _merge_dicts_at(data, constants_at, "constants")
-        expr = _substitute_constants(expr, constants)
 
+    params_explicit = None
     if params_at is not None:
-        params: list[str] = []
+        params_explicit = []
         for path in _normalize_paths(params_at):
             chunk = get_at_path(data, path)
             if not (isinstance(chunk, list)
                     and all(isinstance(p, str) for p in chunk)):
                 raise TypeError(f"params at {path!r} must be a list of "
                                 f"strings, got {type(chunk).__name__}")
-            params.extend(chunk)
-    else:
-        params = _detect_params(expr)
+            params_explicit.extend(chunk)
 
-    return make_expr_func(expr, params, **compile_opts)
+    debug = compile_opts.pop('debug', False)
+    jit = compile_opts.pop('jit', True)
+    fastmath = compile_opts.pop('fastmath', True)
+    cache = compile_opts.pop('cache', True)
+    if compile_opts:
+        raise TypeError(f"unexpected keyword arguments: "
+                        f"{sorted(compile_opts)}")
+
+    # ---- worker thread: every sympy call lives inside the big stack +
+    #      elevated recursionlimit.  sympify itself is recursion-heavy
+    #      on long inputs, so substitutions (which call sympify on the
+    #      whole formula) MUST happen here, not in the main thread.
+    def _heavy():
+        import sys
+        old_limit = sys.getrecursionlimit()
+        if old_limit < 200_000:
+            sys.setrecursionlimit(200_000)
+        try:
+            e = expr_str
+            if subexprs is not None:
+                e = _expand_subexprs(e, subexprs)
+            if constants is not None:
+                e = _substitute_constants(e, constants)
+            p = (params_explicit if params_explicit is not None
+                 else _detect_params(e))
+            return _compile_pyfunc(e, p, debug=debug)
+        finally:
+            sys.setrecursionlimit(old_limit)
+
+    fn = _run_in_big_stack(_heavy, stack_mb=64)
+
+    if jit:
+        from numba import njit
+        fn = njit(cache=cache, fastmath=fastmath)(fn)
+    return fn
 
 
 def compile_expressions_in_data(data, is_expr, **compile_opts):

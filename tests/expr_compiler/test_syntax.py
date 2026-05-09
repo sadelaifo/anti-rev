@@ -117,6 +117,45 @@ def long_expression_check() -> int:
         print(f"  [FAIL] long-expr value mismatch: {got} vs {ref}")
         return 1
     print(f"  [OK]   long-expr compiled and evaluated correctly: {got}")
+
+    # Also drive the same length through make_expr_func_from_json so
+    # the recursion-heavy substitution path (sympify inside
+    # _expand_subexprs / _substitute_constants) is covered too.  The
+    # two helpers run sympify on the whole formula; if they were left
+    # in the main thread they'd blow the C-stack on this size.
+    import json as _json
+    import os as _os
+    import sys as _sys
+    import tempfile
+
+    from expr_compiler import make_expr_func_from_json
+
+    cfg = {
+        "constants": {"k": "0.001"},
+        "subexprs":  {"alpha": "x + y"},
+        "formula":   "k*alpha + " + expr,
+    }
+    fd, p = tempfile.mkstemp(suffix=".json")
+    _os.close(fd)
+    with open(p, "w") as fh:
+        _json.dump(cfg, fh)
+    try:
+        f2 = make_expr_func_from_json(
+            p,
+            expr_at      = "formula",
+            constants_at = "constants",
+            subexprs_at  = "subexprs",
+            jit          = False,
+        )
+        ref2 = ref + 0.001 * (sample["x"] + sample["y"])
+        got2 = f2(sample["x"], sample["y"])
+        if not near(float(got2), float(ref2)):
+            print(f"  [FAIL] from-json long-expr mismatch: {got2} vs {ref2}")
+            return 1
+        print(f"  [OK]   from-json long-expr ({n} terms + subexpr + const): {got2}")
+    finally:
+        _os.unlink(p)
+
     return 0
 
 
