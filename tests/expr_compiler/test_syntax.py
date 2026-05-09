@@ -82,6 +82,43 @@ def near(a: float, b: float, eps: float = 1e-9) -> bool:
     return abs(a - b) <= eps * (abs(a) + abs(b) + 1.0)
 
 
+def long_expression_check() -> int:
+    """Regression check: a few-hundred-term polynomial should compile
+    without hitting CPython's recursion limit during exec().  Default
+    sys.recursionlimit is 1000, so a return line with > ~500 chained
+    additions used to crash with `RecursionError: ... during
+    compilation` on the AST build of the generated source.
+    """
+    n = 600
+    sample = {"x": 1.5, "y": 2.5}
+    # 600 terms of the form `c_i * x**i * y**(n-i)`, simple enough that
+    # eval() can also handle it for cross-checking.
+    expr = " + ".join(f"{(i + 1) * 1e-9} * x**{i % 5} * y**{(i + 7) % 4}"
+                      for i in range(n))
+    print(f"  long-expr: {n} terms, source length ~{len(expr)} chars")
+
+    try:
+        ref = eval(expr, {"__builtins__": {}}, sample)
+    except RecursionError:
+        # Even Python's own eval may need a higher recursion limit on
+        # this length — bump for the reference path too.
+        import sys as _sys
+        old = _sys.getrecursionlimit()
+        _sys.setrecursionlimit(50_000)
+        try:
+            ref = eval(expr, {"__builtins__": {}}, sample)
+        finally:
+            _sys.setrecursionlimit(old)
+
+    f = make_expr_func(expr, sorted(sample), jit=False)
+    got = f(*[sample[k] for k in sorted(sample)])
+    if not near(float(got), float(ref)):
+        print(f"  [FAIL] long-expr value mismatch: {got} vs {ref}")
+        return 1
+    print(f"  [OK]   long-expr compiled and evaluated correctly: {got}")
+    return 0
+
+
 def main() -> int:
     failures = 0
     for label, expr, sample in CASES:
@@ -113,7 +150,10 @@ def main() -> int:
         print(f"  [OK]   {label:42s}  {expr!r}  -> {got}")
 
     print()
-    print(f"[expr_compiler syntax test] {len(CASES) - failures} / {len(CASES)} passed.")
+    failures += long_expression_check()
+    total = len(CASES) + 1
+    passed = total - failures
+    print(f"[expr_compiler syntax test] {passed} / {total} passed.")
     return 0 if failures == 0 else 1
 
 

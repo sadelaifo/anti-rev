@@ -249,8 +249,21 @@ def make_expr_func(expr_str: str, params: list[str], *,
         print(src)
         print(f"--- {len(sub_exprs)} CSE temps ---")
 
-    ns: dict = {}
-    exec(src, ns)
+    # CPython parses left-recursive chains like ``a+b+c+...`` by
+    # recursing on every operator, so a generated source line with
+    # hundreds of terms can hit the default recursion limit (1000)
+    # *during the exec's own AST build* — not in our code, in
+    # CPython's compiler.  Raise the limit just for the exec, then
+    # restore.  5 MB-ish C-stack handles 50k Python frames easily.
+    import sys
+    old_limit = sys.getrecursionlimit()
+    if old_limit < 50_000:
+        sys.setrecursionlimit(50_000)
+    try:
+        ns: dict = {}
+        exec(src, ns)
+    finally:
+        sys.setrecursionlimit(old_limit)
     fn = ns['_expr']
 
     # 4. numba JIT.  Imported lazily so the pure-Python path doesn't pay
