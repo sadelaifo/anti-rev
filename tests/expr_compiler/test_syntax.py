@@ -89,10 +89,11 @@ def long_expression_check() -> int:
     additions used to crash with `RecursionError: ... during
     compilation` on the AST build of the generated source.
     """
-    n = 600
+    # 5000 terms — far past Windows main-thread C-stack capacity
+    # (~1500 frames on a 1 MB stack), so this only passes when the
+    # compile pipeline runs in a worker thread with a larger stack.
+    n = 5000
     sample = {"x": 1.5, "y": 2.5}
-    # 600 terms of the form `c_i * x**i * y**(n-i)`, simple enough that
-    # eval() can also handle it for cross-checking.
     expr = " + ".join(f"{(i + 1) * 1e-9} * x**{i % 5} * y**{(i + 7) % 4}"
                       for i in range(n))
     print(f"  long-expr: {n} terms, source length ~{len(expr)} chars")

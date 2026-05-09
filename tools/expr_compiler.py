@@ -217,62 +217,150 @@ def make_expr_func(expr_str: str, params: list[str], *,
     -------
     callable f(p1, p2, ...) -> float
     """
-    # 1. sympify — bind variable names to sympy Symbols so they're not
-    #    misread as imports or function names.  Empty params (a fully
-    #    constant expression) is allowed; sp.symbols('') would error
-    #    so handle that case first.
-    if params:
-        syms = sp.symbols(' '.join(params))
-        if not isinstance(syms, tuple):       # single-param case
-            syms = (syms,)
-    else:
-        syms = ()
-    expr = sp.sympify(expr_str, locals=dict(zip(params, syms)))
+    # Long expressions (thousands of `+` / `*` terms) overflow two
+    # different stacks during compile:
+    #
+    #   1. Python's recursionlimit  (default 1000) — sympy's tree
+    #      walks (sympify, cse, pycode) and CPython's own AST build
+    #      inside our exec() recurse once per operator.
+    #
+    #   2. The OS thread stack       (Windows main thread is 1 MB,
+    #      Linux ~8 MB) — this caps how deep recursion can go *even
+    #      with recursionlimit raised*.  Hitting the C-stack limit
+    #      shows up as the same RecursionError, so it's easy to
+    #      misdiagnose.
+    #
+    # Solution: run the whole compile pipeline in a worker thread
+    # with a large stack and an elevated Python recursionlimit.  The
+    # numba JIT decoration happens after, in the caller's thread, so
+    # JIT-time state (caches, dispatcher registries) lives where the
+    # user expects.
+    fn = _run_in_big_stack(
+        lambda: _compile_pyfunc(expr_str, params, debug=debug),
+        stack_mb=64,
+    )
 
-    # 2. CSE — let sympy find repeated subterms across the whole expression
-    #    and replace them with intermediates.  cheap on small/medium expr;
-    #    on multi-thousand-term inputs you may want optimizations=[] to
-    #    skip the more expensive passes.
-    sub_exprs, [main] = sp.cse(expr, optimizations='basic')
-
-    # 3. Generate Python source.  sp.pycode is stricter than str() — it
-    #    won't emit Rational(1,2) or other sympy-specific literals that
-    #    Python can't parse.
-    lines = [f"def _expr({', '.join(params)}):"]
-    for tmp, val in sub_exprs:
-        lines.append(f"    {tmp} = {sp.pycode(val)}")
-    lines.append(f"    return {sp.pycode(main)}")
-    src = "\n".join(lines) + "\n"
-
-    if debug:
-        print("--- generated source ---")
-        print(src)
-        print(f"--- {len(sub_exprs)} CSE temps ---")
-
-    # CPython parses left-recursive chains like ``a+b+c+...`` by
-    # recursing on every operator, so a generated source line with
-    # hundreds of terms can hit the default recursion limit (1000)
-    # *during the exec's own AST build* — not in our code, in
-    # CPython's compiler.  Raise the limit just for the exec, then
-    # restore.  5 MB-ish C-stack handles 50k Python frames easily.
-    import sys
-    old_limit = sys.getrecursionlimit()
-    if old_limit < 50_000:
-        sys.setrecursionlimit(50_000)
-    try:
-        ns: dict = {}
-        exec(src, ns)
-    finally:
-        sys.setrecursionlimit(old_limit)
-    fn = ns['_expr']
-
-    # 4. numba JIT.  Imported lazily so the pure-Python path doesn't pay
-    #    the import cost when jit=False.
     if jit:
         from numba import njit
         fn = njit(cache=cache, fastmath=fastmath)(fn)
 
     return fn
+
+
+def _compile_pyfunc(expr_str: str, params: list[str], *, debug: bool):
+    """The recursion-heavy part of make_expr_func, isolated so it can
+    run inside _run_in_big_stack.  Returns a plain Python function;
+    JIT decoration happens in the caller."""
+    import sys
+    old_limit = sys.getrecursionlimit()
+    if old_limit < 200_000:
+        sys.setrecursionlimit(200_000)
+    try:
+        # 1. sympify — bind variable names to sympy Symbols so they're
+        #    not misread as imports or function names.  Empty params
+        #    (a constant expression) is allowed; sp.symbols('') errors.
+        if params:
+            syms = sp.symbols(' '.join(params))
+            if not isinstance(syms, tuple):
+                syms = (syms,)
+        else:
+            syms = ()
+        expr = sp.sympify(expr_str, locals=dict(zip(params, syms)))
+
+        # 2. CSE — find repeated subterms across the whole expression
+        #    and replace them with intermediates.
+        sub_exprs, [main] = sp.cse(expr, optimizations='basic')
+
+        # 3. Generate Python source.  Top-level Adds with many terms
+        #    are split into chunked partial sums so the final return's
+        #    AST stays shallow — cuts CPython's parse depth from O(N)
+        #    to O(sqrt(N)) on big polynomials.
+        lines = [f"def _expr({', '.join(params)}):"]
+        for tmp, val in sub_exprs:
+            lines.append(f"    {tmp} = {sp.pycode(val)}")
+
+        chunk_lines, final_pycode = _emit_chunked_main(main)
+        lines.extend(chunk_lines)
+        lines.append(f"    return {final_pycode}")
+        src = "\n".join(lines) + "\n"
+
+        if debug:
+            print("--- generated source ---")
+            print(src)
+            print(f"--- {len(sub_exprs)} CSE temps, "
+                  f"{len(chunk_lines)} chunk temps ---")
+
+        # 4. exec — CPython parses left-recursive chains by recursing
+        #    on every operator; the chunked source keeps each line
+        #    short, but we still bump the limit as a safety belt.
+        ns: dict = {}
+        exec(src, ns)
+        return ns['_expr']
+    finally:
+        sys.setrecursionlimit(old_limit)
+
+
+def _emit_chunked_main(main, chunk_size: int = 100):
+    """If ``main`` is a long Add, split it into chunks of
+    ``chunk_size`` terms each, emit ``_s0 = ...``, ``_s1 = ...`` lines
+    for each chunk, and return ``(lines, "_s0 + _s1 + ...")`` for the
+    final return.  Otherwise return ``([], pycode(main))`` so the
+    caller emits a single return.
+
+    Why: CPython parses ``a+b+c+...+z`` into a left-deep BinOp tree
+    and recurses once per operator during compilation.  A 5000-term
+    return statement crashes even with a 200k recursionlimit on
+    platforms where the C-stack runs out first.  Chunking limits each
+    line's depth to ``chunk_size`` and the final reduction's depth to
+    ``ceil(N/chunk_size)``.
+    """
+    if not isinstance(main, sp.Add) or len(main.args) <= chunk_size:
+        return [], sp.pycode(main)
+
+    args = main.args
+    lines: list[str] = []
+    chunk_names: list[str] = []
+    for i in range(0, len(args), chunk_size):
+        name = f"_s{len(chunk_names)}"
+        chunk_names.append(name)
+        chunk_expr = sp.Add(*args[i:i + chunk_size], evaluate=False)
+        lines.append(f"    {name} = {sp.pycode(chunk_expr)}")
+    return lines, " + ".join(chunk_names)
+
+
+def _run_in_big_stack(target, *, stack_mb: int = 64):
+    """Run ``target()`` in a thread with ``stack_mb`` megabytes of
+    stack space.  Returns target's value or re-raises its exception.
+
+    Use case: deeply recursive sympy / CPython compile of multi-
+    thousand-term expressions can blow the OS thread stack
+    (Windows main thread is only 1 MB).  ``threading.stack_size``
+    sets the size process-wide for new threads; we save and restore
+    so the main thread's setting isn't disturbed.  This is mildly
+    racy if other code creates threads concurrently with the
+    compile, but it's a one-off cost so the window is small.
+    """
+    import threading
+    box = {'result': None, 'error': None}
+
+    def runner():
+        try:
+            box['result'] = target()
+        except BaseException as e:    # noqa: BLE001 — re-raised below
+            box['error'] = e
+
+    saved = threading.stack_size()
+    threading.stack_size(stack_mb * 1024 * 1024)
+    try:
+        t = threading.Thread(target=runner)
+        t.start()
+        t.join()
+    finally:
+        threading.stack_size(saved)
+
+    if box['error'] is not None:
+        raise box['error']
+    return box['result']
 
 
 @functools.lru_cache(maxsize=128)
