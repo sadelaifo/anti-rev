@@ -43,6 +43,9 @@ because that's where the project keeps general-purpose helpers.
 from __future__ import annotations
 
 import functools
+import json
+from pathlib import Path
+
 import sympy as sp
 
 
@@ -126,6 +129,95 @@ def make_expr_func_cached(expr_str: str, params: tuple[str, ...], *,
 
 
 # ---------------------------------------------------------------------
+# JSON loader — compile a whole file of formulas in one call.
+# ---------------------------------------------------------------------
+def _detect_params(expr_str: str) -> list[str]:
+    """Return alphabetically-sorted free-symbol names in expr_str.
+
+    Sympy's ``sympify`` distinguishes free symbols (variables) from
+    known constants like ``pi``, ``E``, ``I`` and from function names
+    like ``sin``, ``log``, so we get exactly the names that the
+    generated function should accept as arguments.
+
+    If you have a variable that collides with a sympy constant — the
+    classic gotchas are ``E`` and ``I`` — pass an explicit ``params``
+    list via the detailed JSON form below; auto-detect can't see them
+    as free.
+    """
+    return sorted(str(s) for s in sp.sympify(expr_str).free_symbols)
+
+
+def make_funcs_from_json(json_path: str | Path, **compile_opts) -> dict:
+    """Read formulas from a JSON file and compile each one.
+
+    Returns a ``{name: callable}`` mapping.  ``compile_opts`` are
+    forwarded to :func:`make_expr_func` (``jit``, ``fastmath``,
+    ``cache``, ``debug``).
+
+    Two JSON layouts are supported and may be mixed in a single file:
+
+    1. **Flat** — name keys map directly to expression strings.
+       Parameter order is auto-detected alphabetically from each
+       expression::
+
+           {
+               "torque":   "0.5 * m * r**2 * omega",
+               "voltage":  "I * R + L * dI_dt"
+           }
+
+    2. **Detailed** — name keys map to objects with an ``expr`` field
+       and an optional ``params`` field that controls positional
+       argument order::
+
+           {
+               "torque": {
+                   "expr":   "0.5 * m * r**2 * omega",
+                   "params": ["m", "r", "omega"]
+               }
+           }
+
+       Use the detailed form when you need a non-alphabetical arg
+       order, or when a variable's name collides with a sympy
+       constant (``E``, ``I``, ``pi`` …) and auto-detection would
+       miss it.
+
+    Raises ``ValueError`` / ``TypeError`` on a malformed file with a
+    message identifying the offending entry.
+    """
+    path = Path(json_path)
+    with path.open(encoding='utf-8') as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise TypeError(f"{path}: top-level JSON must be an object, "
+                        f"got {type(data).__name__}")
+
+    funcs: dict = {}
+    for name, entry in data.items():
+        if isinstance(entry, str):
+            expr_str = entry
+            params = _detect_params(expr_str)
+        elif isinstance(entry, dict) and 'expr' in entry:
+            expr_str = entry['expr']
+            if not isinstance(expr_str, str):
+                raise TypeError(f"{name}: 'expr' must be a string, "
+                                f"got {type(expr_str).__name__}")
+            params = entry.get('params')
+            if params is None:
+                params = _detect_params(expr_str)
+            elif not (isinstance(params, list)
+                      and all(isinstance(p, str) for p in params)):
+                raise TypeError(f"{name}: 'params' must be a list of strings")
+        else:
+            raise TypeError(
+                f"{name}: entry must be either an expression string or an "
+                f"object with an 'expr' field, got {type(entry).__name__}")
+
+        funcs[name] = make_expr_func(expr_str, params, **compile_opts)
+
+    return funcs
+
+
+# ---------------------------------------------------------------------
 # Demo / micro-benchmark when run as a script.
 # ---------------------------------------------------------------------
 def _demo() -> None:
@@ -177,5 +269,24 @@ def _demo() -> None:
         print(f"speedup:              {t_py / t_jit:.1f}x")
 
 
+def _compile_json_cli(json_path: str) -> None:
+    """Compile every formula in a JSON file and print a summary.
+    Useful as a sanity check before wiring the compiled funcs into a
+    real workload — a malformed expression / missing param will surface
+    here instead of mid-batch."""
+    funcs = make_funcs_from_json(json_path)
+    print(f"compiled {len(funcs)} formula(s) from {json_path}:")
+    for name, fn in funcs.items():
+        # Underlying compiled function lives at fn.py_func when JIT'd,
+        # otherwise just fn.  Reach for the param names via __code__.
+        py_fn = getattr(fn, 'py_func', fn)
+        names = list(py_fn.__code__.co_varnames[:py_fn.__code__.co_argcount])
+        print(f"  {name}({', '.join(names)})")
+
+
 if __name__ == '__main__':
-    _demo()
+    import sys
+    if len(sys.argv) > 1:
+        _compile_json_cli(sys.argv[1])
+    else:
+        _demo()
