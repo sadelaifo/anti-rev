@@ -237,7 +237,7 @@ def make_expr_func(expr_str: str, params: list[str], *,
     # user expects.
     fn = _run_in_big_stack(
         lambda: _compile_pyfunc(expr_str, params, debug=debug),
-        stack_mb=64,
+        stack_mb=256,
     )
 
     if jit:
@@ -253,8 +253,8 @@ def _compile_pyfunc(expr_str: str, params: list[str], *, debug: bool):
     JIT decoration happens in the caller."""
     import sys
     old_limit = sys.getrecursionlimit()
-    if old_limit < 200_000:
-        sys.setrecursionlimit(200_000)
+    if old_limit < 1_000_000:
+        sys.setrecursionlimit(1_000_000)
     try:
         # 1. sympify — bind variable names to sympy Symbols so they're
         #    not misread as imports or function names.  Empty params
@@ -265,11 +265,18 @@ def _compile_pyfunc(expr_str: str, params: list[str], *, debug: bool):
                 syms = (syms,)
         else:
             syms = ()
-        expr = sp.sympify(expr_str, locals=dict(zip(params, syms)))
+        expr = _sympify_chunked(expr_str, dict(zip(params, syms)))
 
         # 2. CSE — find repeated subterms across the whole expression
-        #    and replace them with intermediates.
-        sub_exprs, [main] = sp.cse(expr, optimizations='basic')
+        #    and replace them with intermediates.  ``optimizations=
+        #    'basic'`` runs a couple of pre-CSE algebraic passes that
+        #    are O(N²)-ish on very wide Adds and dominate compile time
+        #    for 10k+ term inputs while finding little extra savings
+        #    on engineering polynomials.  Skip them past ~10k args.
+        opt_level = 'basic' if not (
+            isinstance(expr, sp.Add) and len(expr.args) > 10_000
+        ) else None
+        sub_exprs, [main] = sp.cse(expr, optimizations=opt_level)
 
         # 3. Generate Python source.  Top-level Adds with many terms
         #    are split into chunked partial sums so the final return's
@@ -300,6 +307,123 @@ def _compile_pyfunc(expr_str: str, params: list[str], *, debug: bool):
         sys.setrecursionlimit(old_limit)
 
 
+def _split_top_level_terms(s: str):
+    """Walk ``s`` once and return ``[(sign, term_str), ...]`` where the
+    splits are at *top-level* ``+`` / ``-`` operators (not inside
+    parens or brackets, not part of scientific notation, and not
+    unary signs leading another operator).
+
+    Example::
+
+        "0.5*v*i + 1.5e-3*x - (a + b)*c"
+          → [('+', '0.5*v*i'),
+             ('+', '1.5e-3*x'),
+             ('-', '(a + b)*c')]
+
+    Used as a string-level pre-pass before ``sp.sympify`` on huge
+    formulas — sympy's parser recurses once per operator and a 400+ KB
+    single expression overflows even a 256 MB stack.  Splitting first
+    keeps each sympify call's input small.
+    """
+    pieces: list = []
+    paren = 0
+    bracket = 0
+    n = len(s)
+
+    i = 0
+    while i < n and s[i].isspace():
+        i += 1
+    if i < n and s[i] in '+-':
+        sign = s[i]
+        i += 1
+    else:
+        sign = '+'
+    start = i
+
+    def is_term_continuation(idx: int) -> bool:
+        """A ``+`` / ``-`` at idx belongs to the current term (i.e.
+        unary or scientific-notation exponent) rather than separating
+        a new term."""
+        j = idx - 1
+        while j >= start and s[j].isspace():
+            j -= 1
+        if j < start:
+            return True                           # beginning of term
+        prev = s[j]
+        if prev in 'eE':
+            k = j - 1
+            while k >= start and s[k].isspace():
+                k -= 1
+            if k >= start and s[k].isdigit():
+                return True                       # scientific exponent sign
+        if prev in '+-*/%(,=<>!^~|&':
+            return True                           # unary after operator
+        return False
+
+    while i < n:
+        c = s[i]
+        if c == '(':
+            paren += 1
+        elif c == ')':
+            paren -= 1
+        elif c == '[':
+            bracket += 1
+        elif c == ']':
+            bracket -= 1
+        elif paren == 0 and bracket == 0 and c in '+-':
+            if not is_term_continuation(i):
+                term = s[start:i].strip()
+                if term:
+                    pieces.append((sign, term))
+                sign = c
+                start = i + 1
+        i += 1
+
+    term = s[start:].strip()
+    if term:
+        pieces.append((sign, term))
+    return pieces
+
+
+def _sympify_chunked(expr_str: str, locals_dict: dict | None = None,
+                    threshold: int = 20_000):
+    """Drop-in for ``sp.sympify(expr_str, locals=locals_dict)`` that
+    handles arbitrarily long inputs.  Below ``threshold`` bytes uses
+    sympy's parser directly; above it, splits ``expr_str`` at top-
+    level ``+`` / ``-`` and sympifies each piece independently before
+    combining via ``sp.Add``.
+
+    The combined tree is shaped ``Add(piece1, piece2, ..., piece_n)``
+    — flat, depth ≈ max(piece depth), so downstream operations
+    (``xreplace``, ``cse``, ``pycode``) traverse it iteratively over
+    args without recursing N levels deep.
+
+    Limitation: a long *product* at top level (no top-level + or -)
+    can't be split this way; if you have an expression dominated by
+    multiplication chains and it overflows, restructure the input or
+    raise the OS thread stack.
+    """
+    if locals_dict is None:
+        locals_dict = {}
+    if len(expr_str) <= threshold:
+        return sp.sympify(expr_str, locals=locals_dict)
+
+    pieces = _split_top_level_terms(expr_str)
+    if len(pieces) <= 1:
+        # No top-level + or - to split on; fall back and hope the
+        # stack is big enough.  Caller must already be inside a
+        # big-stack thread.
+        return sp.sympify(expr_str, locals=locals_dict)
+
+    parsed: list = []
+    for sign, term in pieces:
+        e = sp.sympify(term, locals=locals_dict)
+        if sign == '-':
+            e = -e
+        parsed.append(e)
+    return sp.Add(*parsed) if parsed else sp.Integer(0)
+
+
 def _emit_chunked_main(main, chunk_size: int = 100):
     """If ``main`` is a long Add, split it into chunks of
     ``chunk_size`` terms each, emit ``_s0 = ...``, ``_s1 = ...`` lines
@@ -328,7 +452,7 @@ def _emit_chunked_main(main, chunk_size: int = 100):
     return lines, " + ".join(chunk_names)
 
 
-def _run_in_big_stack(target, *, stack_mb: int = 64):
+def _run_in_big_stack(target, *, stack_mb: int = 256):
     """Run ``target()`` in a thread with ``stack_mb`` megabytes of
     stack space.  Returns target's value or re-raises its exception.
 
@@ -336,9 +460,15 @@ def _run_in_big_stack(target, *, stack_mb: int = 64):
     thousand-term expressions can blow the OS thread stack
     (Windows main thread is only 1 MB).  ``threading.stack_size``
     sets the size process-wide for new threads; we save and restore
-    so the main thread's setting isn't disturbed.  This is mildly
-    racy if other code creates threads concurrently with the
-    compile, but it's a one-off cost so the window is small.
+    so the main thread's setting isn't disturbed.
+
+    The platform-allowed maximum stack size differs by OS and Python
+    build (Windows often caps below 256 MB).  We try the requested
+    size first, then halve and retry on ``ValueError`` until we land
+    on something the OS accepts — anything ≥ 8 MB is enough for
+    every test we have.  If even 8 MB is rejected, fall back to the
+    process default (which is what the user already had before this
+    function existed, so no regression).
     """
     import threading
     box = {'result': None, 'error': None}
@@ -350,13 +480,22 @@ def _run_in_big_stack(target, *, stack_mb: int = 64):
             box['error'] = e
 
     saved = threading.stack_size()
-    threading.stack_size(stack_mb * 1024 * 1024)
+    candidate_mb = stack_mb
+    set_ok = False
+    while candidate_mb >= 8:
+        try:
+            threading.stack_size(candidate_mb * 1024 * 1024)
+            set_ok = True
+            break
+        except (ValueError, OSError):
+            candidate_mb //= 2
     try:
         t = threading.Thread(target=runner)
         t.start()
         t.join()
     finally:
-        threading.stack_size(saved)
+        if set_ok:
+            threading.stack_size(saved)
 
     if box['error'] is not None:
         raise box['error']
@@ -393,7 +532,7 @@ def _detect_params(expr_str: str) -> list[str]:
     list via the detailed JSON form below; auto-detect can't see them
     as free.
     """
-    return sorted(str(s) for s in sp.sympify(expr_str).free_symbols)
+    return sorted(str(s) for s in _sympify_chunked(expr_str).free_symbols)
 
 
 def get_at_path(data, path):
@@ -548,7 +687,7 @@ def _expand_subexprs(expr_str: str, subexprs: dict) -> str:
                 f"subexpression cycle: {sym} still depends on "
                 f"{sorted(str(s) for s in leftover)} after substitution")
 
-    return str(sp.sympify(expr_str).xreplace(sub_dict))
+    return str(_sympify_chunked(expr_str).xreplace(sub_dict))
 
 
 def _substitute_constants(expr_str: str, constants: dict) -> str:
@@ -580,7 +719,7 @@ def _substitute_constants(expr_str: str, constants: dict) -> str:
         else:
             raise TypeError(f"constant {name!r} must be int / float / "
                             f"numeric-string, got {type(value).__name__}")
-    return str(sp.sympify(expr_str).xreplace(sub_dict))
+    return str(_sympify_chunked(expr_str).xreplace(sub_dict))
 
 
 def make_expr_func_from_json(json_path, expr_at, *,
@@ -714,8 +853,8 @@ def make_expr_func_from_json(json_path, expr_at, *,
     def _heavy():
         import sys
         old_limit = sys.getrecursionlimit()
-        if old_limit < 200_000:
-            sys.setrecursionlimit(200_000)
+        if old_limit < 1_000_000:
+            sys.setrecursionlimit(1_000_000)
         try:
             e = expr_str
             if subexprs is not None:
@@ -728,7 +867,7 @@ def make_expr_func_from_json(json_path, expr_at, *,
         finally:
             sys.setrecursionlimit(old_limit)
 
-    fn = _run_in_big_stack(_heavy, stack_mb=64)
+    fn = _run_in_big_stack(_heavy, stack_mb=256)
 
     if jit:
         from numba import njit

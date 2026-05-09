@@ -89,27 +89,28 @@ def long_expression_check() -> int:
     additions used to crash with `RecursionError: ... during
     compilation` on the AST build of the generated source.
     """
-    # 5000 terms — far past Windows main-thread C-stack capacity
-    # (~1500 frames on a 1 MB stack), so this only passes when the
-    # compile pipeline runs in a worker thread with a larger stack.
-    n = 5000
+    # 15k terms — covers real-world ~450 KB single-formula JSONs
+    # without dragging the test suite to multiple minutes (CSE on a
+    # 30k-arg Add is O(N²) even with optimizations off).
+    # Passing requires three layers working together: (1) string-level
+    # split-on-+/- so sympify never sees the full input at once,
+    # (2) big-stack worker thread, (3) chunked output so exec()'s
+    # AST build stays shallow.
+    n = 15_000
     sample = {"x": 1.5, "y": 2.5}
     expr = " + ".join(f"{(i + 1) * 1e-9} * x**{i % 5} * y**{(i + 7) % 4}"
                       for i in range(n))
-    print(f"  long-expr: {n} terms, source length ~{len(expr)} chars")
+    print(f"  long-expr: {n} terms, source length ~{len(expr) // 1024} KB")
 
-    try:
-        ref = eval(expr, {"__builtins__": {}}, sample)
-    except RecursionError:
-        # Even Python's own eval may need a higher recursion limit on
-        # this length — bump for the reference path too.
-        import sys as _sys
-        old = _sys.getrecursionlimit()
-        _sys.setrecursionlimit(50_000)
-        try:
-            ref = eval(expr, {"__builtins__": {}}, sample)
-        finally:
-            _sys.setrecursionlimit(old)
+    # Hand-compute the reference with a flat loop instead of eval() —
+    # for a 15k-term expression eval() recurses ~15k frames during
+    # parse, which blows the main thread's 1 MB C-stack on Windows
+    # before any RecursionError can be raised (the process aborts).
+    x = sample["x"]
+    y = sample["y"]
+    ref = 0.0
+    for i in range(n):
+        ref += (i + 1) * 1e-9 * x**(i % 5) * y**((i + 7) % 4)
 
     f = make_expr_func(expr, sorted(sample), jit=False)
     got = f(*[sample[k] for k in sorted(sample)])
