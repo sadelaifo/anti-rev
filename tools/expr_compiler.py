@@ -147,6 +147,76 @@ def _detect_params(expr_str: str) -> list[str]:
     return sorted(str(s) for s in sp.sympify(expr_str).free_symbols)
 
 
+def compile_expressions_in_data(data, is_expr, **compile_opts):
+    """Walk a JSON-like nested structure (dicts, lists, primitives)
+    and compile only the leaves identified by ``is_expr`` as math
+    expressions.  Returns a NEW structure mirroring ``data`` with
+    matched leaves replaced by callables; everything else passes
+    through unchanged.
+
+    Parameters
+    ----------
+    data : dict | list | scalar
+        Anything ``json.load`` can produce.  Walked recursively.
+    is_expr : callable(path, value) -> bool
+        Predicate run on every leaf.  ``path`` is a tuple of dict keys
+        (str) and list indices (int) leading to the value; ``value``
+        is the leaf itself.  Return True iff the leaf is a math
+        expression that should be compiled.
+    **compile_opts
+        Forwarded to :func:`make_expr_func` (``jit``, ``fastmath``,
+        ``cache``, ``debug``).
+
+    Useful predicate shapes::
+
+        # Any string under a key named "formula" / "expr":
+        lambda p, v: isinstance(v, str) and p and p[-1] in ("formula", "expr")
+
+        # Sentinel-prefix convention "=expression":
+        lambda p, v: isinstance(v, str) and v.startswith("=")
+        # (then strip the "=" yourself before passing to make_expr_func —
+        #  or use the load_expressions_from_json marker= helper below)
+
+        # Specific paths only:
+        lambda p, v: p == ("device", "transfer_func")
+
+        # Nested under a "formulas" subtree, regardless of inner key:
+        lambda p, v: isinstance(v, str) and len(p) >= 1 and p[0] == "formulas"
+
+    Returned structure example::
+
+        in:  {"name": "x", "max_v": 220,
+              "calc": {"f": "a*b + c"}, "schedule": [{"v": "x*2"}]}
+        out: {"name": "x", "max_v": 220,
+              "calc": {"f": <fn(a,b,c)>}, "schedule": [{"v": <fn(x)>}]}
+    """
+    def _walk(node, path):
+        if isinstance(node, dict):
+            return {k: _walk(v, path + (k,)) for k, v in node.items()}
+        if isinstance(node, list):
+            return [_walk(v, path + (i,)) for i, v in enumerate(node)]
+        if is_expr(path, node):
+            if not isinstance(node, str):
+                raise TypeError(
+                    f"is_expr returned True for non-string at path {path!r}: "
+                    f"{type(node).__name__} (only strings can be compiled)")
+            params = _detect_params(node)
+            return make_expr_func(node, params, **compile_opts)
+        return node
+
+    return _walk(data, ())
+
+
+def load_expressions_from_json(json_path: str | Path, is_expr,
+                               **compile_opts):
+    """Convenience: open ``json_path``, parse, walk via
+    :func:`compile_expressions_in_data`, return the compiled
+    structure."""
+    with Path(json_path).open(encoding='utf-8') as fh:
+        data = json.load(fh)
+    return compile_expressions_in_data(data, is_expr, **compile_opts)
+
+
 def make_funcs_from_json(json_path: str | Path, **compile_opts) -> dict:
     """Read formulas from a JSON file and compile each one.
 
