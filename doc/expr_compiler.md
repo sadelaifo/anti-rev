@@ -241,12 +241,14 @@ print(f"signature: {py_fn.__name__}({', '.join(names)})")
 - `test_syntax.py` — 19 个语法 / 优先级 case + 一个 15000 项 / 460 KB 的极限 case 走完整 `make_expr_func_from_json` 流程
 - `test_multi.py` — `make_expr_funcs_from_json` 批量编译路径：5 条公式（含不同变量集 / 纯常量公式）共享常量与子表达式，覆盖 `params_at` 统一签名 override
 - `test_cache.py` — 内容寻址磁盘缓存 hit / miss / 失效行为及加速比
+- `test_boundary.py` — 用 `verify` + 手写 Python 参考实现做**三层对账**的边界采样 demo（10 个采样点 × 4 公式：零值 / 极小 / 极大 / 负值 / 极端温度 / 业务点）；**手写参考是关键** —— 仅用 sympy `reference_value` 对账抓不到 JSON 公式本身的语义错误，手写 Python 实现可以
 
 ```bash
 python3 tests/expr_compiler/run.py
 python3 tests/expr_compiler/test_syntax.py
 python3 tests/expr_compiler/test_multi.py
 python3 tests/expr_compiler/test_cache.py
+python3 tests/expr_compiler/test_boundary.py
 ```
 
 ## 十三、依赖
