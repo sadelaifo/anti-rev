@@ -538,6 +538,96 @@ def clear_compile_cache(*, older_than_days: float | None = None) -> dict:
     return report
 
 
+def describe(funcs, *, sample=None, file=None):
+    """Pretty-print compiled function(s) — names, signatures, JIT
+    status, source file paths, and optionally evaluate each at a
+    sample point.
+
+    Accepts either:
+      - a single callable from ``make_expr_func`` /
+        ``make_expr_func_from_json``
+      - a dict from ``make_expr_funcs_from_json`` /
+        ``make_funcs_from_json``
+
+    ``sample`` is an optional ``{var_name: value}`` dict.  For each
+    function whose parameters are all present in ``sample``, the
+    sample values are passed in (in the function's own argument
+    order) and the result is printed.  Functions with parameters
+    not in ``sample`` get a "skipped: missing X" line so it's
+    obvious nothing ran.
+
+    Example::
+
+        funcs = make_expr_funcs_from_json("config.json", ...)
+        describe(funcs, sample={"v": 220.0, "i": 1.5, "t": 25.0})
+
+    Output::
+
+        3 compiled function(s):
+          f1(i, v)        [JIT]  /tmp/expr_compiler_gen/_expr_8af9.py
+                f(1.5, 220.0) = 173.85
+          f2(t)           [JIT]  /tmp/expr_compiler_gen/_expr_3a7c.py
+                f(25.0,) = 0.625
+          f3(p, v)        [JIT]  /tmp/expr_compiler_gen/_expr_5b22.py
+                skipped: sample missing ['p']
+
+    ``file`` defaults to ``sys.stdout``; pass any file-like for
+    custom routing.
+    """
+    import sys
+
+    if file is None:
+        file = sys.stdout
+
+    # Normalise input into a list of (name, callable) tuples.
+    if callable(funcs):
+        items = [("<fn>", funcs)]
+    elif isinstance(funcs, dict):
+        items = list(funcs.items())
+    else:
+        raise TypeError(f"describe expected callable or dict, got "
+                        f"{type(funcs).__name__}")
+
+    if not items:
+        print("(no compiled functions)", file=file)
+        return
+
+    # Build per-row info, then print with aligned columns.
+    rows = []
+    for name, fn in items:
+        py_fn = getattr(fn, 'py_func', fn)
+        n_args = py_fn.__code__.co_argcount
+        args = list(py_fn.__code__.co_varnames[:n_args])
+        is_jit = hasattr(fn, 'py_func')
+        src = py_fn.__code__.co_filename
+        if len(src) > 60:
+            src = "..." + src[-57:]
+        rows.append({
+            'name': name, 'fn': fn, 'args': args,
+            'is_jit': is_jit, 'src': src,
+        })
+
+    sig_width = max(len(f"{r['name']}({', '.join(r['args'])})") for r in rows)
+
+    print(f"{len(rows)} compiled function(s):", file=file)
+    for r in rows:
+        sig = f"{r['name']}({', '.join(r['args'])})"
+        kind = "[JIT]" if r['is_jit'] else "[py] "
+        print(f"  {sig:<{sig_width}}  {kind}  {r['src']}", file=file)
+        if sample is not None:
+            missing = [a for a in r['args'] if a not in sample]
+            if missing:
+                print(f"        skipped: sample missing {missing}", file=file)
+            else:
+                vals = [sample[a] for a in r['args']]
+                try:
+                    result = r['fn'](*vals)
+                    print(f"        f{tuple(vals)} = {result}", file=file)
+                except Exception as e:
+                    print(f"        error during call: "
+                          f"{type(e).__name__}: {e}", file=file)
+
+
 def _split_top_level_terms(s: str):
     """Walk ``s`` once and return ``[(sign, term_str), ...]`` where the
     splits are at *top-level* ``+`` / ``-`` operators (not inside

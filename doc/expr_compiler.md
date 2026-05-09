@@ -182,6 +182,7 @@ JIT 编译的可调用对象 f(args) → float
 | `get_at_path(data, path)` | 通用路径取值工具 |
 | `cache_dir_path()` | 返回磁盘缓存目录路径，便于手动 `ls` / 清理 |
 | `clear_compile_cache(*, older_than_days=None)` | 清空磁盘缓存（可选只清比 N 天老的）；返回 `{removed_files, freed_bytes, cache_dir}` |
+| `describe(funcs, *, sample=None)` | 打印单个函数 / dict 的签名总览，可选传 `sample={var: val}` 顺便跑一遍验证数值 |
 
 `make_expr_funcs_from_json` 还接受 `progress` 参数。`progress=True` 让批量编译过程中向 stderr 周期性输出 `n/total / cache hits / elapsed / ETA`，配合首次跑长时间的场景。`progress=callable` 时每条公式编完回调一次，传入 `{name, done, total, elapsed, duration, cache_hit, cache_hits}`，方便存盘 / 自定义日志：
 
