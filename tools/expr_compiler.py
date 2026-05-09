@@ -278,54 +278,90 @@ def _expand_subexprs(expr_str: str, subexprs: dict) -> str:
     return str(sp.sympify(expr_str).xreplace(sub_dict))
 
 
-def make_expr_func_from_json(json_path, expr_at, params_at,
-                             subexprs_at=None, **compile_opts):
-    """One-shot: read an expression string at ``expr_at`` and a
-    parameter-name list at ``params_at`` from the same JSON file,
-    return the compiled callable.
+def _substitute_constants(expr_str: str, constants: dict) -> str:
+    """Bake numeric constants into ``expr_str`` so they appear as
+    literal values in the compiled code instead of function arguments.
+
+    Substitution is at the sympy AST level, so a constant whose name
+    happens to be a substring of another identifier (e.g. constant
+    ``k`` inside variable ``key``) is unaffected.
+
+    Floats become ``sp.Float`` (preserves the magnitude exactly,
+    including small values like ``6.5e-5`` that ``sp.Rational`` would
+    blow up into a giant fraction); ints become ``sp.Integer``.
+    """
+    sub_dict: dict = {}
+    for name, value in constants.items():
+        if isinstance(value, bool):  # bool is an int subclass — exclude
+            raise TypeError(f"constant {name!r}: bool is not a numeric value")
+        if isinstance(value, float):
+            sub_dict[sp.Symbol(name)] = sp.Float(value)
+        elif isinstance(value, int):
+            sub_dict[sp.Symbol(name)] = sp.Integer(value)
+        else:
+            raise TypeError(f"constant {name!r} must be int or float, "
+                            f"got {type(value).__name__}")
+    return str(sp.sympify(expr_str).xreplace(sub_dict))
+
+
+def make_expr_func_from_json(json_path, expr_at, *,
+                             constants_at=None, subexprs_at=None,
+                             params_at=None, **compile_opts):
+    """One-shot: read an expression at ``expr_at``, optionally inline
+    named sub-expressions and bake in numeric constants, then return
+    the compiled callable.
 
     Path arguments accept the same forms as :func:`get_at_path` —
     tuples or dotted-with-bracket strings.
 
-    Multiple parameter sources
-    --------------------------
-    ``params_at`` may be a single path *or* a list of paths.  When it's
-    a list, each path's value is read as a list of strings and the
-    results are concatenated **in the order given** to form the final
-    positional-argument order.  Useful when the schema splits inputs
-    across keys (``inputs``, ``constants``, …)::
+    Constants
+    ---------
+    ``constants_at`` points to a ``{name: number}`` dict.  Each entry
+    is substituted into the expression as a numeric literal at compile
+    time, so it never appears as a function argument::
 
-        f = make_expr_func_from_json(
-            "config.json",
-            expr_at   = "device.formula",
-            params_at = ["device.inputs", "device.constants"],
-        )
+        "constants": {"k1": 6.5e-5, "k2": 0.001}
 
-    Named sub-expressions
-    ---------------------
-    Optional ``subexprs_at`` points to a ``{name: expr_string}`` dict.
-    Each named expression is inlined into the main formula before
-    compilation; entries may reference each other and resolve in any
-    order::
+    Sub-expressions
+    ---------------
+    ``subexprs_at`` points to a ``{name: expr_string}`` dict.  Each
+    named expression is inlined into the main formula before
+    compilation.  Entries may reference each other and may reference
+    constants defined in ``constants_at``; resolution is iterative,
+    cycles are caught.
+
+    Parameters (variables)
+    ----------------------
+    By default, the function's parameters are whatever free symbols
+    remain after constant + sub-expression substitution, sorted
+    alphabetically — convenient when variable names aren't pinned in
+    the JSON ahead of time.
+
+    Pass ``params_at`` (path / list of paths to lists of strings) to
+    pin a non-alphabetical positional order.  When given, the listed
+    names must be a superset of the surviving free symbols.
+
+    Example.  Given ``config.json``::
 
         {
-          "inputs":   ["v", "i"],
-          "constants":["k1", "k2"],
-          "subexprs": {"power": "v*i",
-                       "loss":  "k1*v**2 + k2*i**2"},
-          "main":     "0.5*power - loss"
+          "constants": {"k1": 6.5e-5, "k2": 0.001},
+          "subexprs":  {"power": "v*i"},
+          "formula":   "0.5*power - k1*v**2 - k2*i**2"
         }
+
+    compile and call::
 
         f = make_expr_func_from_json(
             "config.json",
-            expr_at     = "main",
-            params_at   = ["inputs", "constants"],
-            subexprs_at = "subexprs",
+            expr_at      = "formula",
+            constants_at = "constants",
+            subexprs_at  = "subexprs",
         )
+        f(1.5, 220.0)                # auto-detected order: i, v
 
-    A name appearing in both ``params_at`` and ``subexprs_at`` is
-    treated as a sub-expression (the inlined definition wins) — keep
-    the namespaces disjoint.
+    Names should be disjoint across constants / subexprs / params; if
+    they overlap, sub-expression definitions win over constant values
+    (subexprs are inlined first).
 
     ``compile_opts`` are forwarded to :func:`make_expr_func`
     (``jit``, ``fastmath``, ``cache``, ``debug``).
@@ -338,15 +374,8 @@ def make_expr_func_from_json(json_path, expr_at, params_at,
         raise TypeError(f"expr at {expr_at!r} must be a string, "
                         f"got {type(expr).__name__}")
 
-    params: list[str] = []
-    for path in _normalize_paths(params_at):
-        chunk = get_at_path(data, path)
-        if not (isinstance(chunk, list)
-                and all(isinstance(p, str) for p in chunk)):
-            raise TypeError(f"params at {path!r} must be a list of strings, "
-                            f"got {type(chunk).__name__}")
-        params.extend(chunk)
-
+    # Inline subexprs first — their resolved values may reference
+    # constants, which then get substituted in the next step.
     if subexprs_at is not None:
         subexprs = get_at_path(data, subexprs_at)
         if not isinstance(subexprs, dict):
@@ -357,6 +386,25 @@ def make_expr_func_from_json(json_path, expr_at, params_at,
             raise TypeError(f"subexprs at {subexprs_at!r} must map "
                             f"str -> str")
         expr = _expand_subexprs(expr, subexprs)
+
+    if constants_at is not None:
+        constants = get_at_path(data, constants_at)
+        if not isinstance(constants, dict):
+            raise TypeError(f"constants at {constants_at!r} must be a dict, "
+                            f"got {type(constants).__name__}")
+        expr = _substitute_constants(expr, constants)
+
+    if params_at is not None:
+        params: list[str] = []
+        for path in _normalize_paths(params_at):
+            chunk = get_at_path(data, path)
+            if not (isinstance(chunk, list)
+                    and all(isinstance(p, str) for p in chunk)):
+                raise TypeError(f"params at {path!r} must be a list of "
+                                f"strings, got {type(chunk).__name__}")
+            params.extend(chunk)
+    else:
+        params = _detect_params(expr)
 
     return make_expr_func(expr, params, **compile_opts)
 

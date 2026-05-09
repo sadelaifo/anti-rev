@@ -1,22 +1,21 @@
 {
-  "_comment": "Test fixture for tools/expr_compiler.py — params split across two keys, plus a chain of named sub-expressions inlined into the main formula.",
+  "_comment": "Test fixture for tools/expr_compiler.py — constants are name:number pairs that get baked in as literals; variable names are NOT listed and are auto-detected from the formula's surviving free symbols. A few named sub-expressions exercise the inline path; one of them references a constant to cover the constant-inside-subexpr case.",
 
-  "inputs":    ["v", "i"],
-  "constants": ["k1", "k2"],
-
-  "subexprs": {
-    "power":   "v * i",
-    "ohm":     "k1 * v**2",
-    "iron":    "k2 * i**2",
-    "loss":    "ohm + iron",
-    "scaled":  "0.5 * power"
+  "constants": {
+    "k1":  6.5e-5,
+    "k2":  0.001,
+    "bias": 12,
+    "scale": 0.5
   },
 
-  "main": "scaled - loss",
+  "subexprs": {
+    "power": "v * i",
+    "ohm":   "k1 * v**2",
+    "iron":  "k2 * i**2",
+    "loss":  "ohm + iron"
+  },
 
-  "_other_field": "make sure unrelated keys don't get walked or compiled",
-  "schedule": [
-    { "label": "step1", "value": "v + i" },
-    { "label": "step2", "value": "v - i" }
-  ]
+  "formula": "scale*power - loss + bias",
+
+  "_other_field": "unrelated keys are not walked or compiled"
 }

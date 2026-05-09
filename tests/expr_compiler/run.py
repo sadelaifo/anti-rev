@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Local smoke test for tools/expr_compiler.make_expr_func_from_json.
 
-Loads ./config.json, compiles the main expression with parameters
-gathered from two separate keys and named sub-expressions inlined,
-then verifies the JIT and pure-Python paths agree with a hand-computed
-reference value.
+Loads ./config.json, inlines named sub-expressions, bakes numeric
+constants in as literals, auto-detects the surviving free symbols
+as positional parameters, and verifies the compiled callable agrees
+with a hand-computed reference.
 
 Run from the project root::
 
@@ -21,21 +21,28 @@ sys.path.insert(0, str(ROOT / "tools"))
 from expr_compiler import (        # noqa: E402
     get_at_path,
     make_expr_func_from_json,
+    _substitute_constants,
     _expand_subexprs,
 )
 
 HERE = Path(__file__).parent
 CFG = HERE / "config.json"
 
+# Constants from config.json — duplicated here so the reference function
+# is independent of the loader under test.
+K1, K2, BIAS, SCALE = 6.5e-5, 0.001, 12, 0.5
 
-def reference(v, i, k1, k2):
+
+def reference(i: float, v: float) -> float:
     """Hand-computed reference, mirrors the JSON formula:
 
-        scaled = 0.5 * (v*i)
-        loss   = k1*v**2 + k2*i**2
-        main   = scaled - loss
+        power = v * i
+        ohm   = K1 * v**2
+        iron  = K2 * i**2
+        loss  = ohm + iron
+        f     = SCALE*power - loss + BIAS
     """
-    return 0.5 * v * i - (k1 * v**2 + k2 * i**2)
+    return SCALE * v * i - (K1 * v**2 + K2 * i**2) + BIAS
 
 
 def near(a: float, b: float, eps: float = 1e-9) -> bool:
@@ -45,33 +52,35 @@ def near(a: float, b: float, eps: float = 1e-9) -> bool:
 def main() -> int:
     print(f"[expr_compiler test] config: {CFG}")
 
-    # Pure-Python path first — fastest to fail with a clear traceback if
-    # the JSON shape is wrong.
     f_py = make_expr_func_from_json(
         CFG,
-        expr_at     = "main",
-        params_at   = ["inputs", "constants"],
-        subexprs_at = "subexprs",
-        jit         = False,
+        expr_at      = "formula",
+        constants_at = "constants",
+        subexprs_at  = "subexprs",
+        jit          = False,
+        debug        = True,
     )
 
     py_argnames = list(f_py.__code__.co_varnames[:f_py.__code__.co_argcount])
-    print(f"  param order (auto-built): {py_argnames}")
-    assert py_argnames == ["v", "i", "k1", "k2"], py_argnames
+    print(f"  auto-detected param order: {py_argnames}")
+    # Constants k1/k2/bias/scale are baked in; only v and i survive,
+    # alphabetical sort gives [i, v].
+    assert py_argnames == ["i", "v"], py_argnames
 
     samples = [
-        (220.0, 1.5, 1.2e-5, 3.0e-5),
-        (1.0,   1.0, 1.0,    1.0),
-        (10.0,  0.0, 0.5,    0.5),
-        (-3.0,  4.0, 0.1,    0.2),
+        (1.5,  220.0),
+        (1.0,    1.0),
+        (0.0,   10.0),
+        (4.0,   -3.0),
     ]
     print("  pure-Python results:")
-    for args in samples:
-        got = f_py(*args)
-        ref = reference(*args)
+    for (i_val, v_val) in samples:
+        got = f_py(i_val, v_val)
+        ref = reference(i_val, v_val)
         ok  = near(got, ref)
         marker = "OK" if ok else "FAIL"
-        print(f"    f{args} = {got:>14.6g}    ref = {ref:>14.6g}    [{marker}]")
+        print(f"    f(i={i_val}, v={v_val}) = {got:>14.6g}    "
+              f"ref = {ref:>14.6g}    [{marker}]")
         if not ok:
             return 1
 
@@ -79,10 +88,10 @@ def main() -> int:
     try:
         f_jit = make_expr_func_from_json(
             CFG,
-            expr_at     = "main",
-            params_at   = ["inputs", "constants"],
-            subexprs_at = "subexprs",
-            jit         = True,
+            expr_at      = "formula",
+            constants_at = "constants",
+            subexprs_at  = "subexprs",
+            jit          = True,
         )
     except ImportError:
         print("  numba not installed — skipping JIT cross-check")
@@ -96,15 +105,19 @@ def main() -> int:
                 return 1
         print("  JIT path matches reference on all samples")
 
-    # Spot-check the helpers used internally.
-    inlined = _expand_subexprs("scaled - loss", {
-        "power":  "v*i",
-        "ohm":    "k1*v**2",
-        "iron":   "k2*i**2",
-        "loss":   "ohm + iron",
-        "scaled": "0.5*power",
-    })
-    print(f"  inlined formula: {inlined}")
+    # Helpers spot-check.
+    inlined = _substitute_constants(
+        "scale * power - loss + bias",
+        {"scale": 0.5, "bias": 12},
+    )
+    print(f"  constants substituted into 'scale*power - loss + bias': {inlined}")
+
+    chained = _expand_subexprs(
+        "scale*power - loss + bias",
+        {"power": "v*i", "ohm": "k1*v**2", "iron": "k2*i**2",
+         "loss":  "ohm + iron"},
+    )
+    print(f"  subexprs inlined (chain loss -> ohm + iron): {chained}")
 
     other = get_at_path({"a": [{"b": 42}]}, "a[0].b")
     assert other == 42, other
