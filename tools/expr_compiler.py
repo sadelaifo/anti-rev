@@ -914,6 +914,137 @@ def make_expr_func_from_json(json_path, expr_at, *,
     return fn
 
 
+def make_expr_funcs_from_json(json_path, exprs_at, *,
+                              constants_at=None, subexprs_at=None,
+                              params_at=None, **compile_opts):
+    """Plural version of :func:`make_expr_func_from_json`: compile
+    *every* formula in the dict at ``exprs_at`` using one shared set
+    of constants and sub-expressions.
+
+    Returns ``{name: callable}`` keyed by the dict's keys.
+
+    Why not just call the singular version in a loop?
+
+      - JSON is loaded once, not N times
+      - constants and subexprs dicts are merged once
+      - all formulas compile inside a single worker thread, so the
+        big-stack / high-recursion setup is paid once
+      - generated source files (under tempdir/expr_compiler_gen/) are
+        deduped by content hash across all formulas
+
+    Path arguments accept the same forms as :func:`get_at_path`.
+
+    ``exprs_at`` must point to a ``{name: formula_string}`` dict::
+
+        {
+          "constants": {"k": 6.5e-5},
+          "subexprs":  {"power": "v*i"},
+          "exprs": {
+            "f1": "0.5*power - k*v**2",
+            "f2": "power**2 + k*i",
+            "f3": "..."
+          }
+        }
+
+        funcs = make_expr_funcs_from_json(
+            "config.json",
+            exprs_at     = "exprs",
+            constants_at = "constants",
+            subexprs_at  = "subexprs",
+        )
+        funcs["f1"](1.5, 220.0)
+        funcs["f2"](1.5, 220.0)
+
+    Each formula independently auto-detects its own free symbols
+    (alphabetical) — different formulas may have different parameter
+    sets and that's fine.
+
+    If you pass ``params_at``, the listed names are used as the
+    positional-argument order for *every* compiled function: each
+    formula's free symbols must be a subset of the list, and any
+    listed name not used by a particular formula becomes an unused
+    parameter of that function (handy when you want a uniform call
+    signature across the batch).
+
+    ``compile_opts`` are forwarded to :func:`make_expr_func`
+    (``jit``, ``fastmath``, ``cache``, ``debug``); they apply to
+    every compiled function.
+    """
+    # ---- main thread: cheap I/O, path lookups, dict merging, type checks
+    with Path(json_path).open(encoding='utf-8') as fh:
+        data = json.load(fh, parse_float=str)
+
+    exprs = get_at_path(data, exprs_at)
+    if not isinstance(exprs, dict):
+        raise TypeError(f"exprs at {exprs_at!r} must be a dict, "
+                        f"got {type(exprs).__name__}")
+    if not all(isinstance(k, str) and isinstance(v, str)
+               for k, v in exprs.items()):
+        raise TypeError(f"exprs at {exprs_at!r} must map "
+                        f"str -> str (formula strings)")
+
+    subexprs = None
+    if subexprs_at is not None:
+        subexprs = _merge_dicts_at(data, subexprs_at, "subexprs")
+        if not all(isinstance(k, str) and isinstance(v, str)
+                   for k, v in subexprs.items()):
+            raise TypeError(f"subexprs at {subexprs_at!r} must map "
+                            f"str -> str")
+
+    constants = None
+    if constants_at is not None:
+        constants = _merge_dicts_at(data, constants_at, "constants")
+
+    params_explicit = None
+    if params_at is not None:
+        params_explicit = []
+        for path in _normalize_paths(params_at):
+            chunk = get_at_path(data, path)
+            if not (isinstance(chunk, list)
+                    and all(isinstance(p, str) for p in chunk)):
+                raise TypeError(f"params at {path!r} must be a list of "
+                                f"strings, got {type(chunk).__name__}")
+            params_explicit.extend(chunk)
+
+    debug = compile_opts.pop('debug', False)
+    jit = compile_opts.pop('jit', True)
+    fastmath = compile_opts.pop('fastmath', True)
+    cache = compile_opts.pop('cache', True)
+    if compile_opts:
+        raise TypeError(f"unexpected keyword arguments: "
+                        f"{sorted(compile_opts)}")
+
+    # ---- worker thread: compile every formula serially with one
+    #      stack/recursion setup
+    def _heavy():
+        import sys
+        old_limit = sys.getrecursionlimit()
+        if old_limit < 1_000_000:
+            sys.setrecursionlimit(1_000_000)
+        try:
+            out: dict = {}
+            for name, formula in exprs.items():
+                e = formula
+                if subexprs is not None:
+                    e = _expand_subexprs(e, subexprs)
+                if constants is not None:
+                    e = _substitute_constants(e, constants)
+                p = (params_explicit if params_explicit is not None
+                     else _detect_params(e))
+                out[name] = _compile_pyfunc(e, p, debug=debug)
+            return out
+        finally:
+            sys.setrecursionlimit(old_limit)
+
+    pyfns = _run_in_big_stack(_heavy, stack_mb=256)
+
+    if jit:
+        from numba import njit
+        for name in list(pyfns):
+            pyfns[name] = njit(cache=cache, fastmath=fastmath)(pyfns[name])
+    return pyfns
+
+
 def compile_expressions_in_data(data, is_expr, **compile_opts):
     """Walk a JSON-like nested structure (dicts, lists, primitives)
     and compile only the leaves identified by ``is_expr`` as math

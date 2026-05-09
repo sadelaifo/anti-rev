@@ -10,7 +10,9 @@
 
 ## 二、调用入口
 
-只有一个常用入口，按典型业务场景定制：
+两个常用入口 — 取决于一次要编一条还是多条公式：
+
+**单条**：
 
 ```python
 from expr_compiler import make_expr_func_from_json
@@ -24,6 +26,23 @@ f = make_expr_func_from_json(
 )
 f(1.5, 220.0)
 ```
+
+**多条共享常量 / 子表达式**：
+
+```python
+from expr_compiler import make_expr_funcs_from_json
+
+funcs = make_expr_funcs_from_json(
+    "config.json",
+    exprs_at     = "expr",                    # 路径指向 {name: 公式串} 字典
+    constants_at = ["key1", "key2"],
+    subexprs_at  = "subexprs",
+)
+funcs["f1"](1.5, 220.0)
+funcs["f2"](1.5, 220.0)
+```
+
+JSON 只读一次，常量 / 子表达式只合并一次，所有公式在一个 worker 线程里串行编译，比循环调单条版本省开销。每条公式各自自动检测变量；如果想统一签名就传 `params_at` 给所有公式同一份变量列表（每条公式的 free symbols 必须是子集，不用的名字成为占位参数）。
 
 ## 三、流水线全图
 
@@ -150,10 +169,11 @@ JIT 编译的可调用对象 f(args) → float
 
 | 函数 | 用途 |
 |---|---|
-| `make_expr_func_from_json(...)` | **主入口**，从 JSON 单文件取一条公式编译 |
+| `make_expr_func_from_json(...)` | **主入口**，从 JSON 单文件取**一条**公式编译 |
+| `make_expr_funcs_from_json(...)` | **批量版**，`exprs_at` 指向 `{name: 公式}` 字典，一次编多条；常量 / 子表达式共享 |
 | `make_expr_func(expr_str, params)` | 直接传字符串编译（已有公式串时用） |
 | `make_expr_func_cached(...)` | LRU 包装版，重复调用同表达式时直接命中缓存 |
-| `make_funcs_from_json(...)` | JSON 顶层就是 `{name: 公式}` 时一次编完 |
+| `make_funcs_from_json(...)` | JSON 顶层就是 `{name: 公式}`、无常量子表达式共存时用 |
 | `load_expressions_from_json(...)` | 公式散落在异构 JSON 树里，按谓词函数定位 |
 | `get_at_path(data, path)` | 通用路径取值工具 |
 
@@ -197,10 +217,12 @@ print(f"signature: {py_fn.__name__}({', '.join(names)})")
 
 - `run.py` — JSON 路径全套：常量 + 子表达式 + 变量自动检测 + 精度保留（4 组数值参考）
 - `test_syntax.py` — 19 个语法 / 优先级 case + 一个 15000 项 / 460 KB 的极限 case 走完整 `make_expr_func_from_json` 流程
+- `test_multi.py` — `make_expr_funcs_from_json` 批量编译路径：5 条公式（含不同变量集 / 纯常量公式）共享常量与子表达式，覆盖 `params_at` 统一签名 override
 
 ```bash
 python3 tests/expr_compiler/run.py
 python3 tests/expr_compiler/test_syntax.py
+python3 tests/expr_compiler/test_multi.py
 ```
 
 ## 十三、依赖
