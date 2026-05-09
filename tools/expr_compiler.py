@@ -75,10 +75,15 @@ def make_expr_func(expr_str: str, params: list[str], *,
     callable f(p1, p2, ...) -> float
     """
     # 1. sympify — bind variable names to sympy Symbols so they're not
-    #    misread as imports or function names.
-    syms = sp.symbols(' '.join(params))
-    if not isinstance(syms, tuple):       # single-param case
-        syms = (syms,)
+    #    misread as imports or function names.  Empty params (a fully
+    #    constant expression) is allowed; sp.symbols('') would error
+    #    so handle that case first.
+    if params:
+        syms = sp.symbols(' '.join(params))
+        if not isinstance(syms, tuple):       # single-param case
+            syms = (syms,)
+    else:
+        syms = ()
     expr = sp.sympify(expr_str, locals=dict(zip(params, syms)))
 
     # 2. CSE — let sympy find repeated subterms across the whole expression
