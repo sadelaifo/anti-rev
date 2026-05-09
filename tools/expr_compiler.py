@@ -297,14 +297,53 @@ def _compile_pyfunc(expr_str: str, params: list[str], *, debug: bool):
             print(f"--- {len(sub_exprs)} CSE temps, "
                   f"{len(chunk_lines)} chunk temps ---")
 
-        # 4. exec — CPython parses left-recursive chains by recursing
-        #    on every operator; the chunked source keeps each line
-        #    short, but we still bump the limit as a safety belt.
-        ns: dict = {}
-        exec(src, ns)
+        # 4. Write source to a real file before exec.  This solves
+        #    two problems at once:
+        #      a) numba's `cache=True` needs a locator for the
+        #         function's source file.  `exec(src, ns)` leaves
+        #         co_filename = "<string>", which numba rejects with
+        #         RuntimeError("cannot cache function: no locator
+        #         available for file '<string>'").
+        #      b) tracebacks in the compiled function become
+        #         readable — the line "0.5*v*i + ..." in the
+        #         traceback points at a real file you can open.
+        #    The file path is content-addressed (sha1 of src), so
+        #    re-compiling the same formula reuses the same file and
+        #    numba's on-disk cache hits.
+        src_file = _write_generated_source(src)
+        ns: dict = {'__file__': src_file}
+        code = compile(src, src_file, 'exec')
+        exec(code, ns)
         return ns['_expr']
     finally:
         sys.setrecursionlimit(old_limit)
+
+
+def _write_generated_source(src: str) -> str:
+    """Write ``src`` to a stable path under the system temp dir,
+    keyed by sha1 of the content.  Returns the path.
+
+    Idempotent — concurrent calls with the same source land on the
+    same file via atomic ``os.replace``.  Cache files persist for
+    the lifetime of the temp dir (typically across processes within
+    the same OS session), so numba's ``cache=True`` actually pays
+    off across re-runs.
+    """
+    import hashlib
+    import os
+    import tempfile
+
+    cache_dir = os.path.join(tempfile.gettempdir(), 'expr_compiler_gen')
+    os.makedirs(cache_dir, exist_ok=True)
+
+    h = hashlib.sha1(src.encode('utf-8')).hexdigest()[:16]
+    path = os.path.join(cache_dir, f'_expr_{h}.py')
+    if not os.path.exists(path):
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(src)
+        os.replace(tmp, path)
+    return path
 
 
 def _split_top_level_terms(s: str):
