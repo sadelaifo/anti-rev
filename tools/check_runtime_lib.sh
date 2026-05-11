@@ -69,10 +69,19 @@ head -5 /tmp/run.log | sed 's/^/    /'
 echo ""
 
 # Inspect one specific lib, or every symlink in the dir.
+list_dir_contents() {
+    echo "    --- symlink dir actually contains: ---"
+    ls -la "$DIR" 2>/dev/null \
+        | tail -n +2 \
+        | awk '{print "      " $9 "  " $10 " " $11}' \
+        | grep -v '^      $'
+}
+
 inspect_lib() {
     lib=$1
     if [ ! -e "$lib" ]; then
         echo "===> $(basename "$lib"): NOT FOUND in symlink dir" >&2
+        list_dir_contents
         echo ""
         return
     fi
