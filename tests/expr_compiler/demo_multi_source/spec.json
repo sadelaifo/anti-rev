@@ -1,0 +1,33 @@
+{
+  "_comment": "Demo: variable `v` is pulled from file1.<case>.a, variable `i` from file2.<case>.b — two separate data sources, field names different from parameter names. test_cases lists the case keys to run; runner substitutes {case} into each binding template.",
+
+  "formula_config": {
+    "path":         "formulas.json",
+    "exprs_at":     "expr",
+    "constants_at": "constants",
+    "subexprs_at":  "subexprs"
+  },
+
+  "data_sources": {
+    "file1": "file1.json",
+    "file2": "file2.json",
+    "ref":   "expected.json"
+  },
+
+  "compile_options": { "jit": false },
+  "tolerance": 1e-9,
+
+  "binding": {
+    "vars_from": {
+      "v": "file1.{case}.a",
+      "i": "file2.{case}.b"
+    },
+    "expected_from": "ref.{case}"
+  },
+
+  "test_cases": [
+    "err",
+    "warn",
+    "info"
+  ]
+}

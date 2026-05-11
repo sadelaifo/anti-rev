@@ -1,0 +1,7 @@
+{
+  "_comment": "Expected outputs per case. Formula keys '0' and '1' correspond to formulas.json's expr[0] and expr[1].",
+
+  "err":  { "0": 165.0,  "1": 221.5 },
+  "warn": { "0":  12.5,  "1":  50.5 },
+  "info": { "0":   0.5,  "1":  10.1 }
+}

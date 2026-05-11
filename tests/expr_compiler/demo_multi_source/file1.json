@@ -1,0 +1,7 @@
+{
+  "_comment": "Source #1 — provides the `a` field per case. Maps to function variable `v` via the binding template.",
+
+  "err":  { "a": 220.0 },
+  "warn": { "a":  50.0 },
+  "info": { "a":  10.0 }
+}

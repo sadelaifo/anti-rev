@@ -1,0 +1,12 @@
+{
+  "_comment": "Two simple formulas to test. Variables are `v` and `i`. Stored as a list — the runner keys functions by stringified index '0' and '1'.",
+
+  "constants": {
+    "scale": 0.5
+  },
+  "subexprs": {},
+  "expr": [
+    "scale * v * i",
+    "v + i"
+  ]
+}
