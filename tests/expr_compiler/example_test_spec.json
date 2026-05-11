@@ -1,5 +1,5 @@
 {
-  "_comment": "Auto-binding mode demo: spec lists no individual test cases. The runner iterates top-level keys of `data_sources.inputs` (the 7 case_* entries) and for each one auto-builds vars from `inputs.{case}.{varname}` and expected from `expected.{case}.{formula_name}`. Adding new cases is a JSON-file edit, never a spec edit.",
+  "_comment": "Case-level whitelist with auto-binding inside each case. The `binding` block defines templates for where to find vars and expected values; `test_cases` lists which cases to actually run. Each entry can be a bare string (pure auto-bind) or a dict (auto-bind + manual override / label).",
 
   "formula_config": {
     "path":         "example_config.json",
@@ -16,9 +16,26 @@
   "compile_options": { "jit": false },
   "tolerance": 1e-9,
 
-  "auto_test_cases": {
-    "iterate":       "inputs",
+  "binding": {
     "vars_from":     "inputs.{case}",
     "expected_from": "expected.{case}"
-  }
+  },
+
+  "test_cases": [
+    "case_nominal",
+    "case_zero_i",
+    "case_zero_v",
+    "case_negative",
+
+    { "case": "case_hot",
+      "label": "high temperature — t_corr should rise above 1" },
+
+    { "case": "case_cold",
+      "label": "cold extreme",
+      "vars":  { "t": -50.0 } },
+
+    { "label": "purely manual sanity check (no `case` field)",
+      "vars":     { "v": 100.0, "i": 1.0, "t": 50.0 },
+      "expected": { "0": 50.0 } }
+  ]
 }

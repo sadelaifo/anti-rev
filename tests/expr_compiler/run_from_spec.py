@@ -119,73 +119,104 @@ def _path_exists(path_expr, namespace) -> bool:
         return False
 
 
-def _build_auto_cases(auto_spec, namespace, funcs):
-    """Convention-driven case generator.  When the user's data
-    files are shaped::
+def _build_test_cases(spec, namespace, funcs):
+    """Expand the user's ``test_cases`` list, auto-binding vars and
+    expected against the per-case ``binding`` template when the
+    entry names a case from the data files.
 
-        in.json:  {case_1: {v: ..., i: ...}, case_2: {...}, ...}
-        ref.json: {case_1: {"0": ..., "1": ...}, case_2: {...}, ...}
+    Entry shapes accepted:
 
-    they shouldn't have to write 100 case entries by hand.  This
-    builds them from the data shape using two templates::
+      * **String** — shorthand for ``{"case": <string>}``.  The
+        listed case is looked up in the data sources and every
+        function argument / formula name resolves automatically.
 
-        "iterate":       "in"           - top-level keys of `in` are case names
-        "vars_from":     "in.{case}"    - vars look up `in.<case>.<varname>`
-        "expected_from": "ref.{case}"   - expected look up `ref.<case>.<formula>`
+      * **Dict with ``case`` field** — auto-bind first, then merge
+        any explicit ``vars`` / ``expected`` keys on top (so the
+        user can override one or two entries).
 
-    Missing fields in `in.<case>` cause the relevant function to
-    SKIP for that case (not an error).  Missing fields in
-    `ref.<case>` mean the expected entry just isn't added — the
-    sympy-reference layer still runs.
+      * **Dict without ``case`` field** — purely manual, exactly
+        like before: ``vars`` and ``expected`` must be written out.
+
+    The ``binding`` block defines the templates::
+
+        "binding": {
+          "vars_from":     "inputs.{case}",
+          "expected_from": "expected.{case}"
+        }
+
+    For a case named ``"case_hot"``, the runner looks up
+    ``inputs.case_hot.<arg>`` for every parameter of every function
+    and ``expected.case_hot.<formula_name>`` for every compiled
+    function.  Missing fields are silently dropped — that function /
+    expected entry just doesn't appear (so partial coverage in the
+    data files doesn't produce noisy errors).
     """
-    iterate = auto_spec.get("iterate")
-    if not iterate or iterate not in namespace:
-        raise ValueError(
-            f"auto_test_cases.iterate must name a loaded data source, "
-            f"got {iterate!r}; have {sorted(namespace)}")
+    binding = spec.get("binding", {})
+    vars_template     = binding.get("vars_from")
+    expected_template = binding.get("expected_from")
 
-    vars_template     = auto_spec.get("vars_from")
-    expected_template = auto_spec.get("expected_from")
-
-    # Union of every function's parameter set — vars to look up per case.
+    # Pre-compute argument-name union and formula-name list once.
     union_args = set()
     for fn in funcs.values():
         py_fn = getattr(fn, "py_func", fn)
         n = py_fn.__code__.co_argcount
         union_args.update(py_fn.__code__.co_varnames[:n])
     union_args = sorted(union_args)
+    formula_names = list(funcs.keys())
 
-    iter_data = namespace[iterate]._data
-    if not isinstance(iter_data, dict):
-        raise ValueError(
-            f"data source {iterate!r} must be a top-level dict for "
-            f"iteration; got {type(iter_data).__name__}")
+    raw = spec.get("test_cases") or spec.get("samples", [])
+    out: list = []
+    for i, entry in enumerate(raw):
+        if isinstance(entry, str):
+            entry = {"case": entry}
+        elif not isinstance(entry, dict):
+            raise TypeError(
+                f"test_cases[{i}] must be a string or dict, "
+                f"got {type(entry).__name__}")
 
-    # Skip metadata-style keys (anything starting with `_`).
-    case_names = [k for k in iter_data.keys() if not k.startswith("_")]
+        case_key = entry.get("case")
+        explicit_vars     = entry.get("vars", {})
+        explicit_expected = entry.get("expected", {})
 
-    auto_cases: list = []
-    for case in case_names:
-        vars_dict: dict = {}
-        if vars_template:
-            for arg in union_args:
-                path = f"{vars_template}.{arg}".format(case=case)
-                if _path_exists(path, namespace):
-                    vars_dict[arg] = path
+        if case_key is not None:
+            if not vars_template and not expected_template:
+                raise ValueError(
+                    f"test_cases[{i}] references case={case_key!r} but "
+                    f"spec has no `binding.vars_from` / "
+                    f"`binding.expected_from` template defined")
 
-        expected_dict: dict = {}
-        if expected_template:
-            for fn_name in funcs:
-                path = f"{expected_template}.{fn_name}".format(case=case)
-                if _path_exists(path, namespace):
-                    expected_dict[fn_name] = path
+            auto_vars: dict = {}
+            if vars_template:
+                for arg in union_args:
+                    path = f"{vars_template}.{arg}".format(case=case_key)
+                    if _path_exists(path, namespace):
+                        auto_vars[arg] = path
 
-        auto_cases.append({
-            "label":    f"{iterate}.{case}",
-            "vars":     vars_dict,
-            "expected": expected_dict,
-        })
-    return auto_cases
+            auto_expected: dict = {}
+            if expected_template:
+                for name in formula_names:
+                    path = f"{expected_template}.{name}".format(case=case_key)
+                    if _path_exists(path, namespace):
+                        auto_expected[name] = path
+
+            # Explicit entries override auto-bound paths for the same key.
+            merged_vars     = {**auto_vars,     **explicit_vars}
+            merged_expected = {**auto_expected, **explicit_expected}
+
+            label = entry.get("label") or case_key
+            out.append({
+                "label":    label,
+                "vars":     merged_vars,
+                "expected": merged_expected,
+            })
+        else:
+            label = entry.get("label", "<unlabeled>")
+            out.append({
+                "label":    label,
+                "vars":     explicit_vars,
+                "expected": explicit_expected,
+            })
+    return out
 
 
 def _resolve_constants(cfg, path_spec):
@@ -230,9 +261,6 @@ def main() -> int:
 
     compile_opts = spec.get("compile_options", {})
     tolerance    = spec.get("tolerance", 1e-9)
-    # Manual cases (may be empty); auto cases get appended after we
-    # have `funcs` available since they need the argument signatures.
-    explicit_cases = list(spec.get("test_cases") or spec.get("samples", []))
 
     # ---- load external data sources --------------------------------
     namespace = {}
@@ -286,16 +314,10 @@ def main() -> int:
         )
     print(f"      {len(references)} reference(s) ready")
 
-    # Build auto-cases now that we have function signatures.
-    auto_spec = spec.get("auto_test_cases")
-    auto_cases = _build_auto_cases(auto_spec, namespace, funcs) if auto_spec else []
-    cases = explicit_cases + auto_cases
-    if auto_spec:
-        print(f"      auto-generated {len(auto_cases)} case(s) from "
-              f"data source {auto_spec['iterate']!r}")
+    # Expand test_cases (handles strings, auto-bind dicts, manual dicts)
+    cases = _build_test_cases(spec, namespace, funcs)
 
-    print(f"[3/3] running {len(cases)} test case(s) "
-          f"({len(explicit_cases)} explicit + {len(auto_cases)} auto) ...")
+    print(f"[3/3] running {len(cases)} test case(s) ...")
     print()
 
     n_ok = n_fail = n_skip = 0
