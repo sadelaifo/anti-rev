@@ -1,7 +1,7 @@
 {
-  "_comment": "Source #1 — for each case, `.a` is a dict containing several variables grouped together. The spec's vars_from list mode pulls all of them at once.",
+  "_comment": "Source #1 — container dicts at arbitrary paths. NOT keyed by a uniform 'case' name; each test scenario lives under its own ad-hoc path.",
 
-  "err":  { "a": { "v": 220.0, "t": 25.0 } },
-  "warn": { "a": { "v":  50.0, "t": 85.0 } },
-  "info": { "a": { "v":  10.0, "t": 60.0 } }
+  "vars1": { "a": { "v": 220.0, "t": 25.0 } },
+  "vars3": { "a": { "v":  50.0, "t": 85.0 } },
+  "vars5": { "a": { "v":  10.0, "t": 60.0 } }
 }

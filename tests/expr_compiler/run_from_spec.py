@@ -303,40 +303,55 @@ def _build_test_cases(spec, namespace, funcs):
                 f"got {type(entry).__name__}")
 
         case_key = entry.get("case")
+        # Per-case override: when the data is shaped such that paths
+        # can't be expressed as a global `{case}` template (each case
+        # has its own unique path components), the test_case entry
+        # writes the container paths directly.  Takes precedence over
+        # the global `binding`.
+        per_case_vars_from     = entry.get("vars_from")
+        per_case_expected_from = entry.get("expected_from")
         explicit_vars     = entry.get("vars", {})
         explicit_expected = entry.get("expected", {})
 
-        if case_key is not None:
-            if vars_from is None and expected_from is None:
-                raise ValueError(
-                    f"test_cases[{i}] references case={case_key!r} but "
-                    f"spec has no `binding.vars_from` / "
-                    f"`binding.expected_from` template defined")
-
-            auto_vars = (_build_auto_vars(vars_from, union_args,
-                                          case_key, namespace)
-                         if vars_from is not None else {})
-            auto_expected = (_build_auto_expected(expected_from, formula_names,
-                                                  case_key, namespace)
-                             if expected_from is not None else {})
-
-            # Explicit entries override auto-bound paths for the same key.
-            merged_vars     = {**auto_vars,     **explicit_vars}
-            merged_expected = {**auto_expected, **explicit_expected}
-
-            label = entry.get("label") or case_key
-            out.append({
-                "label":    label,
-                "vars":     merged_vars,
-                "expected": merged_expected,
-            })
+        # Resolve which binding to use for this entry:
+        # per-case override > global binding (only if case_key set) > none
+        if per_case_vars_from is not None:
+            active_vars_from = per_case_vars_from
+        elif case_key is not None:
+            active_vars_from = vars_from   # may be None
         else:
-            label = entry.get("label", "<unlabeled>")
-            out.append({
-                "label":    label,
-                "vars":     explicit_vars,
-                "expected": explicit_expected,
-            })
+            active_vars_from = None
+
+        if per_case_expected_from is not None:
+            active_expected_from = per_case_expected_from
+        elif case_key is not None:
+            active_expected_from = expected_from   # may be None
+        else:
+            active_expected_from = None
+
+        # {case} substitution in templates uses case_key, or empty
+        # string if the user wrote fully literal paths.
+        subst_key = case_key if case_key is not None else ""
+
+        auto_vars = (_build_auto_vars(active_vars_from, union_args,
+                                       subst_key, namespace)
+                     if active_vars_from is not None else {})
+        auto_expected = (_build_auto_expected(active_expected_from,
+                                               formula_names, subst_key,
+                                               namespace)
+                          if active_expected_from is not None else {})
+
+        # Explicit hard-coded entries (literal values or path strings
+        # in `vars` / `expected`) override the auto-bound ones.
+        merged_vars     = {**auto_vars,     **explicit_vars}
+        merged_expected = {**auto_expected, **explicit_expected}
+
+        label = entry.get("label") or case_key or "<unlabeled>"
+        out.append({
+            "label":    label,
+            "vars":     merged_vars,
+            "expected": merged_expected,
+        })
     return out
 
 

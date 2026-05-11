@@ -1,7 +1,7 @@
 {
-  "_comment": "Source #2 — for each case, `.b` is a dict with another group of variables. Combined with file1.<case>.a via the list-of-containers vars_from.",
+  "_comment": "Source #2 — its containers are at different path names than file1 (vars2 / vars4 / vars6 instead of vars1 / vars3 / vars5). There's no global pattern that names both containers for a given case, so each test_case entry has to spell out which two containers belong together.",
 
-  "err":  { "b": { "i": 1.5, "p": 0.1 } },
-  "warn": { "b": { "i": 0.5, "p": 0.05 } },
-  "info": { "b": { "i": 0.1, "p": 0.02 } }
+  "vars2": { "b": { "i": 1.5, "p": 0.1 } },
+  "vars4": { "b": { "i": 0.5, "p": 0.05 } },
+  "vars6": { "b": { "i": 0.1, "p": 0.02 } }
 }

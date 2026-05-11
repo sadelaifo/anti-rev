@@ -1,7 +1,7 @@
 {
-  "_comment": "Expected outputs per case for formula 0 (0.5*v*i) and formula 1 (v+i+t+p).",
+  "_comment": "Expected outputs — each test scenario keyed under its own name (heavy/medium/light), independent of file1 / file2 path names.",
 
-  "err":  { "0": 165.0,  "1": 246.6 },
-  "warn": { "0":  12.5,  "1": 135.55 },
-  "info": { "0":   0.5,  "1":  70.12 }
+  "heavy":  { "0": 165.0,  "1": 246.6 },
+  "medium": { "0":  12.5,  "1": 135.55 },
+  "light":  { "0":   0.5,  "1":  70.12 }
 }

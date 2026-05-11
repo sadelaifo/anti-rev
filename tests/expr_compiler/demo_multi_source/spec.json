@@ -1,5 +1,5 @@
 {
-  "_comment": "Demo: vars_from is a LIST of container paths. For each case, the runner resolves every entry — each one must point to a dict — and merges all those dicts together. Net effect: case 'err' gets vars {v, t} from file1.err.a AND {i, p} from file2.err.b in a single combined vars dict.",
+  "_comment": "Per-case binding: each test_case spells out exactly which container paths to load. Useful when the data files don't share a uniform {case} naming convention — here file1 uses vars1/vars3/vars5 while file2 uses vars2/vars4/vars6 and the expected file uses heavy/medium/light. No single {case} substitution can name all three for one scenario, so each test_case entry writes the paths directly.",
 
   "formula_config": {
     "path":         "formulas.json",
@@ -17,17 +17,21 @@
   "compile_options": { "jit": false },
   "tolerance": 1e-9,
 
-  "binding": {
-    "vars_from": [
-      "file1.{case}.a",
-      "file2.{case}.b"
-    ],
-    "expected_from": "ref.{case}"
-  },
-
   "test_cases": [
-    "err",
-    "warn",
-    "info"
+    {
+      "label":         "heavy load",
+      "vars_from":     ["file1.vars1.a", "file2.vars2.b"],
+      "expected_from": "ref.heavy"
+    },
+    {
+      "label":         "medium load",
+      "vars_from":     ["file1.vars3.a", "file2.vars4.b"],
+      "expected_from": "ref.medium"
+    },
+    {
+      "label":         "light load",
+      "vars_from":     ["file1.vars5.a", "file2.vars6.b"],
+      "expected_from": "ref.light"
+    }
   ]
 }
