@@ -1,7 +1,7 @@
 {
-  "_comment": "Source #1 — provides the `a` field per case. Maps to function variable `v` via the binding template.",
+  "_comment": "Source #1 — for each case, `.a` is a dict containing several variables grouped together. The spec's vars_from list mode pulls all of them at once.",
 
-  "err":  { "a": 220.0 },
-  "warn": { "a":  50.0 },
-  "info": { "a":  10.0 }
+  "err":  { "a": { "v": 220.0, "t": 25.0 } },
+  "warn": { "a": { "v":  50.0, "t": 85.0 } },
+  "info": { "a": { "v":  10.0, "t": 60.0 } }
 }

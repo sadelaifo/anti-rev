@@ -1,5 +1,5 @@
 {
-  "_comment": "Two simple formulas to test. Variables are `v` and `i`. Stored as a list — the runner keys functions by stringified index '0' and '1'.",
+  "_comment": "Two formulas. The function variables (v, i, t, p) come from merging two sub-dicts at runtime: file1.<case>.a gives {v, t}, file2.<case>.b gives {i, p}.",
 
   "constants": {
     "scale": 0.5
@@ -7,6 +7,6 @@
   "subexprs": {},
   "expr": [
     "scale * v * i",
-    "v + i"
+    "v + i + t + p"
   ]
 }

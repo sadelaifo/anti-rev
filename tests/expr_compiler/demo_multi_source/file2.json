@@ -1,7 +1,7 @@
 {
-  "_comment": "Source #2 — provides the `b` field per case. Maps to function variable `i` via the binding template.",
+  "_comment": "Source #2 — for each case, `.b` is a dict with another group of variables. Combined with file1.<case>.a via the list-of-containers vars_from.",
 
-  "err":  { "b": 1.5 },
-  "warn": { "b": 0.5 },
-  "info": { "b": 0.1 }
+  "err":  { "b": { "i": 1.5, "p": 0.1 } },
+  "warn": { "b": { "i": 0.5, "p": 0.05 } },
+  "info": { "b": { "i": 0.1, "p": 0.02 } }
 }

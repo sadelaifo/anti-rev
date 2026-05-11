@@ -119,33 +119,88 @@ def _path_exists(path_expr, namespace) -> bool:
         return False
 
 
+def _expand_container_paths(template_list, case_key, namespace, label):
+    """For ``vars_from`` / ``expected_from`` given as a list of
+    container paths: resolve each template, fetch the container
+    (must be a dict), and return ``{field_name: full_field_path}``
+    for every top-level key.  Several containers can be merged —
+    later entries override earlier ones on key collision.
+
+    Used when the user's data is shaped::
+
+        file1.<case>.a = {var1: ..., var2: ...}    # group dict #1
+        file2.<case>.b = {var3: ..., var4: ...}    # group dict #2
+
+    and the spec lists::
+
+        "vars_from": [
+          "file1.{case}.a",
+          "file2.{case}.b"
+        ]
+
+    so the runner pulls every key from every container and exposes
+    them all as vars (or expected, depending on `label`).
+    """
+    out: dict = {}
+    for tmpl in template_list:
+        if not isinstance(tmpl, str):
+            raise TypeError(
+                f"binding.{label}[*] in list-of-containers form must be a "
+                f"template string, got {type(tmpl).__name__}")
+        container_path = tmpl.format(case=case_key)
+        try:
+            container = eval(container_path, _SPEC_EVAL_GLOBALS, namespace)
+        except Exception:
+            # Path missing for this case — skip the container.
+            continue
+        if isinstance(container, _JsonAccessor):
+            raw = container._data
+        else:
+            raw = container
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"binding.{label} container {container_path!r} must "
+                f"point to a dict, got {type(raw).__name__}")
+        for field_name in raw:
+            if field_name.startswith("_"):
+                continue   # skip _comment-style metadata
+            out[field_name] = f"{container_path}.{field_name}"
+    return out
+
+
 def _build_auto_vars(vars_from, union_args, case_key, namespace):
     """Resolve the per-variable auto-binding for one case.
 
-    ``vars_from`` is either:
+    ``vars_from`` accepts three forms — pick whichever matches how
+    your data is organised:
 
-      * a single template string ``"inputs.{case}"`` — runner builds
-        a path per parameter as ``<template>.<argname>``, replacing
-        ``{case}`` with the case key.  Use when all variables share
-        one source file and the field names match parameter names.
+      * **String** ``"inputs.{case}"`` — runner builds a path per
+        parameter as ``<template>.<argname>``, replacing ``{case}``.
+        Use when all variables share one source and field names
+        match parameter names::
 
-      * a dict ``{argname: template_string}`` — each parameter has
-        its own template, free to reference different data sources
-        and different sub-paths.  Use when variables are scattered
-        across multiple files or when field names disagree with
-        parameter names.
+            vars_from = "inputs.{case}"
+            # v ← inputs.<case>.v,  i ← inputs.<case>.i, ...
 
-    Examples:
+      * **Dict** ``{argname: template}`` — each parameter has its
+        own template, free to reference different sources and
+        different sub-paths.  Use when variables are scattered or
+        field names disagree with parameter names::
 
-        # Single source, varnames == fieldnames
-        "vars_from": "inputs.{case}"
-        # → v ← inputs.<case>.v,  i ← inputs.<case>.i,  ...
+            vars_from = {
+              "v": "file1.{case}.a",       # v ← field a in file1
+              "i": "file2.{case}.x"        # i ← field x in file2
+            }
 
-        # Per-variable, mixed sources, name mapping
-        "vars_from": {
-          "v": "file1.{case}.a",        # var v ← field a in file1
-          "i": "file2.{case}.x"         # var i ← field x in file2
-        }
+      * **List of container paths** — each entry resolves to a dict;
+        the runner enumerates its keys and exposes each one as a
+        var.  Use when the data is grouped into sub-dicts that bundle
+        several variables::
+
+            # file1.err.a = {var1: ..., var2: ...}
+            # file2.err.b = {var3: ..., var4: ...}
+            vars_from = ["file1.{case}.a", "file2.{case}.b"]
+            # vars = {var1, var2, var3, var4}
     """
     auto: dict = {}
     if isinstance(vars_from, str):
@@ -153,6 +208,9 @@ def _build_auto_vars(vars_from, union_args, case_key, namespace):
             path = f"{vars_from}.{arg}".format(case=case_key)
             if _path_exists(path, namespace):
                 auto[arg] = path
+    elif isinstance(vars_from, list):
+        auto = _expand_container_paths(vars_from, case_key, namespace,
+                                       label="vars_from")
     elif isinstance(vars_from, dict):
         for arg_name, template in vars_from.items():
             if not isinstance(template, str):
@@ -164,21 +222,24 @@ def _build_auto_vars(vars_from, union_args, case_key, namespace):
                 auto[arg_name] = path
     else:
         raise TypeError(
-            f"binding.vars_from must be a string or "
-            f"{{argname: template}} dict, got {type(vars_from).__name__}")
+            f"binding.vars_from must be string / list / dict, "
+            f"got {type(vars_from).__name__}")
     return auto
 
 
 def _build_auto_expected(expected_from, formula_names, case_key, namespace):
-    """Same shape as :func:`_build_auto_vars` but for expected
-    outputs — string template appended with ``.<formula_name>``, or
-    per-formula template dict."""
+    """Same three forms as :func:`_build_auto_vars` but for
+    expected outputs.  String / list-of-containers / dict — see
+    that docstring for the shapes."""
     auto: dict = {}
     if isinstance(expected_from, str):
         for name in formula_names:
             path = f"{expected_from}.{name}".format(case=case_key)
             if _path_exists(path, namespace):
                 auto[name] = path
+    elif isinstance(expected_from, list):
+        auto = _expand_container_paths(expected_from, case_key, namespace,
+                                       label="expected_from")
     elif isinstance(expected_from, dict):
         for name, template in expected_from.items():
             if not isinstance(template, str):
@@ -190,8 +251,8 @@ def _build_auto_expected(expected_from, formula_names, case_key, namespace):
                 auto[name] = path
     else:
         raise TypeError(
-            f"binding.expected_from must be a string or "
-            f"{{name: template}} dict, got {type(expected_from).__name__}")
+            f"binding.expected_from must be string / list / dict, "
+            f"got {type(expected_from).__name__}")
     return auto
 
 

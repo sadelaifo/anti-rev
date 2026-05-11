@@ -1,5 +1,5 @@
 {
-  "_comment": "Demo: variable `v` is pulled from file1.<case>.a, variable `i` from file2.<case>.b — two separate data sources, field names different from parameter names. test_cases lists the case keys to run; runner substitutes {case} into each binding template.",
+  "_comment": "Demo: vars_from is a LIST of container paths. For each case, the runner resolves every entry — each one must point to a dict — and merges all those dicts together. Net effect: case 'err' gets vars {v, t} from file1.err.a AND {i, p} from file2.err.b in a single combined vars dict.",
 
   "formula_config": {
     "path":         "formulas.json",
@@ -18,10 +18,10 @@
   "tolerance": 1e-9,
 
   "binding": {
-    "vars_from": {
-      "v": "file1.{case}.a",
-      "i": "file2.{case}.b"
-    },
+    "vars_from": [
+      "file1.{case}.a",
+      "file2.{case}.b"
+    ],
     "expected_from": "ref.{case}"
   },
 
