@@ -3,7 +3,17 @@
 # the stub's symlink dir at runtime.
 #
 # Usage:
-#   tools/check_runtime_lib.sh <protected_bin> [libname]
+#   tools/check_runtime_lib.sh <protected_bin> [libname] [-- <bin_args>...]
+#
+# Examples:
+#   tools/check_runtime_lib.sh ./protected_bin
+#   tools/check_runtime_lib.sh ./protected_bin libA.so
+#   tools/check_runtime_lib.sh ./protected_bin -- --config /etc/foo
+#   tools/check_runtime_lib.sh ./protected_bin libA.so -- --config foo --verbose
+#
+# Everything after `--` is forwarded to the protected bin verbatim,
+# so binaries that require command-line arguments to start (config
+# files, mode flags, etc.) still get them.
 #
 # Pass the STUB-wrapped (encrypted) binary you normally run, NOT the
 # original unencrypted one — the script needs stub to actually run
@@ -29,22 +39,38 @@
 
 set -u
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-    echo "usage: $0 <protected_bin> [libname]" >&2
+if [ "$#" -lt 1 ]; then
+    echo "usage: $0 <protected_bin> [libname] [-- <bin_args>...]" >&2
     echo "  no libname -> inspect every lib in the symlink dir" >&2
+    echo "  args after -- are passed to the protected bin" >&2
     exit 2
 fi
 
 BIN=$1
-LIBNAME=${2:-}
+shift
+
+# Optional libname: present if next arg isn't the `--` separator.
+LIBNAME=""
+if [ "$#" -gt 0 ] && [ "$1" != "--" ]; then
+    LIBNAME=$1
+    shift
+fi
+
+# Strip optional `--` so the remaining $@ is just the bin's own args.
+if [ "$#" -gt 0 ] && [ "$1" = "--" ]; then
+    shift
+fi
 
 if [ ! -x "$BIN" ]; then
     echo "not executable: $BIN" >&2
     exit 2
 fi
 
-# Run protected bin briefly to materialise the symlink dir.
-ANTIREV_LOG=1 "$BIN" >/tmp/run.log 2>&1 &
+# Run protected bin briefly to materialise the symlink dir.  Any
+# args remaining after the libname / -- separator are forwarded to
+# the bin so binaries that need a config flag / mode arg to even
+# start can be inspected.
+ANTIREV_LOG=1 "$BIN" "$@" >/tmp/run.log 2>&1 &
 PID=$!
 # 300 ms is enough on most machines for stub to set up symlinks before
 # fexecve transfers control to the (failing) business code.
