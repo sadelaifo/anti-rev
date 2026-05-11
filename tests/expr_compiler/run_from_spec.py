@@ -119,6 +119,82 @@ def _path_exists(path_expr, namespace) -> bool:
         return False
 
 
+def _build_auto_vars(vars_from, union_args, case_key, namespace):
+    """Resolve the per-variable auto-binding for one case.
+
+    ``vars_from`` is either:
+
+      * a single template string ``"inputs.{case}"`` — runner builds
+        a path per parameter as ``<template>.<argname>``, replacing
+        ``{case}`` with the case key.  Use when all variables share
+        one source file and the field names match parameter names.
+
+      * a dict ``{argname: template_string}`` — each parameter has
+        its own template, free to reference different data sources
+        and different sub-paths.  Use when variables are scattered
+        across multiple files or when field names disagree with
+        parameter names.
+
+    Examples:
+
+        # Single source, varnames == fieldnames
+        "vars_from": "inputs.{case}"
+        # → v ← inputs.<case>.v,  i ← inputs.<case>.i,  ...
+
+        # Per-variable, mixed sources, name mapping
+        "vars_from": {
+          "v": "file1.{case}.a",        # var v ← field a in file1
+          "i": "file2.{case}.x"         # var i ← field x in file2
+        }
+    """
+    auto: dict = {}
+    if isinstance(vars_from, str):
+        for arg in union_args:
+            path = f"{vars_from}.{arg}".format(case=case_key)
+            if _path_exists(path, namespace):
+                auto[arg] = path
+    elif isinstance(vars_from, dict):
+        for arg_name, template in vars_from.items():
+            if not isinstance(template, str):
+                raise TypeError(
+                    f"binding.vars_from[{arg_name!r}] must be a "
+                    f"template string, got {type(template).__name__}")
+            path = template.format(case=case_key)
+            if _path_exists(path, namespace):
+                auto[arg_name] = path
+    else:
+        raise TypeError(
+            f"binding.vars_from must be a string or "
+            f"{{argname: template}} dict, got {type(vars_from).__name__}")
+    return auto
+
+
+def _build_auto_expected(expected_from, formula_names, case_key, namespace):
+    """Same shape as :func:`_build_auto_vars` but for expected
+    outputs — string template appended with ``.<formula_name>``, or
+    per-formula template dict."""
+    auto: dict = {}
+    if isinstance(expected_from, str):
+        for name in formula_names:
+            path = f"{expected_from}.{name}".format(case=case_key)
+            if _path_exists(path, namespace):
+                auto[name] = path
+    elif isinstance(expected_from, dict):
+        for name, template in expected_from.items():
+            if not isinstance(template, str):
+                raise TypeError(
+                    f"binding.expected_from[{name!r}] must be a "
+                    f"template string, got {type(template).__name__}")
+            path = template.format(case=case_key)
+            if _path_exists(path, namespace):
+                auto[name] = path
+    else:
+        raise TypeError(
+            f"binding.expected_from must be a string or "
+            f"{{name: template}} dict, got {type(expected_from).__name__}")
+    return auto
+
+
 def _build_test_cases(spec, namespace, funcs):
     """Expand the user's ``test_cases`` list, auto-binding vars and
     expected against the per-case ``binding`` template when the
@@ -137,23 +213,14 @@ def _build_test_cases(spec, namespace, funcs):
       * **Dict without ``case`` field** — purely manual, exactly
         like before: ``vars`` and ``expected`` must be written out.
 
-    The ``binding`` block defines the templates::
-
-        "binding": {
-          "vars_from":     "inputs.{case}",
-          "expected_from": "expected.{case}"
-        }
-
-    For a case named ``"case_hot"``, the runner looks up
-    ``inputs.case_hot.<arg>`` for every parameter of every function
-    and ``expected.case_hot.<formula_name>`` for every compiled
-    function.  Missing fields are silently dropped — that function /
-    expected entry just doesn't appear (so partial coverage in the
-    data files doesn't produce noisy errors).
+    The ``binding`` block defines the templates — either single-
+    string form (all vars share a path prefix) or per-key dict form
+    (each var / formula has its own template).  See
+    :func:`_build_auto_vars` for the per-variable form.
     """
     binding = spec.get("binding", {})
-    vars_template     = binding.get("vars_from")
-    expected_template = binding.get("expected_from")
+    vars_from     = binding.get("vars_from")
+    expected_from = binding.get("expected_from")
 
     # Pre-compute argument-name union and formula-name list once.
     union_args = set()
@@ -179,25 +246,18 @@ def _build_test_cases(spec, namespace, funcs):
         explicit_expected = entry.get("expected", {})
 
         if case_key is not None:
-            if not vars_template and not expected_template:
+            if vars_from is None and expected_from is None:
                 raise ValueError(
                     f"test_cases[{i}] references case={case_key!r} but "
                     f"spec has no `binding.vars_from` / "
                     f"`binding.expected_from` template defined")
 
-            auto_vars: dict = {}
-            if vars_template:
-                for arg in union_args:
-                    path = f"{vars_template}.{arg}".format(case=case_key)
-                    if _path_exists(path, namespace):
-                        auto_vars[arg] = path
-
-            auto_expected: dict = {}
-            if expected_template:
-                for name in formula_names:
-                    path = f"{expected_template}.{name}".format(case=case_key)
-                    if _path_exists(path, namespace):
-                        auto_expected[name] = path
+            auto_vars = (_build_auto_vars(vars_from, union_args,
+                                          case_key, namespace)
+                         if vars_from is not None else {})
+            auto_expected = (_build_auto_expected(expected_from, formula_names,
+                                                  case_key, namespace)
+                             if expected_from is not None else {})
 
             # Explicit entries override auto-bound paths for the same key.
             merged_vars     = {**auto_vars,     **explicit_vars}
