@@ -1,0 +1,50 @@
+{
+  "_comment": "Example test specification consumed by run_from_spec.py. Points at the existing config.json fixture and runs a small battery of sample points, with optional business-known expected values on a couple of them. Copy this file, point formula_config.path at your own JSON, and add / edit samples to match your business cases.",
+
+  "formula_config": {
+    "path":         "example_config.json",
+    "exprs_at":     "expr",
+    "constants_at": ["physics_consts", "calibration_consts"],
+    "subexprs_at":  "subexprs"
+  },
+
+  "compile_options": {
+    "jit": false
+  },
+
+  "tolerance": 1e-9,
+
+  "samples": [
+    {
+      "label": "nominal operating point",
+      "vars":  {"v": 220.0, "i": 1.5, "t": 25.0},
+      "expected": {
+        "f_power":            165.0,
+        "f_t_corr":           1.0
+      }
+    },
+    {
+      "label": "zero current — power and copper loss vanish",
+      "vars":  {"v": 220.0, "i": 0.0, "t": 25.0},
+      "expected": {
+        "f_power":  0.0
+      }
+    },
+    {
+      "label": "zero voltage — everything proportional to v drops",
+      "vars":  {"v": 0.0, "i": 1.5, "t": 25.0}
+    },
+    {
+      "label": "very small magnitudes",
+      "vars":  {"v": 1e-9, "i": 1e-9, "t": 25.0}
+    },
+    {
+      "label": "negative voltage (AC reverse polarity)",
+      "vars":  {"v": -220.0, "i": 1.5, "t": 25.0}
+    },
+    {
+      "label": "hot temperature — t_corr should rise above 1",
+      "vars":  {"v": 220.0, "i": 1.5, "t": 85.0}
+    }
+  ]
+}
