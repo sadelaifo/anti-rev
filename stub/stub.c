@@ -1278,6 +1278,9 @@ typedef struct {
     char     name[MAX_NAME + 1];
     const uint8_t *key;
     int      fd;      /* result memfd, -1 on failure */
+    dev_t    dev;     /* for inode-based dedup (handles hardlinks; */
+    ino_t    ino;     /*   different files at same basename are kept */
+                      /*   so the arch filter in phase 3 can pick) */
 } dec_job_t;
 
 /* Work-stealing pool: each thread grabs next available job */
@@ -1305,13 +1308,45 @@ static void *pool_worker(void *arg)
     return NULL;
 }
 
+/* Read the e_machine field (ELF header offset 0x12, 2 bytes LE) from
+ * an open ELF fd.  Returns 0 on read failure.  Used by the arch
+ * filter to drop libs that don't match the current daemon / stub
+ * process (e.g. an aarch64 libfoo.so co-located with the x86_64 one
+ * in a multi-arch deployment). */
+static uint16_t read_e_machine(int fd) {
+    uint8_t buf[2];
+    if (pread(fd, buf, 2, 0x12) != 2) return 0;
+    return (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+}
+
+/* Cached e_machine of this process, read once from /proc/self/exe.
+ * 0 means "not yet detected" or "read failed" — in either case the
+ * arch filter falls through without dropping any lib (safe default). */
+static uint16_t g_my_machine = 0;
+
+static void detect_my_machine(void) {
+    if (g_my_machine != 0) return;
+    int fd = open("/proc/self/exe", O_RDONLY);
+    if (fd < 0) return;
+    g_my_machine = read_e_machine(fd);
+    close(fd);
+}
+
 /* Recursively collect paths of encrypted .so / .elf files (ANTREV01 magic).
  *
  * The extension check is a fast-path filter so we do not open every
  * regular file in the tree to test for our magic — the real
  * authoritative filter is the magic-byte check below.  .elf files
  * are program binaries consumed by ANTI_LoadProcess (served to aarch64_extend_shim
- * via OP_GET_LIB) and coexist with .so libs in the same asset pool. */
+ * via OP_GET_LIB) and coexist with .so libs in the same asset pool.
+ *
+ * Dedup strategy: inode-based.  Two paths pointing at the same
+ * physical file (hardlinks; symlinks are already skipped via
+ * S_ISLNK) collapse into one job.  Two different files with the
+ * same basename (a common multi-arch layout: lib/link/libfoo.so
+ * x86_64 alongside L3/lib/link/libfoo.so aarch64) are kept as
+ * separate jobs so the arch filter in scan_encrypted_libs phase 3
+ * can pick the one matching this process. */
 static void collect_enc_paths(const char *dir, dec_job_t *jobs, int *njobs,
                               int max)
 {
@@ -1336,10 +1371,15 @@ static void collect_enc_paths(const char *dir, dec_job_t *jobs, int *njobs,
         if (!S_ISREG(st.st_mode)) continue;
         if (!strstr(de->d_name, ".so") && !strstr(de->d_name, ".elf")) continue;
 
-        /* Skip duplicate filenames (same lib in different subdirs) */
+        /* Dedup by (st_dev, st_ino) instead of basename so two
+         * files with the same basename but different inodes
+         * (e.g. multi-arch builds sharing a tree) are BOTH
+         * collected and the arch filter in phase 3 decides. */
         int dup = 0;
         for (int i = 0; i < *njobs; i++) {
-            if (strcmp(jobs[i].name, de->d_name) == 0) { dup = 1; break; }
+            if (jobs[i].dev == st.st_dev && jobs[i].ino == st.st_ino) {
+                dup = 1; break;
+            }
         }
         if (dup) continue;
 
@@ -1354,7 +1394,9 @@ static void collect_enc_paths(const char *dir, dec_job_t *jobs, int *njobs,
 
         snprintf(jobs[*njobs].path, sizeof(jobs[0].path), "%s", path);
         snprintf(jobs[*njobs].name, sizeof(jobs[0].name), "%s", de->d_name);
-        jobs[*njobs].fd = -1;
+        jobs[*njobs].fd  = -1;
+        jobs[*njobs].dev = st.st_dev;
+        jobs[*njobs].ino = st.st_ino;
         (*njobs)++;
     }
     closedir(dp);
@@ -1401,14 +1443,57 @@ static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
     for (int t = 0; t < nthreads; t++)
         pthread_join(tids[t], NULL);
 
-    /* Phase 3: collect results */
+    /* Phase 3: collect results, filter by architecture, then dedup
+     * by basename.
+     *
+     * Multi-arch deployments often co-locate x86_64 and aarch64
+     * builds in one tree (e.g. lib/link/libfoo.so vs L3/lib/link/
+     * libfoo.so).  collect_enc_paths now keeps both via inode-based
+     * dedup; here we:
+     *   (a) read each decrypted lib's e_machine and drop the ones
+     *       that don't match this process's architecture, and
+     *   (b) dedup by basename among the survivors so the linker
+     *       gets exactly one lib per name (taking the first; warn
+     *       if any other arch-matching duplicate appears).
+     *
+     * Without this filter, a daemon serving the wrong-arch lib
+     * caused silent linker rejection at the client (lib opens fine,
+     * ELF header valid, but e_machine mismatches the process arch),
+     * which presented as a misleading "invalid ELF header" error
+     * from the on-disk fallback path. */
+    detect_my_machine();
     for (int i = 0; i < njobs && *nlibs < MAX_FILES; i++) {
-        if (jobs[i].fd >= 0) {
-            lib_fds[*nlibs] = jobs[i].fd;
-            memcpy(lib_names[*nlibs], jobs[i].name, MAX_NAME + 1);
-            (*nlibs)++;
-            LOG_INFO("[antirev] decrypted: %s\n", jobs[i].name);
+        if (jobs[i].fd < 0) continue;
+
+        if (g_my_machine != 0) {
+            uint16_t lib_mach = read_e_machine(jobs[i].fd);
+            if (lib_mach != 0 && lib_mach != g_my_machine) {
+                LOG_INFO("[antirev] skipping %s: wrong arch "
+                         "(lib e_machine=0x%x, ours=0x%x)\n",
+                         jobs[i].name, lib_mach, g_my_machine);
+                close(jobs[i].fd);
+                jobs[i].fd = -1;
+                continue;
+            }
         }
+
+        int dup = 0;
+        for (int k = 0; k < *nlibs; k++) {
+            if (strcmp(lib_names[k], jobs[i].name) == 0) { dup = 1; break; }
+        }
+        if (dup) {
+            LOG_INFO("[antirev] skipping duplicate basename: %s "
+                     "(already added from %s)\n",
+                     jobs[i].name, jobs[i].path);
+            close(jobs[i].fd);
+            jobs[i].fd = -1;
+            continue;
+        }
+
+        lib_fds[*nlibs] = jobs[i].fd;
+        memcpy(lib_names[*nlibs], jobs[i].name, MAX_NAME + 1);
+        (*nlibs)++;
+        LOG_INFO("[antirev] decrypted: %s\n", jobs[i].name);
     }
 
     free(tids);
