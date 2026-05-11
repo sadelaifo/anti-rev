@@ -1,16 +1,11 @@
 {
-  "_comment": "Business-known expected outputs for each test case. Pre-computed by hand / by a previous trusted implementation. Same field layout as inputs so spec can write `ref.case_1.f_loss_expected` symmetrically.",
+  "_comment": "Expected outputs per case. Formula keys match the (auto-generated) function names produced by make_expr_funcs_from_json — '0', '1', '2', '3' when the formulas in config are stored as a list. Partial coverage is fine: cases or formula keys absent from this file simply skip the second-layer expected check.",
 
-  "case_1": {
-    "f_power_expected":  165.0,
-    "f_loss_expected":    3.14825,
-    "f_balance_expected": 173.85175,
-    "f_t_corr_expected":  1.0
-  },
-  "case_2": {
-    "f_power_expected":   15.0,
-    "f_loss_expected":     0.23425,
-    "f_balance_expected": 26.76575,
-    "f_t_corr_expected":   1.24
-  }
+  "case_nominal":     { "0":  165.0,   "1":  3.14825,    "2":  173.85175,    "3":  1.0   },
+  "case_zero_i":      { "0":    0.0,   "1":  3.146,      "2":    8.854,      "3":  1.0   },
+  "case_zero_v":      { "0":    0.0,   "1":  0.00225,    "2":   11.99775,    "3":  1.0   },
+  "case_cold":        { "0":  165.0,   "1":  3.14825,    "2":  173.85175,    "3":  0.74  },
+  "case_hot":         { "0":  165.0,   "1":  3.14825,    "2":  173.85175,    "3":  1.24  },
+  "case_negative":    { "0": -165.0,   "1":  3.14825,    "2": -156.14825,    "3":  1.0   },
+  "case_light_load":  { "0":   15.0,   "1":  0.23425,    "2":   26.76575,    "3":  1.24  }
 }

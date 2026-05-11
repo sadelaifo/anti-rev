@@ -1,5 +1,5 @@
 {
-  "_comment": "Example test spec: formulas in example_config.json are a LIST (keyed by '0'..'3'); inputs and expected outputs are pulled from two separate JSON files via Python-expression syntax (inputs.case_1.voltage_base + inputs.case_1.voltage_offset, etc.). Add new cases by appending to test_cases — no Python edits required.",
+  "_comment": "Auto-binding mode demo: spec lists no individual test cases. The runner iterates top-level keys of `data_sources.inputs` (the 7 case_* entries) and for each one auto-builds vars from `inputs.{case}.{varname}` and expected from `expected.{case}.{formula_name}`. Adding new cases is a JSON-file edit, never a spec edit.",
 
   "formula_config": {
     "path":         "example_config.json",
@@ -9,49 +9,16 @@
   },
 
   "data_sources": {
-    "inputs": "example_inputs.json",
-    "ref":    "example_expected.json"
+    "inputs":   "example_inputs.json",
+    "expected": "example_expected.json"
   },
 
   "compile_options": { "jit": false },
   "tolerance": 1e-9,
 
-  "test_cases": [
-    {
-      "label": "case 1 — nominal load",
-      "vars": {
-        "v": "inputs.case_1.voltage_base + inputs.case_1.voltage_offset",
-        "i": "inputs.case_1.current",
-        "t": "inputs.case_1.temperature"
-      },
-      "expected": {
-        "0": "ref.case_1.f_power_expected",
-        "1": "ref.case_1.f_loss_expected",
-        "2": "ref.case_1.f_balance_expected",
-        "3": "ref.case_1.f_t_corr_expected"
-      }
-    },
-    {
-      "label": "case 2 — light load, hot temp",
-      "vars": {
-        "v": "inputs.case_2.voltage_base + inputs.case_2.voltage_offset",
-        "i": "inputs.case_2.current",
-        "t": "inputs.case_2.temperature"
-      },
-      "expected": {
-        "0": "ref.case_2.f_power_expected",
-        "1": "ref.case_2.f_loss_expected",
-        "2": "ref.case_2.f_balance_expected",
-        "3": "ref.case_2.f_t_corr_expected"
-      }
-    },
-    {
-      "label": "literal-value case (no file lookup)",
-      "vars": {
-        "v": 100.0,
-        "i": 1.0,
-        "t": 50.0
-      }
-    }
-  ]
+  "auto_test_cases": {
+    "iterate":       "inputs",
+    "vars_from":     "inputs.{case}",
+    "expected_from": "expected.{case}"
+  }
 }

@@ -1,16 +1,11 @@
 {
-  "_comment": "Sample-point inputs. Real-world this file would come from your business / measurement pipeline. Two cases here demonstrate the field shape; run_from_spec.py pulls fields by writing expressions like `inputs.case_1.voltage` in the spec.",
+  "_comment": "Test inputs — one entry per case. run_from_spec.py's auto_test_cases mode iterates the top-level keys here (skipping underscored ones) to discover all case names automatically.",
 
-  "case_1": {
-    "voltage_base":   200.0,
-    "voltage_offset":  20.0,
-    "current":          1.5,
-    "temperature":     25.0
-  },
-  "case_2": {
-    "voltage_base":    50.0,
-    "voltage_offset":  10.0,
-    "current":          0.5,
-    "temperature":     85.0
-  }
+  "case_nominal":     { "v":  220.0, "i":  1.5,  "t":  25.0 },
+  "case_zero_i":      { "v":  220.0, "i":  0.0,  "t":  25.0 },
+  "case_zero_v":      { "v":    0.0, "i":  1.5,  "t":  25.0 },
+  "case_cold":        { "v":  220.0, "i":  1.5,  "t": -40.0 },
+  "case_hot":         { "v":  220.0, "i":  1.5,  "t":  85.0 },
+  "case_negative":    { "v": -220.0, "i":  1.5,  "t":  25.0 },
+  "case_light_load":  { "v":   60.0, "i":  0.5,  "t":  85.0 }
 }

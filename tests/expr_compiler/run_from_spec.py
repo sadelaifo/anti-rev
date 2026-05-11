@@ -108,6 +108,86 @@ def _resolve_value(v, namespace):
         f"got {type(v).__name__}: {v!r}")
 
 
+def _path_exists(path_expr, namespace) -> bool:
+    """Cheap try-resolve used by auto_test_cases to skip data fields
+    that aren't present in a given case (e.g. some cases only have
+    a subset of variables or expected values)."""
+    try:
+        eval(path_expr, _SPEC_EVAL_GLOBALS, namespace)
+        return True
+    except Exception:
+        return False
+
+
+def _build_auto_cases(auto_spec, namespace, funcs):
+    """Convention-driven case generator.  When the user's data
+    files are shaped::
+
+        in.json:  {case_1: {v: ..., i: ...}, case_2: {...}, ...}
+        ref.json: {case_1: {"0": ..., "1": ...}, case_2: {...}, ...}
+
+    they shouldn't have to write 100 case entries by hand.  This
+    builds them from the data shape using two templates::
+
+        "iterate":       "in"           - top-level keys of `in` are case names
+        "vars_from":     "in.{case}"    - vars look up `in.<case>.<varname>`
+        "expected_from": "ref.{case}"   - expected look up `ref.<case>.<formula>`
+
+    Missing fields in `in.<case>` cause the relevant function to
+    SKIP for that case (not an error).  Missing fields in
+    `ref.<case>` mean the expected entry just isn't added — the
+    sympy-reference layer still runs.
+    """
+    iterate = auto_spec.get("iterate")
+    if not iterate or iterate not in namespace:
+        raise ValueError(
+            f"auto_test_cases.iterate must name a loaded data source, "
+            f"got {iterate!r}; have {sorted(namespace)}")
+
+    vars_template     = auto_spec.get("vars_from")
+    expected_template = auto_spec.get("expected_from")
+
+    # Union of every function's parameter set — vars to look up per case.
+    union_args = set()
+    for fn in funcs.values():
+        py_fn = getattr(fn, "py_func", fn)
+        n = py_fn.__code__.co_argcount
+        union_args.update(py_fn.__code__.co_varnames[:n])
+    union_args = sorted(union_args)
+
+    iter_data = namespace[iterate]._data
+    if not isinstance(iter_data, dict):
+        raise ValueError(
+            f"data source {iterate!r} must be a top-level dict for "
+            f"iteration; got {type(iter_data).__name__}")
+
+    # Skip metadata-style keys (anything starting with `_`).
+    case_names = [k for k in iter_data.keys() if not k.startswith("_")]
+
+    auto_cases: list = []
+    for case in case_names:
+        vars_dict: dict = {}
+        if vars_template:
+            for arg in union_args:
+                path = f"{vars_template}.{arg}".format(case=case)
+                if _path_exists(path, namespace):
+                    vars_dict[arg] = path
+
+        expected_dict: dict = {}
+        if expected_template:
+            for fn_name in funcs:
+                path = f"{expected_template}.{fn_name}".format(case=case)
+                if _path_exists(path, namespace):
+                    expected_dict[fn_name] = path
+
+        auto_cases.append({
+            "label":    f"{iterate}.{case}",
+            "vars":     vars_dict,
+            "expected": expected_dict,
+        })
+    return auto_cases
+
+
 def _resolve_constants(cfg, path_spec):
     if path_spec is None:
         return None
@@ -150,7 +230,9 @@ def main() -> int:
 
     compile_opts = spec.get("compile_options", {})
     tolerance    = spec.get("tolerance", 1e-9)
-    cases        = spec.get("test_cases") or spec.get("samples", [])
+    # Manual cases (may be empty); auto cases get appended after we
+    # have `funcs` available since they need the argument signatures.
+    explicit_cases = list(spec.get("test_cases") or spec.get("samples", []))
 
     # ---- load external data sources --------------------------------
     namespace = {}
@@ -170,7 +252,6 @@ def main() -> int:
             print(f"data source:    {k} = "
                   f"{(spec_path.parent / spec['data_sources'][k]).resolve()}")
     print(f"tolerance:      {tolerance:.0e}")
-    print(f"test cases:     {len(cases)}")
     print()
 
     # ---- compile + build references --------------------------------
@@ -205,7 +286,16 @@ def main() -> int:
         )
     print(f"      {len(references)} reference(s) ready")
 
-    print(f"[3/3] running {len(cases)} test case(s) ...")
+    # Build auto-cases now that we have function signatures.
+    auto_spec = spec.get("auto_test_cases")
+    auto_cases = _build_auto_cases(auto_spec, namespace, funcs) if auto_spec else []
+    cases = explicit_cases + auto_cases
+    if auto_spec:
+        print(f"      auto-generated {len(auto_cases)} case(s) from "
+              f"data source {auto_spec['iterate']!r}")
+
+    print(f"[3/3] running {len(cases)} test case(s) "
+          f"({len(explicit_cases)} explicit + {len(auto_cases)} auto) ...")
     print()
 
     n_ok = n_fail = n_skip = 0
