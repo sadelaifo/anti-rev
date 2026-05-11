@@ -373,11 +373,19 @@ def _resolve_constants(cfg, path_spec):
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: run_from_spec.py <test_spec.json>", file=sys.stderr)
+    if len(sys.argv) == 1:
+        # No argument — look for `test_spec.json` in the current working
+        # directory.  Convenient default so `python3 run_from_spec.py`
+        # just works when run from a directory that contains its own
+        # spec file.
+        spec_path = Path("test_spec.json").resolve()
+    elif len(sys.argv) == 2:
+        spec_path = Path(sys.argv[1]).resolve()
+    else:
+        print("usage: run_from_spec.py [<test_spec.json>]", file=sys.stderr)
+        print("       (default spec path: ./test_spec.json)", file=sys.stderr)
         return 2
 
-    spec_path = Path(sys.argv[1]).resolve()
     if not spec_path.exists():
         print(f"test spec not found: {spec_path}", file=sys.stderr)
         return 2
