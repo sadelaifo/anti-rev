@@ -1,0 +1,16 @@
+{
+  "_comment": "Business-known expected outputs for each test case. Pre-computed by hand / by a previous trusted implementation. Same field layout as inputs so spec can write `ref.case_1.f_loss_expected` symmetrically.",
+
+  "case_1": {
+    "f_power_expected":  165.0,
+    "f_loss_expected":    3.14825,
+    "f_balance_expected": 173.85175,
+    "f_t_corr_expected":  1.0
+  },
+  "case_2": {
+    "f_power_expected":   15.0,
+    "f_loss_expected":     0.23425,
+    "f_balance_expected": 26.76575,
+    "f_t_corr_expected":   1.24
+  }
+}

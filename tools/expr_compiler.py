@@ -1594,8 +1594,17 @@ def make_expr_funcs_from_json(json_path, exprs_at, *,
         data = json.load(fh, parse_float=str)
 
     exprs = get_at_path(data, exprs_at)
-    if not isinstance(exprs, dict):
-        raise TypeError(f"exprs at {exprs_at!r} must be a dict, "
+    # Accept both shapes:
+    #   - dict  {name: formula_str}    — keyed by user-chosen names
+    #   - list  [formula_str, ...]     — common when JSON has an array
+    #                                     of unrelated formulas; we key
+    #                                     them by stringified index so
+    #                                     the returned ``{name: callable}``
+    #                                     has predictable lookup.
+    if isinstance(exprs, list):
+        exprs = {str(i): v for i, v in enumerate(exprs)}
+    elif not isinstance(exprs, dict):
+        raise TypeError(f"exprs at {exprs_at!r} must be a dict or list, "
                         f"got {type(exprs).__name__}")
     if not all(isinstance(k, str) and isinstance(v, str)
                for k, v in exprs.items()):

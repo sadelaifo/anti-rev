@@ -1,0 +1,16 @@
+{
+  "_comment": "Sample-point inputs. Real-world this file would come from your business / measurement pipeline. Two cases here demonstrate the field shape; run_from_spec.py pulls fields by writing expressions like `inputs.case_1.voltage` in the spec.",
+
+  "case_1": {
+    "voltage_base":   200.0,
+    "voltage_offset":  20.0,
+    "current":          1.5,
+    "temperature":     25.0
+  },
+  "case_2": {
+    "voltage_base":    50.0,
+    "voltage_offset":  10.0,
+    "current":          0.5,
+    "temperature":     85.0
+  }
+}

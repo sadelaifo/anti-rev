@@ -1,39 +1,26 @@
 #!/usr/bin/env python3
-"""Run sample-driven verification from a JSON test specification.
+"""Data-driven verification runner.
 
-The test spec lists where to find the formula config, which compile
-options to use, and a series of named sample points (each with the
-variable values and, optionally, business-known expected outputs).
-The script compiles all formulas, builds independent sympy
-references, and reports PASS/FAIL/SKIP per (sample, formula).
+The test spec lists where to find the formula config and a series of
+sample points.  Variable values and expected outputs may be:
+
+  - literal numbers (``"v": 220.0``)
+  - field references / small arithmetic over external JSON data
+    sources, evaluated as Python expressions in a sandboxed namespace
+    (``"v": "in.case_1.voltage + 0.5"``)
+
+Formulas in the config may be stored as either a ``{name: formula}``
+dict or as a list (keyed by stringified index — ``"0"``, ``"1"``, ...).
+This handles the common case where the formula JSON is shaped as an
+unnamed array of expressions.
 
 Usage::
 
     python3 tests/expr_compiler/run_from_spec.py path/to/test_spec.json
 
-A minimal test spec::
-
-    {
-      "formula_config": {
-        "path":         "config.json",
-        "exprs_at":     "expr",
-        "constants_at": "constants",
-        "subexprs_at":  "subexprs"
-      },
-      "compile_options": { "jit": false },
-      "tolerance": 1e-9,
-      "samples": [
-        { "label": "nominal",
-          "vars":  {"v": 220.0, "i": 1.5} },
-        { "label": "zero current",
-          "vars":     {"v": 220.0, "i": 0.0},
-          "expected": {"f_power": 0.0, "f_loss": 3.146} }
-      ]
-    }
-
-Exit code is 0 on full pass, 1 on any FAIL.  Paths inside
-``formula_config.path`` are resolved relative to the test spec's
-directory (so a relative spec can reference a sibling config).
+Exit code is 0 on full pass, 1 on any FAIL, 2 if spec or referenced
+files are missing.  Paths inside the spec are resolved relative to
+the spec's directory so a relative spec can reference sibling files.
 """
 from __future__ import annotations
 
@@ -51,21 +38,83 @@ from expr_compiler import (              # noqa: E402
 )
 
 
-def _resolve_path(d, path):
-    """Single-path lookup — same syntax as get_at_path."""
-    return get_at_path(d, path)
+class _JsonAccessor:
+    """Read-only wrapper around a dict/list so ``obj.key`` and
+    ``obj[k]`` both work in eval'd spec expressions.  Lets users
+    write ``inputs.case_1.voltage`` or ``inputs["case_1"]["voltage"]``
+    interchangeably.
+    """
+    __slots__ = ("_data",)
+
+    def __init__(self, data):
+        object.__setattr__(self, "_data", data)
+
+    def _wrap(self, v):
+        if isinstance(v, (dict, list)):
+            return _JsonAccessor(v)
+        return v
+
+    def __getattr__(self, key):
+        if key.startswith("_"):
+            raise AttributeError(key)
+        data = object.__getattribute__(self, "_data")
+        try:
+            return self._wrap(data[key])
+        except (KeyError, TypeError) as e:
+            raise AttributeError(
+                f"no field {key!r} in spec data source: {e}") from None
+
+    def __getitem__(self, key):
+        return self._wrap(self._data[key])
+
+    def __repr__(self):
+        return f"_JsonAccessor({self._data!r})"
+
+
+# Sandbox allowed inside eval()'d test-spec expressions.  Math
+# helpers users are likely to want — abs / min / max / pow — plus
+# the math module under a short name.  No __builtins__ access, no
+# imports, no file I/O.
+import math as _math
+_SPEC_EVAL_GLOBALS = {
+    "__builtins__": {"abs": abs, "min": min, "max": max,
+                     "pow": pow, "round": round},
+    "math": _math,
+}
+
+
+def _resolve_value(v, namespace):
+    """A spec value is a number (used as-is) or a string (evaluated
+    as a Python expression in ``namespace``).  Returns a float."""
+    if isinstance(v, bool):
+        raise TypeError(f"bool is not a numeric spec value: {v!r}")
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            result = eval(v, _SPEC_EVAL_GLOBALS, namespace)
+        except Exception as e:
+            raise ValueError(
+                f"failed to evaluate spec expression {v!r}: "
+                f"{type(e).__name__}: {e}") from None
+        try:
+            return float(result)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"spec expression {v!r} did not produce a number "
+                f"(got {type(result).__name__})") from None
+    raise TypeError(
+        f"spec value must be a number or expression string, "
+        f"got {type(v).__name__}: {v!r}")
 
 
 def _resolve_constants(cfg, path_spec):
-    """`path_spec` may be a single path or a list of paths; merge
-    all dicts at those paths into one.  Mirrors the multi-path
-    `constants_at` handling in make_expr_funcs_from_json."""
     if path_spec is None:
         return None
     if isinstance(path_spec, list):
         merged = {}
         for p in path_spec:
-            chunk = _resolve_path(cfg, p)
+            chunk = get_at_path(cfg, p)
             overlap = set(merged) & set(chunk)
             if overlap:
                 raise ValueError(
@@ -73,7 +122,7 @@ def _resolve_constants(cfg, path_spec):
                     f"multiple paths within constants_at")
             merged.update(chunk)
         return merged
-    return _resolve_path(cfg, path_spec)
+    return get_at_path(cfg, path_spec)
 
 
 def main() -> int:
@@ -101,14 +150,30 @@ def main() -> int:
 
     compile_opts = spec.get("compile_options", {})
     tolerance    = spec.get("tolerance", 1e-9)
-    samples      = spec.get("samples", [])
+    cases        = spec.get("test_cases") or spec.get("samples", [])
+
+    # ---- load external data sources --------------------------------
+    namespace = {}
+    for src_name, rel_path in spec.get("data_sources", {}).items():
+        src_path = (spec_path.parent / rel_path).resolve()
+        if not src_path.exists():
+            print(f"data source {src_name!r} not found: {src_path}",
+                  file=sys.stderr)
+            return 2
+        with src_path.open(encoding="utf-8") as fh:
+            namespace[src_name] = _JsonAccessor(json.load(fh))
 
     print(f"test spec:      {spec_path}")
     print(f"formula config: {config_path}")
+    if namespace:
+        for k, _ in namespace.items():
+            print(f"data source:    {k} = "
+                  f"{(spec_path.parent / spec['data_sources'][k]).resolve()}")
     print(f"tolerance:      {tolerance:.0e}")
-    print(f"samples:        {len(samples)}")
+    print(f"test cases:     {len(cases)}")
     print()
 
+    # ---- compile + build references --------------------------------
     print(f"[1/3] compiling formulas (jit={compile_opts.get('jit', True)}) ...")
     funcs = make_expr_funcs_from_json(
         str(config_path),
@@ -117,14 +182,19 @@ def main() -> int:
         subexprs_at  = subexprs_at,
         **compile_opts,
     )
-    print(f"      {len(funcs)} function(s) ready")
+    print(f"      {len(funcs)} function(s) ready: "
+          f"{sorted(funcs)}")
 
     print(f"[2/3] building sympy references ...")
     with config_path.open(encoding="utf-8") as fh:
         cfg = json.load(fh, parse_float=str)
-    exprs_dict = _resolve_path(cfg, exprs_at)
+    raw_exprs = get_at_path(cfg, exprs_at)
+    if isinstance(raw_exprs, list):
+        exprs_dict = {str(i): v for i, v in enumerate(raw_exprs)}
+    else:
+        exprs_dict = raw_exprs
     constants  = _resolve_constants(cfg, constants_at)
-    subexprs   = _resolve_path(cfg, subexprs_at) if subexprs_at else None
+    subexprs   = get_at_path(cfg, subexprs_at) if subexprs_at else None
 
     references = {}
     for name in funcs:
@@ -135,22 +205,35 @@ def main() -> int:
         )
     print(f"      {len(references)} reference(s) ready")
 
-    print(f"[3/3] running {len(samples)} sample(s) ...")
+    print(f"[3/3] running {len(cases)} test case(s) ...")
     print()
 
     n_ok = n_fail = n_skip = 0
 
-    for sample in samples:
-        label = sample.get("label", "<unlabeled>")
-        vars_dict = sample["vars"]
-        expected_dict = sample.get("expected", {})
+    for case in cases:
+        label = case.get("label", "<unlabeled>")
+        raw_vars = case["vars"]
+        raw_expected = case.get("expected", {})
 
+        # Resolve every var (literal or expression) into a float.
+        try:
+            vars_dict = {k: _resolve_value(v, namespace)
+                         for k, v in raw_vars.items()}
+        except (ValueError, TypeError) as e:
+            print(f"=== {label} ===")
+            print(f"  [ERR ] resolving vars: {e}")
+            n_fail += 1
+            print()
+            continue
+
+        # Same for expected — but resolve lazily, per-formula, so a
+        # bad reference doesn't sink the whole case.
         var_str = ", ".join(f"{k}={v}" for k, v in vars_dict.items())
         print(f"=== {label} ===")
         print(f"sample: {var_str}")
 
         for name, fn in funcs.items():
-            py_fn = getattr(fn, 'py_func', fn)
+            py_fn = getattr(fn, "py_func", fn)
             n_args = py_fn.__code__.co_argcount
             args = list(py_fn.__code__.co_varnames[:n_args])
 
@@ -183,13 +266,18 @@ def main() -> int:
 
             expected_str = ""
             expected_ok = True
-            if name in expected_dict:
-                expected = float(expected_dict[name])
-                exp_rel = abs(got - expected) / (abs(expected) + 1e-300)
-                expected_ok = exp_rel < tolerance
-                exp_mark = "OK" if expected_ok else "FAIL"
-                expected_str = (f"  expected={expected:.6g} "
-                                f"({exp_mark} rel={exp_rel:.1e})")
+            if name in raw_expected:
+                try:
+                    expected = _resolve_value(raw_expected[name], namespace)
+                except (ValueError, TypeError) as e:
+                    expected_str = f"  expected RESOLVE-ERR ({e})"
+                    expected_ok = False
+                else:
+                    exp_rel = abs(got - expected) / (abs(expected) + 1e-300)
+                    expected_ok = exp_rel < tolerance
+                    exp_mark = "OK" if expected_ok else "FAIL"
+                    expected_str = (f"  expected={expected:.6g} "
+                                    f"({exp_mark} rel={exp_rel:.1e})")
 
             ok = ref_ok and expected_ok
             status = "OK  " if ok else "FAIL"
@@ -204,7 +292,7 @@ def main() -> int:
 
     total = n_ok + n_fail + n_skip
     print(f"Summary: {n_ok} OK / {n_fail} FAIL / {n_skip} SKIP "
-          f"(of {total} checks across {len(samples)} sample(s))")
+          f"(of {total} checks across {len(cases)} test case(s))")
     return 0 if n_fail == 0 else 1
 
 

@@ -1,5 +1,5 @@
 {
-  "_comment": "Example multi-formula config consumed by run_from_spec.py via the make_expr_funcs_from_json path. Constants split across two keys; subexprs reference both constants and each other; the `expr` dict holds the formulas to be compiled (one entry per output function).",
+  "_comment": "Example multi-formula config — formulas stored as a LIST (a[0], a[1], ...) the way real-world configs often do, not as a named dict. run_from_spec.py auto-keys them by stringified index ('0', '1', ...).",
 
   "physics_consts": {
     "k1":    6.5e-5,
@@ -19,10 +19,10 @@
     "loss":   "iron + copper"
   },
 
-  "expr": {
-    "f_power":        "scale * power",
-    "f_loss":         "loss",
-    "f_power_minus_loss": "scale*power - loss + bias",
-    "f_t_corr":       "1 + alpha * (t - T_ref)"
-  }
+  "expr": [
+    "scale * power",
+    "loss",
+    "scale*power - loss + bias",
+    "1 + alpha * (t - T_ref)"
+  ]
 }

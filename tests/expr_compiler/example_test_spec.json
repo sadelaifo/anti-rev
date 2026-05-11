@@ -1,5 +1,5 @@
 {
-  "_comment": "Example test specification consumed by run_from_spec.py. Points at the existing config.json fixture and runs a small battery of sample points, with optional business-known expected values on a couple of them. Copy this file, point formula_config.path at your own JSON, and add / edit samples to match your business cases.",
+  "_comment": "Example test spec: formulas in example_config.json are a LIST (keyed by '0'..'3'); inputs and expected outputs are pulled from two separate JSON files via Python-expression syntax (inputs.case_1.voltage_base + inputs.case_1.voltage_offset, etc.). Add new cases by appending to test_cases — no Python edits required.",
 
   "formula_config": {
     "path":         "example_config.json",
@@ -8,43 +8,50 @@
     "subexprs_at":  "subexprs"
   },
 
-  "compile_options": {
-    "jit": false
+  "data_sources": {
+    "inputs": "example_inputs.json",
+    "ref":    "example_expected.json"
   },
 
+  "compile_options": { "jit": false },
   "tolerance": 1e-9,
 
-  "samples": [
+  "test_cases": [
     {
-      "label": "nominal operating point",
-      "vars":  {"v": 220.0, "i": 1.5, "t": 25.0},
+      "label": "case 1 — nominal load",
+      "vars": {
+        "v": "inputs.case_1.voltage_base + inputs.case_1.voltage_offset",
+        "i": "inputs.case_1.current",
+        "t": "inputs.case_1.temperature"
+      },
       "expected": {
-        "f_power":            165.0,
-        "f_t_corr":           1.0
+        "0": "ref.case_1.f_power_expected",
+        "1": "ref.case_1.f_loss_expected",
+        "2": "ref.case_1.f_balance_expected",
+        "3": "ref.case_1.f_t_corr_expected"
       }
     },
     {
-      "label": "zero current — power and copper loss vanish",
-      "vars":  {"v": 220.0, "i": 0.0, "t": 25.0},
+      "label": "case 2 — light load, hot temp",
+      "vars": {
+        "v": "inputs.case_2.voltage_base + inputs.case_2.voltage_offset",
+        "i": "inputs.case_2.current",
+        "t": "inputs.case_2.temperature"
+      },
       "expected": {
-        "f_power":  0.0
+        "0": "ref.case_2.f_power_expected",
+        "1": "ref.case_2.f_loss_expected",
+        "2": "ref.case_2.f_balance_expected",
+        "3": "ref.case_2.f_t_corr_expected"
       }
     },
     {
-      "label": "zero voltage — everything proportional to v drops",
-      "vars":  {"v": 0.0, "i": 1.5, "t": 25.0}
-    },
-    {
-      "label": "very small magnitudes",
-      "vars":  {"v": 1e-9, "i": 1e-9, "t": 25.0}
-    },
-    {
-      "label": "negative voltage (AC reverse polarity)",
-      "vars":  {"v": -220.0, "i": 1.5, "t": 25.0}
-    },
-    {
-      "label": "hot temperature — t_corr should rise above 1",
-      "vars":  {"v": 220.0, "i": 1.5, "t": 85.0}
+      "label": "literal-value case (no file lookup)",
+      "vars": {
+        "v": 100.0,
+        "i": 1.0,
+        "t": 50.0
+      }
     }
   ]
 }

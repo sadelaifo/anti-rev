@@ -245,7 +245,9 @@ print(f"signature: {py_fn.__name__}({', '.join(names)})")
 - `test_boundary.py` — 用 `verify` + 手写 Python 参考实现做**三层对账**的边界采样 demo（10 个采样点 × 4 公式：零值 / 极小 / 极大 / 负值 / 极端温度 / 业务点）；**手写参考是关键** —— 仅用 sympy `reference_value` 对账抓不到 JSON 公式本身的语义错误，手写 Python 实现可以
 - `verify_one_template.py` — 单条公式多采样点对账模板。点对点拿 JSON 里某条公式（如 `expr.f1`），用 `make_reference_func` 一次性做 sympify+替换，再扫一组采样点跟编译函数对账。**这是 450KB 公式无法用 `eval` 时的标准方法**，把 `CONFIG_PATH` / `FORMULA_PATH` / `SAMPLES` 改成你自己的就能跑
 - `test_regressions.py` — 锁定代码审查找到的 bug：`params_explicit=[]` 与 `None` 必须不同 cache key、`params_at` 不是 free_symbols 超集时编译期立即报错（不能拖到运行期 NameError）、extras（多余未用参数）允许、`verify` 总结分 OK / FAIL / SKIP 三元
-- `run_from_spec.py` + `example_test_spec.json` + `example_config.json` — **数据驱动的测试 runner**：测试用例（采样点 + 业务期望值）全部写在 JSON 里，不用改 Python；脚本编译所有公式、建立 sympy 参考、跑遍每个采样点输出 OK/FAIL/SKIP 报告。CI 友好（exit code 0/1）
+- `run_from_spec.py` + `example_test_spec.json` + `example_config.json` + `example_inputs.json` + `example_expected.json` — **数据驱动的测试 runner**：测试用例（采样点 + 业务期望值）全部写在 JSON 里，不用改 Python；脚本编译所有公式、建立 sympy 参考、跑遍每个采样点输出 OK/FAIL/SKIP 报告。CI 友好（exit code 0/1）。
+  - **支持公式 list**：`exprs_at` 指向的可以是 `{name: 公式}` 字典或 `[公式, ...]` 列表（list 按字符串化下标 `"0"`, `"1"`, ... 命名）。
+  - **支持多数据源**：`data_sources` 字段引入若干 JSON 文件命名为变量；`vars` / `expected` 里写 Python 表达式如 `inputs.case_1.voltage + inputs.case_1.offset` 拉取并运算字段值。eval 沙箱限制了 `__builtins__`，只放行 `abs/min/max/pow/round/math`。
 
 ```bash
 python3 tests/expr_compiler/run.py
