@@ -368,6 +368,14 @@ def _generate_source_with_subst(formula, params_explicit, constants,
 
         expr = expr.xreplace(sub_dict)
 
+    # Domain shorthand: variable names ending in `nt` / `pt` expand
+    # to "<prefix> + <prefix><n or p>".  e.g. aaxnt → aax + aaxn,
+    # aa1pt → aa1 + aa1p.  Applied AFTER constant / subexpr
+    # substitution so a user-defined constant or subexpr name
+    # ending in nt/pt would already be resolved away by this point
+    # (and thus not get the shorthand treatment).
+    expr = _expand_nt_pt_suffixes(expr)
+
     # Determine parameter list.  When the caller supplies an
     # explicit list, validate that it covers every free symbol left
     # in the post-substitution expression — otherwise the generated
@@ -410,6 +418,41 @@ def _generate_source_with_subst(formula, params_explicit, constants,
         print(f"--- {len(sub_exprs)} CSE temps, "
               f"{len(chunk_lines)} chunk temps ---")
     return src
+
+
+def _expand_nt_pt_suffixes(expr):
+    """Expand variables ending in ``nt`` / ``pt`` as domain shorthand:
+
+        <prefix>nt  →  <prefix> + <prefix>n
+        <prefix>pt  →  <prefix> + <prefix>p
+
+    e.g. ``aaxnt`` → ``aax + aaxn``,  ``aa1pt`` → ``aa1 + aa1p``.
+
+    Iterates to a fixed point so chained suffixes (rare but possible:
+    ``xntnt`` → ``xnt + xntn`` → ``(x + xn) + xntn``) resolve in one
+    call.  A safety bound of 20 iterations prevents runaway in
+    pathological inputs — convergence is normally 1–2 iterations.
+
+    Variables shorter than 3 chars (``nt`` / ``pt`` alone, or just one
+    char + suffix) are left unchanged: the prefix would be empty or a
+    single character, which is rarely the intended shorthand.  Adjust
+    here if your domain uses 1-char prefixes.
+    """
+    for _ in range(20):
+        sub_dict = {}
+        for sym in expr.free_symbols:
+            name = str(sym)
+            if not (name.endswith("nt") or name.endswith("pt")):
+                continue
+            prefix = name[:-2]
+            if len(prefix) < 1:
+                continue              # 'nt' / 'pt' alone — leave as is
+            middle = name[-2]         # 'n' or 'p'
+            sub_dict[sym] = sp.Symbol(prefix) + sp.Symbol(prefix + middle)
+        if not sub_dict:
+            break
+        expr = expr.xreplace(sub_dict)
+    return expr
 
 
 def _to_sympy_constant(name, value):
@@ -630,6 +673,10 @@ def _reference_value_impl(formula, sample, constants, subexprs):
                     break
             expr = expr.xreplace(sub_dict)
 
+        # Apply nt/pt shorthand expansion so the reference computes
+        # the same value as the compiled function.
+        expr = _expand_nt_pt_suffixes(expr)
+
         if sample:
             var_dict = {sp.Symbol(n): sp.Float(str(v))
                         for n, v in sample.items()}
@@ -726,6 +773,9 @@ def _build_reference_expr(formula, constants, subexprs):
                 if not changed:
                     break
             expr = expr.xreplace(sub_dict)
+        # Apply nt/pt shorthand so make_reference_func's .free_vars
+        # and per-sample evaluation match the compiled function.
+        expr = _expand_nt_pt_suffixes(expr)
         return expr
     finally:
         sys.setrecursionlimit(old)
@@ -1158,12 +1208,18 @@ def _detect_params(expr_str: str) -> list[str]:
     like ``sin``, ``log``, so we get exactly the names that the
     generated function should accept as arguments.
 
+    Also applies the ``nt`` / ``pt`` suffix shorthand expansion so the
+    reported params match what the compiled function will actually
+    take (e.g. a formula containing ``aaxnt`` becomes a function
+    taking ``aax`` and ``aaxn``, not ``aaxnt``).
+
     If you have a variable that collides with a sympy constant — the
     classic gotchas are ``E`` and ``I`` — pass an explicit ``params``
     list via the detailed JSON form below; auto-detect can't see them
     as free.
     """
-    return sorted(str(s) for s in _sympify_chunked(expr_str).free_symbols)
+    expr = _expand_nt_pt_suffixes(_sympify_chunked(expr_str))
+    return sorted(str(s) for s in expr.free_symbols)
 
 
 def get_at_path(data, path):
