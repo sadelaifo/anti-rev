@@ -134,6 +134,21 @@ def test_three_char_name() -> int:
     return 0
 
 
+def test_math_functions_work() -> int:
+    """Generated source uses `math.sin` etc. — make sure that
+    resolves at call time.  Previously raised NameError because
+    `math` wasn't imported in the exec'd namespace."""
+    import math
+    f = make_expr_func("sin(x) + cos(y) + exp(z)", ["x", "y", "z"], jit=False)
+    got = f(0.5, 0.3, 1.0)
+    expected = math.sin(0.5) + math.cos(0.3) + math.exp(1.0)
+    if not near(got, expected):
+        print(f"  [FAIL] sin/cos/exp: got {got}, expected {expected}")
+        return 1
+    print(f"  [OK]   sin/cos/exp resolve via math import")
+    return 0
+
+
 def main() -> int:
     failures = 0
     failures += test_basic_expansion()
@@ -144,6 +159,7 @@ def main() -> int:
     failures += test_chained_suffix()
     failures += test_short_names_untouched()
     failures += test_three_char_name()
+    failures += test_math_functions_work()
     if failures == 0:
         print("\n[expr_compiler suffix test] all checks passed.")
         return 0

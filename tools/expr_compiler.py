@@ -404,7 +404,13 @@ def _generate_source_with_subst(formula, params_explicit, constants,
     ) else None
     sub_exprs, [main] = sp.cse(expr, optimizations=opt_level)
 
-    lines = [f"def _expr({', '.join(params)}):"]
+    # `import math` so generated `math.sin(...)` / `math.cos(...)` /
+    # etc. that sympy.pycode emits for transcendental functions can
+    # resolve at call time.  Without this the exec'd function gets
+    # NameError("name 'math' is not defined") the first time any
+    # math.* function is touched in business code.  numba's njit
+    # handles math.* natively so the JIT path works too.
+    lines = ["import math", "", f"def _expr({', '.join(params)}):"]
     for tmp, val in sub_exprs:
         lines.append(f"    {tmp} = {sp.pycode(val)}")
     chunk_lines, final_pycode = _emit_chunked_main(main)
@@ -488,6 +494,11 @@ def _compute_compile_key(formula, params_explicit, constants, subexprs):
     formula has free symbols, so they must hash to different keys.
     """
     payload = {
+        # Bump _CODEGEN_VERSION whenever the generated source's shape
+        # changes (added/removed imports, new shorthand expansion,
+        # chunk-emission strategy tweak, etc.) so existing on-disk
+        # cache files don't survive an inadvertent upgrade.
+        'codegen_version': _CODEGEN_VERSION,
         'formula': formula,
         'params':  list(params_explicit) if params_explicit is not None else None,
         'constants': sorted(
@@ -497,6 +508,16 @@ def _compute_compile_key(formula, params_explicit, constants, subexprs):
     }
     canonical = json.dumps(payload, sort_keys=True)
     return hashlib.sha1(canonical.encode('utf-8')).hexdigest()[:16]
+
+
+# Codegen version — bump this whenever the generated source's shape
+# changes in a way that should invalidate existing cache entries.
+# Examples that warrant a bump:
+#   - Adding/removing imports in the generated module
+#   - Adding new auto-expansions (nt/pt suffix, etc.)
+#   - Changing chunking thresholds or naming
+#   - sympy version / opt_level changes that produce different code
+_CODEGEN_VERSION = 2  # v2: import math + nt/pt suffix expansion
 
 
 def cache_dir_path() -> str:
