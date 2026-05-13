@@ -439,6 +439,12 @@ def main() -> int:
     # only the got-vs-expected layer runs.  Set in spec when running
     # large batches where sympy build per formula dominates runtime.
     compute_ref  = spec.get("compute_ref", True)
+    # loose_tolerance: relative threshold used only for FAIL
+    # classification — anything within this distance is still a FAIL
+    # but tagged "PREC" / "SIGN~" so the user can tell precision drift
+    # from genuine magnitude mismatches.  Default 1e-2 catches the
+    # common case of expected-data stored to 3-4 significant digits.
+    loose_tolerance = spec.get("loose_tolerance", 1e-2)
 
     # ---- load external data sources --------------------------------
     namespace = {}
@@ -502,6 +508,13 @@ def main() -> int:
     print()
 
     n_ok = n_fail = n_skip = 0
+    # FAIL classification buckets — populated when expected fails.
+    # SIGN: got ≈ -expected within tolerance (exact flip)
+    # SIGN~: got ≈ -expected within loose_tolerance (flip + drift)
+    # PREC: got ≈ +expected within loose_tolerance (precision drift only)
+    # DIFF: genuine magnitude mismatch (none of the above)
+    fail_buckets: dict[str, list[str]] = {
+        "SIGN": [], "SIGN~": [], "PREC": [], "DIFF": []}
 
     for case in cases:
         label = case.get("label", "<unlabeled>")
@@ -573,15 +586,30 @@ def main() -> int:
                                     f"  [from: {raw_expr}]")
                     expected_ok = False
                 else:
-                    exp_rel = abs(got - expected) / (abs(expected) + 1e-300)
+                    denom = abs(expected) + 1e-300
+                    exp_rel  = abs(got - expected) / denom
+                    flip_rel = abs(got + expected) / denom
                     expected_ok = exp_rel < tolerance
-                    exp_mark = "OK" if expected_ok else "FAIL"
+                    # Classify FAIL: SIGN (exact flip) > SIGN~ (flip+drift)
+                    # > PREC (drift only) > DIFF (real mismatch).
+                    if expected_ok:
+                        exp_mark = "OK"
+                    elif flip_rel < tolerance:
+                        exp_mark = "SIGN"
+                    elif flip_rel < loose_tolerance:
+                        exp_mark = "SIGN~"
+                    elif exp_rel < loose_tolerance:
+                        exp_mark = "PREC"
+                    else:
+                        exp_mark = "DIFF"
                     expected_str = (f"  expected={expected:.6g} "
                                     f"({exp_mark} rel={exp_rel:.1e})")
-                    # On FAIL, surface the source expression so the user
-                    # can grep their JSON and verify the underlying data.
-                    if not expected_ok and isinstance(raw_expr, str):
-                        expected_str += f"  [from: {raw_expr}]"
+                    # On FAIL, surface the source expression and bucket
+                    # the failure so the summary can show the breakdown.
+                    if not expected_ok:
+                        if isinstance(raw_expr, str):
+                            expected_str += f"  [from: {raw_expr}]"
+                        fail_buckets[exp_mark].append(f"{label}/{name}")
 
             ok = ref_ok and expected_ok
             status = "OK  " if ok else "FAIL"
@@ -601,6 +629,20 @@ def main() -> int:
     total = n_ok + n_fail + n_skip
     print(f"Summary: {n_ok} OK / {n_fail} FAIL / {n_skip} SKIP "
           f"(of {total} checks across {len(cases)} test case(s))")
+    # FAIL breakdown by category — helps separate sign-convention bugs
+    # from precision-drift "noise" from real magnitude mismatches.
+    bucket_total = sum(len(v) for v in fail_buckets.values())
+    if bucket_total:
+        print()
+        print(f"FAIL breakdown (loose_tolerance={loose_tolerance:.0e}):")
+        print(f"  SIGN  {len(fail_buckets['SIGN']):>4}  "
+              f"got ≈ -expected (exact)        — formula or expected sign flipped")
+        print(f"  SIGN~ {len(fail_buckets['SIGN~']):>4}  "
+              f"got ≈ -expected (within loose) — sign flip + minor drift")
+        print(f"  PREC  {len(fail_buckets['PREC']):>4}  "
+              f"|got-expected|/expected < loose — precision drift, expected data low res")
+        print(f"  DIFF  {len(fail_buckets['DIFF']):>4}  "
+              f"genuine magnitude mismatch     — wrong formula or wrong path")
     return 0 if n_fail == 0 else 1
 
 
