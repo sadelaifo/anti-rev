@@ -440,10 +440,12 @@ def main() -> int:
     # large batches where sympy build per formula dominates runtime.
     compute_ref  = spec.get("compute_ref", True)
     # loose_tolerance: relative threshold used only for FAIL
-    # classification — anything within this distance is still a FAIL
-    # but tagged "PREC" / "SIGN~" so the user can tell precision drift
-    # from genuine magnitude mismatches.  Default 1e-2 catches the
-    # common case of expected-data stored to 3-4 significant digits.
+    # classification — anything within this distance is still a FAIL,
+    # but tagged "NEAR" / "SIGN~" so the user can separate
+    # close-but-not-exact mismatches from outright magnitude errors.
+    # Default 1e-2 surfaces small-formula-difference cases (truncated
+    # series, hardcoded constant like 3.14159 vs sp.pi, float32
+    # round-trip, etc.).
     loose_tolerance = spec.get("loose_tolerance", 1e-2)
 
     # ---- load external data sources --------------------------------
@@ -510,11 +512,11 @@ def main() -> int:
     n_ok = n_fail = n_skip = 0
     # FAIL classification buckets — populated when expected fails.
     # SIGN: got ≈ -expected within tolerance (exact flip)
-    # SIGN~: got ≈ -expected within loose_tolerance (flip + drift)
-    # PREC: got ≈ +expected within loose_tolerance (precision drift only)
+    # SIGN~: got ≈ -expected within loose_tolerance (flip + small drift)
+    # NEAR: got ≈ +expected within loose_tolerance (close-but-not-exact)
     # DIFF: genuine magnitude mismatch (none of the above)
     fail_buckets: dict[str, list[str]] = {
-        "SIGN": [], "SIGN~": [], "PREC": [], "DIFF": []}
+        "SIGN": [], "SIGN~": [], "NEAR": [], "DIFF": []}
 
     for case in cases:
         label = case.get("label", "<unlabeled>")
@@ -591,7 +593,7 @@ def main() -> int:
                     flip_rel = abs(got + expected) / denom
                     expected_ok = exp_rel < tolerance
                     # Classify FAIL: SIGN (exact flip) > SIGN~ (flip+drift)
-                    # > PREC (drift only) > DIFF (real mismatch).
+                    # > NEAR (close-but-not-exact) > DIFF (real mismatch).
                     if expected_ok:
                         exp_mark = "OK"
                     elif flip_rel < tolerance:
@@ -599,7 +601,7 @@ def main() -> int:
                     elif flip_rel < loose_tolerance:
                         exp_mark = "SIGN~"
                     elif exp_rel < loose_tolerance:
-                        exp_mark = "PREC"
+                        exp_mark = "NEAR"
                     else:
                         exp_mark = "DIFF"
                     expected_str = (f"  expected={expected:.6g} "
@@ -629,8 +631,11 @@ def main() -> int:
     total = n_ok + n_fail + n_skip
     print(f"Summary: {n_ok} OK / {n_fail} FAIL / {n_skip} SKIP "
           f"(of {total} checks across {len(cases)} test case(s))")
-    # FAIL breakdown by category — helps separate sign-convention bugs
-    # from precision-drift "noise" from real magnitude mismatches.
+    # FAIL breakdown by category.  When `got == ref` already verifies
+    # the compile pipeline, the remaining buckets point at *what kind*
+    # of mismatch the expected data has — sign convention, formula-form
+    # drift (e.g. truncated series, hardcoded constant), or outright
+    # wrong path / wrong formula.
     bucket_total = sum(len(v) for v in fail_buckets.values())
     if bucket_total:
         print()
@@ -638,9 +643,10 @@ def main() -> int:
         print(f"  SIGN  {len(fail_buckets['SIGN']):>4}  "
               f"got ≈ -expected (exact)        — formula or expected sign flipped")
         print(f"  SIGN~ {len(fail_buckets['SIGN~']):>4}  "
-              f"got ≈ -expected (within loose) — sign flip + minor drift")
-        print(f"  PREC  {len(fail_buckets['PREC']):>4}  "
-              f"|got-expected|/expected < loose — precision drift, expected data low res")
+              f"got ≈ -expected (within loose) — sign flip + small drift")
+        print(f"  NEAR  {len(fail_buckets['NEAR']):>4}  "
+              f"close but not exact            — formula-form drift "
+              f"(truncated series / hardcoded constant / float32 round-trip)")
         print(f"  DIFF  {len(fail_buckets['DIFF']):>4}  "
               f"genuine magnitude mismatch     — wrong formula or wrong path")
     return 0 if n_fail == 0 else 1
