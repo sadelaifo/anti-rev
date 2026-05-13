@@ -25,6 +25,7 @@ the spec's directory so a relative spec can reference sibling files.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -227,16 +228,45 @@ def _build_auto_vars(vars_from, union_args, case_key, namespace):
     return auto
 
 
+_PATH_TOKEN_RE = re.compile(r'[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)+')
+
+
 def _build_auto_expected(expected_from, formula_names, case_key, namespace):
-    """Same three forms as :func:`_build_auto_vars` but for
-    expected outputs.  String / list-of-containers / dict — see
-    that docstring for the shapes."""
+    """Same forms as :func:`_build_auto_vars` for expected outputs,
+    plus one extra:
+
+      * **Path template** (no operators) — e.g. ``"ref.{case}"``.
+        Runner appends ``.<formula_name>`` to the end, then evaluates
+        as a path lookup.  Same as before.
+
+      * **Expression template** (contains ``+ - * / ( )``) — e.g.
+        ``"a.b.c - a.d.e"``.  Each multi-segment path token in the
+        expression gets ``.<formula_name>`` appended; the result is
+        an arithmetic expression that's evaluated as a number.  So
+        for formula ``f1`` the expression becomes
+        ``"a.b.c.f1 - a.d.e.f1"`` and evaluates to the difference
+        of the two per-formula fields.
+
+        Use this when the expected value is a small computation
+        over fields keyed by formula name.
+    """
     auto: dict = {}
     if isinstance(expected_from, str):
-        for name in formula_names:
-            path = f"{expected_from}.{name}".format(case=case_key)
-            if _path_exists(path, namespace):
-                auto[name] = path
+        template = expected_from.format(case=case_key)
+        # Detect arithmetic expression vs plain path: presence of any
+        # operator means treat as expression and per-token expand.
+        has_op = any(op in template for op in "+-*/()")
+        if has_op:
+            for name in formula_names:
+                expr = _PATH_TOKEN_RE.sub(
+                    lambda m: f"{m.group(0)}.{name}", template)
+                if _path_exists(expr, namespace):
+                    auto[name] = expr
+        else:
+            for name in formula_names:
+                path = f"{template}.{name}"
+                if _path_exists(path, namespace):
+                    auto[name] = path
     elif isinstance(expected_from, list):
         auto = _expand_container_paths(expected_from, case_key, namespace,
                                        label="expected_from")
@@ -405,6 +435,10 @@ def main() -> int:
 
     compile_opts = spec.get("compile_options", {})
     tolerance    = spec.get("tolerance", 1e-9)
+    # compute_ref: if False, skip the (slow) sympy reference path —
+    # only the got-vs-expected layer runs.  Set in spec when running
+    # large batches where sympy build per formula dominates runtime.
+    compute_ref  = spec.get("compute_ref", True)
 
     # ---- load external data sources --------------------------------
     namespace = {}
@@ -438,25 +472,28 @@ def main() -> int:
     print(f"      {len(funcs)} function(s) ready: "
           f"{sorted(funcs)}")
 
-    print(f"[2/3] building sympy references ...")
-    with config_path.open(encoding="utf-8") as fh:
-        cfg = json.load(fh, parse_float=str)
-    raw_exprs = get_at_path(cfg, exprs_at)
-    if isinstance(raw_exprs, list):
-        exprs_dict = {str(i): v for i, v in enumerate(raw_exprs)}
-    else:
-        exprs_dict = raw_exprs
-    constants  = _resolve_constants(cfg, constants_at)
-    subexprs   = get_at_path(cfg, subexprs_at) if subexprs_at else None
+    references: dict = {}
+    if compute_ref:
+        print(f"[2/3] building sympy references ...")
+        with config_path.open(encoding="utf-8") as fh:
+            cfg = json.load(fh, parse_float=str)
+        raw_exprs = get_at_path(cfg, exprs_at)
+        if isinstance(raw_exprs, list):
+            exprs_dict = {str(i): v for i, v in enumerate(raw_exprs)}
+        else:
+            exprs_dict = raw_exprs
+        constants  = _resolve_constants(cfg, constants_at)
+        subexprs   = get_at_path(cfg, subexprs_at) if subexprs_at else None
 
-    references = {}
-    for name in funcs:
-        references[name] = make_reference_func(
-            exprs_dict[name],
-            constants = constants,
-            subexprs  = subexprs,
-        )
-    print(f"      {len(references)} reference(s) ready")
+        for name in funcs:
+            references[name] = make_reference_func(
+                exprs_dict[name],
+                constants = constants,
+                subexprs  = subexprs,
+            )
+        print(f"      {len(references)} reference(s) ready")
+    else:
+        print(f"[2/3] sympy references skipped (compute_ref=false in spec)")
 
     # Expand test_cases (handles strings, auto-bind dicts, manual dicts)
     cases = _build_test_cases(spec, namespace, funcs)
@@ -509,17 +546,22 @@ def main() -> int:
                 n_fail += 1
                 continue
 
-            try:
-                ref = float(references[name](vars_dict))
-            except Exception as e:
-                print(f"  [ERR ] {name:<20} reference failed: "
-                      f"{type(e).__name__}: {e}")
-                n_fail += 1
-                continue
+            # Layer 1: ref-vs-got (sympy reference, optional).
+            ref = None
+            ref_ok = True   # don't fail on missing ref
+            rel = None
+            if compute_ref and name in references:
+                try:
+                    ref = float(references[name](vars_dict))
+                except Exception as e:
+                    print(f"  [ERR ] {name:<20} reference failed: "
+                          f"{type(e).__name__}: {e}")
+                    n_fail += 1
+                    continue
+                rel = abs(got - ref) / (abs(ref) + 1e-300)
+                ref_ok = rel < tolerance
 
-            rel = abs(got - ref) / (abs(ref) + 1e-300)
-            ref_ok = rel < tolerance
-
+            # Layer 2: expected-vs-got (business-known value, optional).
             expected_str = ""
             expected_ok = True
             if name in raw_expected:
@@ -537,8 +579,12 @@ def main() -> int:
 
             ok = ref_ok and expected_ok
             status = "OK  " if ok else "FAIL"
-            print(f"  [{status}] {name:<20} ref={ref:>12.6g}  "
-                  f"got={got:>12.6g}  rel={rel:.1e}{expected_str}")
+            if ref is not None:
+                print(f"  [{status}] {name:<20} ref={ref:>12.6g}  "
+                      f"got={got:>12.6g}  rel={rel:.1e}{expected_str}")
+            else:
+                print(f"  [{status}] {name:<20} "
+                      f"got={got:>12.6g}{expected_str}")
 
             if ok:
                 n_ok += 1
