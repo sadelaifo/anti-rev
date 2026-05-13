@@ -565,10 +565,12 @@ def main() -> int:
             expected_str = ""
             expected_ok = True
             if name in raw_expected:
+                raw_expr = raw_expected[name]
                 try:
-                    expected = _resolve_value(raw_expected[name], namespace)
+                    expected = _resolve_value(raw_expr, namespace)
                 except (ValueError, TypeError) as e:
-                    expected_str = f"  expected RESOLVE-ERR ({e})"
+                    expected_str = (f"  expected RESOLVE-ERR ({e})"
+                                    f"  [from: {raw_expr}]")
                     expected_ok = False
                 else:
                     exp_rel = abs(got - expected) / (abs(expected) + 1e-300)
@@ -576,6 +578,10 @@ def main() -> int:
                     exp_mark = "OK" if expected_ok else "FAIL"
                     expected_str = (f"  expected={expected:.6g} "
                                     f"({exp_mark} rel={exp_rel:.1e})")
+                    # On FAIL, surface the source expression so the user
+                    # can grep their JSON and verify the underlying data.
+                    if not expected_ok and isinstance(raw_expr, str):
+                        expected_str += f"  [from: {raw_expr}]"
 
             ok = ref_ok and expected_ok
             status = "OK  " if ok else "FAIL"
