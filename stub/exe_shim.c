@@ -129,14 +129,25 @@ static void resolve_libc_realpath(void)
  * that starts with `prefix`.  Unsets the var if nothing remains.
  * Used during constructor-time env hygiene so children inherit a
  * clean LD_PRELOAD / LD_LIBRARY_PATH when we decide they shouldn't
- * see our shim fds / temp dirs. */
+ * see our shim fds / temp dirs.
+ *
+ * Result is bounded by the input length (we only drop entries, never
+ * add them) so a strlen(val)+1 heap allocation always fits.  An
+ * earlier version used a fixed `char buf[8192]` which silently
+ * truncated LD_LIBRARY_PATH for deployments that put thousands of
+ * directories on the path (introduced in 6fc0441, regressed real
+ * deployments with multi-KB LD_LIBRARY_PATH). */
 static void strip_env_path_entries(const char *varname, const char *prefix) {
     const char *val = getenv(varname);
     if (!val || !strstr(val, prefix))
         return;
 
     size_t plen = strlen(prefix);
-    char buf[8192];
+    size_t vlen = strlen(val);
+    char *buf = (char *)malloc(vlen + 1);
+    if (!buf)
+        return; /* OOM — leave the env unchanged rather than truncate */
+
     size_t off = 0;
     const char *p = val;
     while (*p) {
@@ -145,8 +156,6 @@ static void strip_env_path_entries(const char *varname, const char *prefix) {
             end++;
         size_t seg = (size_t) (end - p);
         if (seg > 0 && strncmp(p, prefix, plen) != 0) {
-            if (off + seg + 2 >= sizeof(buf))
-                break;
             if (off > 0)
                 buf[off++] = ':';
             memcpy(buf + off, p, seg);
@@ -159,6 +168,7 @@ static void strip_env_path_entries(const char *varname, const char *prefix) {
         setenv(varname, buf, 1);
     else
         unsetenv(varname);
+    free(buf);
 }
 
 /* ------------------------------------------------------------------ */
