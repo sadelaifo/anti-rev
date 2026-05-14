@@ -155,21 +155,27 @@ static void init_log_gate(void) {
     }
 }
 
-/* Concat pid+name prefix with caller's format string at preprocess
- * time so the whole line goes out in a single fprintf — keeps
- * cross-process output atomic on append-mode writes ≤ PIPE_BUF.
- * Caller's first arg must be a string literal. */
-#define LOG_INFO(fmt, ...) \
-    do { if (g_stub_log) \
-        fprintf(g_stub_log, "[pid=%d name=%s] " fmt, \
-                (int)g_log_pid, g_log_name, ##__VA_ARGS__); \
-    } while (0)
+/* Two fprintf calls instead of literal-concat-with-macro-param: the
+ * obfstr_gen.py codegen replaces every literal arg in LOG_INFO with
+ * an _OBF(...) call, so "[prefix] " fmt would expand into the
+ * invalid "[prefix] " _OBF(...) (string-literal cannot concat with
+ * a function-call expression).  The stream is line-buffered so the
+ * two writes accumulate and flush as a single write() on the
+ * trailing \n in the caller's format — atomic for cross-process
+ * append. */
+#define LOG_INFO(...) \
+    do { if (g_stub_log) { \
+        fprintf(g_stub_log, "[pid=%d name=%s] ", \
+                (int)g_log_pid, g_log_name); \
+        fprintf(g_stub_log, __VA_ARGS__); \
+    } } while (0)
 
 #define PERR_INFO(s) \
     do { if (g_stub_log) { \
         int _e = errno; \
-        fprintf(g_stub_log, "[pid=%d name=%s] %s: %s\n", \
-                (int)g_log_pid, g_log_name, (s), strerror(_e)); \
+        fprintf(g_stub_log, "[pid=%d name=%s] ", \
+                (int)g_log_pid, g_log_name); \
+        fprintf(g_stub_log, "%s: %s\n", (s), strerror(_e)); \
         errno = _e; \
     } } while (0)
 
