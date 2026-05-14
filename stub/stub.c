@@ -91,36 +91,158 @@
 #define SCM_BATCH    250  /* max fds per SCM_RIGHTS (kernel SCM_MAX_FD = 253) */
 
 /* ------------------------------------------------------------------ */
-/*  Diagnostic-log gate (controlled by ANTIREV_LOG env var)             */
+/*  Diagnostic-log gate                                                 */
 /* ------------------------------------------------------------------ */
-/* Default behaviour is total silence on stderr — production deploys
- * shouldn't ship `[antirev] decrypted: foo.so` chatter to whoever's
- * watching stdout/stderr (systemd journal, a tee, a log scraper, etc.).
+/* xcc_514 branch: file-based logging on by default.  Survives
+ * boost::process::child + detach (which closes stderr).  Every
+ * log line is prefixed with the writing pid so cross-process logs
+ * (parent stub, child stub, daemon, grandchild) stay distinguishable
+ * in the shared file.
  *
- *   ANTIREV_LOG unset / =0 / =false / =no  → silent (default)
- *   ANTIREV_LOG anything else              → all info + errors to stderr
+ *   default               → /tmp/antirev_stub.log (append, line-buffered)
+ *   ANTIREV_LOG_FILE=path → write to <path> instead
+ *   ANTIREV_LOG=0/false/no/off → disable file logging too (opt-out)
  *
- * Both LOG_INFO (status) and PERR_INFO (errno wrapper) are routed
- * through the same gate.  init_log_gate() must be the first thing
- * main() does so that the very first perror at /proc/self/exe open
- * already respects the user's choice. */
-static FILE *g_stub_log = NULL;
+ * init_log_gate() must be the first thing main() does so that the
+ * very first error path (open /proc/self/exe) already respects the
+ * gate. */
+static FILE *g_stub_log     = NULL;
+static pid_t g_log_pid      = 0;
+static char  g_log_name[64] = {0}; /* basename of /proc/self/exe — set
+                                    * once in init_log_gate so every log
+                                    * line tells you WHICH protected
+                                    * binary (parent / child / daemon)
+                                    * produced it */
 
-static void init_log_gate(void) {
-    const char *e = getenv("ANTIREV_LOG");
-    if (!e || !*e) return;
-    /* Treat 0 / false / no / off / disabled as "silent" too — common
-     * shell idioms.  Anything else turns logging on. */
-    if (e[0] == '0' && e[1] == '\0') return;
-    if (e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N') return;
-    g_stub_log = stderr;
+static void capture_log_name(void) {
+    char buf[512];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) {
+        snprintf(g_log_name, sizeof(g_log_name), "?");
+        return;
+    }
+    buf[n] = '\0';
+    const char *base = strrchr(buf, '/');
+    base = base ? base + 1 : buf;
+    snprintf(g_log_name, sizeof(g_log_name), "%s", base);
 }
 
-#define LOG_INFO(...) \
-    do { if (g_stub_log) fprintf(g_stub_log, __VA_ARGS__); } while (0)
+static void init_log_gate(void) {
+    /* Allow explicit opt-out via ANTIREV_LOG=0/false/no */
+    const char *e = getenv("ANTIREV_LOG");
+    if (e && *e) {
+        if (e[0] == '0' && e[1] == '\0') return;
+        if (e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N') return;
+    }
+
+    const char *path = getenv("ANTIREV_LOG_FILE");
+    if (!path || !*path) path = "/tmp/antirev_stub.log";
+
+    FILE *f = fopen(path, "a");
+    if (f) {
+        setvbuf(f, NULL, _IOLBF, 0);
+        g_stub_log = f;
+        g_log_pid  = getpid();
+        capture_log_name();
+    } else if (e && *e) {
+        /* Couldn't open the file but user asked for logging — fall back
+         * to stderr.  Don't fall back silently otherwise (default-on
+         * file logging shouldn't suddenly start spewing to stderr if
+         * /tmp is read-only). */
+        g_stub_log = stderr;
+        g_log_pid  = getpid();
+        capture_log_name();
+    }
+}
+
+/* Concat pid+name prefix with caller's format string at preprocess
+ * time so the whole line goes out in a single fprintf — keeps
+ * cross-process output atomic on append-mode writes ≤ PIPE_BUF.
+ * Caller's first arg must be a string literal. */
+#define LOG_INFO(fmt, ...) \
+    do { if (g_stub_log) \
+        fprintf(g_stub_log, "[pid=%d name=%s] " fmt, \
+                (int)g_log_pid, g_log_name, ##__VA_ARGS__); \
+    } while (0)
 
 #define PERR_INFO(s) \
-    do { if (g_stub_log) perror(s); } while (0)
+    do { if (g_stub_log) { \
+        int _e = errno; \
+        fprintf(g_stub_log, "[pid=%d name=%s] %s: %s\n", \
+                (int)g_log_pid, g_log_name, (s), strerror(_e)); \
+        errno = _e; \
+    } } while (0)
+
+/* ------------------------------------------------------------------ */
+/*  Diagnostic dumps                                                    */
+/* ------------------------------------------------------------------ */
+/* All three are no-ops when g_stub_log is closed, so they're safe to
+ * sprinkle across the stub without conditionals at call sites. */
+
+#define LOG_PREFIX "[pid=%d name=%s]"
+
+static void dump_env_to_log(const char *label, char *const *envp) {
+    if (!g_stub_log || !envp) return;
+    fprintf(g_stub_log, LOG_PREFIX " --- %s envp BEGIN ---\n",
+            (int)g_log_pid, g_log_name, label);
+    for (int i = 0; envp[i]; i++)
+        fprintf(g_stub_log, LOG_PREFIX "   %s\n",
+                (int)g_log_pid, g_log_name, envp[i]);
+    fprintf(g_stub_log, LOG_PREFIX " --- %s envp END ---\n",
+            (int)g_log_pid, g_log_name, label);
+}
+
+static void dump_fds_to_log(const char *label) {
+    if (!g_stub_log) return;
+    DIR *dp = opendir("/proc/self/fd");
+    if (!dp) {
+        fprintf(g_stub_log, LOG_PREFIX " (cannot open /proc/self/fd: %s)\n",
+                (int)g_log_pid, g_log_name, strerror(errno));
+        return;
+    }
+    fprintf(g_stub_log, LOG_PREFIX " --- %s open fds BEGIN ---\n",
+            (int)g_log_pid, g_log_name, label);
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char path[64];
+        char target[512];
+        snprintf(path, sizeof(path), "/proc/self/fd/%s", de->d_name);
+        ssize_t n = readlink(path, target, sizeof(target) - 1);
+        if (n > 0) {
+            target[n] = '\0';
+            fprintf(g_stub_log, LOG_PREFIX "   fd %s -> %s\n",
+                    (int)g_log_pid, g_log_name, de->d_name, target);
+        }
+    }
+    closedir(dp);
+    fprintf(g_stub_log, LOG_PREFIX " --- %s open fds END ---\n",
+            (int)g_log_pid, g_log_name, label);
+}
+
+static void dump_initial_state(int argc, char *argv[], char *const *envp) {
+    if (!g_stub_log) return;
+    fprintf(g_stub_log,
+            LOG_PREFIX " ===== stub start ppid=%d uid=%u euid=%u =====\n",
+            (int)g_log_pid, g_log_name, (int)getppid(),
+            (unsigned)getuid(), (unsigned)geteuid());
+    for (int i = 0; i < argc && argv[i]; i++)
+        fprintf(g_stub_log, LOG_PREFIX "   argv[%d]=%s\n",
+                (int)g_log_pid, g_log_name, i, argv[i]);
+    char exe[512];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+        exe[n] = '\0';
+        fprintf(g_stub_log, LOG_PREFIX "   /proc/self/exe -> %s\n",
+                (int)g_log_pid, g_log_name, exe);
+    }
+    char cwd[512];
+    if (getcwd(cwd, sizeof(cwd)))
+        fprintf(g_stub_log, LOG_PREFIX "   cwd=%s\n",
+                (int)g_log_pid, g_log_name, cwd);
+    dump_env_to_log("inherited", envp);
+    dump_fds_to_log("inherited");
+}
 
 /* ------------------------------------------------------------------ */
 /*  Per-file metadata collected during header scan (Phase 1)          */
@@ -2445,12 +2567,13 @@ static void exec_target(int main_fd, char *const *argv, char **new_env, const ch
 /* ------------------------------------------------------------------ */
 /*  main                                                               */
 /* ------------------------------------------------------------------ */
-int main(int argc __attribute__((unused)), char *argv[], char *envp[])
+int main(int argc, char *argv[], char *envp[])
 {
-    /* Gate stderr diagnostics on ANTIREV_LOG env.  MUST happen before
-     * any LOG_INFO / PERR_INFO call so the very first error path
-     * (open /proc/self/exe) already respects the user's preference. */
+    /* Set up the diagnostic log first — MUST happen before any
+     * LOG_INFO / PERR_INFO call so the earliest error path is
+     * captured.  See init_log_gate() doc-comment for behaviour. */
     init_log_gate();
+    dump_initial_state(argc, argv, envp);
 
     /* 1. Capture real exe path before fexecve replaces /proc/self/exe.
      *    Use raw syscall to bypass any inherited LD_PRELOAD exe_shim from
@@ -2775,6 +2898,17 @@ int main(int argc __attribute__((unused)), char *argv[], char *envp[])
         PERR_INFO("malloc env");
         return 1;
     }
+
+    /* Diagnostic dump: what env + fd state are we about to hand the
+     * decrypted binary?  Captured here (post-build_exec_env) so the
+     * field log shows the exact envp passed to fexecve and the fd
+     * table layout going into exec. */
+    LOG_INFO("[antirev] main_fd=%d antirev_shim_fd=%d daemon_sd=%d "
+             "n_dt_needed=%d n_fdmap=%d link_dir=%s\n",
+             main_fd, antirev_shim_fd, daemon_sd,
+             n_dt_needed, n_fdmap, link_dir_ptr ? link_dir : "(none)");
+    dump_env_to_log("fexecve", new_env);
+    dump_fds_to_log("pre-fexecve");
 
     /* Phase 6. Replace this process with the decrypted binary. */
     exec_target(main_fd, argv, new_env, real_exe);
