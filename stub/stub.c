@@ -2077,9 +2077,10 @@ static char **build_exec_env(const exec_env_cfg_t *cfg) {
     base = base ? base + 1 : cfg->real_exe;
     int force_no_preload = exe_is_no_preload_blacklisted(base);
 
-    /* +12 extras: REAL_EXE, MAIN_FD, LD_PRELOAD, FD_MAP, LIBPATH,
-     * CLOSE_FDS, LIBD_SOCK, ENC_LIBS, SYMLINK_DIR, NO_PRELOAD, NULL + spare */
-    char **out = malloc((size_t) (envc + 12) * sizeof(char *));
+    /* +14 extras: REAL_EXE, MAIN_FD, LD_PRELOAD, FD_MAP, LIBPATH,
+     * CLOSE_FDS, LIBD_SOCK, ENC_LIBS, SYMLINK_DIR, NO_PRELOAD,
+     * LD_DEBUG, LD_DEBUG_OUTPUT, NULL + spare */
+    char **out = malloc((size_t) (envc + 14) * sizeof(char *));
     if (!out)
         return NULL;
 
@@ -2150,6 +2151,42 @@ static char **build_exec_env(const exec_env_cfg_t *cfg) {
          * either way, so the small leak is irrelevant. */
         out[ei++] = strdup(OBFSTR("__r_NP=1"));
     }
+
+    /* Optional: inject LD_DEBUG + LD_DEBUG_OUTPUT for the protected
+     * exe.  Lets us see ld.so's lib search / open / mmap decisions
+     * after fexecve, which is otherwise invisible when the parent
+     * launches us via boost::process::child + detach (stderr gone)
+     * and stub.c's own logging stopped at the pre-fexecve dump.
+     *
+     * Activated by ANTIREV_LD_DEBUG anywhere in our env.  The value
+     * is passed straight to glibc as LD_DEBUG=<value> — supported
+     * tokens are libs / reloc / files / symbols / bindings / all
+     * (see `LD_DEBUG=help true` for the live list).  "1" works too,
+     * glibc treats unknown values as "all".
+     *
+     * Output goes to /tmp/antirev_ld_debug.<pid> (glibc auto-suffixes
+     * the path with .<pid> when LD_DEBUG_OUTPUT is set), so each
+     * spawn gets its own file and they don't stomp on each other. */
+    const char *ld_dbg_val = NULL;
+    for (int j = 0; j < envc; j++) {
+        if (strncmp(cfg->envp[j], "ANTIREV_LD_DEBUG=", 17) == 0) {
+            ld_dbg_val = cfg->envp[j] + 17;
+            break;
+        }
+    }
+    if (ld_dbg_val && *ld_dbg_val &&
+        !(ld_dbg_val[0] == '0' && ld_dbg_val[1] == '\0') &&
+        ld_dbg_val[0] != 'f' && ld_dbg_val[0] != 'F' &&
+        ld_dbg_val[0] != 'n' && ld_dbg_val[0] != 'N') {
+        size_t need = 16 + strlen(ld_dbg_val);
+        char *ld_dbg_entry = malloc(need);
+        if (ld_dbg_entry) {
+            snprintf(ld_dbg_entry, need, "LD_DEBUG=%s", ld_dbg_val);
+            out[ei++] = ld_dbg_entry;
+        }
+        out[ei++] = strdup("LD_DEBUG_OUTPUT=/tmp/antirev_ld_debug");
+    }
+
     out[ei] = NULL;
     return out;
 }
