@@ -6,8 +6,8 @@
  *      so natural-load can be enabled suite-wide via one env var.
  *   2. Natural load resolves a Class-3 implicit dep (encrypted
  *      libenccons -> plaintext libplainprov, no DT_NEEDED edge) that
- *      the daemon-side symbol-completion closure architecturally
- *      cannot fix.
+ *      no daemon-side closure heuristic can infer (the provider is a
+ *      plaintext lib outside the encrypted set).
  *
  * Run with __r_NP=1 in the environment:
  *   - stub honors it -> natural load -> libplainprov mapped before any
