@@ -5,106 +5,111 @@
 #
 # WHY THIS EXISTS
 #   antirev's natural-load path resolves encrypted DT_NEEDED deps through
-#   a symlink dir placed on LD_LIBRARY_PATH (the symlink points at the
-#   *decrypted* memfd).  glibc's library search order is:
+#   a symlink dir on LD_LIBRARY_PATH (symlink -> the *decrypted* memfd).
+#   glibc's search order is:
 #
-#       (old-style) DT_RPATH  →  LD_LIBRARY_PATH  →  DT_RUNPATH  →  cache
+#       (old-style) DT_RPATH  ->  LD_LIBRARY_PATH  ->  DT_RUNPATH  -> cache
 #
-#   So a lib carrying an old-style DT_RPATH that resolves into the
-#   on-disk directory (where the *encrypted* ciphertext .so lives — note
-#   $ORIGIN resolves to exactly that dir in an antirev deployment) is
-#   searched BEFORE LD_LIBRARY_PATH: glibc would load the ciphertext and
-#   fail ("invalid ELF") or load garbage.  DT_RUNPATH is searched AFTER
-#   LD_LIBRARY_PATH, so the decrypted symlink always wins — RUNPATH is
-#   safe, RPATH is the hazard.
-#
-#   This script first just TELLS YOU whether the hazard exists in your
-#   tree (read-only survey, the default).  Only with an explicit --fix
-#   does it touch anything, and then it backs every file up first.
+#   A lib with an old-style DT_RPATH resolving into the on-disk dir
+#   (where the *encrypted* ciphertext .so lives; $ORIGIN resolves to
+#   exactly that dir) is searched BEFORE LD_LIBRARY_PATH: glibc loads
+#   the ciphertext and fails / loads garbage.  DT_RUNPATH is searched
+#   AFTER LD_LIBRARY_PATH, so the decrypted symlink wins -> safe.
+#   RPATH = hazard, RUNPATH / none = safe.
 #
 # USAGE
-#   tools/rpath_audit.sh [DIR]                 # survey (read-only, default)
-#   tools/rpath_audit.sh [DIR] --fix convert   # DT_RPATH -> DT_RUNPATH (keep paths)
-#   tools/rpath_audit.sh [DIR] --fix remove    # drop DT_RPATH entirely
+#   tools/rpath_audit.sh [DIR] [--libs-only] [--fix convert|remove]
 #
-#   DIR defaults to the current directory.  Recurses.  Operates on every
-#   real ELF (by magic, not extension) — .so, .so.N, .elf, unsuffixed.
+#   DIR           tree to scan (default: .), recursed
+#   --libs-only   only look at *.so / *.so.* / *.elf  (MUCH faster on a
+#                 full install tree full of scripts/data; recommended)
+#   --fix convert DT_RPATH -> DT_RUNPATH, keep the path list
+#   --fix remove  drop DT_RPATH entirely
+#   (default = read-only survey; nothing is modified)
+#
+#   Streams every DT_RPATH hit as it is found and prints a progress
+#   counter to stderr, so a big tree shows output immediately.
 #
 # NOTES
-#   - convert preserves the path list, only flips the tag RPATH->RUNPATH.
-#     RUNPATH is NOT transitive (RPATH is): a lib that relied on its
-#     RPATH being inherited by its *dependencies'* searches could change
-#     behaviour.  The survey shows you exactly which/how many libs carry
-#     RPATH so you can judge before converting.
-#   - --fix writes "<file>.rpath.bak" next to each modified file and
-#     re-verifies the result; it is idempotent and safe to re-run.
-#   - Requires readelf (binutils) and, for --fix, patchelf.
+#   - convert preserves paths, only flips the tag. RUNPATH is NOT
+#     transitive (RPATH is); the survey lists every affected lib so the
+#     blast radius is visible before converting.
+#   - --fix writes "<file>.rpath.bak" and re-verifies; idempotent.
+#   - Requires readelf; --fix also needs patchelf.
+
+# Re-exec under real bash if started by a POSIX sh (dash / busybox ash):
+# uses arrays / here-strings.  POSIX-parseable, runs before any bashism.
+if [ -z "${BASH_VERSION:-}" ]; then
+    if [ -z "${_RPATH_AUDIT_REEXEC:-}" ]; then
+        _RPATH_AUDIT_REEXEC=1
+        export _RPATH_AUDIT_REEXEC
+        exec bash "$0" "$@"
+    fi
+    echo "error: needs real bash (got a POSIX sh; 'bash' on PATH is not bash). Run: bash $0 ..." >&2
+    exit 1
+fi
 
 set -euo pipefail
 
-# ---- args ---------------------------------------------------------------
 DIR="."
 FIX=""
 MODE=""
+LIBS_ONLY=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --fix)
-            FIX=1
-            MODE="${2:-}"
-            shift 2 || { echo "error: --fix needs a mode: convert|remove" >&2; exit 2; }
-            ;;
-        -h|--help)
-            sed -n '2,40p' "$0"; exit 0 ;;
-        -*)
-            echo "error: unknown option: $1" >&2; exit 2 ;;
-        *)
-            DIR="$1"; shift ;;
+        --libs-only) LIBS_ONLY=1; shift ;;
+        --fix) FIX=1; MODE="${2:-}"; shift 2 || { echo "error: --fix needs convert|remove" >&2; exit 2; } ;;
+        -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+        -*) echo "error: unknown option: $1" >&2; exit 2 ;;
+        *) DIR="$1"; shift ;;
     esac
 done
 
 if [ -n "$FIX" ] && [ "$MODE" != "convert" ] && [ "$MODE" != "remove" ]; then
-    echo "error: --fix mode must be 'convert' or 'remove' (got '${MODE:-}')" >&2
-    exit 2
+    echo "error: --fix mode must be 'convert' or 'remove' (got '${MODE:-}')" >&2; exit 2
 fi
-
 command -v readelf >/dev/null 2>&1 || { echo "error: readelf not found (install binutils)" >&2; exit 1; }
 if [ -n "$FIX" ]; then
     command -v patchelf >/dev/null 2>&1 || { echo "error: patchelf not found (needed for --fix)" >&2; exit 1; }
 fi
-
 [ -d "$DIR" ] || { echo "error: not a directory: $DIR" >&2; exit 2; }
 
-# ---- scan ---------------------------------------------------------------
-total=0          # ELF files scanned
-n_rpath=0        # have DT_RPATH (HAZARD under natural-load)
-n_runpath=0      # have DT_RUNPATH only (safe)
-n_none=0         # neither (safe)
-n_fixed=0
-rpath_list=()    # "file\tvalue" for the hazardous ones
+total=0; n_rpath=0; n_runpath=0; n_none=0; n_fixed=0
+rpath_list=()
 
-is_elf() {
-    # first 4 bytes == 0x7f 'E' 'L' 'F'
-    [ "$(head -c4 "$1" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')" = "7f454c46" ]
-}
+# Build the find predicate.  --libs-only skips the (usually huge)
+# non-lib file population entirely -> the dominant speedup.
+if [ -n "$LIBS_ONLY" ]; then
+    find_expr=( -type f ! -name '*.rpath.bak' \( -name '*.so' -o -name '*.so.*' -o -name '*.elf' \) )
+else
+    find_expr=( -type f ! -name '*.rpath.bak' )
+fi
+
+echo "scanning $DIR ${LIBS_ONLY:+(libs-only) }..." >&2
 
 while IFS= read -r -d '' f; do
-    [ -f "$f" ] || continue
-    is_elf "$f" || continue
-    total=$((total + 1))
-
-    # readelf -d distinguishes (RPATH) from (RUNPATH); patchelf does not.
+    # One fork per file: readelf -d.  Non-ELF -> empty stdout (skip,
+    # don't count).  Any ELF (even static) -> non-empty -> counted.
     dyn="$(readelf -d "$f" 2>/dev/null || true)"
-    rpath_line="$(printf '%s\n' "$dyn" | grep -E '\(RPATH\)'   || true)"
-    runpath_line="$(printf '%s\n' "$dyn" | grep -E '\(RUNPATH\)' || true)"
+    [ -n "$dyn" ] || continue
+    total=$((total + 1))
+    if [ $((total % 500)) -eq 0 ]; then
+        printf '\r  scanned %d ELF (rpath hits: %d)   ' "$total" "$n_rpath" >&2
+    fi
 
-    if [ -n "$rpath_line" ]; then
+    # No grep forks: bash substring test on the captured text.
+    if [[ "$dyn" == *"(RPATH)"* ]]; then
         n_rpath=$((n_rpath + 1))
-        val="$(printf '%s\n' "$rpath_line" | sed -E 's/.*\[(.*)\].*/\1/')"
-        # ELF machine, so a mixed x86_64+aarch64 tree audited from one
-        # host can be read per target arch (readelf is cross-arch).
+        rline=""
+        while IFS= read -r ln; do
+            case "$ln" in *"(RPATH)"*) rline="$ln"; break ;; esac
+        done <<< "$dyn"
+        val="${rline##*\[}"; val="${val%%\]*}"
         mach="$(readelf -h "$f" 2>/dev/null | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
         [ -n "$mach" ] || mach="?"
         rpath_list+=("$mach"$'\t'"$f"$'\t'"$val")
+        # stream the hit immediately
+        printf '\r\033[K  [%s] %s\n      RPATH = %s\n' "$mach" "$f" "$val" >&2
 
         if [ -n "$FIX" ]; then
             cp -p -- "$f" "$f.rpath.bak"
@@ -113,62 +118,51 @@ while IFS= read -r -d '' f; do
             else
                 cur="$(patchelf --print-rpath -- "$f" 2>/dev/null || true)"
                 patchelf --remove-rpath -- "$f"
-                [ -n "$cur" ] && patchelf --set-rpath "$cur" -- "$f"   # writes DT_RUNPATH
+                [ -n "$cur" ] && patchelf --set-rpath "$cur" -- "$f"   # -> DT_RUNPATH
             fi
-            # verify: no (RPATH) tag must remain
             if readelf -d "$f" 2>/dev/null | grep -qE '\(RPATH\)'; then
-                echo "FAIL: DT_RPATH still present after fix: $f" >&2
-                exit 1
+                echo "FAIL: DT_RPATH still present after fix: $f" >&2; exit 1
             fi
             n_fixed=$((n_fixed + 1))
         fi
-    elif [ -n "$runpath_line" ]; then
+    elif [[ "$dyn" == *"(RUNPATH)"* ]]; then
         n_runpath=$((n_runpath + 1))
     else
         n_none=$((n_none + 1))
     fi
-done < <(find "$DIR" -type f ! -name '*.rpath.bak' -print0)
+done < <(find "$DIR" "${find_expr[@]}" -print0)
 
-# ---- report -------------------------------------------------------------
-echo "=== rpath_audit: $DIR ==="
-echo "ELF files scanned : $total"
+printf '\r\033[K' >&2   # clear the progress line
+
+echo
+echo "=== rpath_audit: $DIR ${LIBS_ONLY:+(libs-only)} ==="
+echo "ELF scanned       : $total"
 echo "  DT_RPATH (HAZARD): $n_rpath"
 echo "  DT_RUNPATH (safe): $n_runpath"
 echo "  neither   (safe) : $n_none"
-if [ -n "$FIX" ]; then
-    echo "  fixed ($MODE)    : $n_fixed   (backups: *.rpath.bak)"
-fi
+[ -n "$FIX" ] && echo "  fixed ($MODE)    : $n_fixed   (backups: *.rpath.bak)"
 
 if [ "$n_rpath" -gt 0 ]; then
     echo
-    echo "  DT_RPATH by ELF arch (this is what matters per target machine):"
+    echo "  DT_RPATH by ELF arch (decide per target machine):"
     printf '%s\n' "${rpath_list[@]}" | cut -f1 | sort | uniq -c | sed 's/^/    /'
-    echo
-    echo "--- libs carrying DT_RPATH (searched BEFORE LD_LIBRARY_PATH ---"
-    echo "--- => natural-load could load the ENCRYPTED on-disk copy) ---"
-    for e in "${rpath_list[@]}"; do
-        IFS=$'\t' read -r _m _f _v <<< "$e"
-        printf '  [%s] %s\n      RPATH = %s\n' "$_m" "$_f" "$_v"
-    done
 fi
 
 echo
 if [ "$n_rpath" -eq 0 ]; then
-    echo "VERDICT: no DT_RPATH in this tree -> natural-load already loads the"
-    echo "         decrypted libs safely here. Pack-time neutralization would"
-    echo "         only be a belt-and-suspenders invariant, not a fix you need."
-    exit 0
+    echo "VERDICT: no DT_RPATH here -> natural-load already loads decrypted"
+    echo "         libs safely. Pack-time neutralization would only be a"
+    echo "         belt-and-suspenders invariant, not a fix you need."
 else
     if [ -n "$FIX" ]; then
-        echo "VERDICT: $n_fixed lib(s) neutralized ($MODE). Re-run without --fix"
-        echo "         to confirm DT_RPATH count is now 0. Test on a COPY of the"
-        echo "         tree and run the full regression before trusting it."
+        echo "VERDICT: $n_fixed lib(s) neutralized ($MODE). Re-run w/o --fix to"
+        echo "         confirm count is 0. Validate on a COPY + full regression."
     else
-        echo "VERDICT: $n_rpath lib(s) carry DT_RPATH -> natural-load is UNSAFE"
-        echo "         for them as-is (ciphertext could win the search). Inspect"
-        echo "         the list above, then dry-run a fix on a COPY:"
-        echo "             cp -a \"$DIR\" /tmp/rpath_test && \\"
-        echo "             tools/rpath_audit.sh /tmp/rpath_test --fix convert"
+        echo "VERDICT: $n_rpath lib(s) carry DT_RPATH -> natural-load UNSAFE for"
+        echo "         them (ciphertext could win). Look at the arch breakdown"
+        echo "         (only the arch you run antirev on matters), then dry-run"
+        echo "         a fix on a COPY:  cp -a DIR /tmp/t && \\"
+        echo "             tools/rpath_audit.sh /tmp/t --libs-only --fix convert"
     fi
-    exit 0
 fi
+exit 0
