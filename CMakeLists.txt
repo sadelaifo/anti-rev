@@ -427,6 +427,17 @@ compile_lib("${CMAKE_BINARY_DIR}/mylib.so"
     gcc "${CMAKE_SOURCE_DIR}/tests/dlopen/mylib.c")
 add_custom_target(mylib DEPENDS "${CMAKE_BINARY_DIR}/mylib.so")
 
+# LD_AUDIT gate (manual, aarch64/2.34): build with
+#   cmake --build . --target audit_shim_noop
+# then on the 下位机 run a real RPC business binary under
+#   LD_AUDIT=<build/audit_shim_noop.so>
+# If RPC survives, the 2.26 "LD_AUDIT breaks RPC" verdict does not hold
+# on 2.34 -> the la_objsearch decrypt-on-demand design becomes viable
+# (kills the pack-time DT_RPATH problem). See stub/audit_shim_noop.c.
+compile_lib("${CMAKE_BINARY_DIR}/audit_shim_noop.so"
+    gcc "${CMAKE_SOURCE_DIR}/stub/audit_shim_noop.c")
+add_custom_target(audit_shim_noop DEPENDS "${CMAKE_BINARY_DIR}/audit_shim_noop.so")
+
 compile_test_bin("${CMAKE_BINARY_DIR}/dlopen_main"
     gcc "${CMAKE_SOURCE_DIR}/tests/dlopen/main.c")
 add_custom_target(dlopen_main DEPENDS "${CMAKE_BINARY_DIR}/dlopen_main")
