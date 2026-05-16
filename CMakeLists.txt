@@ -769,6 +769,140 @@ add_custom_target(test_dlopen_interpose
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_dlopen_interpose_np — same overlapping-static-state scenario as
+#  test_dlopen_interpose, but the protected exe runs in __r_NP=1
+#  (natural-load) mode.  The exe is built as a binary literally named
+#  "GUI" so the stub's exe_is_no_preload_blacklisted() injects __r_NP=1
+#  exactly the way production enables it.  In that mode dlopen_shim
+#  skips the per-dep preload loop; the fix forces RTLD_GLOBAL onto the
+#  root real_dlopen so glibc still puts the whole freshly-loaded subtree
+#  in the global scope and the duplicate descriptor_table-style symbol
+#  interposes first-wins.  Without the fix the caller's RTLD_NOW (no
+#  RTLD_GLOBAL) leaves dup1/dup2 in local scope, both ctors run, and
+#  libregistrar abort()s — exercising the protobuf "File already exists
+#  in database" failure under __r_NP without per-binary patchelf.
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_test_bin("${CMAKE_BINARY_DIR}/GUI"
+    gcc "${CMAKE_SOURCE_DIR}/tests/dlopen_interpose/main.c")
+add_custom_target(dlopen_interpose_np_bin DEPENDS "${CMAKE_BINARY_DIR}/GUI")
+
+set(_TD_INTER_NP "${CMAKE_BINARY_DIR}/daemon_test_dlopen_interpose_np")
+add_custom_target(test_dlopen_interpose_np
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlopen_interpose_np ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_INTER_NP}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_INTER_NP}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_INTER_NP}/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libregistrar.so"
+                         "${CMAKE_BINARY_DIR}/libinterpose_dup1.so"
+                         "${CMAKE_BINARY_DIR}/libinterpose_dup2.so"
+                         "${CMAKE_BINARY_DIR}/libroot.so"
+            --output-dir "${_TD_INTER_NP}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_INTER_NP}/test.key"
+            --output "${_TD_INTER_NP}/.lrxd"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/GUI"
+            --key    "${_TD_INTER_NP}/test.key"
+            --daemon-libs
+            --output "${_TD_INTER_NP}/test.protected"
+    COMMAND ${CMAKE_COMMAND}
+            "-DBINARY=${_TD_INTER_NP}/test.protected"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
+    DEPENDS stub libregistrar libinterpose_dup1 libinterpose_dup2
+            libroot_interpose dlopen_interpose_np_bin
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "dlopen interpose under __r_NP: forced RTLD_GLOBAL still dedups static state"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_env_no_preload — the stub must honor an *inherited* __r_NP=1
+#  (exe is NOT blacklisted), and natural load must resolve a Class-3
+#  implicit dep (encrypted libenccons -> plaintext libplainprov, no
+#  DT_NEEDED edge) that the encrypted-only symbol-completion closure
+#  cannot.  With __r_NP=1 in the env: stub honors it -> natural load ->
+#  encroot_get()==99.  Without the stub change the inherited var is
+#  scrubbed, the default preload path preloads libenccons in isolation,
+#  its ctor calls the unresolved plain_impl(), and the process aborts.
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libplainprov.so"
+    COMMAND gcc -shared -fPIC -O2 -Wl,-soname,libplainprov.so
+            -o "${CMAKE_BINARY_DIR}/libplainprov.so"
+            "${CMAKE_SOURCE_DIR}/tests/env_no_preload/libplainprov.c"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/env_no_preload/libplainprov.c"
+    COMMENT "Building libplainprov.so (env_no_preload test, plaintext)"
+)
+add_custom_target(libplainprov DEPENDS "${CMAKE_BINARY_DIR}/libplainprov.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libenccons.so"
+    COMMAND gcc -shared -fPIC -O2 -Wl,-soname,libenccons.so
+            -o "${CMAKE_BINARY_DIR}/libenccons.so"
+            "${CMAKE_SOURCE_DIR}/tests/env_no_preload/libenccons.c"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/env_no_preload/libenccons.c"
+    COMMENT "Building libenccons.so (env_no_preload test)"
+)
+add_custom_target(libenccons DEPENDS "${CMAKE_BINARY_DIR}/libenccons.so")
+
+add_custom_command(
+    OUTPUT  "${CMAKE_BINARY_DIR}/libencroot.so"
+    COMMAND gcc -shared -fPIC -O2 -Wl,-soname,libencroot.so
+            -o "${CMAKE_BINARY_DIR}/libencroot.so"
+            "${CMAKE_SOURCE_DIR}/tests/env_no_preload/libencroot.c"
+            -L "${CMAKE_BINARY_DIR}" -lenccons -lplainprov -Wl,--no-as-needed
+    DEPENDS "${CMAKE_SOURCE_DIR}/tests/env_no_preload/libencroot.c"
+            "${CMAKE_BINARY_DIR}/libenccons.so"
+            "${CMAKE_BINARY_DIR}/libplainprov.so"
+    COMMENT "Building libencroot.so (env_no_preload test)"
+)
+add_custom_target(libencroot DEPENDS "${CMAKE_BINARY_DIR}/libencroot.so")
+
+compile_test_bin("${CMAKE_BINARY_DIR}/env_np_main"
+    gcc "${CMAKE_SOURCE_DIR}/tests/env_no_preload/main.c")
+add_custom_target(env_np_main_bin DEPENDS "${CMAKE_BINARY_DIR}/env_np_main")
+
+set(_TD_ENVNP "${CMAKE_BINARY_DIR}/daemon_test_env_no_preload")
+add_custom_target(test_env_no_preload
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_env_no_preload ==="
+    COMMAND ${CMAKE_COMMAND} -DTEST_DIR=${_TD_ENVNP}
+            -P "${CMAKE_SOURCE_DIR}/cmake/cleanup_daemons.cmake"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_TD_ENVNP}"
+    # Only libencroot + libenccons are encrypted; libplainprov stays
+    # plaintext and is found at runtime via LD_LIBRARY_PATH.
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" encrypt-lib
+            --key        "${_TD_ENVNP}/test.key"
+            --libs       "${CMAKE_BINARY_DIR}/libencroot.so"
+                         "${CMAKE_BINARY_DIR}/libenccons.so"
+            --output-dir "${_TD_ENVNP}"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-daemon
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --key    "${_TD_ENVNP}/test.key"
+            --output "${_TD_ENVNP}/.lrxd"
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/encryptor/protect.py" protect-exe
+            --stub   "${CMAKE_BINARY_DIR}/stub"
+            --main   "${CMAKE_BINARY_DIR}/env_np_main"
+            --key    "${_TD_ENVNP}/test.key"
+            --daemon-libs
+            --output "${_TD_ENVNP}/test.protected"
+    COMMAND ${CMAKE_COMMAND}
+            "-DBINARY=${_TD_ENVNP}/test.protected"
+            "-DRUN_ENV=__r_NP=1"
+            "-DLD_LIBRARY_PATH=${CMAKE_BINARY_DIR}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/run_test.cmake"
+    DEPENDS stub libplainprov libenccons libencroot env_np_main_bin
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "inherited __r_NP=1 honored; natural load resolves Class-3 plaintext-provider dep"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_preload_memfd — smoke test: DT_NEEDED satisfied via LD_PRELOAD
 #  from a memfd (no .so on disk, no LD_AUDIT)
 # ═══════════════════════════════════════════════════════════════════════

@@ -65,7 +65,21 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
  * mapping everything before running any ctor.  Setting this env var
  * reproduces that plaintext-equivalent load pattern, at the cost of
  * losing the DT_RPATH-hits-ciphertext protection for libs that set
- * DT_RPATH to the encrypted on-disk dir. */
+ * DT_RPATH to the encrypted on-disk dir.
+ *
+ * Protobuf interaction: skipping the preload loop also skips the
+ * RTLD_GLOBAL it applied to every dep.  glibc's natural recursive
+ * load (triggered by the caller's real_dlopen of the root) would
+ * otherwise inherit the caller's flags — typically RTLD_LOCAL — so
+ * DSOs that statically link the same .pb.o keep separate
+ * `descriptor_table_<file>_2eproto` copies and libprotobuf aborts
+ * with "File already exists in database".  We compensate by forcing
+ * RTLD_GLOBAL onto the root real_dlopen in this mode (see dlopen()):
+ * glibc propagates RTLD_GLOBAL to the entire freshly-loaded dep
+ * subtree, restoring the first-definition-wins interposition the
+ * preload path provided — so __r_NP gives plaintext-equivalent
+ * implicit-dep resolution *and* protobuf ODR dedup, with no
+ * per-binary patchelf. */
 static int g_no_preload = 0;
 
 /* Diagnostic log file opened at ctor time if ANTIREV_DLOPEN_LOG is set
@@ -394,18 +408,31 @@ void *dlopen(const char *filename, int flags)
     fetch_closure(base);
     pthread_mutex_unlock(&g_lock);
 
+    /* In __r_NP (natural-load) mode the per-dep preload loop — and the
+     * RTLD_GLOBAL it applied to every dep — is skipped, so this root
+     * real_dlopen is what triggers glibc's recursive DT_NEEDED walk for
+     * the whole subtree.  Force RTLD_GLOBAL: glibc promotes the root
+     * AND every freshly-loaded dep into the global scope, so DSOs that
+     * statically link the same .pb.o interpose their
+     * `descriptor_table_<file>_2eproto` first-definition-wins instead
+     * of each registering a duplicate (libprotobuf "File already exists
+     * in database").  This restores the preload path's ODR dedup while
+     * keeping natural-load implicit-dep resolution.  Gated on
+     * g_no_preload so the default preload path is untouched. */
+    int root_flags = g_no_preload ? (flags | RTLD_GLOBAL) : flags;
+
     /* Resolve via the symlink dir so glibc sees a stable on-disk path
      * and its DT_NEEDED search finds sibling encrypted deps too.
      * %.255s bounds each directive — see preload_closure_deps. */
     char spath[512];
     snprintf(spath, sizeof(spath), "%.255s/%.255s", g_symlink_dir, base);
-    void *h = real_dlopen_fn(spath, flags);
+    void *h = real_dlopen_fn(spath, root_flags);
     if (!h) {
         const char *err = dlerror();
         LOG("  real_dlopen(%s) FAILED: %s\n", spath, err ? err : "(null)");
         /* If the symlink path didn't work (e.g., lib wasn't in our set),
          * fall through to the original request. */
-        h = real_dlopen_fn(filename, flags);
+        h = real_dlopen_fn(filename, root_flags);
         if (!h) {
             const char *e2 = dlerror();
             LOG("  real_dlopen(%s) also failed: %s\n", filename, e2 ? e2 : "(null)");

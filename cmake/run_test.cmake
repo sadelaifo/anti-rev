@@ -13,6 +13,11 @@ endif()
 if(DEFINED LD_LIBRARY_PATH)
     list(APPEND ENV_ARGS "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}")
 endif()
+# Optional extra env entries (semicolon-separated NAME=VALUE list),
+# e.g. -DRUN_ENV=__r_NP=1 to exercise the inherited-__r_NP path.
+if(DEFINED RUN_ENV)
+    list(APPEND ENV_ARGS ${RUN_ENV})
+endif()
 
 if(ENV_ARGS)
     set(RUN_CMD ${CMAKE_COMMAND} -E env ${ENV_ARGS} "${BINARY}" test_arg)
