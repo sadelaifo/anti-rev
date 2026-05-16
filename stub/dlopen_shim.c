@@ -394,35 +394,18 @@ void *dlopen(const char *filename, int flags)
     fetch_closure(base);
     pthread_mutex_unlock(&g_lock);
 
-    /* aarch64 (下位机) ONLY: under __r_NP the per-dep preload loop —
-     * and the RTLD_GLOBAL it applied to every dep — is skipped, so
-     * this root real_dlopen is what triggers glibc's recursive
-     * DT_NEEDED walk.  Force RTLD_GLOBAL: glibc propagates it to the
-     * whole freshly-loaded subtree, so DSOs that statically link the
-     * same .pb.o interpose descriptor_table_<file>_2eproto
-     * first-definition-wins instead of each re-registering
-     * (libprotobuf "File already exists in database").  x86 (上位机)
-     * is deliberately left byte-identical to baseline (root_flags ==
-     * flags) — its encrypted processes have no such issue.  Gated on
-     * g_no_preload so the default preload path is untouched. */
-#if defined(__aarch64__)
-    int root_flags = g_no_preload ? (flags | RTLD_GLOBAL) : flags;
-#else
-    int root_flags = flags;
-#endif
-
     /* Resolve via the symlink dir so glibc sees a stable on-disk path
      * and its DT_NEEDED search finds sibling encrypted deps too.
      * %.255s bounds each directive — see preload_closure_deps. */
     char spath[512];
     snprintf(spath, sizeof(spath), "%.255s/%.255s", g_symlink_dir, base);
-    void *h = real_dlopen_fn(spath, root_flags);
+    void *h = real_dlopen_fn(spath, flags);
     if (!h) {
         const char *err = dlerror();
         LOG("  real_dlopen(%s) FAILED: %s\n", spath, err ? err : "(null)");
         /* If the symlink path didn't work (e.g., lib wasn't in our set),
          * fall through to the original request. */
-        h = real_dlopen_fn(filename, root_flags);
+        h = real_dlopen_fn(filename, flags);
         if (!h) {
             const char *e2 = dlerror();
             LOG("  real_dlopen(%s) also failed: %s\n", filename, e2 ? e2 : "(null)");
