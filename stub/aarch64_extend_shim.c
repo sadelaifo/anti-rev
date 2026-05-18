@@ -395,20 +395,49 @@ int ANTI_LoadProcess(void *info_raw)
 /*     avoid any chance of recursion via real_openat.                   */
 /* ------------------------------------------------------------------ */
 
-static int     (*g_real_openat)(int, const char *, int, ...) = NULL;
-static int     (*g_real_newfstatat)(int, const char *, struct stat *, int) = NULL;
-static int     (*g_real_stat)(const char *, struct stat *) = NULL;
-static int     (*g_real_lstat)(const char *, struct stat *) = NULL;
-static int     (*g_real_access)(const char *, int) = NULL;
+/* Perform the real file-IO via RAW SYSCALLS instead of dlsym'ing libc
+ * symbols.
+ *
+ * Why: glibc >= 2.33 makes stat/lstat/fstatat header *inlines* (not
+ * exported symbols), and NO glibc ever exports a symbol literally
+ * named "newfstatat" (that is the syscall name; libc's API symbols are
+ * fstatat / __fxstatat).  The previous
+ * dlsym(RTLD_NEXT,"newfstatat"/"stat"/"lstat") therefore returned NULL
+ * on modern glibc, so every interceptor fell through to ENOSYS — and
+ * because these functions are LD_PRELOAD-interposed *process-wide*,
+ * EVERY stat()/lstat()/open()/access() in the protected process began
+ * returning ENOSYS, so nothing could start.  Raw syscalls have no
+ * libc-symbol dependency and are glibc-version-independent (same
+ * pattern the shim already uses for memfd_create).  This TU only
+ * compiles on aarch64, so the aarch64 syscall numbers are fixed.
+ *
+ * glibc's syscall() still returns -1 and sets errno on failure, so the
+ * errno semantics business code observes are unchanged.  On aarch64
+ * there is one canonical struct stat layout (no _FILE_OFFSET_BITS
+ * split, no _STAT_VER, native 64-bit time), so the kernel's
+ * newfstatat fills the same struct the caller expects — identical to
+ * what glibc's own thin aarch64 wrapper would have copied. */
+#ifndef __NR_openat
+#  define __NR_openat     56
+#endif
+#ifndef __NR_newfstatat
+#  define __NR_newfstatat 79
+#endif
+#ifndef __NR_faccessat
+#  define __NR_faccessat  48
+#endif
 
-static void resolve_real_io_funcs(void)
+static int raw_openat(int dirfd, const char *path, int flags, mode_t mode)
 {
-    if (g_real_openat && g_real_newfstatat) return;
-    if (!g_real_openat)     g_real_openat     = dlsym(RTLD_NEXT, "openat");
-    if (!g_real_newfstatat) g_real_newfstatat = dlsym(RTLD_NEXT, "newfstatat");
-    if (!g_real_stat)       g_real_stat       = dlsym(RTLD_NEXT, "stat");
-    if (!g_real_lstat)      g_real_lstat      = dlsym(RTLD_NEXT, "lstat");
-    if (!g_real_access)     g_real_access     = dlsym(RTLD_NEXT, "access");
+    return (int) syscall(__NR_openat, dirfd, path, flags, (long) mode);
+}
+static int raw_newfstatat(int dirfd, const char *path, struct stat *buf, int flags)
+{
+    return (int) syscall(__NR_newfstatat, dirfd, path, buf, flags);
+}
+static int raw_faccessat(int dirfd, const char *path, int mode, int flags)
+{
+    return (int) syscall(__NR_faccessat, dirfd, path, mode, flags);
 }
 
 /* Return stable /proc/self/fd/N path if this pathname refers to an
@@ -449,8 +478,6 @@ static const char *maybe_rewrite_elf_path(const char *pathname)
 __attribute__((visibility("default")))
 int openat(int dirfd, const char *pathname, int flags, ...)
 {
-    resolve_real_io_funcs();
-
     /* Diagnostic: every openat invocation through this shim gets
      * logged (path only).  If strace shows an openat for a given
      * path but this log does not, the caller is bypassing libc
@@ -459,10 +486,10 @@ int openat(int dirfd, const char *pathname, int flags, ...)
      * (seccomp-bpf user-notify / ptrace) would be required. */
     if (g_log && pathname) LOG("openat trace: %s\n", pathname);
 
-    /* O_CREAT / O_TMPFILE pass a mode_t via varargs; forward verbatim. */
+    /* O_CREAT / O_TMPFILE pass a mode_t via varargs; the kernel
+     * ignores mode otherwise, so forwarding 0 verbatim is safe. */
     mode_t mode = 0;
-    int has_mode = (flags & (O_CREAT | O_TMPFILE)) != 0;
-    if (has_mode) {
+    if ((flags & (O_CREAT | O_TMPFILE)) != 0) {
         va_list ap;
         va_start(ap, flags);
         mode = (mode_t)va_arg(ap, int);
@@ -472,14 +499,9 @@ int openat(int dirfd, const char *pathname, int flags, ...)
     const char *redirect = maybe_rewrite_elf_path(pathname);
     if (redirect) {
         LOG("openat redirect %s -> %s\n", pathname, redirect);
-        if (!g_real_openat) { errno = ENOSYS; return -1; }
-        return g_real_openat(AT_FDCWD, redirect, flags, mode);
+        return raw_openat(AT_FDCWD, redirect, flags, mode);
     }
-
-    if (!g_real_openat) { errno = ENOSYS; return -1; }
-    return has_mode
-        ? g_real_openat(dirfd, pathname, flags, mode)
-        : g_real_openat(dirfd, pathname, flags);
+    return raw_openat(dirfd, pathname, flags, mode);
 }
 
 /* Some glibc builds call open() -> openat(AT_FDCWD, ...) internally,
@@ -504,66 +526,49 @@ int open(const char *pathname, int flags, ...)
 __attribute__((visibility("default")))
 int newfstatat(int dirfd, const char *pathname, struct stat *buf, int flags)
 {
-    resolve_real_io_funcs();
     const char *redirect = maybe_rewrite_elf_path(pathname);
     if (redirect) {
         LOG("newfstatat redirect %s -> %s\n", pathname, redirect);
-        if (!g_real_newfstatat) { errno = ENOSYS; return -1; }
-        return g_real_newfstatat(AT_FDCWD, redirect, buf, flags);
+        return raw_newfstatat(AT_FDCWD, redirect, buf, flags);
     }
-    if (!g_real_newfstatat) { errno = ENOSYS; return -1; }
-    return g_real_newfstatat(dirfd, pathname, buf, flags);
+    return raw_newfstatat(dirfd, pathname, buf, flags);
 }
 
 __attribute__((visibility("default")))
 int stat(const char *pathname, struct stat *buf)
 {
-    resolve_real_io_funcs();
     const char *redirect = maybe_rewrite_elf_path(pathname);
     if (redirect) {
         LOG("stat redirect %s -> %s\n", pathname, redirect);
-        if (g_real_stat) return g_real_stat(redirect, buf);
-        /* Fall back to newfstatat if libc's stat isn't exported (glibc
-         * >= 2.33 provides stat as an inline wrapper in headers). */
-        if (g_real_newfstatat) return g_real_newfstatat(AT_FDCWD, redirect, buf, 0);
-        errno = ENOSYS; return -1;
+        return raw_newfstatat(AT_FDCWD, redirect, buf, 0);
     }
-    if (g_real_stat) return g_real_stat(pathname, buf);
-    if (g_real_newfstatat) return g_real_newfstatat(AT_FDCWD, pathname, buf, 0);
-    errno = ENOSYS; return -1;
+    return raw_newfstatat(AT_FDCWD, pathname, buf, 0);
 }
 
 __attribute__((visibility("default")))
 int lstat(const char *pathname, struct stat *buf)
 {
-    resolve_real_io_funcs();
     const char *redirect = maybe_rewrite_elf_path(pathname);
     if (redirect) {
         /* For our rewrite the symlink-vs-target distinction is
          * irrelevant — /proc/self/fd/N IS a symlink but we want the
-         * target (the memfd), matching plaintext semantics. */
+         * target (the memfd), matching plaintext semantics, so follow
+         * it (flags = 0, not AT_SYMLINK_NOFOLLOW). */
         LOG("lstat redirect %s -> %s\n", pathname, redirect);
-        if (g_real_newfstatat) return g_real_newfstatat(AT_FDCWD, redirect, buf, 0);
-        errno = ENOSYS; return -1;
+        return raw_newfstatat(AT_FDCWD, redirect, buf, 0);
     }
-    if (g_real_lstat) return g_real_lstat(pathname, buf);
-    if (g_real_newfstatat)
-        return g_real_newfstatat(AT_FDCWD, pathname, buf, AT_SYMLINK_NOFOLLOW);
-    errno = ENOSYS; return -1;
+    return raw_newfstatat(AT_FDCWD, pathname, buf, AT_SYMLINK_NOFOLLOW);
 }
 
 __attribute__((visibility("default")))
 int access(const char *pathname, int mode)
 {
-    resolve_real_io_funcs();
     const char *redirect = maybe_rewrite_elf_path(pathname);
     if (redirect) {
         LOG("access redirect %s -> %s\n", pathname, redirect);
-        if (g_real_access) return g_real_access(redirect, mode);
-        errno = ENOSYS; return -1;
+        return raw_faccessat(AT_FDCWD, redirect, mode, 0);
     }
-    if (g_real_access) return g_real_access(pathname, mode);
-    errno = ENOSYS; return -1;
+    return raw_faccessat(AT_FDCWD, pathname, mode, 0);
 }
 
 /* ------------------------------------------------------------------ */
