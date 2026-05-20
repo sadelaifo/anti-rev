@@ -176,10 +176,19 @@ def _make_chunk(node, src_lines: List[str], path: pathlib.Path,
     # tests with ops floods every bucket with noise (a 150k-test repo
     # otherwise produces 60k+ false "init" / "cleanup" hits from names
     # like `test_clean_session`, `test_setup_xxx`).
+    #
+    # Within helper/fixture: NAME WINS over DOCSTRING.  Function names
+    # are a strong, explicit categorization signal (`start_immer` is
+    # clearly a start op); docstrings on the same function often
+    # mention generic verbs ("creates / prepares / sets up ...") that
+    # would dilute it with spurious tags like `init`.  Doc keywords
+    # only fire when the name doesn't match anything — i.e. as a
+    # fallback for non-conventional naming.
     if kind == "test":
         tags: List[str] = []
     else:
-        tags = sorted(set(tag_by_name(node.name) + tag_by_doc(doc)))
+        name_tags = tag_by_name(node.name)
+        tags = sorted(set(name_tags)) if name_tags else sorted(set(tag_by_doc(doc)))
     refs = _extract_refs(node)
     fixture_deps = [a.arg for a in node.args.args if a.arg not in ("self", "cls")]
 
