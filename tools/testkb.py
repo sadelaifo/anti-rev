@@ -287,6 +287,52 @@ def scan_repo(root: pathlib.Path) -> List[Dict]:
 # ---------------------------------------------------------------------------
 _WORD_RE = re.compile(r"\w+", flags=re.UNICODE)
 _CAMEL_RE = re.compile(r"[A-Z][a-z]+|[a-z]+|[A-Z]+(?=[A-Z]|$|\d)|\d+")
+_HAN_RE = re.compile(r"[一-鿿]")
+
+# Optional jieba for Chinese segmentation; falls back to char + bigram
+# if not installed.  `re.UNICODE` makes \w+ match Chinese, but a phrase
+# like "启动服务" then becomes ONE giant token and BM25 can never match
+# it — without proper segmentation, every Chinese query returns "no
+# hits".
+try:
+    import jieba  # type: ignore
+    _HAS_JIEBA = True
+except Exception:
+    _HAS_JIEBA = False
+    jieba = None  # type: ignore
+
+
+def _segment_chinese(raw: str) -> List[str]:
+    """Split a Chinese-containing run into searchable tokens."""
+    if _HAS_JIEBA:
+        return [s for s in jieba.cut_for_search(raw) if s.strip()]
+    # No jieba: every single character + every adjacent bigram.
+    # BM25's IDF naturally down-weights very common chars (的/是/...)
+    # while up-weighting rare meaningful ones; bigrams add some
+    # phrase-level structure so "启动" matches better than just "启" + "动".
+    chars = list(raw)
+    out: List[str] = list(chars)
+    for i in range(len(chars) - 1):
+        out.append(chars[i] + chars[i + 1])
+    return out
+
+
+def _split_at_script_boundary(raw: str) -> List[str]:
+    """Split `start启动` into ['start', '启动'] so each half can be
+    tokenized in its own style (camel/snake vs CJK segmentation)."""
+    parts: List[str] = []
+    cur = ""
+    cur_is_han: Optional[bool] = None
+    for ch in raw:
+        is_han = bool(_HAN_RE.match(ch))
+        if cur and is_han != cur_is_han:
+            parts.append(cur)
+            cur = ""
+        cur += ch
+        cur_is_han = is_han
+    if cur:
+        parts.append(cur)
+    return parts
 
 
 def tokenize(text: str) -> List[str]:
@@ -294,18 +340,23 @@ def tokenize(text: str) -> List[str]:
     for raw in _WORD_RE.findall(text):
         if not raw:
             continue
-        low = raw.lower()
-        tokens.append(low)
-        # split snake_case
-        if "_" in raw:
-            for p in raw.split("_"):
-                if p and p.lower() != low:
-                    tokens.append(p.lower())
-        # split CamelCase / mixedCase / runs
-        for p in _CAMEL_RE.findall(raw):
-            pl = p.lower()
-            if pl and pl != low:
-                tokens.append(pl)
+        for part in _split_at_script_boundary(raw):
+            if _HAN_RE.search(part):
+                for seg in _segment_chinese(part):
+                    s = seg.strip().lower()
+                    if s:
+                        tokens.append(s)
+                continue
+            low = part.lower()
+            tokens.append(low)
+            if "_" in part:
+                for p in part.split("_"):
+                    if p and p.lower() != low:
+                        tokens.append(p.lower())
+            for p in _CAMEL_RE.findall(part):
+                pl = p.lower()
+                if pl and pl != low:
+                    tokens.append(pl)
     return tokens
 
 
