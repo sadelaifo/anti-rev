@@ -55,6 +55,7 @@ import pathlib
 import pickle
 import re
 import sys
+import warnings
 from collections import Counter, defaultdict
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
@@ -223,8 +224,18 @@ def iter_chunks_in_file(path: pathlib.Path) -> Iterator[Dict]:
         src = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return
+    # Suppress SyntaxWarning ("invalid escape sequence '\d'" etc.) that
+    # the user's test files trigger when they contain non-raw regex
+    # strings like "\d+".  Those warnings are about THEIR code, not
+    # ours; ast.parse still produces a valid tree, so the chunks are
+    # extracted fine — we just shouldn't spam them at our caller.
+    # DeprecationWarning is included for older Python versions where
+    # the same condition was a DeprecationWarning.
     try:
-        tree = ast.parse(src)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            warnings.simplefilter("ignore", DeprecationWarning)
+            tree = ast.parse(src, filename=str(path))
     except SyntaxError:
         return
     src_lines = src.split("\n")
