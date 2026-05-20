@@ -93,15 +93,20 @@
 /* ------------------------------------------------------------------ */
 /*  Diagnostic-log gate                                                 */
 /* ------------------------------------------------------------------ */
-/* xcc_514 branch: file-based logging on by default.  Survives
+/* File-based diagnostic logging: OPT-IN, default OFF.  Survives
  * boost::process::child + detach (which closes stderr).  Every
  * log line is prefixed with the writing pid so cross-process logs
  * (parent stub, child stub, daemon, grandchild) stay distinguishable
- * in the shared file.
+ * in the shared file.  Default OFF avoids any /tmp writes /
+ * shared-file contention / disk-pressure surprises in production.
  *
- *   default               → /tmp/antirev_stub.log (append, line-buffered)
- *   ANTIREV_LOG_FILE=path → write to <path> instead
- *   ANTIREV_LOG=0/false/no/off → disable file logging too (opt-out)
+ *   ANTIREV_LOG unset / empty / 0 / false / no / off  → logging OFF (default)
+ *   ANTIREV_LOG=1 (or any other truthy value)         → enable, write to
+ *                                                       /tmp/antirev_stub.log
+ *                                                       (append, line-buffered)
+ *   ANTIREV_LOG_FILE=path                             → when logging is on,
+ *                                                       use <path> instead of
+ *                                                       /tmp/antirev_stub.log
  *
  * init_log_gate() must be the first thing main() does so that the
  * very first error path (open /proc/self/exe) already respects the
@@ -128,12 +133,17 @@ static void capture_log_name(void) {
 }
 
 static void init_log_gate(void) {
-    /* Allow explicit opt-out via ANTIREV_LOG=0/false/no */
+    /* Opt-in: file logging stays OFF unless ANTIREV_LOG is explicitly
+     * set to a truthy value.  Treat unset/empty/"0"/"false"/"no"/"off"
+     * (case-insensitive first chars) as OFF so production never writes
+     * to /tmp by accident. */
     const char *e = getenv("ANTIREV_LOG");
-    if (e && *e) {
-        if (e[0] == '0' && e[1] == '\0') return;
-        if (e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N') return;
-    }
+    if (!e || !*e) return;
+    if (e[0] == '0' && e[1] == '\0') return;
+    if (e[0] == 'f' || e[0] == 'F') return;                       /* false */
+    if (e[0] == 'n' || e[0] == 'N') return;                       /* no    */
+    if ((e[0] == 'o' || e[0] == 'O') &&
+        (e[1] == 'f' || e[1] == 'F')) return;                     /* off   */
 
     const char *path = getenv("ANTIREV_LOG_FILE");
     if (!path || !*path) path = "/tmp/antirev_stub.log";
@@ -144,11 +154,10 @@ static void init_log_gate(void) {
         g_stub_log = f;
         g_log_pid  = getpid();
         capture_log_name();
-    } else if (e && *e) {
-        /* Couldn't open the file but user asked for logging — fall back
-         * to stderr.  Don't fall back silently otherwise (default-on
-         * file logging shouldn't suddenly start spewing to stderr if
-         * /tmp is read-only). */
+    } else {
+        /* Logging was requested (opt-in) but the file couldn't be
+         * opened — fall back to stderr so the request isn't silently
+         * dropped. */
         g_stub_log = stderr;
         g_log_pid  = getpid();
         capture_log_name();
