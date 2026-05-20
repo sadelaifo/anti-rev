@@ -170,7 +170,16 @@ def _make_chunk(node, src_lines: List[str], path: pathlib.Path,
     else:
         body = "\n".join(src_lines[start:end])
 
-    tags = sorted(set(tag_by_name(node.name) + tag_by_doc(doc)))
+    # Op tags are the "verb library" view — only meaningful for helpers
+    # and fixtures, NOT for tests.  A test named `test_create_user` is
+    # NOT itself a create-operation; it just exercises one.  Tagging
+    # tests with ops floods every bucket with noise (a 150k-test repo
+    # otherwise produces 60k+ false "init" / "cleanup" hits from names
+    # like `test_clean_session`, `test_setup_xxx`).
+    if kind == "test":
+        tags: List[str] = []
+    else:
+        tags = sorted(set(tag_by_name(node.name) + tag_by_doc(doc)))
     refs = _extract_refs(node)
     fixture_deps = [a.arg for a in node.args.args if a.arg not in ("self", "cls")]
 
