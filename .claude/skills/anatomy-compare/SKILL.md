@@ -37,66 +37,20 @@ function_logic_cap_<N>_<slug>.md   — 每个能力一份,函数级业务逻辑 
 
 ---
 
-## 执行模式 — 适配 context 大小(重要,在开始 Phase 1 前先读)
+## 配合建议:加载 streaming-execution
 
-**本 skill 必须按"逐单元流式执行"跑,不要试图一次性把 A、B 装进 context:**
+本 skill 只关注**比对业务本身**(四阶段 / 11 维度 / 五档分类 / Phase 4 模板)。
 
-- 小 context 模型(< 100K)直接爆
-- 大 context 模型也会因为 context 太满导致**注意力稀释**,产出质量明显下降
-- **流式还有个红利:中断可恢复、单步可审计**,在任何 context 大小下都更稳
+"怎么稳定地跑完这么大一摊活" 是**正交的关注点**,抽到了另一份通用 skill `streaming-execution` 里 —— manifest + per-unit + append + `_progress.md` + 可中断恢复。
 
-### 通用流式节奏(每个 Phase 都按这个跑)
+**强烈建议两份一起加载**,尤其是:
 
-```
-1. 建 manifest:Glob / ls 列出待处理对象(文件 / 能力 / 函数对),
-                写入 _<phase>_manifest.txt
-2. 逐项处理:每次循环只把【一个对象】+【产物文件的尾部】放进 context
-3. 追加写入:Read 当前产物 → 计算追加内容 → Write 回去 → 释放 context
-4. 记录进度:每完成一项,append 一行到 _progress.md
-5. 中断可恢复:重启时先 Read _progress.md,从下一个 pending 继续
-```
+- 小 context 模型(< 100K) → **必须**
+- 大 ctx 模型也建议加载,获得 crash-safe 和单步可审计
 
-### 不同 context 档位的 tuning
+加载顺序:**先 streaming-execution,再 anatomy-compare**。
 
-| Context 大小 | 单次循环最多 | 能否回看完整 anatomy | 备注 |
-|---|---|---|---|
-| < 64K(小型本地模型) | 1 个文件,大文件分段 Read | 否,只 Grep 出当前段 | Phase 4 严格 "1 函数对 = 1 chunk" |
-| 64-200K(中等) | 2-5 个文件 / 函数对 | 局部可以 | 适度批量 |
-| > 200K(Sonnet/Opus/Gemini Pro) | 更多 | 是 | 仍按流式跑,figure out audit trail |
-
-### 实操技巧(小 context 模型必看)
-
-- **`Read` 用 `offset` + `limit`**:源文件 > 500 行就分段读,不要一口气全 Read
-- **anatomy 不回看全文**:Phase 3 / 4 引用 anatomy 时用 `Grep` 抓需要的 section,**不要用 `Read` 加载整份 a_anatomy.md / b_anatomy.md**
-- **每个函数对写完就 close**:不要在同一次循环里塞多对函数,产物文件 append 一段就提交
-- **每次新循环开头先"清场"**:默念"忘掉上次的源码内容,只保留 SKILL.md + 当前任务",**物理上靠每次新的 Read 重写 working set**(LLM 没有真正的 forget,但更小的新输入会自然挤掉旧的注意力)
-
-### `_progress.md` 格式(简洁、可重入)
-
-```
-phase: 1
-total: 47
-done: 24
-done_list:
-  - encryptor/protect.py
-  - encryptor/antirev-pack.py
-  ...
-pending:
-  - stub/dlopen_shim.c
-  - stub/aarch64_extend_shim.c
-  ...
-last_updated: <ISO 时间戳>
-```
-
-中断后恢复:LLM 先 Read `_progress.md`,从 `pending` 第一项继续。
-
-### 极小 context(< 32K)的降级模式
-
-如果连流式都吃紧(SKILL.md 占 ~5K + 一个 500 行文件 ~3K + 进度 ~1K,已经接近一半):
-
-- **11 维度压到 5 个核心**:1 项目目的、3 顶层能力、4 架构分层、5 核心抽象、6 数据流
-- **Phase 4 只钻 Phase 3 标 ⚠️ 风险高的 3-5 个函数对**,其他归入"待人工 review"
-- **产物会损失粒度,但结构和约束保持** —— 仍然可以横向 review
+下面四个 Phase 里都会说 "按 streaming-execution 的核心循环跑某某 manifest" —— 那些细节都在 streaming-execution 那份里。如果没加载它,LLM 自己也要按"逐单元 + 追加 + 进度文件"的方式走,不要一次性把 A 或 B 全装 context。
 
 ---
 
@@ -104,7 +58,7 @@ last_updated: <ISO 时间戳>
 
 ### Phase 1 — 构建 A 的 anatomy(独立)
 
-**按 §执行模式 的流式节奏跑** —— 先 `Glob` 列出 A 的所有源文件到 `_phase1_manifest.txt`,然后**一次一个文件**(或大文件分段)处理,每文件读完就追加到 `a_anatomy.md` 对应维度的 section。
+**按 streaming-execution 的核心循环跑**:`Glob` 出 A 的源文件清单 → `_phase1_manifest.txt` → 每次循环只处理一个文件 → 追加到 `a_anatomy.md` 对应维度 section → 更新 `_progress.md`。
 
 沿下列 **11 个维度** 逐项写 `a_anatomy.md`(各维度的 section 在第一个文件处理时初始化,后续文件**追加**到对应 section):
 
@@ -131,7 +85,7 @@ last_updated: <ISO 时间戳>
 
 ### Phase 2 — 构建 B 的 anatomy(独立 —— 严禁参考 Phase 1)
 
-同 Phase 1 的流程、维度、格式、证据要求,**同样按 §执行模式 流式跑**(`_phase2_manifest.txt` + 逐文件追加 `b_anatomy.md`)。
+同 Phase 1 的流程、维度、格式、证据要求,**同样按 streaming-execution 的核心循环跑**(`_phase2_manifest.txt` + 逐文件追加 `b_anatomy.md`)。
 
 #### Phase 2 关键硬约束(违反则全盘失效)
 
@@ -143,9 +97,9 @@ last_updated: <ISO 时间戳>
 
 ### Phase 3 — 维度对齐对照
 
-**按 §执行模式 的流式节奏 —— 一次只对齐一个维度**:从 `a_anatomy.md` 和 `b_anatomy.md` 用 `Grep` 抓出当前维度的 section,产出该维度的对照内容追加到 `comparison.md`,然后释放 context 进入下一个维度。
+**按 streaming-execution 的核心循环跑 —— manifest 是 11 维度本身**:每次只对齐一个维度,从 `a_anatomy.md` 和 `b_anatomy.md` 用 `Grep` 抓出该维度的 section,产出该维度的对照内容追加到 `comparison.md`,然后释放 context 进入下一个维度。
 
-**小 context 模型严禁一次 `Read` 整个 anatomy 文件**。
+**严禁一次 `Read` 整个 anatomy 文件** —— 即使是大 ctx 模型也别这么干,注意力稀释。
 
 产 `comparison.md`,**每个维度一张并排表 / 段落**。
 
@@ -175,19 +129,19 @@ last_updated: <ISO 时间戳>
 
 ### Phase 4 — 函数级业务逻辑 diff
 
-**按 §执行模式 的流式节奏 —— 严格"一个能力一份文件,一个函数对一次循环"**:
+**按 streaming-execution 的核心循环跑 —— 严格"一个能力一份文件,一个函数对一次循环"**:
 
 ```
 for each capability in Phase 3 钻深名单:
     新建 function_logic_cap_<N>_<slug>.md,先写头部声明
     建 _phase4_cap_<N>_manifest.txt: 列出该 capability 的 A/B 函数对清单
     for each function pair:
-        Read 两边对应行号范围(不读整文件)
+        Read 两边对应行号范围(用 offset+limit,不读整文件)
         写一段对照(下方模板)→ append 到 .md
-        清空 context 进入下一对
+        更新 _progress.md
 ```
 
-**关键**:Read 时**用 `offset` + `limit` 只读函数对应的行号范围**,不要 Read 整文件。函数位置从 a_anatomy.md / b_anatomy.md 的证据 file:line 拿(这就是为什么 Phase 1/2 必须老老实实标行号)。
+**关键**:函数位置从 `a_anatomy.md` / `b_anatomy.md` 的证据 file:line 拿(这就是为什么 Phase 1/2 必须老老实实标行号)。
 
 对 Phase 3 标的每个能力,写一份 `function_logic_cap_<N>_<slug>.md`(`<N>` 从 01 起,`<slug>` 用英文短词,如 `file_encryption`)。
 
@@ -237,6 +191,19 @@ for each capability in Phase 3 钻深名单:
 
 ---
 
+## 可选简化模式(用户主动 opt-in)
+
+如果用户在调用时**明确请求简化模式**(例如:"我的模型小,请用简化模式"),或者你自己运行时发现产出反复被打断:
+
+- **11 维度压成 5 个核心**:1 项目目的、3 顶层能力、4 架构分层、5 核心抽象、6 数据流
+- **Phase 4 只钻 Phase 3 标 ⚠️ 风险高的 3-5 个函数对**,其他归入 `_deferred_review.md` 待人工 review
+- **结构和约束(证据、五档分类、UNCLEAR 允许)保持不变** —— 损失粒度,不损失可信度
+
+**LLM 不准自己判断"该不该简化" —— 没有用户明确请求,默认按全 11 维度跑**。
+LLM 也不准基于"我可能 context 不够"自行简化,因为它不知道自己 context 多大。
+
+---
+
 ## 各份产物头部必须写的 "本文不做的事" 声明
 
 把下面这段原样放每份产物开头:
@@ -266,5 +233,4 @@ for each capability in Phase 3 钻深名单:
 - **不要把"看起来完整"当成目标**。UNCLEAR、N/A、GAP 都是合法且有价值的产出 —— 假装懂、强行配对才是最大的失败
 - **能力清单是结构骨架**,Phase 4 的钻深完全依赖它。Phase 1/2 的第 3 维度建得粗、建得错,Phase 4 全跟着废。这部分要多花时间
 - **遇到 1:N / N:M、跨语言 idiom 翻译,慢一点写清楚**,不要急着收 —— 这种地方含金量最高,也最容易藏坑
-- **Context 不够时绝不死扛**:严格走 §执行模式 的流式节奏,小 context (<32K) 走降级模式。**强行塞导致注意力稀释 → 产出更差,得不偿失**
-- **每完成一项就 append + 更新 `_progress.md`**,中断了下次接着跑就行,**不要重新开始**
+- **流式执行细节看 streaming-execution skill** —— 它定义了 manifest / append / progress / Read offset+limit 等通用模式,不要在 anatomy-compare 里重新发明
