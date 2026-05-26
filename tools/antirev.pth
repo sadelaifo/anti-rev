@@ -1,0 +1,1 @@
+import antirev_client; antirev_client._safe_activate()

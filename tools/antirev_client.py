@@ -694,6 +694,95 @@ def _find_key_source():
     )
 
 
+def _should_activate() -> bool:
+    """Decide whether the .pth-triggered _safe_activate() should actually
+    engage the hooks.
+
+    Explicit ``activate()`` calls bypass this and always activate — this
+    gate only governs the implicit, .pth-driven path so unrelated Python
+    invocations on the same interpreter (pip, system tools, ad-hoc
+    scripts) don't pay any antirev cost or risk daemon-connection
+    side effects.
+
+    Decision order (first match wins):
+
+      1. ``ANTIREV_DISABLE=1`` env var          → never activate
+      2. ``ANTIREV_ENABLE=1`` env var           → always activate
+      3. ``ANTIREV_DIRS`` (os.pathsep-separated list of dirs) → activate
+         iff the currently-running script (``sys.argv[0]``) resolves to
+         a path under one of those directories
+      4. Otherwise                              → do not activate
+
+    Notes:
+    - REPL / ``python -c '...'`` / ``python -m mod`` paths have an
+      empty or non-file ``argv[0]`` — they never auto-activate.  Users
+      who want activation in those contexts must call ``activate()``
+      explicitly or set ``ANTIREV_ENABLE=1``.
+    - ``ANTIREV_DIRS`` is checked once at import time; if the protected
+      install moves at runtime, restart the script.
+    """
+    disable = os.environ.get("ANTIREV_DISABLE")
+    if disable and disable != "0":
+        return False
+    enable = os.environ.get("ANTIREV_ENABLE")
+    if enable and enable != "0":
+        return True
+
+    dirs_env = os.environ.get("ANTIREV_DIRS", "")
+    if not dirs_env:
+        # No protected dirs configured → no auto-activation.
+        # Explicit activate() still works for code that imports antirev
+        # itself.
+        return False
+
+    if not sys.argv or not sys.argv[0]:
+        return False
+
+    try:
+        script = Path(sys.argv[0]).resolve()
+    except (OSError, ValueError):
+        return False
+
+    for d in dirs_env.split(os.pathsep):
+        if not d:
+            continue
+        try:
+            protected = Path(d).expanduser().resolve()
+        except (OSError, ValueError):
+            continue
+        try:
+            script.relative_to(protected)
+            return True
+        except ValueError:
+            continue
+
+    return False
+
+
+def _safe_activate(*args, **kwargs):
+    """Auto-activation entry point used by the .pth file.
+
+    Self-gates via _should_activate() and swallows every exception so
+    a broken antirev install (daemon down, key missing, environment
+    misconfigured, etc.) cannot break unrelated Python invocations on
+    the host.  Reports failures to stderr but never re-raises.
+    """
+    try:
+        if not _should_activate():
+            return None
+        return activate(*args, **kwargs)
+    except BaseException as e:  # noqa: BLE001 — last-resort site.py guard
+        try:
+            print(
+                "[antirev] auto-activation skipped: "
+                "{}: {}".format(type(e).__name__, e),
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+        return None
+
+
 def activate(key_source=None, preload='on_demand'):
     """Connect to daemon and transparently load encrypted libs.
 
