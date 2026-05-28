@@ -72,6 +72,15 @@ extern "C" {
  * cache the results.  Subsequent calls are no-ops. */
 void daemon_client_init(void);
 
+/* Shared owner-process flag.  exe_shim's constructor decides ownership
+ * (/proc/self/exe "memfd:" or the __r_MF marker) and calls mark_owner
+ * BEFORE it unsets __r_MF.  aarch64_extend_shim's constructor runs later
+ * and, under QEMU where /proc/self/exe is the qemu binary (so __r_MF was
+ * its only ownership signal and is now consumed), reads is_owner instead.
+ * Without this, ANTI_LoadProcess interception silently no-ops on QEMU. */
+void daemon_client_mark_owner(void);
+int  daemon_client_is_owner(void);
+
 /* Inherited daemon socket fd, or -1 if unset / disabled. */
 int  daemon_client_sock(void);
 

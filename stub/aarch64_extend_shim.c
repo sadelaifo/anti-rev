@@ -265,6 +265,11 @@ static void init_aarch64_extend_shim(void)
         /* QEMU fallback: trust __r_MF's presence. */
         if (getenv("__r_MF")) is_owner = 1;
     }
+    /* exe_shim's ctor runs before ours and consumes __r_MF (unsetenv).
+     * Under QEMU /proc/self/exe is the qemu binary, not a memfd, so both
+     * checks above miss — fall back to the ownership decision exe_shim
+     * stashed in the shared daemon_client state. */
+    if (!is_owner && daemon_client_is_owner()) is_owner = 1;
     if (is_owner) g_owner_pid = getpid();
 
     LOG("[aarch64_extend_shim] ctor pid=%d owner=%d\n", getpid(), is_owner);

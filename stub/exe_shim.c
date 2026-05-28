@@ -25,6 +25,7 @@
 #define _GNU_SOURCE
 #include "obfstr.h"        /* compile-time string-literal obfuscation */
 #include "runtime_paths.h" /* per-build-random /tmp prefix accessors  */
+#include "daemon_client.h" /* shared owner flag — daemon_client_mark_owner */
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
@@ -215,6 +216,12 @@ static int detect_owner(void) {
         }
     }
 
+    /* Stash the decision in the shared daemon_client BEFORE consuming
+     * __r_MF, so aarch64_extend_shim's later ctor can read it under QEMU
+     * (where /proc/self/exe is the qemu binary and __r_MF was the only
+     * ownership signal). */
+    if (is_owner)
+        daemon_client_mark_owner();
     unsetenv("__r_MF");
     return is_owner;
 }

@@ -35,6 +35,11 @@ static const char *g_fd_map      = NULL;
 static char g_enc_names[DC_MAX_FILES][DC_MAX_NAME + 1];
 static int  g_enc_count = 0;
 
+/* Owner pid, stashed by exe_shim's ctor via daemon_client_mark_owner()
+ * so other shims (aarch64_extend_shim) can read the decision after
+ * __r_MF has been consumed. */
+static pid_t g_owner_pid = 0;
+
 /* Serializes send/recv pairs on g_sock — see daemon_client_io_lock(). */
 static pthread_mutex_t g_io_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -93,6 +98,12 @@ void daemon_client_init(void)
 /* ------------------------------------------------------------------ */
 
 int daemon_client_sock(void)         { return g_sock; }
+
+void daemon_client_mark_owner(void)  { g_owner_pid = getpid(); }
+int  daemon_client_is_owner(void)
+{
+    return g_owner_pid != 0 && getpid() == g_owner_pid;
+}
 int daemon_client_have_fd_map(void)  { return g_fd_map != NULL; }
 
 int daemon_client_is_encrypted(const char *base)
