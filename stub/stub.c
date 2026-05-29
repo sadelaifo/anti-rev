@@ -1546,9 +1546,9 @@ static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
 {
     char dir[4096];
     /* Lib-scan root is pinned to $HOME/SA — the install tree of the
-     * protected suite — so the daemon (.lrxd) can live anywhere under it
+     * protected suite — so the daemon (lrxd) can live anywhere under it
      * (e.g. $HOME/SA/bin) and still serve every encrypted lib in the
-     * tree (e.g. $HOME/SA/lib).  Falls back to the .lrxd's own directory
+     * tree (e.g. $HOME/SA/lib).  Falls back to the lrxd's own directory
      * when $HOME/SA is absent (tests/demos not installed under it). */
     char sa_root[4096];
     const char *home = getenv("HOME");
@@ -1671,7 +1671,7 @@ static void raise_fd_limit(void) {
 /*  Phase 3 helpers: fetch encrypted lib fds from the libd daemon       */
 /* ------------------------------------------------------------------ */
 
-/* Write "<dir>/.lrxd[-arch]" to `out`, falling back to the
+/* Write "<dir>/lrxd[-arch]" to `out`, falling back to the
  * arch-free name if the suffixed binary isn't present. */
 static void derive_daemon_path(const char *real_exe, char *out, size_t out_sz) {
     const char *slash = strrchr(real_exe, '/');
@@ -1682,20 +1682,22 @@ static void derive_daemon_path(const char *real_exe, char *out, size_t out_sz) {
     } else {
         memcpy(out, real_exe, dirlen);
     }
-    /* Daemon binary name was renamed from ".antirev-libd*" to ".lrxd*"
+    /* Daemon binary name was renamed from ".antirev-libd*" to "lrxd*"
      * to drop the antirev brand from `ls` / `ps aux` / customer start
-     * scripts.  Existing deployments must rename the file alongside
-     * an antirev upgrade — the stub no longer falls back to the old
-     * name (a fallback would defeat the point of removing the leak). */
+     * scripts.  No leading dot on purpose: a hidden *executable* is
+     * itself a red flag (normal binaries aren't dotfiles), and a leading
+     * dot makes the file get skipped by glob-based copies (`cp dir/*`,
+     * rsync); plain "lrxd" blends in with ordinary binaries.  Existing
+     * deployments must rename the file alongside an antirev upgrade. */
 #if defined(__x86_64__) || defined(__i386__)
-    snprintf(out + dirlen, out_sz - dirlen, "/.lrxd-x86_64");
+    snprintf(out + dirlen, out_sz - dirlen, "/lrxd-x86_64");
 #elif defined(__aarch64__)
-    snprintf(out + dirlen, out_sz - dirlen, "/.lrxd-aarch64");
+    snprintf(out + dirlen, out_sz - dirlen, "/lrxd-aarch64");
 #else
-    snprintf(out + dirlen, out_sz - dirlen, "/.lrxd");
+    snprintf(out + dirlen, out_sz - dirlen, "/lrxd");
 #endif
     if (access(out, X_OK) != 0)
-        snprintf(out + dirlen, out_sz - dirlen, "/.lrxd");
+        snprintf(out + dirlen, out_sz - dirlen, "/lrxd");
 }
 
 /* Fork the daemon binary if it's on disk; parent waits for the daemon

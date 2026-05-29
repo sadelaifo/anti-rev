@@ -23,5 +23,5 @@ echo "  libbar DT_NEEDED:" && readelf -d libbar.so | grep NEEDED
 echo ""
 echo "Next steps:"
 echo "  1. Pack with antirev-pack.py (encrypt libfoo.so + libtee.so, skip libbar.so)"
-echo "  2. Start .lrxd"
-echo "  3. Run: python3 demo.py /path/to/.lrxd"
+echo "  2. Start lrxd"
+echo "  3. Run: python3 demo.py /path/to/lrxd"

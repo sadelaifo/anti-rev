@@ -769,16 +769,17 @@ def main():
                     sys.exit(f"[error] encrypt lib failed for {futures[fut]}: {e}")
 
         # Build lightweight daemon per architecture.  Multi-arch deploys
-        # get suffixed filenames (.lrxd-x86_64 / -aarch64); single-arch
-        # builds keep the unsuffixed .lrxd.  Renamed from
-        # ".antirev-libd*" so `ls /opt/biz/` / `ps aux` doesn't immediately
-        # fingerprint the daemon as antirev's.  No wrapper binary —
-        # wrapper mode was retired.
+        # get suffixed filenames (lrxd-x86_64 / -aarch64); single-arch
+        # builds keep the unsuffixed lrxd.  Renamed from ".antirev-libd*"
+        # so `ls /opt/biz/` / `ps aux` doesn't fingerprint the daemon as
+        # antirev's.  No leading dot: a hidden executable is itself
+        # suspicious, and dotfiles get skipped by glob/rsync copies;
+        # plain "lrxd" blends in.  No wrapper binary — wrapper mode retired.
         for arch, stub_path in stubs.items():
             stub_data = stub_path.read_bytes()
             suffix = f'-{arch}' if len(stubs) > 1 else ''
 
-            daemon_path = output_dir / f'.lrxd{suffix}'
+            daemon_path = output_dir / f'lrxd{suffix}'
             bundle = struct.pack("<IB", 0, 0)  # 0 files, no flags
             bundle_offset = len(stub_data)
             trailer = struct.pack("<Q", bundle_offset) + key + MAGIC
