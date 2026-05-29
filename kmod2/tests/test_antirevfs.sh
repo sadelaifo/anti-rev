@@ -14,6 +14,24 @@
 # Requires root (insmod/mount).  Run:  sudo bash test_antirevfs.sh
 set -uo pipefail
 
+# Re-exec under a fresh, real session keyring shared by every child below this
+# point (the `antirev-keyctl` unlock AND the later `mount`).  The module's
+# request_key() runs in the mount process's context, so the key must live in a
+# session keyring that process inherits.  On a root shell that has no session
+# keyring of its own (SLES `su`, ssh/cron root, etc.), `keyctl padd @s` would
+# otherwise create an *ephemeral* session keyring local to the keyctl process,
+# which vanishes before `mount` runs -> request_key() returns -ENOKEY and every
+# decrypted read fails with "Required key not available".  A login session that
+# already owns a `_ses` (a desktop dev box) masks the bug; this re-exec makes
+# the test pass regardless of the starting environment.
+if [[ -z "${ANTIREVFS_TEST_SESSION:-}" ]]; then
+	if command -v keyctl >/dev/null 2>&1; then
+		export ANTIREVFS_TEST_SESSION=1
+		exec keyctl session - bash "$0" "$@"
+	fi
+	echo "warning: keyctl not found; cannot guarantee a shared session keyring" >&2
+fi
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
