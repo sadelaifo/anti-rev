@@ -6,6 +6,7 @@
  */
 #include <linux/namei.h>
 #include <linux/file.h>
+#include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/mount.h>
 #include <linux/fs.h>
