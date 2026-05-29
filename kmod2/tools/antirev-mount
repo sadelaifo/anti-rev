@@ -1,0 +1,29 @@
+#!/bin/bash
+# antirev-mount — mount an encrypted .enc/ subtree as a decrypted antirevfs view.
+#
+# Usage:
+#   antirev-mount <lowerdir> <mountpoint> [passthrough-exts]
+#
+#   <lowerdir>        ciphertext tree (e.g. /root/proj/.enc/lib)
+#   <mountpoint>      where the plaintext view appears (e.g. /root/proj/lib)
+#   passthrough-exts  optional colon-separated extensions served verbatim
+#                     (e.g. json:md) for mixed-content directories
+#
+# The AES key must already be in the kernel keyring (see antirev-keyctl unlock).
+# For ad-hoc testing you can instead append ,key=<64hex> to ANTIREV_MOUNT_OPTS.
+set -euo pipefail
+
+die() { echo "antirev-mount: $*" >&2; exit 1; }
+
+[[ $# -ge 2 ]] || die "usage: antirev-mount <lowerdir> <mountpoint> [passthrough-exts]"
+lower="$1"; mp="$2"; pass="${3:-}"
+
+[[ -d "$lower" ]] || die "lowerdir not a directory: $lower"
+[[ -d "$mp" ]]    || die "mountpoint not a directory: $mp"
+
+opts="ro"
+[[ -n "$pass" ]] && opts="$opts,passthrough=$pass"
+[[ -n "${ANTIREV_MOUNT_OPTS:-}" ]] && opts="$opts,$ANTIREV_MOUNT_OPTS"
+
+modprobe antirevfs 2>/dev/null || true
+exec mount -t antirevfs -o "$opts" "$lower" "$mp"
