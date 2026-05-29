@@ -1545,14 +1545,28 @@ static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
                                int *nlibs)
 {
     char dir[4096];
-    const char *slash = strrchr(exe_path, '/');
-    if (slash) {
-        size_t dlen = (size_t)(slash - exe_path);
-        if (dlen >= sizeof(dir)) return -1;
-        memcpy(dir, exe_path, dlen);
-        dir[dlen] = '\0';
+    /* Lib-scan root is pinned to $HOME/SA — the install tree of the
+     * protected suite — so the daemon (.lrxd) can live anywhere under it
+     * (e.g. $HOME/SA/bin) and still serve every encrypted lib in the
+     * tree (e.g. $HOME/SA/lib).  Falls back to the .lrxd's own directory
+     * when $HOME/SA is absent (tests/demos not installed under it). */
+    char sa_root[4096];
+    const char *home = getenv("HOME");
+    struct stat sa_st;
+    if (home && home[0]
+        && (size_t) snprintf(sa_root, sizeof(sa_root), "%s/SA", home) < sizeof(sa_root)
+        && stat(sa_root, &sa_st) == 0 && S_ISDIR(sa_st.st_mode)) {
+        snprintf(dir, sizeof(dir), "%s", sa_root);
     } else {
-        dir[0] = '.'; dir[1] = '\0';
+        const char *slash = strrchr(exe_path, '/');
+        if (slash) {
+            size_t dlen = (size_t)(slash - exe_path);
+            if (dlen >= sizeof(dir)) return -1;
+            memcpy(dir, exe_path, dlen);
+            dir[dlen] = '\0';
+        } else {
+            dir[0] = '.'; dir[1] = '\0';
+        }
     }
 
     /* Phase 1: collect encrypted file paths */
