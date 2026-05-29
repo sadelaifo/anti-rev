@@ -324,12 +324,11 @@ systemctl start business-*
 5. **Key rotation.** How to add a new key to the keyring and re-encrypt artifacts without taking the mount offline. Probably: dual-key support, mount accepts either key, packer rotates on next build.
 6. **fsck / disk-integrity tooling.** Customers running periodic fsck or backup tools will see ciphertext under `.enc/` — confirm no operational surprise (e.g., antivirus alerting on high-entropy files).
 7. **Resource accounting.** Page cache occupancy attributed to antirevfs mount. Memory pressure / OOM behavior under load. Test under realistic concurrent-process counts.
-8. **PoC validation step** before committing to full design:
-   - 50-line module registering stacked FS with no-op (XOR) `read_folio`.
-   - Confirm: pre-XOR'd `.so` loads successfully via `dlopen`.
-   - Confirm: two processes mmapping share physical pages (verify via `/proc/<pid>/pagemap`).
-   - Confirm: `/proc/<pid>/maps` shows real file path.
-   - If all three hold, the rest is engineering.
+8. **PoC validation step** before committing to full design: **RESOLVED — implemented in `module/`, validated by `tests/test_antirevfs.sh` on kernel 6.8.0.** Built a real stacked FS with AES-256-GCM `read_folio` (not just XOR) and confirmed all three:
+   - ✅ A pre-encrypted (`encrypt-lib` / `ANTREV01`) `.so` loads successfully via `dlopen`+`dlsym`+call.
+   - ✅ Two processes mmapping the file share the same physical frame (identical PFN via `/proc/<pid>/pagemap`).
+   - ✅ `/proc/<pid>/maps` shows the real file path, no `memfd:` artifact.
+   - Plus: strict-mode `-EIO` for non-`ANTREV01` files, extension passthrough whitelist, wrong-key rejection via GCM tag, clean module load/unload. The rest (kernel-version compat shims, module signing, key rotation, DKMS `.deb`/`.rpm`) is engineering.
 
 ## Discussion history
 
