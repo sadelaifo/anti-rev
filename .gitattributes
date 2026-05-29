@@ -1,0 +1,7 @@
+# Keep shell and Python scripts LF on every platform.  Without this,
+# Windows checkouts (core.autocrlf) inject CRLF, and bash chokes on the
+# trailing \r ($'\r': command not found) when the script is later run in
+# a Linux / qemu container.  This is exactly what broke tests/obfstr in
+# the WSL test run.
+*.sh  text eol=lf
+*.py  text eol=lf
