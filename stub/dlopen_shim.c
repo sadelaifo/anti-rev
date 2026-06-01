@@ -501,37 +501,14 @@ static int raw_openat(int dirfd, const char *path, int flags, int mode) {
     return (int)r;
 }
 
-__attribute__((visibility("default")))
-int openat(int dirfd, const char *path, int flags, ...)
-{
-    /* glibc's openat is variadic; mode is consumed only when the
-     * flags request a create-style operation.  Parse it the same way
-     * libc itself does so we can forward it verbatim. */
-    int mode = 0;
-    if (flags & (O_CREAT | O_TMPFILE)) {
-        va_list ap;
-        va_start(ap, flags);
-        mode = va_arg(ap, int);
-        va_end(ap);
-    }
-
-    /* Hot path: native deployments take this branch.  g_qemu_mode is a
-     * static int set once in init_shim, so the load and branch are
-     * fully predictable; tail-call to raw_openat means no observable
-     * overhead. */
-    if (__builtin_expect(!g_qemu_mode, 1))
-        return raw_openat(dirfd, path, flags, mode);
-
-    /* QEMU path.  Try the real syscall first; intervene only on ENOENT
-     * inside our symlink dir, in the owner process, for a basename
-     * the daemon's __r_EL set knows about.  Every other ENOENT (system
-     * libs, non-encrypted business libs, non-owner subprocesses, paths
-     * outside our dir) returns immediately with errno preserved, so
-     * ld.so's normal search continues unperturbed. */
-    int fd = raw_openat(dirfd, path, flags, mode);
-    if (fd >= 0) return fd;
-    if (errno != ENOENT) return -1;
-
+/* Shim-shared lazy openat fallback.  Returns fd >= 0 on successful
+ * lazy fetch (caller should use this fd as the openat result), -1 if
+ * we declined to handle the call (caller should preserve its own
+ * errno from the original openat).  Self-gates on qemu_mode, owner
+ * process, path-prefix, and __r_EL -- safe to call from any shim's
+ * openat hook on any arch. */
+int dlopen_shim_lazy_openat(int dirfd, const char *path, int flags, int mode) {
+    if (!g_qemu_mode) return -1;
     if (!path || path[0] != '/') return -1;
     if (!path_in_symlink_dir(path)) return -1;
     if (!daemon_client_is_owner()) return -1;
@@ -549,13 +526,11 @@ int openat(int dirfd, const char *path, int flags, ...)
         if (memfd < 0) {
             pthread_mutex_unlock(&g_lock);
             LOG("  op_get_lib(%s) failed\n", base);
-            errno = ENOENT;
             return -1;
         }
         size_t nlen = strlen(base);
         if (install_closure_member(base, nlen, memfd) < 0) {
             pthread_mutex_unlock(&g_lock);
-            errno = ENOENT;
             return -1;
         }
     }
@@ -568,3 +543,41 @@ int openat(int dirfd, const char *path, int flags, ...)
         LOG("  re-openat(%s) OK fd=%d\n", path, fd2);
     return fd2;
 }
+
+/* The openat hook itself.  Gated on !__aarch64__ because the aarch64
+ * build also includes aarch64_extend_shim.c, which defines its own
+ * openat for ANTI_LoadProcess .elf-path hijacking; both shims linked
+ * into the same antirev_shim.so would collide.  On aarch64 builds the
+ * aarch64_extend_shim openat calls dlopen_shim_lazy_openat as its
+ * ENOENT fallback, so the lazy-fetch behavior is identical -- it just
+ * lives in one openat instead of two. */
+#if !defined(__aarch64__)
+__attribute__((visibility("default")))
+int openat(int dirfd, const char *path, int flags, ...)
+{
+    int mode = 0;
+    if (flags & (O_CREAT | O_TMPFILE)) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
+    }
+
+    /* Hot path: native deployments take this branch.  g_qemu_mode is a
+     * static int set once in init_shim, so the load and branch are
+     * fully predictable; tail-call to raw_openat means no observable
+     * overhead. */
+    if (__builtin_expect(!g_qemu_mode, 1))
+        return raw_openat(dirfd, path, flags, mode);
+
+    int fd = raw_openat(dirfd, path, flags, mode);
+    if (fd >= 0) return fd;
+    int saved_errno = errno;
+    if (saved_errno == ENOENT) {
+        int lazy = dlopen_shim_lazy_openat(dirfd, path, flags, mode);
+        if (lazy >= 0) return lazy;
+    }
+    errno = saved_errno;
+    return -1;
+}
+#endif

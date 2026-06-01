@@ -506,7 +506,24 @@ int openat(int dirfd, const char *pathname, int flags, ...)
         LOG("openat redirect %s -> %s\n", pathname, redirect);
         return raw_openat(AT_FDCWD, redirect, flags, mode);
     }
-    return raw_openat(dirfd, pathname, flags, mode);
+
+    int fd = raw_openat(dirfd, pathname, flags, mode);
+    if (fd >= 0) return fd;
+
+    /* ENOENT fallback: ask dlopen_shim if this path is an encrypted
+     * lib in the daemon's __r_EL set that pack-time closure missed.
+     * The helper self-gates on qemu_mode + owner + path-prefix and
+     * returns -1 when it declines (so non-encrypted ENOENTs fall
+     * through verbatim).  Declared extern; lives in dlopen_shim.c. */
+    int saved_errno = errno;
+    if (saved_errno == ENOENT) {
+        extern int dlopen_shim_lazy_openat(int dirfd, const char *path,
+                                           int flags, int mode);
+        int lazy = dlopen_shim_lazy_openat(dirfd, pathname, flags, (int)mode);
+        if (lazy >= 0) return lazy;
+    }
+    errno = saved_errno;
+    return fd;
 }
 
 /* Some glibc builds call open() -> openat(AT_FDCWD, ...) internally,
