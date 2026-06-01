@@ -27,6 +27,7 @@
 #include "obfstr.h"     /* compile-time string-literal obfuscation */
 
 #include <dlfcn.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -74,6 +75,15 @@ static int g_no_preload = 0;
  * production binaries without needing stderr. */
 static FILE *g_log = NULL;
 #define LOG(...) do { if (g_log) { fprintf(g_log, __VA_ARGS__); fflush(g_log); } } while (0)
+
+/* QEMU-only gate.  Set in init_shim from /proc/self/exe (native has
+ * "memfd:" in the link target, qemu-user does not).  The openat hook
+ * (lazy fallback for libs the pack-time closure missed) only does any
+ * real work when this is 1; when 0 it tail-calls real_openat after a
+ * single branch — zero observable overhead on native x86 / native
+ * aarch64.  See the openat() definition at the bottom of this file. */
+static int g_qemu_mode = 0;
+static int (*real_openat_fn)(int, const char *, int, ...) = NULL;
 
 /* ------------------------------------------------------------------ */
 /*  Little-endian helper                                               */
@@ -343,9 +353,25 @@ static void init_shim(void)
         g_no_preload = 1;
     }
 
-    LOG("[dlopen_shim] sock=%d dir=%s fd_map=%s no_preload=%d\n",
+    /* Detect qemu-user.  On native (x86_64 or real aarch64) the kernel
+     * resolves /proc/self/exe to the memfd path containing "memfd:".
+     * Under qemu-user the link is the qemu binary (or /proc/self/fd/N)
+     * with no "memfd:" substring.  This single readlink in the ctor is
+     * the only runtime cost on native — the openat hook below pivots
+     * on g_qemu_mode and tail-calls real_openat when 0. */
+    {
+        char buf[256];
+        ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            if (strstr(buf, "memfd:") == NULL)
+                g_qemu_mode = 1;
+        }
+    }
+
+    LOG("[dlopen_shim] sock=%d dir=%s fd_map=%s no_preload=%d qemu_mode=%d\n",
         daemon_client_sock(), g_symlink_dir,
-        daemon_client_have_fd_map() ? "yes" : "no", g_no_preload);
+        daemon_client_have_fd_map() ? "yes" : "no", g_no_preload, g_qemu_mode);
 }
 
 /* ------------------------------------------------------------------ */
@@ -414,4 +440,161 @@ void *dlopen(const char *filename, int flags)
         LOG("  real_dlopen(%s) OK\n", spath);
     }
     return h;
+}
+
+/* ------------------------------------------------------------------ */
+/*  openat hook — qemu-only lazy fallback for closure misses           */
+/* ------------------------------------------------------------------ */
+/*
+ * Why this exists.  antirev-pack.py computes XXBIN's transitive
+ * DT_NEEDED closure at pack time and bakes it into the exe's bundled
+ * needed-libs list; the stub then eagerly fetches only those libs from
+ * the daemon and stages symlinks in the per-pid /tmp/antirev_*_*/ dir.
+ * Two situations break the assumption that this list is sufficient:
+ *
+ *   1. A plaintext (third-party) lib in XXBIN's closure has DT_NEEDED
+ *      on an encrypted business lib.  pack walks XXBIN's DT_NEEDED but
+ *      doesn't always recurse through plaintext intermediaries, so the
+ *      encrypted leaf never lands in the bundled list.
+ *
+ *   2. An encrypted lib has a qemu-specific variant whose DT_NEEDED
+ *      differs from the native variant pack saw (same pattern that
+ *      bit libXXE/libAAA earlier in the qemu deployment).
+ *
+ * In both, ld.so resolving the missing DT_NEEDED tries the symlink dir
+ * (LD_LIBRARY_PATH first entry) → openat ENOENT → falls back to system
+ * paths → "cannot open shared object file: No such file or directory".
+ *
+ * Fix.  Hook openat.  On ENOENT for a path inside the symlink dir
+ * whose basename IS in the daemon's encrypted-name set (__r_EL), fetch
+ * it lazily via OP_GET_LIB, materialize the symlink (so subsequent
+ * lookups don't re-enter), and re-issue real_openat.
+ *
+ * Why gated on qemu only.  Native deployments don't hit this pattern in
+ * practice and the field-tested hot path is "openat in symlink dir
+ * either succeeds or genuinely fails".  Adding any unconditional logic
+ * here would tax every openat in every protected process.  Gating on
+ * g_qemu_mode keeps native at one branch + tail call to real_openat,
+ * which the compiler + CPU branch predictor make ~zero ns.
+ */
+
+/* Fast path-prefix check.  True iff path is an absolute path inside
+ * g_symlink_dir (i.e. path == g_symlink_dir + "/" + something). */
+static int path_in_symlink_dir(const char *path) {
+    if (!g_symlink_dir[0]) return 0;
+    size_t dlen = strlen(g_symlink_dir);
+    if (strncmp(path, g_symlink_dir, dlen) != 0) return 0;
+    return path[dlen] == '/';
+}
+
+/* Single-lib fetch.  Sends DC_OP_GET_LIB for `base`, expects DC_OP_LIB
+ * back with one fd via SCM_RIGHTS.  Returns the fd on success, -1 on
+ * any failure.  Takes daemon_client_io_lock internally — caller must
+ * NOT already hold it.  Locking order matches the rest of this file
+ * (g_lock above daemon_client_io_lock; this function takes only the
+ * IO lock so the per-shim g_lock may be held by the caller). */
+static int op_get_lib(const char *base) {
+    uint16_t nlen = (uint16_t)strlen(base);
+    if (nlen == 0 || nlen > DC_MAX_NAME) return -1;
+
+    uint8_t req[2 + DC_MAX_NAME];
+    put_u16le(req, nlen);
+    memcpy(req + 2, base, nlen);
+
+    int got_fd = -1;
+    daemon_client_io_lock();
+    if (daemon_client_send(DC_OP_GET_LIB, req, (uint32_t)(2 + nlen)) == 0) {
+        uint32_t op = 0, plen = 0;
+        uint8_t payload[16];
+        int fds[1] = { -1 };
+        int nfds = 0;
+        if (daemon_client_recv(&op, payload, &plen, sizeof(payload),
+                               fds, &nfds, 1) == 0
+            && op == DC_OP_LIB && nfds == 1) {
+            got_fd = fds[0];
+        } else {
+            for (int i = 0; i < nfds; i++) close(fds[i]);
+        }
+    }
+    daemon_client_io_unlock();
+    return got_fd;
+}
+
+__attribute__((visibility("default")))
+int openat(int dirfd, const char *path, int flags, ...)
+{
+    /* glibc's openat is variadic — mode is consumed only when the
+     * flags request a create-style operation.  Parse it the same way
+     * libc itself does so we can forward it verbatim. */
+    mode_t mode = 0;
+    if (flags & (O_CREAT | O_TMPFILE)) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t) va_arg(ap, int);
+        va_end(ap);
+    }
+
+    if (!real_openat_fn) {
+        real_openat_fn = dlsym(RTLD_NEXT, "openat");
+        if (!real_openat_fn) {
+            errno = ENOSYS;
+            return -1;
+        }
+    }
+
+    /* Hot path: native deployments take this branch.  g_qemu_mode is a
+     * static int set once in init_shim, so the load + branch is fully
+     * predictable.  Tail-call to real_openat — no observable overhead. */
+    if (__builtin_expect(!g_qemu_mode, 1))
+        return real_openat_fn(dirfd, path, flags, mode);
+
+    /* QEMU path.  Try the real syscall first; intervene only on ENOENT
+     * inside our symlink dir, in the owner process, for a basename
+     * the daemon's __r_EL set knows about.  Every other ENOENT (system
+     * libs, non-encrypted business libs, non-owner subprocesses, paths
+     * outside our dir) returns immediately with errno preserved, so
+     * ld.so's normal search continues unperturbed. */
+    int fd = real_openat_fn(dirfd, path, flags, mode);
+    if (fd >= 0) return fd;
+    if (errno != ENOENT) return -1;
+
+    if (!path || path[0] != '/') return -1;
+    if (!path_in_symlink_dir(path)) return -1;
+    if (!daemon_client_is_owner()) return -1;
+    if (daemon_client_sock() < 0) return -1;
+
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    if (!daemon_client_is_encrypted(base)) return -1;   /* errno = ENOENT stands */
+
+    LOG("openat-lazy: %s -> base=%s (cache miss + in __r_EL)\n", path, base);
+
+    pthread_mutex_lock(&g_lock);
+    if (cache_find(base) < 0) {
+        int memfd = op_get_lib(base);
+        if (memfd < 0) {
+            pthread_mutex_unlock(&g_lock);
+            LOG("  op_get_lib(%s) failed\n", base);
+            errno = ENOENT;
+            return -1;
+        }
+        size_t nlen = strlen(base);
+        if (install_closure_member(base, nlen, memfd) < 0) {
+            /* install_closure_member already closed the fd on symlink
+             * failure; report ENOENT so ld.so continues its search. */
+            pthread_mutex_unlock(&g_lock);
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    /* Symlink now exists in g_symlink_dir; the same path the caller
+     * tried originally will now succeed via the staged memfd. */
+    int fd2 = real_openat_fn(dirfd, path, flags, mode);
+    if (fd2 < 0)
+        LOG("  re-openat(%s) FAILED errno=%d\n", path, errno);
+    else
+        LOG("  re-openat(%s) OK fd=%d\n", path, fd2);
+    return fd2;
 }
