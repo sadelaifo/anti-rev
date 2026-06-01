@@ -80,7 +80,7 @@ static FILE *g_log = NULL;
  * "memfd:" in the link target, qemu-user does not).  The openat hook
  * (lazy fallback for libs the pack-time closure missed) only does any
  * real work when this is 1; when 0 it tail-calls real_openat after a
- * single branch — zero observable overhead on native x86 / native
+ * single branch -- zero observable overhead on native x86 / native
  * aarch64.  See the openat() definition at the bottom of this file. */
 static int g_qemu_mode = 0;
 static int (*real_openat_fn)(int, const char *, int, ...) = NULL;
@@ -443,7 +443,7 @@ void *dlopen(const char *filename, int flags)
 }
 
 /* ------------------------------------------------------------------ */
-/*  openat hook — qemu-only lazy fallback for closure misses           */
+/*  openat hook -- qemu-only lazy fallback for closure misses          */
 /* ------------------------------------------------------------------ */
 /*
  * Why this exists.  antirev-pack.py computes XXBIN's transitive
@@ -462,8 +462,9 @@ void *dlopen(const char *filename, int flags)
  *      bit libXXE/libAAA earlier in the qemu deployment).
  *
  * In both, ld.so resolving the missing DT_NEEDED tries the symlink dir
- * (LD_LIBRARY_PATH first entry) → openat ENOENT → falls back to system
- * paths → "cannot open shared object file: No such file or directory".
+ * (LD_LIBRARY_PATH first entry) -> openat ENOENT -> falls back to
+ * system paths -> "cannot open shared object file: No such file or
+ * directory".
  *
  * Fix.  Hook openat.  On ENOENT for a path inside the symlink dir
  * whose basename IS in the daemon's encrypted-name set (__r_EL), fetch
@@ -489,7 +490,7 @@ static int path_in_symlink_dir(const char *path) {
 
 /* Single-lib fetch.  Sends DC_OP_GET_LIB for `base`, expects DC_OP_LIB
  * back with one fd via SCM_RIGHTS.  Returns the fd on success, -1 on
- * any failure.  Takes daemon_client_io_lock internally — caller must
+ * any failure.  Takes daemon_client_io_lock internally -- caller must
  * NOT already hold it.  Locking order matches the rest of this file
  * (g_lock above daemon_client_io_lock; this function takes only the
  * IO lock so the per-shim g_lock may be held by the caller). */
@@ -523,7 +524,7 @@ static int op_get_lib(const char *base) {
 __attribute__((visibility("default")))
 int openat(int dirfd, const char *path, int flags, ...)
 {
-    /* glibc's openat is variadic — mode is consumed only when the
+    /* glibc's openat is variadic -- mode is consumed only when the
      * flags request a create-style operation.  Parse it the same way
      * libc itself does so we can forward it verbatim. */
     mode_t mode = 0;
