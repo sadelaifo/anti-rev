@@ -27,7 +27,6 @@
 #include "obfstr.h"     /* compile-time string-literal obfuscation */
 
 #include <dlfcn.h>
-#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -36,8 +35,6 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
-#include <sys/syscall.h>   /* raw SYS_openat for the hooked openat below */
-#include <sys/types.h>
 
 /* ------------------------------------------------------------------ */
 /*  State                                                              */
@@ -77,14 +74,6 @@ static int g_no_preload = 0;
  * production binaries without needing stderr. */
 static FILE *g_log = NULL;
 #define LOG(...) do { if (g_log) { fprintf(g_log, __VA_ARGS__); fflush(g_log); } } while (0)
-
-/* QEMU-only gate.  Set in init_shim from /proc/self/exe (native has
- * "memfd:" in the link target, qemu-user does not).  The openat hook
- * (lazy fallback for libs the pack-time closure missed) only does any
- * real work when this is 1; when 0 it tail-calls real_openat after a
- * single branch -- zero observable overhead on native x86 / native
- * aarch64.  See the openat() definition at the bottom of this file. */
-static int g_qemu_mode = 0;
 
 /* ------------------------------------------------------------------ */
 /*  Little-endian helper                                               */
@@ -354,25 +343,9 @@ static void init_shim(void)
         g_no_preload = 1;
     }
 
-    /* Detect qemu-user.  On native (x86_64 or real aarch64) the kernel
-     * resolves /proc/self/exe to the memfd path containing "memfd:".
-     * Under qemu-user the link is the qemu binary (or /proc/self/fd/N)
-     * with no "memfd:" substring.  This single readlink in the ctor is
-     * the only runtime cost on native -- the openat hook below pivots
-     * on g_qemu_mode and tail-calls raw_openat when 0. */
-    {
-        char buf[256];
-        ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-        if (n > 0) {
-            buf[n] = '\0';
-            if (strstr(buf, "memfd:") == NULL)
-                g_qemu_mode = 1;
-        }
-    }
-
-    LOG("[dlopen_shim] sock=%d dir=%s fd_map=%s no_preload=%d qemu_mode=%d\n",
+    LOG("[dlopen_shim] sock=%d dir=%s fd_map=%s no_preload=%d\n",
         daemon_client_sock(), g_symlink_dir,
-        daemon_client_have_fd_map() ? "yes" : "no", g_no_preload, g_qemu_mode);
+        daemon_client_have_fd_map() ? "yes" : "no", g_no_preload);
 }
 
 /* ------------------------------------------------------------------ */
@@ -442,142 +415,3 @@ void *dlopen(const char *filename, int flags)
     }
     return h;
 }
-
-/* openat hook -- qemu-only lazy fallback for libs the pack-time
- * closure missed.  See commit aceb93b for the full design rationale. */
-
-/* Fast path-prefix check.  True iff path is an absolute path inside
- * g_symlink_dir (i.e. path == g_symlink_dir + "/" + something). */
-static int path_in_symlink_dir(const char *path) {
-    if (!g_symlink_dir[0]) return 0;
-    size_t dlen = strlen(g_symlink_dir);
-    if (strncmp(path, g_symlink_dir, dlen) != 0) return 0;
-    return path[dlen] == '/';
-}
-
-/* Single-lib fetch.  Sends DC_OP_GET_LIB for `base`, expects DC_OP_LIB
- * back with one fd via SCM_RIGHTS.  Returns the fd on success, -1 on
- * any failure.  Takes daemon_client_io_lock internally -- caller must
- * NOT already hold it.  Locking order matches the rest of this file
- * (g_lock above daemon_client_io_lock; this function takes only the
- * IO lock so the per-shim g_lock may be held by the caller). */
-static int op_get_lib(const char *base) {
-    uint16_t nlen = (uint16_t)strlen(base);
-    if (nlen == 0 || nlen > DC_MAX_NAME) return -1;
-
-    uint8_t req[2 + DC_MAX_NAME];
-    put_u16le(req, nlen);
-    memcpy(req + 2, base, nlen);
-
-    int got_fd = -1;
-    daemon_client_io_lock();
-    if (daemon_client_send(DC_OP_GET_LIB, req, (uint32_t)(2 + nlen)) == 0) {
-        uint32_t op = 0, plen = 0;
-        uint8_t payload[16];
-        int fds[1] = { -1 };
-        int nfds = 0;
-        if (daemon_client_recv(&op, payload, &plen, sizeof(payload),
-                               fds, &nfds, 1) == 0
-            && op == DC_OP_LIB && nfds == 1) {
-            got_fd = fds[0];
-        } else {
-            for (int i = 0; i < nfds; i++) close(fds[i]);
-        }
-    }
-    daemon_client_io_unlock();
-    return got_fd;
-}
-
-/* Direct openat syscall.  Avoids declaring a variadic function pointer
- * and dlsym'ing glibc's openat -- both add nothing here (no cancellation
- * needed in the lib-load path) and either could surprise older
- * toolchains used to build the aarch64 stub. */
-static int raw_openat(int dirfd, const char *path, int flags, int mode) {
-    long r = syscall(SYS_openat, dirfd, path, flags, mode);
-    if (r < 0) {
-        errno = (int)(-r);
-        return -1;
-    }
-    return (int)r;
-}
-
-/* Shim-shared lazy openat fallback.  Returns fd >= 0 on successful
- * lazy fetch (caller should use this fd as the openat result), -1 if
- * we declined to handle the call (caller should preserve its own
- * errno from the original openat).  Self-gates on qemu_mode, owner
- * process, path-prefix, and __r_EL -- safe to call from any shim's
- * openat hook on any arch. */
-int dlopen_shim_lazy_openat(int dirfd, const char *path, int flags, int mode) {
-    if (!g_qemu_mode) return -1;
-    if (!path || path[0] != '/') return -1;
-    if (!path_in_symlink_dir(path)) return -1;
-    if (!daemon_client_is_owner()) return -1;
-    if (daemon_client_sock() < 0) return -1;
-
-    const char *base = strrchr(path, '/');
-    base = base ? base + 1 : path;
-    if (!daemon_client_is_encrypted(base)) return -1;
-
-    LOG("openat-lazy: %s -> base=%s (cache miss + in __r_EL)\n", path, base);
-
-    pthread_mutex_lock(&g_lock);
-    if (cache_find(base) < 0) {
-        int memfd = op_get_lib(base);
-        if (memfd < 0) {
-            pthread_mutex_unlock(&g_lock);
-            LOG("  op_get_lib(%s) failed\n", base);
-            return -1;
-        }
-        size_t nlen = strlen(base);
-        if (install_closure_member(base, nlen, memfd) < 0) {
-            pthread_mutex_unlock(&g_lock);
-            return -1;
-        }
-    }
-    pthread_mutex_unlock(&g_lock);
-
-    int fd2 = raw_openat(dirfd, path, flags, mode);
-    if (fd2 < 0)
-        LOG("  re-openat(%s) FAILED errno=%d\n", path, errno);
-    else
-        LOG("  re-openat(%s) OK fd=%d\n", path, fd2);
-    return fd2;
-}
-
-/* The openat hook itself.  Gated on !__aarch64__ because the aarch64
- * build also includes aarch64_extend_shim.c, which defines its own
- * openat for ANTI_LoadProcess .elf-path hijacking; both shims linked
- * into the same antirev_shim.so would collide.  On aarch64 builds the
- * aarch64_extend_shim openat calls dlopen_shim_lazy_openat as its
- * ENOENT fallback, so the lazy-fetch behavior is identical -- it just
- * lives in one openat instead of two. */
-#if !defined(__aarch64__)
-__attribute__((visibility("default")))
-int openat(int dirfd, const char *path, int flags, ...)
-{
-    int mode = 0;
-    if (flags & (O_CREAT | O_TMPFILE)) {
-        va_list ap;
-        va_start(ap, flags);
-        mode = va_arg(ap, int);
-        va_end(ap);
-    }
-
-    /* Hot path: native deployments take this branch.  g_qemu_mode is a
-     * static int set once in init_shim, so the load and branch are
-     * fully predictable; tail-call to raw_openat means no observable
-     * overhead. */
-    if (__builtin_expect(!g_qemu_mode, 1))
-        return raw_openat(dirfd, path, flags, mode);
-
-    int fd = raw_openat(dirfd, path, flags, mode);
-    if (fd >= 0) return fd;
-    int saved_errno = errno;
-    if (saved_errno == ENOENT) {
-        int lazy = dlopen_shim_lazy_openat(dirfd, path, flags, mode);
-        if (lazy >= 0) return lazy;
-    }
-    errno = saved_errno;
-    return -1;
-}
-#endif
