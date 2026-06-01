@@ -36,6 +36,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sys/syscall.h>   /* raw SYS_openat for the hooked openat below */
+#include <sys/types.h>
 
 /* ------------------------------------------------------------------ */
 /*  State                                                              */
@@ -83,7 +85,6 @@ static FILE *g_log = NULL;
  * single branch -- zero observable overhead on native x86 / native
  * aarch64.  See the openat() definition at the bottom of this file. */
 static int g_qemu_mode = 0;
-static int (*real_openat_fn)(int, const char *, int, ...) = NULL;
 
 /* ------------------------------------------------------------------ */
 /*  Little-endian helper                                               */
@@ -357,8 +358,8 @@ static void init_shim(void)
      * resolves /proc/self/exe to the memfd path containing "memfd:".
      * Under qemu-user the link is the qemu binary (or /proc/self/fd/N)
      * with no "memfd:" substring.  This single readlink in the ctor is
-     * the only runtime cost on native — the openat hook below pivots
-     * on g_qemu_mode and tail-calls real_openat when 0. */
+     * the only runtime cost on native -- the openat hook below pivots
+     * on g_qemu_mode and tail-calls raw_openat when 0. */
     {
         char buf[256];
         ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -521,33 +522,39 @@ static int op_get_lib(const char *base) {
     return got_fd;
 }
 
+/* Direct openat syscall.  Avoids declaring a variadic function pointer
+ * and dlsym'ing glibc's openat -- both add nothing here (no cancellation
+ * needed in the lib-load path) and either could surprise older
+ * toolchains used to build the aarch64 stub. */
+static int raw_openat(int dirfd, const char *path, int flags, int mode) {
+    long r = syscall(SYS_openat, dirfd, path, flags, mode);
+    if (r < 0) {
+        errno = (int)(-r);
+        return -1;
+    }
+    return (int)r;
+}
+
 __attribute__((visibility("default")))
 int openat(int dirfd, const char *path, int flags, ...)
 {
-    /* glibc's openat is variadic -- mode is consumed only when the
+    /* glibc's openat is variadic; mode is consumed only when the
      * flags request a create-style operation.  Parse it the same way
      * libc itself does so we can forward it verbatim. */
-    mode_t mode = 0;
+    int mode = 0;
     if (flags & (O_CREAT | O_TMPFILE)) {
         va_list ap;
         va_start(ap, flags);
-        mode = (mode_t) va_arg(ap, int);
+        mode = va_arg(ap, int);
         va_end(ap);
     }
 
-    if (!real_openat_fn) {
-        real_openat_fn = dlsym(RTLD_NEXT, "openat");
-        if (!real_openat_fn) {
-            errno = ENOSYS;
-            return -1;
-        }
-    }
-
     /* Hot path: native deployments take this branch.  g_qemu_mode is a
-     * static int set once in init_shim, so the load + branch is fully
-     * predictable.  Tail-call to real_openat — no observable overhead. */
+     * static int set once in init_shim, so the load and branch are
+     * fully predictable; tail-call to raw_openat means no observable
+     * overhead. */
     if (__builtin_expect(!g_qemu_mode, 1))
-        return real_openat_fn(dirfd, path, flags, mode);
+        return raw_openat(dirfd, path, flags, mode);
 
     /* QEMU path.  Try the real syscall first; intervene only on ENOENT
      * inside our symlink dir, in the owner process, for a basename
@@ -555,7 +562,7 @@ int openat(int dirfd, const char *path, int flags, ...)
      * libs, non-encrypted business libs, non-owner subprocesses, paths
      * outside our dir) returns immediately with errno preserved, so
      * ld.so's normal search continues unperturbed. */
-    int fd = real_openat_fn(dirfd, path, flags, mode);
+    int fd = raw_openat(dirfd, path, flags, mode);
     if (fd >= 0) return fd;
     if (errno != ENOENT) return -1;
 
@@ -566,7 +573,7 @@ int openat(int dirfd, const char *path, int flags, ...)
 
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
-    if (!daemon_client_is_encrypted(base)) return -1;   /* errno = ENOENT stands */
+    if (!daemon_client_is_encrypted(base)) return -1;
 
     LOG("openat-lazy: %s -> base=%s (cache miss + in __r_EL)\n", path, base);
 
@@ -581,8 +588,6 @@ int openat(int dirfd, const char *path, int flags, ...)
         }
         size_t nlen = strlen(base);
         if (install_closure_member(base, nlen, memfd) < 0) {
-            /* install_closure_member already closed the fd on symlink
-             * failure; report ENOENT so ld.so continues its search. */
             pthread_mutex_unlock(&g_lock);
             errno = ENOENT;
             return -1;
@@ -590,9 +595,7 @@ int openat(int dirfd, const char *path, int flags, ...)
     }
     pthread_mutex_unlock(&g_lock);
 
-    /* Symlink now exists in g_symlink_dir; the same path the caller
-     * tried originally will now succeed via the staged memfd. */
-    int fd2 = real_openat_fn(dirfd, path, flags, mode);
+    int fd2 = raw_openat(dirfd, path, flags, mode);
     if (fd2 < 0)
         LOG("  re-openat(%s) FAILED errno=%d\n", path, errno);
     else
