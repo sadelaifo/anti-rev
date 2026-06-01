@@ -1456,13 +1456,36 @@ static uint16_t read_e_machine(int fd) {
     return (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
 }
 
-/* Cached e_machine of this process, read once from /proc/self/exe.
- * 0 means "not yet detected" or "read failed" — in either case the
- * arch filter falls through without dropping any lib (safe default). */
-static uint16_t g_my_machine = 0;
+/* e_machine of this process, used by the arch filter in
+ * scan_encrypted_libs to drop libs whose ELF arch doesn't match.
+ *
+ * Sourced from the *compile-time* arch, not /proc/self/exe: the daemon
+ * binary is built for a specific target arch and can only ever be
+ * loaded into a process address space of that arch, so it must serve
+ * libs of that arch.  The earlier /proc/self/exe-based detection broke
+ * under qemu-user — qemu doesn't always redirect open("/proc/self/exe")
+ * to the guest binary, so an aarch64 lrxd running under qemu would read
+ * the host's qemu-aarch64-static (x86_64) ELF header, conclude it was
+ * x86, and silently drop every aarch64 lib in the install tree → client
+ * ld.so reported the libs as missing.
+ *
+ * 0 means "compile-time arch unknown" — the arch filter then falls
+ * through without dropping any lib (safe default). */
+static uint16_t g_my_machine =
+#if defined(__aarch64__)
+    0xB7
+#elif defined(__x86_64__)
+    0x3E
+#elif defined(__i386__)
+    0x03
+#else
+    0
+#endif
+    ;
 
 static void detect_my_machine(void) {
     if (g_my_machine != 0) return;
+    /* Compile-time arch was unknown — fall back to /proc/self/exe. */
     int fd = open("/proc/self/exe", O_RDONLY);
     if (fd < 0) return;
     g_my_machine = read_e_machine(fd);
