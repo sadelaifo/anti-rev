@@ -347,26 +347,13 @@ def build_soname_maps(lib_files: list, cache: _ElfCache) -> tuple[dict, dict]:
 def get_transitive_needed(path: Path, encrypted_names: set[str],
                           soname_to_filename: dict[str, str],
                           lib_by_lookup: dict[str, 'Path'],
-                          plain_lib_by_lookup: dict[str, 'Path'],
                           cache: _ElfCache,
                           ldcache: dict) -> list[str]:
     """Get transitive closure of encrypted libs needed by an ELF binary.
 
-    Phase 1: BFS from path's DT_NEEDED, following through ALL libs --
-    including unencrypted intermediaries -- to discover every encrypted
+    Phase 1: BFS from path's DT_NEEDED, following through ALL libs —
+    including unencrypted intermediaries — to discover every encrypted
     lib reachable from this exe.
-
-    Lookup order for an unencrypted intermediate's DT_NEEDED:
-      1. plain_lib_by_lookup -- install-tree plaintext libs (third-party
-         deps that ship alongside the encrypted suite but aren't in any
-         system path).  Required so chains like
-             exe -> libConsumer.so (plain, install-tree)
-                          -> libXX.so (encrypted)
-         actually surface libXX.  Skipping this step was a real bug
-         that produced "invalid ELF header" errors at runtime when
-         ld.so found the on-disk encrypted libXX on a search path.
-      2. ldcache -- system ldconfig.  Genuine system libs whose deps
-         we can read but rarely reach an encrypted leaf through.
 
     Phase 2: Build a dependency graph among those encrypted libs and
     topologically sort (Kahn's algorithm) so leaf dependencies come
@@ -399,10 +386,7 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
                     if dep not in visited:
                         queue.append(dep)
         else:
-            # Unencrypted intermediate: try install-tree plain libs first
-            # so libConsumer.so -> libXX.so chains are discovered, then
-            # fall back to system ldconfig.
-            lib_path = plain_lib_by_lookup.get(name) or ldcache.get(name)
+            lib_path = ldcache.get(name)
             if lib_path:
                 for dep in cache.get_needed(lib_path):
                     if dep not in visited:
@@ -818,23 +802,9 @@ def main():
         encrypted_names = {src.name for src in lib_files}
         exe_needed = {}
         if exe_daemon_libs and encrypted_names:
-            # Parallel bulk-parse: one readelf per ELF, all in parallel.
-            # plain_libs are install-tree plaintext libs (third-party deps
-            # not encrypted by config or blacklist).  They MUST be parsed
-            # too so get_transitive_needed can walk through them and find
-            # encrypted leaves on the other side -- e.g. an unencrypted
-            # libConsumer.so (in install tree, not in system ldconfig)
-            # that DT_NEEDED's an encrypted libXX.so.  Without parsing
-            # plain_libs here, the closure walk's plaintext branch falls
-            # back to system ldcache, which doesn't know about install-
-            # tree plaintext libs, and silently drops every encrypted
-            # leaf reachable only through them.
+            # Parallel bulk-parse: one readelf per ELF, all in parallel
             elf_cache = _ElfCache()
-            all_parse = (
-                [src for src in lib_files]
-                + [src for src in plain_libs]
-                + [src for _, _, src in exe_files]
-            )
+            all_parse = [src for src in lib_files] + [src for _, _, src in exe_files]
             t0 = time.monotonic()
             print("[pack] Parsing {} ELFs in parallel...".format(len(all_parse)))
             elf_cache.bulk_parse(all_parse)
@@ -846,22 +816,12 @@ def main():
             if soname_to_filename:
                 for sn, fn in soname_to_filename.items():
                     print("[pack]   soname {} -> {}".format(sn, fn))
-
-            # Separate soname/filename lookup for plaintext install-tree
-            # libs.  Passed to get_transitive_needed so its plaintext
-            # branch can resolve install-tree intermediates *before*
-            # falling back to system ldcache.  We discard the
-            # soname_to_filename half -- only encrypted libs need that
-            # (Phase 2 closure graph keys by filename), plain libs only
-            # need a path so we can read their DT_NEEDED.
-            _, plain_lib_by_lookup = build_soname_maps(plain_libs, elf_cache)
-
             ldcache = _build_ldconfig_cache()
             print("[pack] Analyzing DT_NEEDED per executable (transitive)...")
             for rel, arch, src in exe_files:
                 needed = get_transitive_needed(
                     src, encrypted_names, soname_to_filename, lib_by_lookup,
-                    plain_lib_by_lookup, elf_cache, ldcache)
+                    elf_cache, ldcache)
                 exe_needed[rel] = needed
 
         with ProcessPoolExecutor(max_workers=workers) as pool:
