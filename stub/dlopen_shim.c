@@ -443,42 +443,8 @@ void *dlopen(const char *filename, int flags)
     return h;
 }
 
-/* ------------------------------------------------------------------ */
-/*  openat hook -- qemu-only lazy fallback for closure misses          */
-/* ------------------------------------------------------------------ */
-/*
- * Why this exists.  antirev-pack.py computes XXBIN's transitive
- * DT_NEEDED closure at pack time and bakes it into the exe's bundled
- * needed-libs list; the stub then eagerly fetches only those libs from
- * the daemon and stages symlinks in the per-pid /tmp/antirev_*_*/ dir.
- * Two situations break the assumption that this list is sufficient:
- *
- *   1. A plaintext (third-party) lib in XXBIN's closure has DT_NEEDED
- *      on an encrypted business lib.  pack walks XXBIN's DT_NEEDED but
- *      doesn't always recurse through plaintext intermediaries, so the
- *      encrypted leaf never lands in the bundled list.
- *
- *   2. An encrypted lib has a qemu-specific variant whose DT_NEEDED
- *      differs from the native variant pack saw (same pattern that
- *      bit libXXE/libAAA earlier in the qemu deployment).
- *
- * In both, ld.so resolving the missing DT_NEEDED tries the symlink dir
- * (LD_LIBRARY_PATH first entry) -> openat ENOENT -> falls back to
- * system paths -> "cannot open shared object file: No such file or
- * directory".
- *
- * Fix.  Hook openat.  On ENOENT for a path inside the symlink dir
- * whose basename IS in the daemon's encrypted-name set (__r_EL), fetch
- * it lazily via OP_GET_LIB, materialize the symlink (so subsequent
- * lookups don't re-enter), and re-issue real_openat.
- *
- * Why gated on qemu only.  Native deployments don't hit this pattern in
- * practice and the field-tested hot path is "openat in symlink dir
- * either succeeds or genuinely fails".  Adding any unconditional logic
- * here would tax every openat in every protected process.  Gating on
- * g_qemu_mode keeps native at one branch + tail call to real_openat,
- * which the compiler + CPU branch predictor make ~zero ns.
- */
+/* openat hook -- qemu-only lazy fallback for libs the pack-time
+ * closure missed.  See commit aceb93b for the full design rationale. */
 
 /* Fast path-prefix check.  True iff path is an absolute path inside
  * g_symlink_dir (i.e. path == g_symlink_dir + "/" + something). */
