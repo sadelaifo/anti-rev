@@ -18,7 +18,7 @@ Usage (explicit):
 Usage (auto-patch — works with both import and ctypes.CDLL):
     from antirev_client import activate
 
-    activate("/path/to/.lrxd")  # or key file
+    activate("/path/to/lrxd")  # or key file
 
     # Python import of encrypted native extensions now works:
     import my_encrypted_module          # redirected to memfd
@@ -30,7 +30,7 @@ Usage (auto-patch — works with both import and ctypes.CDLL):
 Key source discovery for activate():
     1. Explicit path argument
     2. ANTIREV_KEY env var (path to key file or daemon binary)
-    3. .lrxd in the script's directory
+    3. lrxd in the script's directory
 """
 
 import array
@@ -673,7 +673,7 @@ class AntirevClient:
 # ── Auto-patch helper ──────────────────────────────────────────────
 
 def _find_key_source():
-    """Find key source: ANTIREV_KEY env, or .lrxd near caller."""
+    """Find key source: ANTIREV_KEY env, or lrxd near caller."""
     env = os.environ.get("ANTIREV_KEY")
     if env:
         p = Path(env)
@@ -684,13 +684,13 @@ def _find_key_source():
     # Search near the calling script
     main = getattr(sys.modules.get("__main__"), "__file__", None)
     if main:
-        candidate = Path(main).resolve().parent / ".lrxd"
+        candidate = Path(main).resolve().parent / "lrxd"
         if candidate.exists():
             return candidate
 
     raise FileNotFoundError(
         "Cannot find antirev key. Set ANTIREV_KEY env var or place "
-        ".lrxd next to your script."
+        "lrxd next to your script."
     )
 
 
@@ -705,7 +705,7 @@ def activate(key_source=None, preload='on_demand'):
 
     Args:
         key_source: path to key file or daemon binary. If None,
-                    auto-discovers via ANTIREV_KEY env or .lrxd.
+                    auto-discovers via ANTIREV_KEY env or lrxd.
         preload: 'on_demand' (default) — load encrypted deps only when
                      an import or ctypes.CDLL() actually needs them.
                      Avoids conflicts from loading unrelated libs (e.g.

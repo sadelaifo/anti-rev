@@ -25,6 +25,7 @@
 #define _GNU_SOURCE
 #include "obfstr.h"        /* compile-time string-literal obfuscation */
 #include "runtime_paths.h" /* per-build-random /tmp prefix accessors  */
+#include "daemon_client.h" /* shared owner flag — daemon_client_mark_owner */
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
@@ -54,10 +55,21 @@ extern char *program_invocation_short_name;
  * On x86_64, ownership is detected lazily: interceptor calls that
  * arrive before the shim's constructor (e.g. from a C++ global
  * static initializer in a DT_NEEDED lib) fall into the lazy path
- * and probe /proc/self/exe themselves.  On aarch64 we keep master's
- * constructor-only detection (the ARM build has never needed the
- * lazy path in practice and this keeps the runtime code identical
- * to what's been field-tested on ARM). */
+ * and probe /proc/self/exe themselves.
+ *
+ * On aarch64 we previously kept master's constructor-only detection
+ * — ARM native didn't need the lazy path in practice and the field-
+ * tested behavior was "return 0 pre-ctor".  The qemu-user production
+ * deployment breaks the underlying assumption: under qemu, pre-ctor
+ * pass-through hits qemu's emulated /proc/self/exe (synthesised as
+ * "/proc/self/fd/N" with a fd qemu has already closed after mapping
+ * the guest), and callers like boost::dll::program_location crash
+ * with ENOENT.  The aarch64 branch now adds a surgical qemu-only
+ * lazy path: if /proc/self/exe contains "memfd:" we're on real ARM
+ * hardware and fall through to return 0 (field-tested behavior
+ * preserved exactly); only when "memfd:" is absent (= we're under
+ * qemu) do we accept __r_MF as the owner signal.  Native x86_64 and
+ * native aarch64 behavior is unchanged. */
 static pid_t g_owner_pid = 0;
 #if !defined(__aarch64__)
 static int g_owner_checked = 0; /* 1 once constructor or lazy probe decided */
@@ -66,7 +78,31 @@ static int g_owner_checked = 0; /* 1 once constructor or lazy probe decided */
 static int is_owner_process(void)
 {
 #if defined(__aarch64__)
-    return g_owner_pid != 0 && getpid() == g_owner_pid;
+    if (g_owner_pid != 0 && getpid() == g_owner_pid)
+        return 1;
+
+    /* Pre-ctor (or not-owner).  Native aarch64 must keep its field-
+     * tested "return 0 until ctor decides" behavior — detect native
+     * via a successful "memfd:" probe and fall through.  Under qemu-
+     * user /proc/self/exe carries no "memfd:" → use __r_MF as the
+     * owner signal (the same fallback detect_owner uses in the ctor;
+     * read non-destructively so the ctor still consumes it via
+     * unsetenv and runs its full mark-owner path). */
+    if (!getenv("__r_RE"))
+        return 0;
+    char exe_buf[256];
+    ssize_t n = (ssize_t) syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    if (n > 0) {
+        exe_buf[n] = '\0';
+        if (strstr(exe_buf, "memfd:") != NULL)
+            return 0; /* native aarch64 — preserve pre-ctor behavior */
+    }
+    /* No "memfd:" → we're under qemu-user. */
+    if (getenv("__r_MF")) {
+        g_owner_pid = getpid();
+        return 1;
+    }
+    return 0;
 #else
     if (g_owner_checked)
         return g_owner_pid != 0 && getpid() == g_owner_pid;
@@ -215,6 +251,12 @@ static int detect_owner(void) {
         }
     }
 
+    /* Stash the decision in the shared daemon_client BEFORE consuming
+     * __r_MF, so aarch64_extend_shim's later ctor can read it under QEMU
+     * (where /proc/self/exe is the qemu binary and __r_MF was the only
+     * ownership signal). */
+    if (is_owner)
+        daemon_client_mark_owner();
     unsetenv("__r_MF");
     return is_owner;
 }

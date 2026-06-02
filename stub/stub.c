@@ -1456,13 +1456,36 @@ static uint16_t read_e_machine(int fd) {
     return (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
 }
 
-/* Cached e_machine of this process, read once from /proc/self/exe.
- * 0 means "not yet detected" or "read failed" — in either case the
- * arch filter falls through without dropping any lib (safe default). */
-static uint16_t g_my_machine = 0;
+/* e_machine of this process, used by the arch filter in
+ * scan_encrypted_libs to drop libs whose ELF arch doesn't match.
+ *
+ * Sourced from the *compile-time* arch, not /proc/self/exe: the daemon
+ * binary is built for a specific target arch and can only ever be
+ * loaded into a process address space of that arch, so it must serve
+ * libs of that arch.  The earlier /proc/self/exe-based detection broke
+ * under qemu-user — qemu doesn't always redirect open("/proc/self/exe")
+ * to the guest binary, so an aarch64 lrxd running under qemu would read
+ * the host's qemu-aarch64-static (x86_64) ELF header, conclude it was
+ * x86, and silently drop every aarch64 lib in the install tree → client
+ * ld.so reported the libs as missing.
+ *
+ * 0 means "compile-time arch unknown" — the arch filter then falls
+ * through without dropping any lib (safe default). */
+static uint16_t g_my_machine =
+#if defined(__aarch64__)
+    0xB7
+#elif defined(__x86_64__)
+    0x3E
+#elif defined(__i386__)
+    0x03
+#else
+    0
+#endif
+    ;
 
 static void detect_my_machine(void) {
     if (g_my_machine != 0) return;
+    /* Compile-time arch was unknown — fall back to /proc/self/exe. */
     int fd = open("/proc/self/exe", O_RDONLY);
     if (fd < 0) return;
     g_my_machine = read_e_machine(fd);
@@ -1545,14 +1568,28 @@ static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
                                int *nlibs)
 {
     char dir[4096];
-    const char *slash = strrchr(exe_path, '/');
-    if (slash) {
-        size_t dlen = (size_t)(slash - exe_path);
-        if (dlen >= sizeof(dir)) return -1;
-        memcpy(dir, exe_path, dlen);
-        dir[dlen] = '\0';
+    /* Lib-scan root is pinned to $HOME/SA — the install tree of the
+     * protected suite — so the daemon (lrxd) can live anywhere under it
+     * (e.g. $HOME/SA/bin) and still serve every encrypted lib in the
+     * tree (e.g. $HOME/SA/lib).  Falls back to the lrxd's own directory
+     * when $HOME/SA is absent (tests/demos not installed under it). */
+    char sa_root[4096];
+    const char *home = getenv("HOME");
+    struct stat sa_st;
+    if (home && home[0]
+        && (size_t) snprintf(sa_root, sizeof(sa_root), "%s/SA", home) < sizeof(sa_root)
+        && stat(sa_root, &sa_st) == 0 && S_ISDIR(sa_st.st_mode)) {
+        snprintf(dir, sizeof(dir), "%s", sa_root);
     } else {
-        dir[0] = '.'; dir[1] = '\0';
+        const char *slash = strrchr(exe_path, '/');
+        if (slash) {
+            size_t dlen = (size_t)(slash - exe_path);
+            if (dlen >= sizeof(dir)) return -1;
+            memcpy(dir, exe_path, dlen);
+            dir[dlen] = '\0';
+        } else {
+            dir[0] = '.'; dir[1] = '\0';
+        }
     }
 
     /* Phase 1: collect encrypted file paths */
@@ -1657,7 +1694,7 @@ static void raise_fd_limit(void) {
 /*  Phase 3 helpers: fetch encrypted lib fds from the libd daemon       */
 /* ------------------------------------------------------------------ */
 
-/* Write "<dir>/.lrxd[-arch]" to `out`, falling back to the
+/* Write "<dir>/lrxd[-arch]" to `out`, falling back to the
  * arch-free name if the suffixed binary isn't present. */
 static void derive_daemon_path(const char *real_exe, char *out, size_t out_sz) {
     const char *slash = strrchr(real_exe, '/');
@@ -1668,20 +1705,22 @@ static void derive_daemon_path(const char *real_exe, char *out, size_t out_sz) {
     } else {
         memcpy(out, real_exe, dirlen);
     }
-    /* Daemon binary name was renamed from ".antirev-libd*" to ".lrxd*"
+    /* Daemon binary name was renamed from ".antirev-libd*" to "lrxd*"
      * to drop the antirev brand from `ls` / `ps aux` / customer start
-     * scripts.  Existing deployments must rename the file alongside
-     * an antirev upgrade — the stub no longer falls back to the old
-     * name (a fallback would defeat the point of removing the leak). */
+     * scripts.  No leading dot on purpose: a hidden *executable* is
+     * itself a red flag (normal binaries aren't dotfiles), and a leading
+     * dot makes the file get skipped by glob-based copies (`cp dir/*`,
+     * rsync); plain "lrxd" blends in with ordinary binaries.  Existing
+     * deployments must rename the file alongside an antirev upgrade. */
 #if defined(__x86_64__) || defined(__i386__)
-    snprintf(out + dirlen, out_sz - dirlen, "/.lrxd-x86_64");
+    snprintf(out + dirlen, out_sz - dirlen, "/lrxd-x86_64");
 #elif defined(__aarch64__)
-    snprintf(out + dirlen, out_sz - dirlen, "/.lrxd-aarch64");
+    snprintf(out + dirlen, out_sz - dirlen, "/lrxd-aarch64");
 #else
-    snprintf(out + dirlen, out_sz - dirlen, "/.lrxd");
+    snprintf(out + dirlen, out_sz - dirlen, "/lrxd");
 #endif
     if (access(out, X_OK) != 0)
-        snprintf(out + dirlen, out_sz - dirlen, "/.lrxd");
+        snprintf(out + dirlen, out_sz - dirlen, "/lrxd");
 }
 
 /* Fork the daemon binary if it's on disk; parent waits for the daemon
@@ -2472,17 +2511,30 @@ static int needs_qemu_for_fd(int fd) {
 #endif
 }
 
-/* Build argv for a QEMU exec: [binname, /proc/self/fd/N, <original argv[1..]>, NULL].
+/* Build argv for a QEMU exec:
+ *   [binname, "-0", binname, /proc/self/fd/N, <original argv[1..]>, NULL]
+ *
+ * out[0] is QEMU's own argv[0] (ignored by QEMU).  The `-0 <binname>`
+ * option makes QEMU set the *guest's* argv[0] to the real program name
+ * instead of "/proc/self/fd/N" — business binaries that key off argv[0]
+ * (multi-call dispatch, name-based resource lookup) would otherwise see
+ * the fd path.  "-0" is an ordinary string literal (static storage), not
+ * OBFSTR: OBFSTR returns an alloca buffer that would dangle past return,
+ * and "-0" is not a QEMU fingerprint worth hiding anyway.
+ *
  * Caller owns the returned allocation. */
 static char **build_qemu_argv(const char *binname, const char *fd_path, char *const *argv, int orig_argc) {
-    char **out = malloc((size_t) (orig_argc + 2) * sizeof(char *));
+    char **out = malloc((size_t) (orig_argc + 4) * sizeof(char *));
     if (!out)
         return NULL;
-    out[0] = (char *) binname;
-    out[1] = (char *) fd_path;
+    int o = 0;
+    out[o++] = (char *) binname;   /* QEMU's own argv[0] (ignored) */
+    out[o++] = (char *) "-0";      /* set guest argv[0]... */
+    out[o++] = (char *) binname;   /* ...to the real program name */
+    out[o++] = (char *) fd_path;   /* the guest program */
     for (int i = 1; i < orig_argc; i++)
-        out[i + 1] = argv[i];
-    out[orig_argc + 1] = NULL;
+        out[o++] = argv[i];        /* original guest args */
+    out[o] = NULL;
     return out;
 }
 
@@ -2495,8 +2547,7 @@ static char **build_qemu_argv(const char *binname, const char *fd_path, char *co
  * happily print every QEMU path the stub knows about, which is a
  * dead-giveaway that this binary launches under QEMU user-mode. */
 static void try_exec_known_qemu(char **qemu_argv, char **new_env) {
-    const char *qemu_candidates[] = {OBFSTR("/tmp/.antirev-qemu-aarch64"),
-                                     OBFSTR("/usr/bin/qemu-aarch64-static"),
+    const char *qemu_candidates[] = {OBFSTR("/usr/bin/qemu-aarch64-static"),
                                      OBFSTR("/usr/bin/qemu-aarch64"), NULL};
     for (int qi = 0; qemu_candidates[qi]; qi++) {
         struct stat st;
@@ -2505,88 +2556,27 @@ static void try_exec_known_qemu(char **qemu_argv, char **new_env) {
     }
 }
 
-/* Buffered copy of an fd.  Returns 0 on success, -1 on any write error. */
-static int copy_fd_to_fd(int src, int dst) {
-    char buf[8192];
-    ssize_t n;
-    while ((n = read(src, buf, sizeof(buf))) > 0) {
-        ssize_t off = 0;
-        while (off < n) {
-            ssize_t w = write(dst, buf + off, (size_t) (n - off));
-            if (w <= 0)
-                return -1;
-            off += w;
-        }
-    }
-    return n < 0 ? -1 : 0;
-}
-
-/* Probe /proc/<pid>/exe for up to `timeout_ms` (polled at 20ms) looking
- * for a path containing "qemu".  Returns the resolved path in `out` on
- * success (NUL-terminated), or returns -1 on timeout. */
-static int wait_for_qemu_exe(pid_t pid, char *out, size_t out_sz, int timeout_ms) {
-    char proc_exe[64];
-    snprintf(proc_exe, sizeof(proc_exe), "/proc/%d/exe", (int) pid);
-    for (int i = 0; i < timeout_ms / 20; i++) {
-        usleep(20000);
-        ssize_t n = readlink(proc_exe, out, out_sz - 1);
-        if (n > 0) {
-            out[n] = '\0';
-            if (strstr(out, "qemu"))
-                return 0;
-        }
-    }
-    return -1;
-}
-
-/* Probe-cache path: fork a child through binfmt_misc, copy its
- * /proc/<pid>/exe (= the QEMU binary the kernel chose) to /tmp so
- * we can exec it directly next time.  Handles Docker where QEMU
- * isn't on PATH (binfmt_misc F-flag keeps it kernel-side only).
- *
- * Returns 0 if the cache file is populated; -1 otherwise. */
-static int cache_qemu_from_probe(int main_fd, char *const *argv, char **new_env) {
-    pid_t probe = fork();
-    if (probe == 0) {
-        fexecve(main_fd, argv, new_env);
-        _exit(127);
-    }
-    if (probe < 0)
-        return -1;
-
-    char qemu_path[256];
-    int found = wait_for_qemu_exe(probe, qemu_path, sizeof(qemu_path), 1000);
-    int cached = -1;
-    if (found == 0) {
-        char proc_exe[64];
-        snprintf(proc_exe, sizeof(proc_exe), "/proc/%d/exe", (int) probe);
-        int src = open(proc_exe, O_RDONLY);
-        if (src >= 0) {
-            int dst = open("/tmp/.antirev-qemu-aarch64", O_WRONLY | O_CREAT | O_TRUNC, 0755);
-            if (dst >= 0) {
-                if (copy_fd_to_fd(src, dst) == 0)
-                    cached = 0;
-                close(dst);
-            }
-            close(src);
-        }
-    }
-
-    kill(probe, SIGKILL);
-    int st;
-    waitpid(probe, &st, 0);
-    return cached;
-}
-
-/* Phase 6 dispatcher.  On native execution: fexecve(main_fd).  On
- * cross-arch: try cached QEMU, then known system paths, then fall
- * back to binfmt_misc-probe-and-cache, then re-exec through the
- * cached QEMU.  Any failure falls through to a direct fexecve — the
- * kernel's own binfmt handling is the last line of defence. */
+/* Phase 6 dispatcher.  Native execution: fexecve(main_fd).  Cross-arch
+ * (or native-arch under qemu-user, where fexecve ENOSYS's — see the
+ * ENOSYS fall-through below): run the guest via QEMU on /proc/self/fd/N
+ * at the standard /usr/bin/qemu-aarch64-static path (try_exec_known_qemu).
+ * Any failure falls through to a direct fexecve as the last line of
+ * defence. */
 static void exec_target(int main_fd, char *const *argv, char **new_env, const char *real_exe) {
     if (!needs_qemu_for_fd(main_fd)) {
         fexecve(main_fd, (char *const *) argv, new_env);
-        return;
+        /* fexecve returned → it failed.  Under qemu-user (e.g. an aarch64
+         * container emulated on an x86 host), execveat(AT_EMPTY_PATH) /
+         * fexecve is unimplemented → ENOSYS, and glibc's /proc/self/fd
+         * fallback can't complete either, so the native path dies here.
+         * Fall through to the explicit-QEMU dispatch below, which runs the
+         * guest via `qemu /proc/self/fd/N` — qemu's core path, no execveat,
+         * no binfmt re-trigger.  Any other errno is a genuine native exec
+         * failure: return and let main() report it (try_exec_known_qemu is
+         * also stat-guarded, so a real aarch64 host with no qemu installed
+         * just falls back through to the final fexecve unharmed). */
+        if (errno != ENOSYS)
+            return;
     }
 
     const char *binname = strrchr(real_exe, '/');
@@ -2605,14 +2595,9 @@ static void exec_target(int main_fd, char *const *argv, char **new_env, const ch
         free(qemu_argv);
     }
 
-    if (cache_qemu_from_probe(main_fd, argv, new_env) == 0) {
-        char **re_argv = build_qemu_argv(binname, fd_path, argv, orig_argc);
-        if (re_argv) {
-            execve("/tmp/.antirev-qemu-aarch64", re_argv, new_env);
-            free(re_argv);
-        }
-    }
-
+    /* Last resort: a bare fexecve.  On a native host the kernel's own
+     * binfmt_misc handling may still pick the right interpreter; under
+     * qemu-user this just ENOSYS's again and main() reports the failure. */
     fexecve(main_fd, (char *const *) argv, new_env);
 }
 

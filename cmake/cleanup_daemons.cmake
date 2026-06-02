@@ -6,7 +6,7 @@
 # Usage: cmake -DTEST_DIR=<path> -P cleanup_daemons.cmake
 #
 # Without this, test reruns hit:
-#   OSError: [Errno 26] Text file busy: '.../.lrxd'
+#   OSError: [Errno 26] Text file busy: '.../lrxd'
 
 if(NOT TEST_DIR)
     return()
