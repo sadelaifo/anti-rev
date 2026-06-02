@@ -1,78 +1,118 @@
 ---
 name: anatomy-compare
-description: 在两份代码库(典型场景:Python 应用 A 迁移到 C++ 引擎 B)之间产出多层结构化对比 —— 项目 anatomy + 维度对齐 + 按能力划分的函数级业务逻辑 diff。适用于"基础能力 / 业务"边界不清晰、纯函数级对比会丢架构信息、纯架构 anatomy 又看不到行为细节的场景。
+description: 为"把一个 Python 项目(A1)集成进一个更大的 C++ 引擎(B)"这类迁移任务,产出以复用为先的结构化落位分析 —— A1 anatomy + 引擎能力面 anatomy + 按能力对齐的 REUSE/ADAPT/BUILD 判决 + 函数级行为 diff。专为非对称场景设计:A 整体就是要迁移的能力 A1,B 是同业务的超集引擎、已有支撑 A1 的基础能力但没实现 A1 本身,且两边接口/用法按设计就不同。
 ---
 
 # anatomy-compare
 
 ## 用途与设计前提
 
-为代码迁移规划产出多层结构化对比报告。设计前提:
+为"能力迁移/集成"产出多层结构化分析报告。**本 skill 是非对称、有方向、以复用为先的**,前提如下:
 
-- A 通常是较老 / 较小 / 应用层一侧(常为 Python)
-- B 通常是较新 / 较广 / 引擎层一侧(常为 C++),已实现 A 的一部分能力
-- **"engine vs business" 的边界是 emergent 的,不是事先拍出来的** —— 所以本 skill **不做这种分类**
-- 跨语言 / 跨架构,**纯函数级对比丢架构,纯 anatomy 丢行为细节** —— 所以分层
+- **A = Python 项目,整体就是要迁移的能力 A1**(没有"在 A 里再切 A1"的问题,整个 A 都在 scope)
+- **B = C++ 引擎,是同业务的超集**。B 还没实现 A1,但**一定有支撑 A1 的基础能力**(REUSE 候选)
+- **A1 ⊆ B(概念上)** —— A 的每个零件都应该落到 B 的世界里某处:要么 B 的基础能力已提供(REUSE),要么用 B 的基础能力组装出来(BUILD)
+- **接口和用法按设计就不同** —— 所以不能靠"API 像不像"判断等价,必须在能力层和行为层判断
+- 跨语言(Python→C++)、跨架构,**纯函数级对比丢架构,纯 anatomy 丢行为细节** —— 所以分层
+
+这次任务的产物收敛成一句话:**A 的每条能力 → 它在 B 里是 REUSE / ADAPT / BUILD,以及 A1 的 Python 接口怎么映射到引擎的范式与扩展点。**
+
+### 三层差异模型(贯穿全 skill,最重要的概念工具)
+
+任何 A↔B 的"不同"必须先归到下面三层之一再处理,**严禁混为一谈**:
+
+| 层 | 是什么 | 怎么对待 | 在哪个 Phase 处理 |
+|---|---|---|---|
+| **L1 能力层** | B 有没有 A1 需要的底层能力 | 判 REUSE / ADAPT / BUILD | Phase 3 主轴 |
+| **L2 接口/用法层** | 怎么调用、API 形状、参数风格 | **按设计就不同 → 要"映射",不是要"消除";不准误报成问题** | Phase 4 映射栏 |
+| **L3 行为/语义层** | 实际算什么、边界、副作用、错误路径、数值 | **必须保持等价 → 真正的迁移风险都在这** | Phase 4 的 ⚠️ 只针对 L3 |
+
+为什么这层切分是核心:接口全不一样,人一眼扫过去全是"差异",**L2 的噪声会淹没 L3 的信号**。把三层切开,就是把"预期内的接口差异"和"必须盯死的语义差异"分开,别让前者掩盖后者。
+
+### 本次范围(分步,别越界)
+
+- **第一步(本 skill 现在做的)**:只做 A1 **内部能力**的落位分析 —— 每条能力 REUSE/ADAPT/BUILD,以及接口/idiom 映射。
+- **第二步(本步不碰)**:A1 的**对外契约 / 使用方兼容性**(谁在调 A1、迁进引擎后接口怎么对上游保持)。**第一步显式不处理这块**,LLM 不准自作主张去分析 A1 的调用方或改动对外行为。
 
 ## 调用方式
 
 ```
-/anatomy-compare <A 项目路径> <B 项目路径>
+/anatomy-compare <A=Python 项目路径> <A 入口文件> <B=C++ 引擎路径> [--scaffold]
 ```
 
-如果用户没把两个路径都给齐,**先问清楚再开工**,不要假设默认值。
+- A1 是**单一入口**项目 —— 入口文件是 Phase 1 遍历的起点(从它跟 `import` / 调用还原 A1 脊柱)。
+- **没给入口**:提示用户"强烈建议给入口,否则 Phase 1 只能扁平扫全部 `.py`,会把死脚本/实验/测试脚手架当一等公民,质量打折"。用户坚持不给 → 退化成扁平扫,并在 `a_anatomy.md` 头部标"无入口,结构为扁平推断"。
+- 路径/入口没给齐,**先问清楚再开工**,不要假设默认值。第一个路径是 Python 侧(A1),最后一个是 C++ 引擎侧(B);若顺序不确定,问。
+- `--scaffold`(可选,默认关):跑完分析后额外执行 **Phase 5**,对 BUILD/ADAPT 项生成 C++ 接口骨架。不带这个 flag 就只做分析(A+B)。
 
 ## 产物
 
 全部写到 `./anatomy_compare_out/`(不存在则创建):
 
 ```
-a_anatomy.md                       — A 的独立结构化描述
-b_anatomy.md                       — B 的独立结构化描述(不准引用 A)
-comparison.md                      — 按维度对齐的横向对照
-function_logic_cap_<N>_<slug>.md   — 每个能力一份,函数级业务逻辑 diff
+a_anatomy.md                       — A1(Python)的独立结构化描述(入口驱动)
+b_anatomy.md                       — B(C++ 引擎)的独立结构化描述,含引擎执行模型(不准引用 A)
+comparison.md                      — 判决总账速览表 + 按能力的 REUSE/ADAPT/BUILD 判决 + 引擎执行模型约束
+function_logic_cap_<N>_<slug>.md   — 每个能力一份,函数级行为 diff + 落位判决 + 接口映射 + 两边源码摘录
+_phase1_orphans.md                 — 入口不可达的孤立 .py(疑似死脚本),留痕供裁决,不纳入 anatomy
+scaffold/<cap_slug>/               — (仅 --scaffold)BUILD/ADAPT 的 C++ 接口骨架 + 带证据的 TODO,迁移起点、非成品
 ```
 
-每份产物的**头部**必须写"本文不做的事"声明(见末尾"显式不做的事"段)。
+每份产物的**头部**必须写"本文不做的事"声明(见末尾"本文不做的事"段)。
 
 ---
 
-## 配合建议:加载 streaming-execution
+## 流式执行(内置,无外部依赖)
 
-本 skill 只关注**比对业务本身**(四阶段 / 11 维度 / 五档分类 / Phase 4 模板)。
+本 skill **自带流式执行约定,不依赖任何其它 skill**。每个 Phase 都按下面这套跑,任何 context 大小的 LLM(包括内网中等规模模型)都能稳跑、可中断恢复:
 
-"怎么稳定地跑完这么大一摊活" 是**正交的关注点**,抽到了另一份通用 skill `streaming-execution` 里 —— manifest + per-unit + append + `_progress.md` + 可中断恢复。
+1. **建 manifest** —— 枚举本阶段待处理对象 → `_phaseN_manifest.txt`(只列 path / 标识,尽量短)。**顺序很重要**:能按依赖/可达顺序排就别按字母序(见 Phase 1 入口驱动、Phase 2 CMake 驱动)
+2. **建产物文件 + 哨兵** —— 先写头部声明,每个 section 标题下放一个**唯一哨兵**,如 `<!-- append:cap3 -->`。哨兵是后续 append 的锚点
+3. **建 `_phaseN_progress.md`** —— 每 Phase 一个,列出全部对象,初始 pending
+4. **主循环,每次只处理一个对象**:
+   - 取 `_phaseN_progress.md` 第一个 pending
+   - 用 `Read offset+limit` / `Grep` **只读该对象必要片段**(源文件 >200 行就分段读;产物 .md 用 `Grep` 锁定哨兵,**不要 Read 整文件**)
+   - **append 的正确姿势**:用 `Edit` 把哨兵 `<!-- append:cap3 -->` 替换成 `新内容\n<!-- append:cap3 -->`。唯一、确定、O(1),**不用读整文件,也不用 Write 重写**(Edit 工具只能唯一匹配替换,没有原生 append —— 哨兵就是给它造一个稳定锚点)
+   - 把该对象在 `_phaseN_progress.md` 标 done
+   - 进入下一轮(每轮都从 progress + 源码**重新取**,不在 context 里攒上一轮的料)
+5. 全部 done 后(可选)cleanup pass:去重、重排、最终格式化
 
-**强烈建议两份一起加载**,尤其是:
+**四条铁律**:① 只读当前需要的最小片段,永远不 Read 整棵源码树;② append-only(哨兵替换),一段写完立刻落盘;③ `_phaseN_progress.md` 是进度唯一真源,没记录的就当没做;④ 不要"先批量 Read N 个再处理"—— 你不知道自己 context 多大,不要赌。
 
-- 小 context 模型(< 100K) → **必须**
-- 大 ctx 模型也建议加载,获得 crash-safe 和单步可审计
-
-加载顺序:**先 streaming-execution,再 anatomy-compare**。
-
-下面四个 Phase 里都会说 "按 streaming-execution 的核心循环跑某某 manifest" —— 那些细节都在 streaming-execution 那份里。如果没加载它,LLM 自己也要按"逐单元 + 追加 + 进度文件"的方式走,不要一次性把 A 或 B 全装 context。
+下面各 Phase 都说"按核心循环跑某 manifest",指的就是这套。
 
 ---
 
-## 四阶段工作流(必须按序)
+## 工作流:四阶段必跑(按序)+ 可选 Phase 5
 
-### Phase 1 — 构建 A 的 anatomy(独立)
+> **结构发现:两边用各自的天然来源,别一律 flat Glob。**
+> - **Python A1**:从**入口文件**跟 `import` / 实例化 / 调用,还原真实脊柱和调用图。flat Glob 全部 `.py` 只作**兜底完整性核对**(扫漏网的孤立模块,标出来而非纳入)。
+> - **C++ 引擎 B**:从 **`CMakeLists.txt`** 拿 target / 模块切分 / 依赖方向作结构图;**公开头文件(`.h`/`.hpp`)是引擎的能力面**,REUSE 候选主要从这里找。
+>
+> 理由:C++ 有 CMake 这张现成结构图,Python 一堆散脚本没有 manifest —— 入口驱动才能还原 A1 真实结构,并自然甩掉死脚本/实验/测试脚手架(它们多半从入口不可达)。
 
-**按 streaming-execution 的核心循环跑**:`Glob` 出 A 的源文件清单 → `_phase1_manifest.txt` → 每次循环只处理一个文件 → 追加到 `a_anatomy.md` 对应维度 section → 更新 `_progress.md`。
+### Phase 1 — 构建 A1(Python)的 anatomy(独立)
 
-沿下列 **11 个维度** 逐项写 `a_anatomy.md`(各维度的 section 在第一个文件处理时初始化,后续文件**追加**到对应 section):
+**按核心循环跑,但 manifest 是入口驱动的**:从入口文件出发,跟 `import` / 实例化 / 调用,把**项目内**可达的模块按依赖顺序(脊柱在前)列进 `_phase1_manifest.txt` → 每次循环只处理一个模块 → 追加到 `a_anatomy.md` 对应维度 section → 更新 `_phase1_progress.md`。
 
-1. **项目目的** — 一句话定位 + 一段展开
-2. **入口点** — 怎么被调用(CLI / 库 / 守护进程 / 服务 / ...)
+- **边界守卫**:跟 import 时**只进 A1 项目树**;第三方库(numpy、requests…)和 stdlib **不展开**,只作为名字记到维度 7(外部依赖)。等同 C++ 侧不会去 anatomy Boost。
+- **flat 兜底**:manifest 建完后 `Glob` 一次全部 `.py`,跟可达集对比,把**入口不可达的孤立模块**列到 `_phase1_orphans.md` 标注"疑似死脚本/工具,未纳入"—— 不纳入正式 anatomy,但留痕供裁决。
+- **没给入口** → 退化成 flat 扫全部 `.py`,并在 `a_anatomy.md` 头部标"无入口,结构为扁平推断"。
+- **配置文件当参考物**:A1 若有配置文件(YAML/JSON/ini/...),Phase 1 **先读它** —— 配置是 A1 能力与可调参数的高密度摘要,**每个配置段/项大概率对应一条能力**。用它**反向核对维度 3 能力清单的完整性**(有配置项却没扫到对应能力 = 可能漏扫,回头补);配置项本身记到维度 9。
+
+A 整体就是 A1,**可达源文件都在 scope**。沿下列 **11 个维度** 逐项写 `a_anatomy.md`(各维度 section 在第一个模块处理时初始化哨兵,后续模块**追加**):
+
+1. **项目目的** — A1 一句话定位 + 一段展开
+2. **入口点** — A1 怎么被调用(CLI / 库 / 守护进程 / 服务 / ...)—— 这是 L2 接口层的 Python 侧基线
 3. **顶层能力清单**(5-30 条粗粒度能力)
 4. **架构分层** — 目录 / 模块切分 + 依赖方向
-5. **核心抽象** — 承载模型的 class / type / interface
-6. **数据流** — 主要数据怎么流过系统、怎么变形
+5. **核心抽象** — 承载模型的 class / type
+6. **数据流** — 主要数据怎么流过 A1、怎么变形
 7. **外部依赖** — 第三方库、系统接口、文件、网络
-8. **扩展机制** — 怎么加新行为(插件、注册、回调、配置)
+8. **扩展机制** — A1 自己怎么加新行为(插件、注册、回调、配置)
 9. **配置体系** — 什么可配,怎么表达
-10. **状态 + 生命周期** — stateless / 单进程 / 持久;init → run → shutdown
-11. **错误处理风格** — exception / status code / panic / silent
+10. **状态 + 生命周期 + 并发模型** — stateless / 单进程 / 持久;init→run→shutdown;**是否依赖 GIL 串行、隐式执行顺序、单线程假设**(这是 L3 迁移风险的高发区,务必写清)
+11. **错误处理风格** — 异常 / 返回码 / silent;**A1 的异常传播路径**
 
 **第 3 项每个能力下,子条目列出实现它的函数 / 文件 + 行号** —— 这些是 Phase 4 的锚点。
 
@@ -83,111 +123,192 @@ function_logic_cap_<N>_<slug>.md   — 每个能力一份,函数级业务逻辑 
 - 不确定的维度 → 写 `UNCLEAR — [原因]`,**不准猜**
 - 任何维度暂无内容也保留 section,标 `N/A — [原因]`,不能整段省略
 
-### Phase 2 — 构建 B 的 anatomy(独立 —— 严禁参考 Phase 1)
+### Phase 2 — 构建 B(C++ 引擎)的 anatomy(独立 —— 严禁参考 Phase 1)
 
-同 Phase 1 的流程、维度、格式、证据要求,**同样按 streaming-execution 的核心循环跑**(`_phase2_manifest.txt` + 逐文件追加 `b_anatomy.md`)。
+同 Phase 1 的流程、维度、格式、证据要求,**同样按核心循环跑**,但 **manifest 从 `CMakeLists.txt` 驱动**:先读顶层 + 各子目录 CMake,按 target / 库组织 `_phase2_manifest.txt`(一个 target 一组,**公开头文件优先**),再逐单元追加 `b_anatomy.md`。这样 B 的能力面按引擎自己的模块结构铺开,REUSE 候选天然按组件归类。
+
+**B 是超集引擎,这一步的目标和 Phase 1 不同 —— 它是整个迁移最高价值也最难的部分:**
+
+- **重点 A:找全 REUSE 候选。** 因为 A1 ⊆ B 且 B 有基础支撑,B 已有哪些基础能力能服务 A1 的某个需求,决定了后面"复用还是新建"。所以**覆盖必须够宽 —— 扫到 B 的基础能力面,不能只扫你以为 A1 会用到的地方**。否则会把"B 其实早有"误判成 BUILD,白做。
+- **重点 B:抓引擎执行模型(横切约束)。** 第 10 维度对 B 要写得格外重,单列一个 `## 引擎执行模型` 小节:**线程模型(单线程?线程池?事件循环?)、对象所有权约定(谁 new 谁 delete?shared_ptr / 裸指针 / RAII?)、生命周期(init→register→run→teardown 的时机)、跨边界传值/传所有权的约定**。理由见 Phase 4 —— A1 的每个零件都要拿这套模型复检,孤立等价不代表放进引擎里等价。
+- **重点 C:抓扩展/集成点。** 第 8 维度对 B 要具体到"一个新能力 A1 该怎么注册/挂接进引擎"(注册表?工厂?虚接口?插件?)—— 这是 A1 的落脚点。
+- **重点 D:REUSE 搜索按"领域概念"不按 A1 的标识符。** 接口/命名两边按设计就不同,拿 A1 的函数名去 `Grep` B 基本搜不到。要用**领域名词/动词 + 签名形状**搜 B 的公开头文件(类名、公有方法、自由函数)。搜不到先标 UNCLEAR,别急着判 BUILD;优先**在用的公开 API**,而非内部/废弃符号。
 
 #### Phase 2 关键硬约束(违反则全盘失效)
 
 - **严禁打开 `a_anatomy.md`**
-- **严禁让 A 的词汇、概念、结构泄到 B 的描述里**
+- **严禁让 A1 的词汇、概念、结构泄到 B 的描述里** —— 按 B 自己的命名描述。反而正是这样才能发现"B 里换了个名字的同款能力"
 - **当作 Phase 1 从未发生过来写 Phase 2**
 
-理由:如果用 A 的镜头描述 B,Phase 3 的对照就失真了 ——"B 看起来像 A,但只是因为我描述 B 时一直在想 A"。
+理由:如果用 A1 的镜头描述 B,Phase 3 的对照就失真了 —— "B 看起来正好有 A1 要的,但只是因为我描述 B 时一直在想 A1"。独立描述,才能让 REUSE 匹配是真匹配。
 
-### Phase 3 — 维度对齐对照
+### Phase 3 — 能力对齐 + REUSE/ADAPT/BUILD 判决
 
-**按 streaming-execution 的核心循环跑 —— manifest 是 11 维度本身**:每次只对齐一个维度,从 `a_anatomy.md` 和 `b_anatomy.md` 用 `Grep` 抓出该维度的 section,产出该维度的对照内容追加到 `comparison.md`,然后释放 context 进入下一个维度。
+**按核心循环跑 —— manifest 是 A1 的顶层能力清单(Phase 1 第 3 维度)**:每次只对齐一条 A1 能力,从 `b_anatomy.md` 用 `Grep` 抓 B 的相关能力 section,产出该能力的判决追加到 `comparison.md`,然后释放 context 进下一条。
 
-**严禁一次 `Read` 整个 anatomy 文件** —— 即使是大 ctx 模型也别这么干,注意力稀释。
+**严禁一次 `Read` 整个 anatomy 文件** —— 即使大 ctx 模型也别这么干,注意力稀释。
 
-产 `comparison.md`,**每个维度一张并排表 / 段落**。
+`comparison.md` 结构:① 开头从 `b_anatomy.md` 抄一份 `## 引擎执行模型约束`(线程/所有权/生命周期/扩展点)作为全局约束;② 紧接一张 **`## 判决总账`** 速览表(全能力一行一条,见下),它就是迁移工作的总地图;③ 然后**每条 A1 能力一个判决条目**展开。
 
-#### 第 3 项(顶层能力)用五档分类
+判决总账表(随每条能力判完逐行 append):
 
-| 标签 | 含义 |
-|---|---|
-| ✅ HIGH | 双方都有,语义看起来对得上 |
-| 🟡 MEDIUM | 双方都有,但语义对齐不完全 / 不确定 |
-| 🔴 GAP | A 有,B 没 → **B 待补** |
-| ⚪ EXTRA | B 有,A 不用 → 引擎多余能力,跟本次迁移无关 |
-| ❓ UNCLEAR | 看了拿不准 → **强制必须有这一档,不准强行配对求"看起来完整"** |
+| A1 能力 | 判决 | B 锚点(REUSE/ADAPT 时) | 行为风险 | A1 证据 |
+|---|---|---|---|---|
+| <能力名> | ♻️/🔧/🧱/❓/⏭️ | `b_file:line` 或 — | H/M/L | `a_file:line` |
+
+(只填判决事实,**不排期、不给顺序** —— 那是 planning 的事)
+
+#### 判决用五档(这是本 skill 的主轴,以 A1 为基准、问 B 的状态)
+
+| 标签 | 含义 | 后续动作 |
+|---|---|---|
+| ♻️ REUSE | B 已有等价底层能力,A1 这条可直接复用(接口另说) | Phase 4 钻深:确认行为等价 + 设计接口映射 |
+| 🔧 ADAPT | B 有相近基础能力,但语义/边界/能力不全 | Phase 4 钻深:写清差距 + 怎么补齐/组装 |
+| 🧱 BUILD | B 完全没有,需用 B 的基础能力新建 | Phase 4 钻深:写 A1 侧 spec + 接入引擎哪个扩展点 |
+| ❓ UNCLEAR | 看了拿不准 B 有没有 | **强制必须有这一档**;Phase 4 钻深以澄清。**不准为了"看起来完整"硬判成 REUSE** |
+| ⏭️ N/A | A1 这条是 Python 运行时/打包/测试脚手架,迁移引擎时本就不需要 | 不钻,但要写明为什么不需要 |
+
+**注意与旧"对称比对"的关键区别:**
+
+- B 多出来的基础能力**不是无关噪声 —— 它正是 REUSE/ADAPT 的依据,是金矿**。Phase 2 把它扫全,就是为了这里能判 REUSE。
+- **配置面速判(快速线索)**:若两边都有配置体系,先对比配置项 —— A1 有、B 配置里也有对应概念 = REUSE 强信号;A1 有 B 完全没有 = BUILD 信号。**只是线索,仍须读函数体确认**,不能凭配置直接定档。
+- **判 REUSE/ADAPT 必须在 L1 能力层 + L3 行为层做,和 L2 接口形状解耦** —— 接口按设计就不同,长得不像不代表能力不在。**没读两边函数体、只看名字的,最多标 UNCLEAR,不准标 REUSE。**
 
 #### Phase 3 硬约束
 
-- 每行至少引一边的 file:line(双方都有 → 各引一处)
-- **不准做 "engine / business" 分类** —— planning 的事
-- **不准给迁移顺序 / 优先级建议** —— 同上
-- **不准只看名字判断语义等价** —— 没读两边函数体的,只能标 MEDIUM / UNCLEAR,**不能标 HIGH**
+- 每条判决至少引一边的 file:line(REUSE/ADAPT 要引 B 侧证据,BUILD 要引 A 侧证据)
+- **不准给迁移顺序 / 优先级排期** —— 那是 planning 的事;本 skill 只产判决,不排期
+- **不准只看名字判断能力等价** —— 见上
+- 每条判决末尾标 Phase 4 是否钻深(REUSE/ADAPT/BUILD/UNCLEAR 都钻,N/A 不钻)
 
-#### `comparison.md` 末尾必须列 Phase 4 钻深名单
+#### `comparison.md` 末尾必须列 Phase 4 钻深名单 + 预算
 
-- ✅ HIGH 和 🟡 MEDIUM 的能力 → 钻深(行为差异最容易藏在这)
-- 🔴 GAP 的能力 → **只钻 A 那一侧**(产 "B 应该怎么实现" 的 spec)
-- ⚪ EXTRA → 不钻
-- ❓ UNCLEAR → 钻深以澄清
+- 按上表,REUSE/ADAPT/BUILD/UNCLEAR 进钻深名单,N/A 排除
+- **名单很长时(>15 条)必须排预算**:按"行为风险"给每条标 H/M/L —— 凡涉及引擎执行模型冲突(并发/所有权/生命周期)、数值/边界、错误路径的标 H。**先钻完所有 H,再钻 M,L 归入 `_deferred_review.md`**,并在 `comparison.md` 里**显式写明哪些被推迟了**(不准静默截断,否则报告看起来"全覆盖"其实没有)
 
-### Phase 4 — 函数级业务逻辑 diff
+### Phase 4 — 函数级行为 diff + 落位判决 + 接口映射
 
-**按 streaming-execution 的核心循环跑 —— 严格"一个能力一份文件,一个函数对一次循环"**:
+**按核心循环跑 —— 严格"一个能力一份文件,一个函数对一次循环"**:
 
 ```
-for each capability in Phase 3 钻深名单:
-    新建 function_logic_cap_<N>_<slug>.md,先写头部声明
-    建 _phase4_cap_<N>_manifest.txt: 列出该 capability 的 A/B 函数对清单
-    for each function pair:
-        Read 两边对应行号范围(用 offset+limit,不读整文件)
+for each capability in Phase 3 钻深名单(按 H→M→L 预算顺序):
+    新建 function_logic_cap_<N>_<slug>.md,先写头部声明 + 该能力的 Phase 3 判决(REUSE/ADAPT/BUILD/UNCLEAR)
+    建 _phase4_cap_<N>_manifest.txt: 列出 A1 函数 + (REUSE/ADAPT 时)对应的 B 函数
+    for each function (pair):
+        Read 两边对应行号范围(offset+limit,不读整文件)
         写一段对照(下方模板)→ append 到 .md
-        更新 _progress.md
+        更新 _phase4_progress.md
 ```
 
 **关键**:函数位置从 `a_anatomy.md` / `b_anatomy.md` 的证据 file:line 拿(这就是为什么 Phase 1/2 必须老老实实标行号)。
 
-对 Phase 3 标的每个能力,写一份 `function_logic_cap_<N>_<slug>.md`(`<N>` 从 01 起,`<slug>` 用英文短词,如 `file_encryption`)。
-
-每个函数对(或函数组,1:N、N:M 都允许)用下面模板:
+每个能力写一份 `function_logic_cap_<N>_<slug>.md`(`<N>` 从 01 起,`<slug>` 用英文短词,如 `task_scheduling`)。每个函数(对)用下面模板:
 
 ```markdown
-## Function pair: A.<fn> ↔ B.<fn>          (gap 时写 "A.fn ↔ —")
+## Function: A1.<fn>  →  [REUSE B.<fn> | ADAPT B.<fn> | BUILD new | UNCLEAR]
 
-### A.<name>(<args>)  (<file>:<lineStart>-<lineEnd>)
+### A1.<name>(<args>)  (<file>:<lineStart>-<lineEnd>)   [Python]
 - 输入:<类型 + 语义>
 - 算法:<高层步骤>
 - 边界:<处理 / 不处理什么>
-- 错误:<怎么报错>
-- 副作用:<改了什么外部状态>
+- 错误:<怎么报错(异常?)>
+- 副作用 / 状态:<改了什么外部/进程状态;是否依赖串行/顺序>
+- 源码摘录(承重行,**原样粘贴、不转述、不补全**;>30 行只摘核心并标 `…省略 N 行`):
+  ```python
+  <粘贴 A1 关键源码>
+  ```
 
-### B.<name>(<args>)  (<file>:<lineStart>-<lineEnd>)
+### B.<name>(<args>)  (<file>:<lineStart>-<lineEnd>)   [C++,REUSE/ADAPT 时填;BUILD 时写 "—,引擎无对应"]
 - 同样字段
+- 源码摘录(同上规则;BUILD 时此栏为空):
+  ```cpp
+  <粘贴 B 关键源码>
+  ```
 
-### Diff summary
-- ✅ <等价点>
-- ⚠️ <行为差异 + 迁移影响>
-- ℹ️ <非行为差异,例如分块大小、内部 buffer 名>
+### L1 能力判决
+- ♻️/🔧/🧱:<B 的底层能力够不够,缺什么>
+
+### L3 行为 diff(只列真正的语义差异,L2 接口差异不进这里)
+- ✅ <行为等价点>
+- ⚠️ <行为差异 + 迁移影响> —— **每条必配迁移建议**
+- ℹ️ <非行为差异:分块大小、内部 buffer 名等>
+
+### L2 接口/用法映射(按设计就不同,这里是"怎么映射"不是"问题")
+- A1 的调用方式 <X> → 引擎里对应 <Y>(注册点/工厂/虚接口/...)
+- Python idiom <如 generator/with/**kwargs> → C++ <对应,见下表>
+
+### 引擎执行模型复检(拿 b_anatomy 的执行模型逐条对)
+- 并发:<A1 是否假设串行/GIL?引擎多线程下是否需要加锁/改设计>
+- 所有权/生命周期:<谁 new 谁 delete?跨边界传所有权怎么处理>
+- 若无冲突,明确写 "无冲突"
+
+### 等价验证提示(给后续差分测试留的保险,尽量写)
+- 喂 <什么输入> 时两边应得 <什么相同输出>;最可能暴露差异的输入是 <...>
 
 ### Migration note
-- <具体建议:改 A / 改 B / 加 shim / 可接受>
+- <具体落位建议:复用 B.X / 用 B.Y+Z 组装 / 新建并挂到引擎扩展点 W / 可接受的差异>
 ```
 
 #### Phase 4 硬约束
 
 - **必须真打开两边函数体读完再写**,**严禁仅凭签名 + docstring 推断**
+- **⚠️ 只给 L3 行为差异**;接口不同(L2)不算 ⚠️,进"接口映射"栏。**别让 L2 噪声淹没 L3 信号**
 - **每条 ⚠️ 必须配迁移建议** —— 不能只罗列差异不给行动
-- **跨语言 idiom 翻译必须显式标出**(常见对应见下表)
-- **1:N / N:M 是常态,不准为了凑 1:1 强配**;一段对应关系一节,写清拆合
+- **每个零件必须做"引擎执行模型复检"** —— 这是孤立等价之外最容易崩的地方
+- **跨语言 idiom 翻译必须显式标出**(见下表)
+- **1:N / N:M 是常态,不准为了凑 1:1 强配**;BUILD 常常是"A1 一个函数 → B 多个基础能力组装"
+- **A1 跨能力共享的 helper 只深读一次** —— 再遇到就在对应 .md 里引用首次结论(`见 cap_0X`),不重复读、不重复写
+- **源码摘录必须原样粘贴** —— 不转述、不"顺手修正"、不补全省略号里的内容;太长就摘核心 + 标省略行数。这是给你/后续 Phase 5 核验用的真实证据,改了就失真
 
-#### 跨语言 idiom 对照(遇到时显式说明)
+#### Python → C++ idiom 对照(遇到时显式说明)
 
 | Python | C++ |
 |---|---|
 | `@property` getter | getter / setter 对 |
-| `with ctx:` 上下文管理器 | RAII 类 / `unique_ptr` deleter |
-| generator (`yield`) | iterator class / coroutine |
-| `__init__` | constructor + 可能的 factory function + RAII |
-| `@dataclass` | POD struct + 可能的 `operator==` |
-| decorator | wrapper class / macro / template |
-| `**kwargs` | overload set / 参数对象 / builder |
+| `with ctx:` 上下文管理器 | RAII 类 / scope guard / `unique_ptr` deleter |
+| generator (`yield`) | iterator class / coroutine / 回调 / range |
+| `__init__` | constructor(+ 可能的 factory + RAII) |
+| `@dataclass` | POD struct(+ 可能的 `operator==`) |
+| decorator | wrapper class / template / macro |
+| `**kwargs` | overload set / options struct / builder |
 | `raise Exception` | `throw` / `Status` 返回值 / 错误码 |
+| duck typing | template / concept / 虚接口 |
+| 动态属性 / `setattr` | 固定字段 / `std::map` / `std::variant` |
+| `None` | `nullptr` / `std::optional` |
+| list/dict 推导 | ranges / 手写循环 |
+| `isinstance` 分派 | virtual / `std::visit` / `dynamic_cast` |
+
+#### Python → C++ 迁移陷阱(L3 高发区,逐条复检)
+
+1. **所有权与生命周期** — Python GC/引用计数 vs C++ 谁拥有谁释放。跨 A1↔引擎边界传对象时尤其要定清所有权
+2. **异常传播** — Python 全程异常 vs 引擎可能 Status/错误码。A1 的每条异常路径都要映射到引擎的错误约定,**不能让异常"消失"**
+3. **并发模型** — Python GIL 串行 + 隐式顺序 vs 引擎多线程。**A1 里"反正单线程不会被打断"的隐含假设,放进引擎可能直接崩** —— 最隐蔽、最危险
+4. **数值** — Python int 任意精度 vs C++ 固定宽度。溢出 / 截断 / 有无符号
+5. **动态分派** — 运行期 duck typing vs 编译期模板/虚函数,接口要显式化
+6. **可变默认参数 / 闭包捕获** — 语义差异容易出 bug
+7. **字符串 / 字节 / 编码** — `str` vs `std::string`/`bytes`,编码假设
+8. **浮点格式化 / round** — 计算多半一致,但格式化、取整行为可能不同
+
+---
+
+### Phase 5 — 生成迁移骨架代码(可选,默认关,显式 opt-in)
+
+**门控(全部满足才跑)**:① 用户带了 `--scaffold` 或**显式要求**骨架;② Phase 4 全部 done 且已 self-check;③ 只对 **BUILD / ADAPT** 项生成。**没满足就不跑,默认不生成任何代码。**
+
+骨架是**迁移起点,不是成品**。产到独立目录 `scaffold/<cap_slug>/`,**绝不混进 anatomy / function_logic 分析文件**。
+
+**按核心循环跑**(manifest = `comparison.md` 判决总账里的 BUILD/ADAPT 项):
+
+- **BUILD 项**:生成 C++ 头(接口)+ cpp 骨架。签名照 Phase 4 的"L2 接口映射"栏定;**接入引擎扩展点**用 Phase 2 重点 C 抓到的注册/工厂/虚接口;**实现体是 `// TODO`,不写完整算法** —— 但把 Phase 4 的 L3 行为点、迁移陷阱、执行模型复检结论**逐条写成 TODO 注释 + 引用 A1 源码 `file:line`**,让接手的人照着填。
+- **ADAPT 项**:生成**适配/接线草图** —— 怎么调已有的 B 基础能力 + 还要补什么,同样 TODO 化。
+- **REUSE 项**:不生成文件,只在 `scaffold/_reuse_calls.md` 写一行"调 `B::X`(`b_file:line`),A1 接口 `Y` 映射到此"。
+
+#### Phase 5 铁律(非前沿模型尤其要守)
+
+- **绝不臆造引擎 API** —— 只准引用在 `b_anatomy.md` 里**带 `file:line` 证据出现过的符号**。拿不准的接法 → 写 `// TODO: 确认引擎是否提供 …`,**不准编一个看起来合理的调用**
+- **每个骨架文件头部必须写**:`// DRAFT — 未编译、未验证;签名/扩展点接法需人工核对;实现体为 TODO,非成品`
+- **不写完整算法实现** —— 那是迁移执行阶段的事;Phase 5 只搭"接口 + 接入点 + 带证据的 TODO 清单"
+- 生成完在 `scaffold/_INDEX.md` 列清每个文件对应哪条能力、哪个判决、引用了 b_anatomy 的哪些证据
 
 ---
 
@@ -195,9 +316,9 @@ for each capability in Phase 3 钻深名单:
 
 如果用户在调用时**明确请求简化模式**(例如:"我的模型小,请用简化模式"),或者你自己运行时发现产出反复被打断:
 
-- **11 维度压成 5 个核心**:1 项目目的、3 顶层能力、4 架构分层、5 核心抽象、6 数据流
-- **Phase 4 只钻 Phase 3 标 ⚠️ 风险高的 3-5 个函数对**,其他归入 `_deferred_review.md` 待人工 review
-- **结构和约束(证据、五档分类、UNCLEAR 允许)保持不变** —— 损失粒度,不损失可信度
+- **11 维度压成 6 个核心**:1 项目目的、3 顶层能力、4 架构分层、5 核心抽象、6 数据流、**10 状态+并发模型**(并发这维不能省,它是迁移风险核心)
+- **Phase 4 只钻 Phase 3 钻深名单里标 H(高行为风险)的 3-5 个**,其余归 `_deferred_review.md`
+- **结构和约束(证据、五档判决、UNCLEAR 允许、三层差异、执行模型复检)保持不变** —— 损失粒度,不损失可信度
 
 **LLM 不准自己判断"该不该简化" —— 没有用户明确请求,默认按全 11 维度跑**。
 LLM 也不准基于"我可能 context 不够"自行简化,因为它不知道自己 context 多大。
@@ -210,9 +331,9 @@ LLM 也不准基于"我可能 context 不够"自行简化,因为它不知道自�
 
 ```
 > 本文档 *不* 做的事:
-> - 不证明语义等价(只是静态比对,runtime / 差分测试必须后续补)
-> - 不给迁移优先级 / 顺序(planning 的事,不是 comparison 的事)
-> - 不做 "engine vs business" 分类(边界 emergent,planning 时决定)
+> - 不证明语义等价(只是静态比对,runtime / 差分测试必须后续补 —— 见每个函数的"等价验证提示")
+> - 不给迁移优先级 / 排期(planning 的事,本文只产 REUSE/ADAPT/BUILD 判决与落位建议)
+> - 不把"接口/用法不同"当问题(L2 差异是设计内的,本文只做映射,不做报警)
 > - 不给性能评估
 ```
 
@@ -220,17 +341,19 @@ LLM 也不准基于"我可能 context 不够"自行简化,因为它不知道自�
 
 ## 什么时候 *不* 用这个 skill
 
-- A、B 在同一层、只需简单函数 map → 用更轻的工具
-- 你已经完全懂 A、只需规划迁移 → vertical-slice 更快
-- A、B 的层级边界明确 → 简单的 primitive-gap 分析就够
-- A 极小(< 5 文件、< 1000 行)→ 直接 Read 两边、回答即可,不必走四阶段仪式
+- A1 极小(< 5 文件、< 1000 行)→ 直接 Read 两边、回答即可,不必走四阶段仪式
+- 你已经完全懂 A1、只需规划接入顺序 → planning 工具更快
+- A1 和 B 接口几乎一致、只是语言翻译 → 简单的函数 map 就够,不必上三层模型
 
 ---
 
 ## 执行时的几条提醒(给 LLM 自己)
 
-- **跑得慢没关系,跑歪了就全废**。每个 Phase 跑完先停下来 self-check:产物里每条都有证据吗?Phase 2 真的没看 Phase 1 吗?
-- **不要把"看起来完整"当成目标**。UNCLEAR、N/A、GAP 都是合法且有价值的产出 —— 假装懂、强行配对才是最大的失败
-- **能力清单是结构骨架**,Phase 4 的钻深完全依赖它。Phase 1/2 的第 3 维度建得粗、建得错,Phase 4 全跟着废。这部分要多花时间
-- **遇到 1:N / N:M、跨语言 idiom 翻译,慢一点写清楚**,不要急着收 —— 这种地方含金量最高,也最容易藏坑
-- **流式执行细节看 streaming-execution skill** —— 它定义了 manifest / append / progress / Read offset+limit 等通用模式,不要在 anatomy-compare 里重新发明
+- **跑得慢没关系,跑歪了就全废**。每个 Phase 跑完先停下来 self-check:产物里每条都有证据吗?Phase 2 真的没看 Phase 1 吗?REUSE 判决真读了 B 的函数体吗?
+- **B 多出来的能力是金矿不是噪声**。这是本 skill 和"对称比对"最大的区别 —— 别把 B 已有的基础能力当无关的扔掉,它决定每个 A1 零件复用还是新建
+- **Python 从入口跟图、C++ 从 CMake/头文件铺开**,别对 Python 扁平扫 —— 死脚本会污染能力清单。REUSE 搜 B 按领域概念,不按 A1 的标识符名
+- **三层差异是纪律**:L2 接口不同是预期内的,别报警;L3 行为不同才是风险,盯死。两者混在一起是最常见的失败
+- **引擎执行模型复检不能省**。孤立看等价的两个函数,放进引擎的并发/所有权模型里可能就崩 —— 并发那条尤其
+- **不要把"看起来完整"当成目标**。UNCLEAR、N/A、BUILD 都是合法且有价值的产出 —— 假装懂、硬判 REUSE 才是最大的失败
+- **能力清单是结构骨架**,Phase 3 判决和 Phase 4 钻深全靠它。Phase 1/2 第 3 维度建得粗、建得错,后面全跟着废,这部分多花时间
+- **遇到 1:N / N:M、跨语言 idiom、执行模型冲突,慢一点写清楚** —— 这种地方含金量最高,也最容易藏坑
