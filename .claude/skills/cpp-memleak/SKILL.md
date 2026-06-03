@@ -226,6 +226,20 @@ Independent methods:
 | Env-var experiment (`MALLOC_ARENA_MAX`, `MALLOC_TRIM_THRESHOLD_`, jemalloc preload) | Changes allocator behavior; if RSS changes, leak hypothesis was wrong |
 | Code modification + redeploy | The most definitive: fix → observe → confirm growth stops |
 
+**Snapshot-delta decision matrix (high-leverage, zero-overhead method for glibc).**
+
+Take two snapshots ≥ 30 min apart (whatever lets you observe a few hundred MB of growth). Extract from each: `VmRSS`, count of 64 MB anon segments (ptmalloc subheaps), and `malloc_info` summary lines (`<system current>`, `<total rest>`, `<total fast>`, `<total mmap>`). Compute deltas, then read off this table:
+
+| Pattern | Interpretation | Action |
+|---|---|---|
+| Δsystem ≈ Δ(subheap_count) × 64 MB **AND** Δrest ≈ 0 | **100% true accumulation in ptmalloc** — newly OS-allocated memory is all live data, not free pool growth. Fragmentation hypothesis is dead. | Skip allocator tuning; go straight to source review / live profiler |
+| Δsystem ≈ Δrest | Allocator pulling pages from OS, but new pages end up in free pool. **Free-but-not-returned** behavior. | Try `MALLOC_ARENA_MAX=2 MALLOC_TRIM_THRESHOLD_=131072`; if RSS stabilizes, no source fix needed |
+| Δsystem ≪ ΔVmRSS | Growth is **outside ptmalloc** (mmap, stack, shared anon, file mappings). | Diff the `pmap` files (`comm -13 t0.pmap t1.pmap`) to see which non-heap segment is growing |
+| Δsubheap_count = 0 but Δrest grows | Heavy churn inside existing arenas; RSS stable. Not a leak. | Stop investigating; this is normal |
+| Δmmap (`<total type="mmap">`) grows | Large direct mmap blocks (≥ 128 KB) accumulating. | Suspect big buffers, file mappings, or `posix_memalign` users with large alignments |
+
+The first row is the cleanest possible signal for a true leak — if you see it, source review is justified and tuning is wasted time.
+
 **Convergence rule:** if Phase 3 says "Pattern A in ClassMyCache::add", confirm by at least one of:
 - Snapshot diff shows the rate matches estimate (~1 OOM)
 - LD_PRELOAD profiler captures `MyCache::add` as the top allocator
@@ -276,17 +290,26 @@ RSS:      21.7 GB, growing ~4 GB/day = ~46 MB/min ≈ 460 KB/sec
 Threads:  59 stable
 Segments: 309 × 64 MB anon (= 19.3 GB, 89% of RSS) + 3 large + heap + libs
 
-malloc_info summary:
-  <system size> 20.17 GB
-  <total fast>   73 KB
-  <total rest>  469 MB    ← only 2.3% free, utilization 97.7%
-  <total mmap>  665 MB    ← 42 large direct-mmap blocks
+malloc_info summary at T0:
+  <system current> 20.17 GB
+  <total fast>     73 KB
+  <total rest>     469 MB    ← only 2.3% free, utilization 97.7%
+  <total mmap>     665 MB    ← 42 large direct-mmap blocks
 
-Suspect profile: long-lived container, ~512 B objects, ~500 ops/sec,
+T0 → T1 snapshot diff (69 minutes apart):
+  ΔVmRSS         = +186 MB
+  Δsubheap_count = +3   (3 × 64 MB = 192 MB ≈ ΔVmRSS)
+  Δsystem        = +186 MB
+  Δrest          = -0.01 MB  (free pool essentially flat)
+  Δfast          = -0.003 MB
+  Δthreads       = 0   (still 59)
+  → Snapshot-delta row 1 hit: 100% true accumulation. Source review justified.
+
+Suspect profile: long-lived container, ~512 B objects, ~900 ops/sec,
 all-workers, steady-state. Most likely pattern A (monotonic map).
 ```
 
-The point: the rate (460 KB/s) × the chunk size (~512 B) constraint immediately ruled out big-buffer hypotheses and zeroed in on small-object container patterns.
+The point: the rate (460 KB/s) × the chunk size (~512 B) constraint immediately ruled out big-buffer hypotheses and zeroed in on small-object container patterns. The snapshot diff then ruled out fragmentation cleanly in one round.
 
 ### Common false-positive readings
 

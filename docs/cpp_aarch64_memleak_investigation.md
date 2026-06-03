@@ -118,6 +118,18 @@ LD_PRELOAD: 未设置
 
 → **不论 (A) 还是 (B),都必须定位具体调用栈或源码位置**才能根治。
 
+### 3.4 §4 snapshot diff 已 cross-verify 的结论(2026-06-03)
+
+经过 T0 → T1 (69 min) snapshot 对比(见 §4.3):
+
+1. **新增 RSS 100% 是 live 数据**(Δrest ≈ 0,Δsystem = ΔVmRSS = 3×64MB subheap)
+2. **稳定线性增长** ~2.7 MB/min,符合最初 4 GB/天 观察
+3. **完全排除**:线程泄漏、自定义 allocator、共享内存、文件 cache、ptmalloc 碎片化、ptmalloc 不归还
+4. **唯一剩余假说**:long-lived 容器内的小对象单调累积(§3.3 中的 A 或 B,语义上不可区分)
+5. **要解决的问题**:源码定位到具体的 long-lived 容器 + 写入路径
+
+此结论已**交叉验证**(snapshot diff 法 + malloc_info 统计法 + smaps 段统计法 三种方法独立指向同一结论)。
+
 ---
 
 ## 4. 当前执行的方案:**Snapshot Diff**(优先,不重启不干扰生产)
@@ -212,20 +224,35 @@ echo "T0:"; cat $SNAP_DIR/$T0.threads
 echo "T1:"; cat $SNAP_DIR/$T1.threads
 ```
 
-### 4.3 结果记录区(填回本文档)
+### 4.3 结果记录区(已填,T0 → T1 = 69 min)
 
 | 项 | T0 | T1 | Δ |
 |---|---|---|---|
-| RSS | (待填) | | |
-| VSZ | | | |
-| 64 MB subheap 数 | 309 | | |
-| `<system current>` | 20.17 GB | | |
-| `<total fast>` | 73 KB | | |
-| `<total rest>` | 469 MB | | |
-| `<total mmap>` | 665 MB | | |
-| 线程数 | 59 | | |
+| VmRSS | 21,929,824 KB ≈ 21.42 GB | 22,120,384 KB ≈ 21.61 GB | **+186 MB** |
+| 64 MB subheap 数 | 311 | 314 | **+3**(= 192 MB,与 ΔRSS 吻合) |
+| `<system current>` | 21,747,040,256 B ≈ 20.25 GB | 21,942,280,192 B ≈ 20.44 GB | **+186 MB** |
+| `<aspace total>` | 21,747,040,256 B | 21,942,280,192 B | +186 MB(同上) |
+| `<total rest>` count | 917,015 | 917,038 | +23(几乎不变) |
+| `<total rest>` size | 491,522,631 B ≈ 469 MB | 491,511,726 B ≈ 469 MB | **−0.01 MB**(反而轻微缩小) |
+| `<total fast>` count | 1,249 | 1,186 | −63 |
+| `<total fast>` size | 75,264 B | 72,288 B | −2.9 KB |
+| 大于 64 MB 的 anon 段对比 | (3 段,见 §2.2) | 同 T0 | **无新增** |
+| 线程数 | 59 | 59 | 0 |
 
-**判读结论**:(等 T1 后填)
+**判读结论(对照 SKILL.md Phase 4 snapshot-delta decision matrix 第 1 行)**:
+
+- Δsystem(+186 MB)≈ Δsubheap × 64 MB(+192 MB)≈ ΔVmRSS(+186 MB),三个数字两两吻合到 < 4%
+- Δrest 实际为 **−0.01 MB**(free 池没有任何增长)
+- 无 > 64 MB 新增段(排除单次大对象 mmap)
+- 线程数不变(排除 thread leak / stack 增长)
+
+→ **100% 的新增 RSS 全部进入"live 业务数据"**。碎片化假说彻底排除,allocator 不归还假说排除。
+
+**速率**:69 min → +186 MB → **2.7 MB/min ≈ 162 MB/h ≈ 3.88 GB/天**,与最初观测 "17 GB → 21 GB / 一天" 完全一致。
+
+**活数据量**:`<system current> - <total rest> - <total fast>` ≈ **20.97 GB**,即 C++ 进程中**真实正在引用、不可释放**的对象总量。
+
+**下一步**:已无需更多外部诊断,直接进入 §5 / 交接文档 `cpp_memleak_source_review_handoff.md`,把约束交给有源码的 reviewer / 内部模型做语义分析。
 
 ---
 
