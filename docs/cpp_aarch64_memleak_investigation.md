@@ -3,6 +3,8 @@
 > 工作类型:**进行中的诊断**(非结题报告)
 > 跟踪分支:`xcc_memleak`
 > 适用对象:跑在 aarch64 GPB 板上的 C++ 业务进程,默认 glibc ptmalloc,工具受限(无 bcc/heaptrack/valgrind)
+>
+> **方法论已抽取为通用 skill**:[`.claude/skills/cpp-memleak/SKILL.md`](../.claude/skills/cpp-memleak/SKILL.md) —— 约束驱动 + 多假设 + 交叉验证,可以对任意 C++ 程序的内存增长问题套用。本文档是它在**这个具体 case** 上的实例化记录。
 
 ---
 
