@@ -227,85 +227,202 @@ echo "T1:"; cat $SNAP_DIR/$T1.threads
 
 ---
 
-## 5. 源码审查方向(有源码 → 必做)
+## 5. 源码语义分析 Skill(约束驱动)
 
-Snapshot diff 给出**外部表象**(系统视角),源码审查给出**内部嫌疑**(代码视角),两边交叉验证最有效。
+> **设计原则**:不做 grep 式机械模式匹配,而是把 §1-3 已得到的诊断画像**作为代码必须满足的约束**,用语义理解(由懂 C++ 的人或 LLM 执行)在源码里找符合约束的具体位置。
+>
+> 语义分析比 grep 强在三点:① 能区分"形似但实际无关"的代码(同名函数、注释里的关键字);② 能跨调用边界看"语义上的对称"(insert 跟 erase 是不是真的对称);③ 能基于诊断数字(比如 460 KB/s)给嫌疑点定**速率证据**,排序更准。
 
-### 5.1 重点扫描的代码模式
+### 5.1 把诊断现象翻译成"嫌疑代码必须满足的画像"
 
-```bash
-# 在 C++ 业务源码根目录下跑(替换 <SRC> 为你的源码根):
-SRC=<源码根>
+每个诊断事实推导成一条对嫌疑代码的**约束**。代码必须同时满足所有约束,否则被排除。
 
-# 5.1.1 裸 new(高危,看是不是配对了 delete / 接进 unique_ptr)
-grep -rn '\bnew\b' --include='*.cpp' --include='*.cc' --include='*.h' $SRC \
-    | grep -v '//\|/\*\|new_' \
-    > /tmp/raw_new.txt
-wc -l /tmp/raw_new.txt
+| 诊断事实(来自 §2-3) | 推导出的代码约束 |
+|---|---|
+| 19.7 GB **业务真数据在持有**,利用率 97.7% | 嫌疑代码必然包含一个或多个 **long-lived 容器 / 持久持有结构**,不是局部变量 |
+| **91.7 万 个 small free chunk**(平均块大小 ~512 B) | 累积的**对象很小**:`std::string`、节点式容器的 node、shared_ptr 的 control block、struct 几十/几百字节量级。**排除大 buffer 类(数 KB 以上单对象)** |
+| **4 GB/天 ≈ 460 KB/秒** ≈ 每秒分配 ~900 个 ~512 B 对象不释放 | 嫌疑代码在**稳态业务路径**上,被高频触发(每秒至少几十次到几百次)。**排除冷路径**(配置加载、错误处理、初始化) |
+| **59 线程稳定**,arena 数 ≈ 线程数,每 arena ≈ 5 subheap | 每个 worker 线程都贡献,**leak 是平均分布的**,不是个别 worker / 个别业务路径的 bug → 嫌疑代码在**所有 worker 都路过的共享逻辑**里 |
+| 涨势**稳态、无突变** | **不是事件触发型**(reconnect 风暴、配置 reload、burst 入流);是稳定业务流量自身贡献 |
+| Pss ≈ Rss(几乎全私有内存) | 跟**共享内存 / mmap 公共文件 / page cache 无关**,排除这些方向 |
+| `<total type=mmap>` 仅 665 MB / 42 块(平均 16 MB) | 直接 mmap 的大对象**不是主要矛盾**,可以最后看 |
 
-# 5.1.2 全局/静态容器(unbounded 来源)
-grep -rEn '^(static\s+)?std::(map|unordered_map|vector|list|deque|set|queue|multimap|multiset)<' \
-    --include='*.cpp' --include='*.h' $SRC
+**合并以上,嫌疑画像总结**:
 
-# 5.1.3 单例 / 全局状态
-grep -rEn 'singleton|getInstance|Instance\(\)|static\s+.*\s+&\s*\w+\(\)' \
-    --include='*.cpp' --include='*.h' $SRC
+> 所有 worker 线程都路过的、被 ~每秒几百次触发的稳态业务路径里,有一个或多个 long-lived 容器(static / singleton 成员 / manager 成员 / thread_local),持续 push 进**小对象**(~512 B 量级),没有匹配的清理路径。
 
-# 5.1.4 容器的 push/insert 操作(看有没有对应 erase/clear/eviction)
-grep -rEn 'emplace_back|push_back|insert\(|emplace\(' \
-    --include='*.cpp' $SRC | wc -l
+### 5.2 优先排查位置(根据画像精准定位)
 
-# 5.1.5 回调/observer 注册(看有没有 unregister/detach)
-grep -rEn 'register|subscribe|addListener|on(Event|Connect|Message)' \
-    --include='*.cpp' --include='*.h' $SRC | wc -l
+**不是 grep**,而是回答"哪些代码块语义上符合上面的画像"。
 
-# 5.1.6 shared_ptr 循环引用风险(this 被 capture 进 lambda / member 持有 shared_ptr)
-grep -rEn '\[.*this.*\]|shared_from_this' --include='*.cpp' $SRC | head -50
+#### 5.2.1 "所有线程路过的稳态路径"通常是:
+- 主事件循环 / 消息分发 / 协程调度器 的 dispatch 函数
+- worker thread 的 `run()` / `loop()` 入口
+- 中间件 / 拦截器 / handler chain 的入口
+- 协议解析器的 main entry
+- RPC server 的 request handler
 
-# 5.1.7 大对象直接 new(大 buffer / 矩阵 / 大字符串)
-grep -rEn 'new\s+(char|byte|int|float|double)\[' --include='*.cpp' $SRC
+→ **从这些点开始往下追**,看每次 dispatch 路径上有没有"对 long-lived 容器的写入"。
 
-# 5.1.8 第三方库的常见 leak 来源
-grep -rEn 'protobuf::Arena|libcurl|curl_multi|SSL_CTX_new|EVP_|av_malloc' \
-    --include='*.cpp' --include='*.h' $SRC
+#### 5.2.2 "long-lived 容器"具体识别:
+| 形态 | 怎么找(语义识别) |
+|---|---|
+| 静态成员变量 | 类定义里 `static T member` 且 T 是容器/智能指针/裸指针 |
+| namespace-level 全局 | `.cpp` 文件顶部的非 const 容器变量 |
+| Singleton 类的成员 | Singleton/Manager/Registry 类的实例变量 |
+| 长期存活 manager 的成员 | 在 `main()` 早期 new、在 shutdown 前永不 delete 的对象的成员 |
+| thread_local 容器 | `thread_local std::xxx<T>` 在 .cpp/.h 里 |
+| 通过 unique_ptr / shared_ptr 长期持有的对象 | 持有方是上述任意一种 |
+
+→ 一个 long-lived 容器的**寿命**等于它的持有者的寿命。
+
+#### 5.2.3 "insert / erase 不对称"的语义比对:
+对每个 candidate 容器,执行:
+
+1. 找到**所有写入**(`insert / emplace / push_back / operator[] = / try_emplace / merge`)
+2. 找到**所有移除**(`erase / clear / pop_front / pop_back / extract / reset()`)
+3. 评估两侧的**调用频率**和**触发条件**
+4. 比较**频率比**:
+   - 写入比移除频繁 1000:1 以上 → 高嫌疑
+   - 写入在 hot path,移除在 destructor / shutdown → 高嫌疑
+   - 写入和移除频率接近,但移除有 "if (some_condition)" → 看 condition 触发率
+5. 如果有 "eviction strategy" 类的代码(LRU、TTL、size cap),**评估它是否真的会触发**(配置的阈值是不是太大,LRU 是不是基于业务很少触发的边界条件)
+
+### 5.3 关键嫌疑模式分类(C++ 业务里 80% leak 落在这里)
+
+每条模式给出**画像匹配度**(哪些诊断约束对得上)+ **怎么从源码识别**。
+
+#### Pattern A:`unordered_map<Key, BigValue>` 单调增长
+- **画像匹配**:long-lived ✓,小到中等对象 ✓,稳态写入 ✓
+- **典型场景**:metric 聚合 by key、user/session map、cache 无 TTL
+- **识别**:找类型 `std::(unordered_)?map<...>` 的成员,看它的 insert/emplace 在哪些方法被调,erase 在哪些方法被调,频率对比
+- **快速验证**:如果能拿到那个 map 的 .size(),看是不是异常大
+
+#### Pattern B:`vector<T*>` 装裸指针,容器析构不删指针
+- **画像匹配**:long-lived ✓,小对象 ✓,稳态 ✓
+- **典型场景**:工厂/registry 模式遗留的 C 风格代码、迁移到 C++ 一半的库
+- **识别**:`std::vector<T*> v; v.push_back(new T())` 在 hot path,容器是 long-lived
+- **快速验证**:`vector::size()` 单调增,但容器内对象数据流不再访问
+
+#### Pattern C:shared_ptr 循环引用
+- **画像匹配**:long-lived ✓,大量 control block(small chunk)✓,稳态 ✓
+- **典型场景**:Session 持有 shared_ptr<Connection>,Connection 通过 callback 持有 shared_ptr<Session>
+- **识别**:任何 `shared_ptr<A>` 成员在 A 自己或 A 的成员的另一个 `shared_ptr<...>` 链路里被持有
+- **快速验证**:对 A 的 use_count() 跟踪,看它会不会归零
+
+#### Pattern D:Callback / Observer 注册没注销
+- **画像匹配**:long-lived(broker 持有)✓,小对象(closure / function 对象)✓,稳态 ✓
+- **典型场景**:`event_bus.subscribe(this, handler)` 在 hot path,destructor 里漏 `unsubscribe`,或者异常路径跳过
+- **识别**:`subscribe / register / addListener / on(...)` 的调用站点,看对面有没有等量的 `unsubscribe / remove / off`
+- **快速验证**:event_bus 的 subscriber 数单调增
+
+#### Pattern E:thread_local 容器
+- **画像匹配**:每线程都贡献 ✓(完美匹配 "59 线程平均贡献" 这条约束)
+- **典型场景**:`thread_local std::vector<Stat> g_stats` 用于线程局部统计,但永远不 reset
+- **识别**:所有 thread_local 变量都列出来,看是不是容器,有没有 size 上限
+- **快速验证**:`pthread` 级别的 RSS 趋势是不是相对均匀的
+
+#### Pattern F:第三方库已知 leak 点
+| 库 | 已知 leak / 累积点 |
+|---|---|
+| protobuf | `Arena` 没 Reset;`Message::set_*` 反复调没释放旧 |
+| libcurl | `CURL` handle 没 `curl_easy_cleanup`;multi handle 没 `curl_multi_cleanup` |
+| OpenSSL | `SSL_CTX` session cache 默认无上限;`X509` 链没 free |
+| log4cxx / spdlog | 异步 logger 的 buffer 是否会归还 |
+| RapidJSON / nlohmann::json | Document 反复 Parse 不 Clear |
+| Boost.Asio | strand / timer / io_context::work 持有 |
+
+→ 对每个引入的第三方库,**单独评估**它的"长期持有结构"是不是有清理路径。
+
+### 5.4 调用 Skill 的方式
+
+#### 给 LLM 用的 prompt 模板
+
+```
+你是一位有经验的 C++ 内存问题调查者。下面是已经做完的内存现场诊断,
+然后是待审查的源码文件。请基于诊断结果,做语义分析(不做 grep),
+找出最符合诊断画像的嫌疑代码点。
+
+## 已知诊断画像(约束)
+- 平台:aarch64,默认 glibc ptmalloc
+- 现象:RSS 持续涨,~4 GB/天 = 460 KB/秒
+- ptmalloc 利用率 97.7%(业务真持有 19.7 GB,不是碎片)
+- ~91.7 万 small free chunk(平均块 ~512 B)→ 累积的是小对象
+- 59 线程稳定,每个 arena 平均 5 subheap → leak 平均分布,所有 worker 贡献
+- 涨势稳态 → 不是事件触发,是稳定业务流量
+- Pss ≈ Rss → 跟共享内存无关
+
+→ 嫌疑画像:所有 worker 线程都路过的稳态路径里,有 long-lived 容器
+   在被高频(~每秒数百次)推入小对象(~512 B),且没有匹配的清理路径
+
+## 任务
+对附上的源码文件,做以下分析:
+
+1. **识别 long-lived 容器**:
+   列出所有 static 成员、namespace 全局、Singleton/Manager 成员、
+   thread_local 的容器/智能指针。
+
+2. **对每个候选容器,列出 insert/emplace 点 + erase/clear 点,做对称性比对**:
+   - 写入调用站点(文件:行 + 触发条件 + 估算调用频率)
+   - 移除调用站点(同上)
+   - **频率比 / 触发条件** 是否对称?
+
+3. **评估每个嫌疑点是否符合 460 KB/秒的累积速率**:
+   - 如果是 unordered_map<string, X>,每 insert 一项 ~多少字节?
+   - 实际触发频率(估算)× 单项字节数 ≈ ?
+   - 接近 460 KB/秒(±一个量级)才是强嫌疑
+
+4. **跟 §5.3 的 Pattern A-F 对照**,如果命中某 pattern 直接标注
+
+5. **给嫌疑度排序**,列前 5 个:
+   | 排名 | 文件:行 | 命中 pattern | 累积速率估算 | 修法建议 |
+
+要求:
+- 不要做 grep 式报告(列一堆文件名没分析)
+- 每个嫌疑点要有"为什么符合画像"的具体推理
+- 排除画像不符的(大 buffer 类、冷路径类、非 long-lived 类)
 ```
 
-### 5.2 业务侧自问 7 题
+#### 给人工 reviewer 用的 checklist
 
-每题如果**回答不出"yes 且有上限"**,就是嫌疑点:
+按 §5.2 顺序走:
 
-1. 进程里**最大的容器是哪个**?它有没有 size 上限?
-2. **缓存**有没有 eviction(LRU、TTL、count-cap、bytes-cap)?
-3. **日志 / metric / event 历史记录**有没有滚动/截断?
-4. **session / 连接上下文**断开时是否真的释放(不是只标记 dead)?
-5. **后台 thread / coroutine** 的局部状态是不是单调增长?(尤其 thread_local 容器)
-6. **第三方库的全局**:protobuf Arena 是否 Reset?libcurl multi handle 是否 cleanup?SSL session cache 有没有限?
-7. **shared_ptr 是否有循环引用**?(member 持有 shared_ptr<callback>,callback capture 了 shared_ptr<this>)
+- [ ] (5.2.1) 列出 3-5 个"所有线程路过的稳态入口函数",写在下面:
+  ```
+  - file.cpp:NNN  func_name  (描述: ...)
+  - ...
+  ```
+- [ ] (5.2.2) 列出所有 long-lived 容器(分形态)
+- [ ] (5.2.3) 对每个 long-lived 容器,做 insert/erase 对称性分析
+- [ ] (5.3) 对照 Pattern A-F,每个 pattern 评估是否在本代码库出现
+- [ ] (5.4) 把嫌疑点按本节末尾的"嫌疑登记表"格式记录
 
-### 5.3 静态分析工具(本机或离线 dev 机)
+### 5.5 嫌疑代码登记(分析结论写在这)
+
+| 排名 | 文件:行 | 嫌疑容器 | 命中 pattern | insert 频率 | erase 触发率 | 估算累积速率 | 是否符合 460 KB/s | 推荐修法 | 状态 |
+|---|---|---|---|---|---|---|---|---|---|
+| (待填) | | | | | | | | | |
+
+### 5.6 静态分析工具(辅助,不替代上面的语义分析)
+
+静态分析适合**先扫一遍**找潜在线索,**但不能替代** §5.1-5.4 的约束驱动分析(它们不知道你的诊断画像)。
 
 ```bash
-# cppcheck(几乎所有发行版都有)
+# cppcheck
 cppcheck --enable=all --inconclusive --suppress=missingIncludeSystem \
-         -j4 --output-file=/tmp/cppcheck.log $SRC
+         -j4 --output-file=/tmp/cppcheck.log <SRC>
 
-# clang-tidy(更慢但更细)
+# clang-tidy
 clang-tidy -checks='cppcoreguidelines-*,bugprone-*,modernize-use-smart-ptr' \
-           -p <build_dir> $SRC/*.cpp 2>&1 | tee /tmp/clang_tidy.log
+           -p <build_dir> <SRC>/*.cpp 2>&1 | tee /tmp/clang_tidy.log
 ```
 
 关注的检查项:
-- `cppcoreguidelines-owning-memory`(谁拥有 new 出来的对象)
-- `bugprone-use-after-move`、`bugprone-unchecked-optional-access`
-- `modernize-use-smart-ptr`(裸 new 提示)
+- `cppcoreguidelines-owning-memory`
+- `bugprone-use-after-move`
+- `modernize-use-smart-ptr`
 
-### 5.4 嫌疑代码登记
-
-把扫描和审查发现的可疑点登记在这里(由人工填写):
-
-| 优先级 | 文件:行 | 模式 | 备注 | 状态 |
-|---|---|---|---|---|
-| (待填) | | | | |
+把这些工具的结果**作为 §5.4 prompt 的额外输入**,让 LLM/人工 reviewer 在做语义分析时同时参考。
 
 ---
 
