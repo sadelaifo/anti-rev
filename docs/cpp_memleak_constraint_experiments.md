@@ -181,7 +181,29 @@ awk 'NR==FNR{a[$1]=$2; next}
     $SNAP/arena_sizes.txt $SNAP_T1/arena_sizes.txt
 ```
 
-**判读**:
+**必做的算术一致性校验**(防 "top-10 排序的视觉误判" 陷阱):
+
+```bash
+# 直接算 T0 / T1 各自的 per-arena 总和,跟全局 <system current> 对比
+T0_SUM_MB=$(awk '{s+=$2} END{print int(s/1048576)}' $SNAP/arena_sizes.txt)
+T1_SUM_MB=$(awk '{s+=$2} END{print int(s/1048576)}' $SNAP_T1/arena_sizes.txt)
+echo "T0 per-arena sum = $T0_SUM_MB MB"
+echo "T1 per-arena sum = $T1_SUM_MB MB"
+echo "Δ                = $((T1_SUM_MB - T0_SUM_MB)) MB"
+echo ""
+echo "T0 arena 数: $(wc -l < $SNAP/arena_sizes.txt)"
+echo "T1 arena 数: $(wc -l < $SNAP_T1/arena_sizes.txt)"
+```
+
+**glibc 数学约束**:`Σ(per-arena <system current>) ≡ 全局 <system current>`(mmap 走 `<total mmap>`,不算这里)。所以上面 `Δ` 必须**约等于** R7.4 角度 2 拿到的全局 system Δ。
+
+| 现象 | 含义 |
+|---|---|
+| 上面 Δ ≈ 全局 system Δ | 数据自洽,**leak 在 per-arena heap**;再回头看 top-10 排序找谁涨得多(或者多人小幅涨) |
+| 上面 Δ ≈ 0 而全局 system Δ > 0 | **数据矛盾**,该停了 — 走 Round 8 体面转交。可能原因:T1 新 arena 没被 awk 收录、mi.xml 抓取不完整、用户的 awk 在视觉上漏看了散布的小幅涨 |
+| T1 arena 数 > T0 arena 数 | 新出现 arena,新增量都在新 arena 上 → 用 `comm -23 <(awk '{print $1}' T1) <(awk '{print $1}' T0)` 找出新 arena id |
+
+**判读**(角度 1 整体):
 - **Σ Δ per-arena ≈ ΔRSS** → leak 在 per-arena heap 里;top Δ 排序就是新嫌疑 arena 列表
 - **Σ Δ per-arena ≪ ΔRSS** → leak 跑出了 per-arena heap,走角度 2
 
