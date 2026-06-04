@@ -304,6 +304,9 @@ Independent methods:
 | Live profiler (bcc memleak, perf uprobe, custom LD_PRELOAD wrapper) | Captures actual leak stack traces |
 | Env-var experiment (`MALLOC_ARENA_MAX`, `MALLOC_TRIM_THRESHOLD_`, jemalloc preload) | Changes allocator behavior; if RSS changes, leak hypothesis was wrong |
 | **Plugin elimination experiment** (plugin host only) | Load N-1 of N plugins, rotate omission; combo where RSS stays flat identifies the involved plugin(s). Often the cheapest way to localize a combo-dependent leak. Cost: each rotation needs a restart + observation window |
+| **Multi-snapshot rate validation** | Once a steady-state rate R is measured at one observation point, predict subsequent snapshots: at time T+Δt, RSS should equal observed-RSS + R·Δt; same for top arena. Match within 20% confirms a stable rate (rules out burst, threshold, and one-off causes). Mismatch tells you which sub-hypothesis to revisit. Cost: a follow-up snapshot run after the chosen Δt. Worth doing whenever you've quoted a rate as if it were stable. |
+| **Init-baseline arithmetic** | Compute process uptime (from `/proc/PID/stat` field 22 + `btime`). Implied init-time accumulation = current RSS − (rate × uptime). A small (<1 GB) baseline ⇒ runtime-driven leak; a multi-GB baseline ⇒ init-time accumulation dominates. Cheapest possible discrimination between two very different fix paths. |
+| **Rate → call-frequency translation** | Top-arena rate (bytes/sec) divided by typical leaked-object size gives the suspect function's invocation frequency in Hz. The Hz range labels the code pattern: 20-100 Hz ≈ simulator tick / heartbeat; 100-1000 Hz ≈ moderate RPC; 10000+ ≈ epoll callback. Narrows the source-review question from "any function" to "this Hz family of functions". |
 | Code modification + redeploy | The most definitive: fix → observe → confirm growth stops |
 
 **Snapshot-delta decision matrix (high-leverage, zero-overhead method for glibc).**

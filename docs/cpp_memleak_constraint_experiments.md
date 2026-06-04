@@ -32,11 +32,127 @@
 
 | Round | 日期 | 触发 | 加入了什么 | 同步改动 |
 |---|---|---|---|---|
+| **Round 6** | 2026-06-04 | Round 5 锁定嫌疑 tid 后,意识到还缺一个关键判别:**leak 是 init-time(进程启动一次性分配)还是 runtime(持续累积)**,两者修复方向截然不同;同时发现"snapshot 取的时点 = 进程刚重启"的隐含假设没验证;**纯 process uptime 这一个数据点能砍掉大量假设** | 多 snapshot 速率交叉验证 playbook:进程运行时长反推 init baseline / 用已知速率预测下一次 snapshot 并校验 / 速率换算成"函数频率 × 对象大小"的精细化画像 | SKILL.md Phase 4 加 "multi-snapshot rate validation" 作为通用 cross-verification 方法;工作文档 §3.7 记录本 case 实测 |
 | **Round 5** | 2026-06-04 | R3.4.2 在板上连续踩三个坑(gdb 无 Python → 无 struct malloc_state → 无 main_arena 符号),发现 libc 被深度 strip 时精确 arena→tid 映射代价过高,而本 case 主要目的(识别嫌疑 tid)用更廉价的方式也能达到 | 简化嫌疑识别 playbook(纯 L0:线程名分组 + CPU 时间排行 + 栈顶分类);何时跳过精确 arena 映射的判断标准 | R3.4.4 doc header 加 "走不通时跳 Round 5" 提示;识别失败兜底指向 gcore 离线(R2.7) |
 | **Round 4** | 2026-06-04 | 在执行 R3.4 Exp-F 时 gdb 卡住,意识到原命令没有迭代上限 / 超时保护,gdb 卡住后强杀风险大;另发现 R3.4 子步骤顺序(原 R3.4.2 中间穿插 R3.4.3 集中度,再跳回 R3.4.2 步 5)逻辑不连贯 → 整段重排为 R3.4.1 ~ R3.4.6 线性流 | 操作安全规则(L0-L3 风险分级、6 条纪律);卡住诊断阶梯;已有命令的安全版替换;R3.4 线性化 | 所有 Round 的 gdb 命令统一加 `timeout` 包裹 + `while $n < N` 迭代上限;`call malloc_info` 标 L2 风险并给出 L1 替代;R3.4 拆成 6 步(baseline / arena walk / 集中度 / tid→arena / 线程名 / 钻取) |
 | **Round 3** | 2026-06-04 | 目标进程被重启,RSS 21 GB → 3 GB | 重启诊断窗口 playbook(多时点采样、对照实验、失败模式) | SKILL.md Phase 0 strategic note;工作文档 §3.6 |
 | **Round 2** | 2026-06-04 | Exp-A 实测 max/avg = 45.9× + 大段稳定 → 推翻"all-workers"画像 | Exp-F (arena → tid 映射);决策树补 Exp-F 分支;Exp-A 增量对照加 awk fallback (板上无 `join`) | handoff §3 加修订 callout;SKILL.md Phase 4 加 per-arena concentration check |
 | **Round 1** | 2026-06-03 | 怀疑初步"long-lived 容器小对象漏 erase"画像过窄,可能漏 Alt-1 单大对象、Alt-2 pool、Alt-3 背压、Alt-7 dlopen 等 | Exp-A~E 五件套(per-arena、大段、in-use 直方图、线程 bt、dlopen);修订表;决策树 | 创建本文档 |
+
+---
+
+# Round 6 (2026-06-04 #4) — 多 snapshot 速率交叉验证 + Init vs Runtime 判别
+
+## R6.1 触发与价值
+
+Round 5 锁定了候选 tid 后,源码审查方向**还差一关键判别**:
+
+| 判别 | 修复方向 |
+|---|---|
+| **Init-time leak**(进程启动时一次性分配大块,长期不释放) | 改 plugin load / config build / scenario init 代码 |
+| **Runtime leak**(运行中以稳态频率持续累积) | 改 hot path 上的容器 / 队列 / cache 清理 |
+
+两条修复路径**几乎不交叉**。先判别才能集中火力。
+
+更进一步:R6 拿到稳态速率后,可以反算"嫌疑函数被调用的频率 + 单次累积对象大小",**这是最窄的源码审查约束**。
+
+## R6.2 进程运行时长(L0,2 秒)
+
+```bash
+# 方法 A:最简单
+ps -o etime=,lstart= -p $PID
+
+# 方法 B:精确到秒
+PROC_START=$(awk '{print $22}' /proc/$PID/stat)
+BOOT_TIME=$(awk '/btime/{print $2}' /proc/stat)
+CLK_TCK=$(getconf CLK_TCK)
+START_EPOCH=$((BOOT_TIME + PROC_START / CLK_TCK))
+NOW=$(date +%s)
+UPTIME=$((NOW - START_EPOCH))
+echo "进程启动: $(date -d @$START_EPOCH '+%Y-%m-%d %H:%M:%S')"
+echo "已运行: $UPTIME 秒 = $((UPTIME/3600)) h $((UPTIME%3600/60)) min"
+```
+
+## R6.3 反推 init baseline
+
+> 前提:已经从前期 snapshot 测得稳态速率 R(单位 MB/h)。
+
+```
+预期 runtime 累积 = R × uptime
+隐含 init baseline = 当前 RSS − 预期 runtime 累积
+```
+
+| init baseline | 解读 |
+|---|---|
+| **< 1 GB**(典型 C++ 启动量) | 累积**全是 runtime**,leak 在 hot path |
+| **几 GB** | 大块在 init 时分配,**leak 是 init-time** |
+| **接近当前 RSS** | runtime 累积几乎为零,要么是负载没起来,要么是 leak 偶发(不在稳态业务路径) |
+| **负数 / 远低于合理 baseline** | 速率估算错了 / 进程时长测错了 / 中途有 RSS 突降事件 → 重新核对 |
+
+## R6.4 T0 → T1 预测与校验
+
+利用稳态速率 R,可以**预测**下一次 snapshot 的关键值,跟实际对照:
+
+```
+T1 时 RSS 预测     = T0 RSS + R × (T1 - T0)
+T1 时 top arena    = T0 top arena + R_top × (T1 - T0)   ← R_top 是 top arena 自己的速率
+```
+
+预测对得上(±20% 内)= **速率稳态彻底确认**,排除 burst / threshold-triggered 假说。
+
+预测不对(>30% 偏差)的几种情形:
+
+| 偏差 | 解读 |
+|---|---|
+| 实际比预测显著高 | leak 加速;查负载是否上升,或新触发条件 |
+| 实际比预测显著低 | 业务负载下降,或 leak 间歇性 |
+| top arena 偏低 | arena 集中性减弱,可能多 arena 同步在涨 → Round 5 嫌疑画像需复核 |
+| top arena 编号变了 | 嫌疑线程角色不固定 → Round 5 候选要重定 |
+
+## R6.5 速率换算成"函数频率 × 对象大小"(精细化画像)
+
+```
+若 leak 累积对象平均大小 = B 字节
+则 嫌疑函数触发频率 = R_top / B   (Hz)
+```
+
+R_top 是 top arena 的速率(单位 字节/秒)。
+
+平均对象大小 B 的估算来源(精度从低到高):
+
+1. **ptmalloc free chunk 平均**(`rest size / rest count` from `malloc_info`)——粗略,反映过去 freed 的分布,可能跟正在 leak 的不一样
+2. **Round 1 Exp-C gcore + heap walker** —— 精确的 in-use 分布(贵)
+3. **业务对象典型大小推断**(从源码审查 hint:`std::string ~ 32 B + 内容`、protobuf message 几百 B、连接 state 几 KB)
+
+得到嫌疑函数的**触发频率**就锁住了它的语义:
+
+| Hz 范围 | 常见对应 |
+|---|---|
+| 10000+ | epoll IO 事件、热路径 callback |
+| 1000-10000 | 中等 RPC 吞吐,中频内部消息 |
+| **100-1000** | gRPC server 中等负载、协议帧处理 |
+| **20-100** | 仿真器 tick / step、状态报告、心跳 |
+| 1-20 | 定时 metric、慢任务、配置 refresh |
+| < 1 | 启动 / 一次性 / 配置变更 |
+
+这把审查范围从"任何函数"缩到"被这个频率触发的函数",通常只有 1-3 个候选。
+
+## R6.6 本 case 实测(2026-06-04)
+
+| 指标 | 值 | 算法 |
+|---|---|---|
+| 进程运行时长 | 16 h 5 min(2026-06-03 18:57 → 2026-06-04 11:02) | R6.2 |
+| 已知稳态速率 | 162 MB/h(Round 1 工作文档 §3.4 测得) | 历史 |
+| 预期 runtime 累积 | 16 × 162 = **2.6 GB** | R6.3 |
+| snapshot RSS | 3 GB | 实测 |
+| **隐含 init baseline** | 3 − 2.6 = **0.4 GB** | R6.3 |
+| 判断 | **runtime-driven**(0.4 GB baseline 合理) | R6.3 |
+| top arena 速率 R_top | 2 GB / 16 h = **125 MB/h ≈ 35 KB/s** | R6.5 |
+| 估算对象大小 B | ~500 B(ptmalloc rest avg) | R6.5(粗估) |
+| **嫌疑函数频率** | 35 KB/s ÷ 500 B = **~70 Hz** | R6.5 |
+| 匹配的代码 pattern | 仿真器 tick / 中等吞吐 RPC / 心跳 | R6.5 表 |
+
+→ Init-time 假说从 ~30% 降到 ~10%。审查锁到 "**~70 Hz 触发,每次留 ~500 B 不释放,落入某长寿持有结构**"。
 
 ---
 
