@@ -208,4 +208,7 @@
 
 - 方法论 skill:`.claude/skills/cpp-memleak/SKILL.md`(语义审查的通用做法,与本 case 解耦)
 - 完整诊断过程 + 数据原始记录:`docs/cpp_aarch64_memleak_investigation.md`(留作 forensics 参考)
+- **约束收窄实验手册**:`docs/cpp_memleak_constraint_experiments.md`(Exp-A~E,在把本 handoff 交给审查方**之前**跑,可能会修订本文 §3 的约束表)
 - 本文:`docs/cpp_memleak_source_review_handoff.md`(给审查方的精简交接)
+
+> 注意:本 handoff §3 的画像是经验先验,**不是数据强制的唯一形态**。强烈建议先按 `cpp_memleak_constraint_experiments.md` 跑一轮 Exp-A/B/D/E(都不重启,~ 30-60 min),再决定 §3 要不要改。原画像至少漏掉了:Alt-1 单大对象、Alt-2 自管理 pool、Alt-3 异步背压、Alt-7 dlopen 累积等替代假说。
