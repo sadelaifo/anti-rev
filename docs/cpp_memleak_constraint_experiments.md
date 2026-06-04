@@ -436,7 +436,11 @@ sort -k6 -n $SNAP/arena_addr.txt | tail -5
 - **top 是 arena 0(main)** → 主线程在涨;继续 R3.4.4-6,但嫌疑代码区是 main 上的 manager / singleton
 - **top 是 arena N > 0** → 某 worker 在涨;R3.4.4 找出 tid,R3.4.5/6 给它身份
 
-### R3.4.4 tid → arena 映射(L1,**不用** `$_thread_name`)
+### R3.4.4 tid → arena 映射(L1)
+
+> **如果 R3.4.2 走不通**(libc strip 太狠、main_arena 符号没有、偏移 fallback 也失败)— 跳过本步,直接走 **R3.4.X 简化路:线程名 + CPU 时间识别嫌疑**(本节末尾)。**arena→tid 映射不是必需**,只是众多识别手段中最精确的一种。
+>
+> **不用** `$_thread_name`,容易卡。线程名走 R3.4.5 /proc。
 
 ```bash
 timeout 90 gdb -batch --nx \
@@ -493,6 +497,62 @@ awk -v t="$SUSPECT_TID" '
 ```
 
 输出的四块(arena 地址 / tid / name / backtrace)就是 handoff §3 从"某 worker 持有大量小对象"细化到 **"thread tid=X (name=Y, entry=Z) 持有 N% heap"** 的全部素材。直接贴给工作文档 §3.6 / handoff §3。
+
+### R3.4.X 简化识别(当 R3.4.2/4 任一步走不通时直接跳到这里)
+
+> **触发**:libc 被 strip 没 main_arena 符号、偏移 fallback 失败、gdb 各种卡。**arena→tid 不是必需**;线程身份还能从别的角度抓。
+>
+> **风险**:全 L0(/proc 读 + 已有 threads.bt 解析)。不动 gdb。
+
+#### 步 1:线程名分布 + CPU 时间排行
+
+```bash
+echo "=== 线程名分组 ==="
+for tid in $(ls /proc/$PID/task); do
+    cat /proc/$PID/task/$tid/comm 2>/dev/null
+done | sort | uniq -c | sort -rn
+
+echo ""
+echo "=== top 10 by CPU time (utime+stime jiffies) ==="
+for tid in $(ls /proc/$PID/task); do
+    fields=$(cat /proc/$PID/task/$tid/stat 2>/dev/null) || continue
+    name=$(cat /proc/$PID/task/$tid/comm 2>/dev/null)
+    cpu=$(echo "$fields" | awk '{print $14+$15}')
+    echo "$cpu  tid=$tid  name=$name"
+done | sort -rn | head -10
+```
+
+#### 步 2:栈顶函数分类(用已有 threads.bt)
+
+```bash
+echo "=== 栈顶函数排行 ==="
+awk '
+  /^Thread / { in_t = 1; next }
+  in_t && /^#0/ {
+    if (match($0, / in [^ (]+/)) fn = substr($0, RSTART+4, RLENGTH-4)
+    else fn = $NF
+    print fn; in_t = 0
+  }
+' $SNAP/threads.bt | sort | uniq -c | sort -rn | head -10
+```
+
+#### 步 3:挑出可疑 tid,看其完整 backtrace
+
+```bash
+SUSPECT_TID=12345    # 从步 1/2 找出来的孤儿线程 tid
+awk -v t="$SUSPECT_TID" '
+    /^Thread / { in_t = (index($0, "(LWP "t")") > 0) }
+    in_t { print }
+    /^$/ && in_t { exit }
+' $SNAP/threads.bt
+```
+
+#### 识别要点
+
+- **线程名分组里有"孤儿"**(一群叫 WorkerN,一个叫 MetaCache / DataLoader / RouteMgr 这种语义化名)→ 孤儿很可能是嫌疑
+- **CPU 时间排行最高那个,跟其他差距 10× 以上** → 它在持续干活,可能就是源头
+- **栈顶分类:50 个在 `pthread_cond_wait` / `epoll_wait`,3-5 个在业务代码** → 嫌疑在那 3-5 个里
+- 三个角度交叉对照 → 通常能锁定 1-3 个候选 tid 给内部模型扫
 
 ## R3.5 多时点采样表
 
