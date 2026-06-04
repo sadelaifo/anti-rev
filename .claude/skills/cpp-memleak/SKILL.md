@@ -18,6 +18,34 @@ The skill enforces three discipline rules:
 
 ---
 
+## First principles — what every C++ leak is
+
+Before any phase, anchor on the essential model. Every memory leak in C++ satisfies the same equivalent statement:
+
+> **There exists a long-lived holder structure,**
+> **an operation that adds references to it,**
+> **and a missing or broken operation that should remove them.**
+
+| Holder structure | "Add" operation | Missing "remove" |
+|---|---|---|
+| `std::vector<T>` member | `push_back` / `emplace_back` | `erase` / `pop_back` / `clear` |
+| `std::map / unordered_map` member | `emplace` / `operator[]` / `try_emplace` | `erase` / `clear` |
+| Callback / observer registry | `subscribe` / `register` / `addListener` | `unsubscribe` / `remove` |
+| `shared_ptr` reference cycle | `make_shared` / capture in lambda | (break with `weak_ptr`) |
+| Async queue | producer `push` | consumer can't keep up / not running |
+| `thread_local` container | per-thread `push` | no per-thread reset |
+| Cross-module boundary (plugin↔platform↔third-party) | API hand-off | symmetric hand-back missing |
+
+Crucially, **these are not seven independent leak types** — they are the same essential mechanism instantiated on seven kinds of structure. Investigation reduces to **find the structure, find the add, find the missing remove**.
+
+Architectural context — "is this a plugin host?", "is this a microservice?", "is this third-party-heavy?" — is **data about where the holder structure might live**. It is **not** a narrowing of the hypothesis. A plugin host can still leak inside one plugin, in the platform, in a third-party library, or at the platform/plugin boundary — the same first-principles model applies to each location.
+
+Use this framing whenever you catch yourself jumping from a contextual label ("it's a plugin host", "it's a gRPC server") to a specific mechanism ("must be cross-plugin interaction", "must be a connection cache"). The label only enlarges your search list of candidate structures; it does not eliminate any.
+
+---
+
+---
+
 ## When to invoke
 
 Trigger when the user describes:
@@ -51,16 +79,18 @@ Before any analysis, get hard numbers. Push back if the user only has anecdotes 
 - Platform: arch (x86_64/aarch64/…), kernel version, OS
 - What tools are available on the target (grep, gdb, pmap is usually a yes; bcc-tools / heaptrack / valgrind often a no)
 
-**Architecture question to ask up front — is the target a plugin host?**
+**Architectural context — purely as data, NOT as a narrowing.** Ask what the process is — plugin host (`dlopen` of `.so` / `.dll`), microservice, monolith, multi-tenant fabric, game engine, etc. — and which third-party libraries it links against. Record these as context. They tell you **where the holder structure might be located** (one of several candidate code regions), but they do **not** eliminate any of the patterns A-F or any code region.
 
-Before going further, ask whether the process loads `.so` / `.dll` plugins via `dlopen`, or is otherwise a multi-tenant host (game engine, simulator platform, RPC fabric loading per-service handlers, web framework loading modules). A "yes" significantly changes the suspect picture:
+A plugin host can still leak in:
+- a single plugin's internal container
+- the platform's plugin-management code
+- a third-party library used by one or several plugins
+- the platform/plugin API boundary
+- initialization-time state held for process lifetime
 
-- Leaks often live at the platform-plugin boundary (callbacks, observer registrations, shared message buses) rather than inside a single plugin
-- A leak that appears only under a specific combination of loaded plugins points at cross-plugin interaction (e.g., plugin A's producer with no consumer because the consumer plugin in this combo doesn't process those events)
-- Single-arena concentration in a plugin host often means a fixed scheduler/dispatcher worker is handling all plugin events, not that one plugin is solely responsible
-- Plugin elimination experiment (load N-1 of N plugins, rotate which one is left out) is a high-information, low-cost verification step — often the cheapest way to localize the leak to a plugin pair before any source review
+Don't pre-pick one based on the label. Carry all candidates into Phase 2.
 
-If yes, plan to use Pattern G (combo-dependent) in Phase 3 alongside the standard A-F.
+When the leak appears only under a specific configuration / plugin combination / workload, that's a **strong cross-verification signal** (Phase 4) — but it still doesn't tell you the mechanism. It only narrows *where the work runs*. The mechanism could still be any of A-F.
 
 **Strongly recommended additional snapshot:**
 
@@ -228,7 +258,8 @@ For H1, H2, H6, H10 — source review with the suspect profile as filter.
 | **D. Subscribe without unsubscribe** | Long-lived broker + small closures | `subscribe`/`register`/`addListener` count > matching unsubscribe count |
 | **E. `thread_local` container** | Per-thread balanced growth | `thread_local` declaration + container type, no reset across cycles |
 | **F. Third-party library hot spots** | Specific to lib | protobuf Arena no Reset; libcurl handle no cleanup; SSL_CTX session cache no cap; spdlog async buffer; nlohmann::json Parse reuse |
-| **G. Plugin / multi-tenant platform combo-dependent** | Leak only with specific combination of loaded plugins; one plugin's expected consumer (another plugin) doesn't consume properly in this combo | Process is a plugin host (`.so` / dlopen-based platform, game-engine-style scenario loader, simulator, request-routing fabric); leak appears only under specific plugin set; single arena dominant suggests work is funneled to a fixed scheduler worker. Investigate plugin-to-plugin interactions: registered callbacks (plugin A registers via platform, plugin B emits, B's events get buffered if A's consumer never fires); shared message buses where one topic has a producer but no active consumer in this combo; plugin lifecycle (init order, callback chains established at load time and never torn down) |
+
+> **About "Pattern G" plugin / combo-dependent leaks**: an earlier revision of this skill listed combo-dependent plugin leaks as a separate Pattern G. That was overfit. A combo-dependent leak still falls into A-F — the structure may be a vector in one plugin, a callback registry on the platform side, an async queue between two plugins, etc. The combo-dependence is a clue about *where to look* (which plugin's code, which boundary), not about which mechanism is at work. Always run A-F semantic review at every candidate location the architecture suggests.
 
 **To invoke source review programmatically** (e.g., paste into an LLM with the source):
 
@@ -423,6 +454,7 @@ Before concluding "the cause is X":
 - [ ] If a fix is proposed, is there a measurement plan to confirm RSS growth actually stops post-fix?
 - [ ] Could a DIFFERENT leak in the same codebase coexist? (Sometimes you fix one and another shows up.)
 - [ ] If symptom was on a niche platform (qemu, embedded, RTOS), did you check that platform's specific gotchas (qemu mmap emulation, embedded fixed heap, etc.)?
+- [ ] **Have architectural labels narrowed the hypothesis space?** "It's a plugin host so the leak must be at the plugin boundary" / "It's a gRPC server so it must be connection caching" / "It's a microservice so it must be a stale message queue" — none of these chains of reasoning are valid. Labels enlarge the candidate-location list; they don't shrink it. If you narrowed because of a label, re-open the discarded hypotheses.
 
 If any box is unchecked, you have a partial answer; communicate uncertainty to the user.
 
@@ -449,7 +481,10 @@ Avoid:
 ## Skill version
 
 - v1 — Initial extraction from C++ aarch64 case study (2026-06)
-- Methodology: constraint-driven, multi-hypothesis, cross-verified
-- Tested-against case: aarch64 ptmalloc 21 GB RSS @ 4 GB/day growth
+- v1.1 — Restart-window technique + per-arena concentration + arena→tid mapping
+- v1.2 — Safety rules (L0-L3 risk levels, 6 disciplines, hang ladder); simplified identification (thread name + CPU + bt) when arena→tid unavailable
+- **v1.3 — First-principles framing** (every leak = holder structure + add op + missing remove); Pattern G (combo-dependent) **demoted** to a note under A-F because architectural labels (plugin host, microservice, gRPC, etc.) do not narrow the leak mechanism, only enlarge candidate locations; anti-overfit checklist gains an explicit "did labels narrow your hypothesis?" check
+- Methodology: constraint-driven, multi-hypothesis, cross-verified, **label-blind to mechanism**
+- Tested-against case: aarch64 ptmalloc 21 GB RSS @ 4 GB/day growth on a plugin-host process (`simultor`); successive over-narrowing (single-arena → single-worker → plugin-interaction) was the lesson that drove v1.3
 
-Update version when adding new patterns / tools / platform gotchas.
+Update version when adding new patterns / tools / platform gotchas. **Resist** adding a new "Pattern X" for each new architectural circumstance encountered — first check if it's an existing A-F mechanism at a new location.
