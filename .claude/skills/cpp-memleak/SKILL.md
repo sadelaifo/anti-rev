@@ -186,6 +186,8 @@ For each piece of ground truth, derive a constraint:
 | Pss ≈ Rss | Private memory; **rules out shared mmap, file cache, copy-on-write** |
 | Mmap allocation share (`<total type=mmap>` size / total) | Small (< 5%) → ignore big-block hypothesis; large → suspect 16 MB+ allocations |
 | Steady vs spiky growth | Steady → stable business path; spiky → event-driven (reconnect storm, config reload, burst) |
+| **Single-snapshot arena concentration** | A snapshot shows "arena N holds 67% of heap". This describes **historical accumulation up to this moment** — not necessarily where memory is actively growing right now. **Without a T0→T1 per-arena delta**, you cannot distinguish "this arena is actively accumulating now" from "this arena front-loaded long ago and has been static since". Both yield the same concentration signal. |
+| **max/avg stability across snapshots** | If `max/avg` is the same in T0 and T1, this has **multiple solutions**: (a) the top arena grew proportionally with everyone; (b) **the top arena's value is locked and growth happens outside per-arena heap entirely** (mmap'd large chunks, business direct mmap, thread stacks); (c) the top arena number changed but the new top happens to match the old ratio. Always look at the top arena's absolute Δ and the per-arena sum's Δ before drawing a conclusion. |
 
 After this phase, you should have a **suspect profile** — a one-sentence picture of what the leaking code must look like. Example from the case study:
 
@@ -458,6 +460,7 @@ Before concluding "the cause is X":
 - [ ] Could a DIFFERENT leak in the same codebase coexist? (Sometimes you fix one and another shows up.)
 - [ ] If symptom was on a niche platform (qemu, embedded, RTOS), did you check that platform's specific gotchas (qemu mmap emulation, embedded fixed heap, etc.)?
 - [ ] **Have architectural labels narrowed the hypothesis space?** "It's a plugin host so the leak must be at the plugin boundary" / "It's a gRPC server so it must be connection caching" / "It's a microservice so it must be a stale message queue" — none of these chains of reasoning are valid. Labels enlarge the candidate-location list; they don't shrink it. If you narrowed because of a label, re-open the discarded hypotheses.
+- [ ] **Have you confused historical accumulation with active accumulation?** Single-snapshot arena/segment concentration tells you where memory CURRENTLY SITS, not where it is CURRENTLY GROWING. The two can be different if accumulation was front-loaded and then plateaued at that location while later growth lands elsewhere. **Validate every "X is the leak location" claim with an explicit T0 → T1 per-arena (or per-segment) delta showing X is still growing during the observation window.** A constant `max/avg` ratio in particular has multiple solutions — see the Phase 1 row "max/avg stability across snapshots".
 
 If any box is unchecked, you have a partial answer; communicate uncertainty to the user.
 

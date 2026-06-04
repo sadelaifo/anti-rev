@@ -32,12 +32,153 @@
 
 | Round | 日期 | 触发 | 加入了什么 | 同步改动 |
 |---|---|---|---|---|
+| **Round 7** | 2026-06-04 | T1 实测发现一个我之前没考虑到的解:**arena 55 数值锁定(2048 → 2047 MB)同时 max/avg 不变(45.2 → 45.17)** —— 我先把这解读成"arena 55 继续主导",其实是"arena 55 锁定 + 增长在别处"。**单 snapshot 的 arena 集中 ≠ 活跃累积者**,这个区分之前所有 Round 都没明确写过 | "历史累积 vs 活跃累积"判别 playbook;max/avg 跨 snapshot 解读规则(同一数字有多解);定位活跃累积者的 3 个角度(per-arena Δ / 全局 system mmap Δ / pmap 大段 Δ) | SKILL.md Phase 1 加 max/avg 多解警告;防过拟合 checklist 加"是否实际算了 per-arena Δ" |
 | **Round 6** | 2026-06-04 | Round 5 锁定嫌疑 tid 后,意识到还缺一个关键判别:**leak 是 init-time(进程启动一次性分配)还是 runtime(持续累积)**,两者修复方向截然不同;同时发现"snapshot 取的时点 = 进程刚重启"的隐含假设没验证;**纯 process uptime 这一个数据点能砍掉大量假设** | 多 snapshot 速率交叉验证 playbook:进程运行时长反推 init baseline / 用已知速率预测下一次 snapshot 并校验 / 速率换算成"函数频率 × 对象大小"的精细化画像 | SKILL.md Phase 4 加 "multi-snapshot rate validation" 作为通用 cross-verification 方法;工作文档 §3.7 记录本 case 实测 |
 | **Round 5** | 2026-06-04 | R3.4.2 在板上连续踩三个坑(gdb 无 Python → 无 struct malloc_state → 无 main_arena 符号),发现 libc 被深度 strip 时精确 arena→tid 映射代价过高,而本 case 主要目的(识别嫌疑 tid)用更廉价的方式也能达到 | 简化嫌疑识别 playbook(纯 L0:线程名分组 + CPU 时间排行 + 栈顶分类);何时跳过精确 arena 映射的判断标准 | R3.4.4 doc header 加 "走不通时跳 Round 5" 提示;识别失败兜底指向 gcore 离线(R2.7) |
 | **Round 4** | 2026-06-04 | 在执行 R3.4 Exp-F 时 gdb 卡住,意识到原命令没有迭代上限 / 超时保护,gdb 卡住后强杀风险大;另发现 R3.4 子步骤顺序(原 R3.4.2 中间穿插 R3.4.3 集中度,再跳回 R3.4.2 步 5)逻辑不连贯 → 整段重排为 R3.4.1 ~ R3.4.6 线性流 | 操作安全规则(L0-L3 风险分级、6 条纪律);卡住诊断阶梯;已有命令的安全版替换;R3.4 线性化 | 所有 Round 的 gdb 命令统一加 `timeout` 包裹 + `while $n < N` 迭代上限;`call malloc_info` 标 L2 风险并给出 L1 替代;R3.4 拆成 6 步(baseline / arena walk / 集中度 / tid→arena / 线程名 / 钻取) |
 | **Round 3** | 2026-06-04 | 目标进程被重启,RSS 21 GB → 3 GB | 重启诊断窗口 playbook(多时点采样、对照实验、失败模式) | SKILL.md Phase 0 strategic note;工作文档 §3.6 |
 | **Round 2** | 2026-06-04 | Exp-A 实测 max/avg = 45.9× + 大段稳定 → 推翻"all-workers"画像 | Exp-F (arena → tid 映射);决策树补 Exp-F 分支;Exp-A 增量对照加 awk fallback (板上无 `join`) | handoff §3 加修订 callout;SKILL.md Phase 4 加 per-arena concentration check |
 | **Round 1** | 2026-06-03 | 怀疑初步"long-lived 容器小对象漏 erase"画像过窄,可能漏 Alt-1 单大对象、Alt-2 pool、Alt-3 背压、Alt-7 dlopen 等 | Exp-A~E 五件套(per-arena、大段、in-use 直方图、线程 bt、dlopen);修订表;决策树 | 创建本文档 |
+
+---
+
+# Round 7 (2026-06-04 #5) — 区分"历史累积"vs"活跃累积"
+
+## R7.1 触发(本 case 实测踩坑)
+
+T0 snapshot 显示 arena 55 = 2048 MB,占总 RSS 67%,max/avg = 45.2×。**我的(错误)推断**:arena 55 是 leak 持有者,某 worker 线程在持续往这里累积。
+
+T1 snapshot 4.7 h 后:
+- **arena 55 = 2047 MB**(几乎完全没动)
+- max/avg = 45.17×(几乎完全没变)
+- 但 **RSS 涨了 789 MB**
+
+**真相**:arena 55 是**历史累积**(进程前 16 h 涨起来后就锁定了),T0 之后**它不再涨**;真正的 168 MB/h 活跃 leak 在**其他地方**(很可能 mmap 大对象,或多个 arena 同时小幅涨)。
+
+**教训**:**单 snapshot 的 arena 集中分布 ≠ 当前活跃累积者**。两者必须分开判断,否则源码审查指向错的位置。
+
+## R7.2 max/avg 跨 snapshot 的多解陷阱
+
+`max/avg` 相同有**至少三种解**,以 RSS 涨幅判别:
+
+| max | max/avg | per-arena 总和 | RSS | 实际情况 | 解读 |
+|---|---|---|---|---|---|
+| 涨 | 不变 | 涨 | 涨 | top arena 跟着所有 arena 比例同涨 | **真持续主导**,leak 在 top arena 持续累积 |
+| **不变** | **不变** | **不变** | **涨** | top arena 锁定 + 增长在 mmap / 直接 mmap / 大段 | **本 case 命中**:历史累积 + 现在涨在别处 |
+| 涨 | 变小 | 涨更多 | 涨 | top arena 涨,但其他 arena 涨更快 | 集中度被稀释,leak 分散到多 arena |
+| 不变 | 变大 | 跌 | 不变或微涨 | top arena 锁定,其他 arena 缩(归还内存) | 罕见;说明非 top arena 在释放 |
+
+**判读不能只看 max/avg**,必须同时看 **max 绝对值** 和 **per-arena 总和**(从 `arena_sizes.txt` `sum($2)` 算)。
+
+## R7.3 历史 vs 活跃 — 概念分离
+
+| | 历史累积 | 活跃累积 |
+|---|---|---|
+| 定义 | snapshot 时点以前已经分配,目前**静止**(不再增长) | 当下持续在涨 |
+| 信号 | 单点 snapshot 的 arena 集中 / 大段占比 | T0 → T1 per-arena Δ / pmap 段 Δ / 全局 system Δ |
+| 来源 | init / load / 早期负载 / 历史峰值后没归还 | 现在的 hot path / 持续业务 |
+| 修复方向 | 改 plugin load / config build / cache 初始 size | 改 hot path 持有结构 |
+| 单 snapshot 能区分? | **不能**;必须有 ≥ 2 snapshot diff |
+
+**Round 6 R6.3 init-baseline arithmetic** 用 process uptime 算 init baseline,可以**部分**做这个区分(算的是 init 一次性 vs runtime 持续),**但不能区分"早期高速累积然后停"vs"一直慢速累积"**。
+
+→ 必须用 **T0 → T1 per-arena Δ** 才能精确区分。
+
+## R7.4 定位活跃累积者的 3 个角度(L0,5 秒每个)
+
+### 角度 1:per-arena Δ 排序(看谁在涨)
+
+```bash
+# 期望存在的文件
+# T0: $SNAP/arena_sizes.txt   (arena_id  system_bytes)
+# T1: $SNAP_T1/arena_sizes.txt 同样格式
+
+awk 'NR==FNR{a[$1]=$2; next}
+     {d=$2-a[$1]; printf "arena %4d: %7.1f -> %7.1f MB  (Δ %+7.1f MB)\n",
+             $1, a[$1]/1024/1024, $2/1024/1024, d/1024/1024}' \
+    $SNAP/arena_sizes.txt $SNAP_T1/arena_sizes.txt | sort -k7 -nr | head -10
+
+echo "---"
+# 累加 Δ 看是不是接近 ΔRSS
+awk 'NR==FNR{a[$1]=$2; next}
+     {sum += $2-a[$1]} END{printf "Σ Δ per-arena = %.1f MB\n", sum/1024/1024}' \
+    $SNAP/arena_sizes.txt $SNAP_T1/arena_sizes.txt
+```
+
+**判读**:
+- **Σ Δ per-arena ≈ ΔRSS** → leak 在 per-arena heap 里;top Δ 排序就是新嫌疑 arena 列表
+- **Σ Δ per-arena ≪ ΔRSS** → leak 跑出了 per-arena heap,走角度 2
+
+### 角度 2:全局 `<system>` 和 `<total type="mmap">` Δ(看 leak 在 heap 还是 mmap)
+
+```bash
+echo "=== T0 全局 ==="
+grep -E '<system type|<total type' $SNAP/mi.xml | tail -8
+echo ""
+echo "=== T1 全局 ==="
+grep -E '<system type|<total type' $SNAP_T1/mi.xml | tail -8
+```
+
+**判读**:
+| Δ 项 | 含义 |
+|---|---|
+| `<total type="mmap">` size 涨 ≈ ΔRSS | leak **走 ptmalloc 大对象 mmap 路径**(单对象 ≥ 128 KB);嫌疑改"大缓冲单调累积"假说 |
+| `<system type="current">` 涨 ≈ ΔRSS | 总 heap(per-arena 加起来)涨了,跟角度 1 一致 |
+| 两个都不涨,但 RSS 涨 | leak **完全在 ptmalloc 外**(业务直接 mmap、stack 涨、dlopen 新加载),走角度 3 |
+
+### 角度 3:pmap 大段 Δ(看 ptmalloc 外的具体段)
+
+```bash
+# T1 拿 pmap(如果还没采)
+pmap -x $PID > $SNAP_T1/pmap.full
+
+echo "=== T0 > 64 MB 段 ==="
+awk '$2 > 65536 {print $1, $2, $3, $NF}' $SNAP/pmap.full 2>/dev/null | sort
+
+echo "=== T1 > 64 MB 段 ==="
+awk '$2 > 65536 {print $1, $2, $3, $NF}' $SNAP_T1/pmap.full | sort
+
+echo "=== diff ==="
+diff <(awk '$2 > 65536 {print $1, $2, $3}' $SNAP/pmap.full | sort) \
+     <(awk '$2 > 65536 {print $1, $2, $3}' $SNAP_T1/pmap.full | sort) 2>&1 | head -30
+```
+
+**判读**:
+- T1 新增大段 → 业务 / 库直接 mmap 新缓冲
+- 老段 RSS 涨了 → 已有段在被填满(典型:reserve 段被 commit / 大 buffer 在 append)
+- 段完全一样 → 增长在线程 stack / 库数据段 / 不可见处
+
+## R7.5 三个角度组合 → 真嫌疑画像
+
+| 角度 1 | 角度 2 | 角度 3 | 判读 |
+|---|---|---|---|
+| top Δ 集中 | system 涨 | 大段不变 | 单 arena 活跃累积 → Round 5 候选要换成新 top Δ 的 arena |
+| Δ 分散 | system 涨 | 大段不变 | leak 分散到多 arena → Round 5 集中度路径失效,改用 Round 6 速率画像 + 内部模型搜全代码 |
+| Σ Δ 小 | mmap 涨 | 大段不变 | **leak 在 mmap 大对象**(单对象 ≥ 128 KB)→ 找业务里反复 alloc 大 buffer 不释放 |
+| Σ Δ 小 | 都不涨 | 新增大段 | 业务直接 mmap,新增段地址 + size 反查源码 |
+| Σ Δ 小 | 都不涨 | 大段不变 | 增长在线程 stack 或库数据段,查 `/proc/$PID/maps` diff |
+
+## R7.6 本 case 实测(待填)
+
+| 角度 | T0 → T1 数据 | 判读 |
+|---|---|---|
+| 1. per-arena Δ 排序 top 5 | (待跑) | |
+| 1. Σ Δ per-arena | (待跑) | |
+| 2. `<system type="current">` Δ | (待跑) | |
+| 2. `<total type="mmap">` Δ | (待跑) | |
+| 3. 新增大段 | (待跑) | |
+| 3. 老段 Δ RSS | (待跑) | |
+| **结论** | (待填) | |
+
+→ 跑完 R7.4 三段后,本表填完,**真嫌疑的位置就明确了**,handoff §3 才能再次更新。
+
+## R7.7 总结教训
+
+1. **arena 集中分布(snapshot)≠ 活跃累积(time-diff)**。前者是历史快照,后者是当下行为
+2. **max/avg 跨 snapshot 不变有多解**,不能只看这个比;必须同时看 max 绝对值 + per-arena 总和
+3. **Round 3 R3.4.3 集中度检查** 只回答"现在是不是集中",**不回答"现在还在涨吗"**
+4. **Round 6 速率验证** 验证的是**总速率**稳态,**不能保证累积位置稳定** —— 总速率可以不变,而累积者切换
+5. **每个 T1 验证 cycle 都要算 per-arena Δ**,不仅是总 RSS
 
 ---
 
