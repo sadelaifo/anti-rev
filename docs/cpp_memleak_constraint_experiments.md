@@ -359,7 +359,57 @@ awk '/^arena/ {sum += $6} END {printf "total sysmem = %.1f MB (compare to RSS)\n
 
 - sum 离 RSS 数量级差距过大 → 偏移版本不对,把上面三个 `_OFF` 改成 < 2.27 偏移(2152 / 2168 / 2176)
 - 链 1-2 步就回到 main_arena → 偏移错,`next` 指针拿到了别的字段
-- 还是不行 → 跑 `ldd --version` 看 glibc 版本告诉我,我查具体偏移;或者走 R2.7 gcore 离线到 dev 机用完整符号分析
+- gdb 报 `no symbol main_arena in current context` → libc 被全 strip,符号也没了。走下面"无 main_arena 符号"的备用路
+
+#### 无 `main_arena` 符号的备用路
+
+板上 libc 若被深度 strip(连 `.symtab` 都没),gdb 无法用名字找 main_arena。三步排查:
+
+**步 1:强制 gdb 加载所有共享库符号**(便宜,先试)
+
+```bash
+timeout 15 gdb -batch --nx -iex 'set auto-load off' -p $PID \
+    -ex 'sharedlibrary' \
+    -ex 'info variables main_arena' \
+    -ex 'p &main_arena' \
+    -ex 'detach' 2>&1
+```
+
+找到 → 在 R3.4.2 命令里加 `-ex 'sharedlibrary'` 一行,然后正常走;找不到 → 步 2。
+
+**步 2:从 libc 文件本身找偏移**(板上 nm / readelf)
+
+```bash
+LIBC=$(awk '$NF ~ /libc.*\.so/ && /r-xp/{print $NF; exit}' /proc/$PID/maps)
+LIBC_BASE=$(awk -v L="$LIBC" '$NF == L && /r-xp/{split($1, p, "-"); print p[1]; exit}' /proc/$PID/maps)
+echo "libc = $LIBC  base = 0x$LIBC_BASE"
+
+nm "$LIBC" 2>&1 | grep -E 'main_arena|thread_arena' | head -5
+nm -D "$LIBC" 2>&1 | grep -E 'main_arena|thread_arena' | head -5
+readelf -s "$LIBC" 2>&1 | grep -E 'main_arena|thread_arena' | head -5
+ls /usr/lib/debug/lib*/libc.so.* 2>/dev/null
+ls /usr/lib/debug$(dirname $LIBC)/* 2>/dev/null
+```
+
+任一命令命中(类似 `00000000001f0080 B main_arena`),拿 offset:
+
+```bash
+MAIN_ARENA_OFFSET=0x1f0080   # ← 填实际看到的偏移
+MAIN_ARENA_ADDR=$(printf "0x%x" $((0x$LIBC_BASE + $MAIN_ARENA_OFFSET)))
+echo "main_arena = $MAIN_ARENA_ADDR"
+```
+
+然后把上面 raw 偏移走链脚本里的 `(unsigned long)&main_arena` 替换为 `$MAIN_ARENA_ADDR`(用 heredoc 时用普通 `cat <<EOF` 注意 `\` 转义,或者直接写绝对地址数值)。
+
+**步 3:gcore 离线分析**(步 1/2 都失败的兜底)
+
+```bash
+ulimit -c unlimited
+gcore -o /tmp/m $PID                  # L3,3 GB 进程冻 ~30 秒
+scp /tmp/m.$PID dev:/data/
+# dev 机有 libc6-dbg / glibc-debuginfo,完整符号
+# 在 dev 机上用 R2.7 备选脚本走完整分析
+```
 
 ### R3.4.3 算 max/avg + 找 top arena(L0,纯 awk)
 
