@@ -32,10 +32,115 @@
 
 | Round | 日期 | 触发 | 加入了什么 | 同步改动 |
 |---|---|---|---|---|
+| **Round 5** | 2026-06-04 | R3.4.2 在板上连续踩三个坑(gdb 无 Python → 无 struct malloc_state → 无 main_arena 符号),发现 libc 被深度 strip 时精确 arena→tid 映射代价过高,而本 case 主要目的(识别嫌疑 tid)用更廉价的方式也能达到 | 简化嫌疑识别 playbook(纯 L0:线程名分组 + CPU 时间排行 + 栈顶分类);何时跳过精确 arena 映射的判断标准 | R3.4.4 doc header 加 "走不通时跳 Round 5" 提示;识别失败兜底指向 gcore 离线(R2.7) |
 | **Round 4** | 2026-06-04 | 在执行 R3.4 Exp-F 时 gdb 卡住,意识到原命令没有迭代上限 / 超时保护,gdb 卡住后强杀风险大;另发现 R3.4 子步骤顺序(原 R3.4.2 中间穿插 R3.4.3 集中度,再跳回 R3.4.2 步 5)逻辑不连贯 → 整段重排为 R3.4.1 ~ R3.4.6 线性流 | 操作安全规则(L0-L3 风险分级、6 条纪律);卡住诊断阶梯;已有命令的安全版替换;R3.4 线性化 | 所有 Round 的 gdb 命令统一加 `timeout` 包裹 + `while $n < N` 迭代上限;`call malloc_info` 标 L2 风险并给出 L1 替代;R3.4 拆成 6 步(baseline / arena walk / 集中度 / tid→arena / 线程名 / 钻取) |
 | **Round 3** | 2026-06-04 | 目标进程被重启,RSS 21 GB → 3 GB | 重启诊断窗口 playbook(多时点采样、对照实验、失败模式) | SKILL.md Phase 0 strategic note;工作文档 §3.6 |
 | **Round 2** | 2026-06-04 | Exp-A 实测 max/avg = 45.9× + 大段稳定 → 推翻"all-workers"画像 | Exp-F (arena → tid 映射);决策树补 Exp-F 分支;Exp-A 增量对照加 awk fallback (板上无 `join`) | handoff §3 加修订 callout;SKILL.md Phase 4 加 per-arena concentration check |
 | **Round 1** | 2026-06-03 | 怀疑初步"long-lived 容器小对象漏 erase"画像过窄,可能漏 Alt-1 单大对象、Alt-2 pool、Alt-3 背压、Alt-7 dlopen 等 | Exp-A~E 五件套(per-arena、大段、in-use 直方图、线程 bt、dlopen);修订表;决策树 | 创建本文档 |
+
+---
+
+# Round 5 (2026-06-04 #3) — 简化嫌疑识别(绕开 gdb 符号路径)
+
+## R5.1 触发条件
+
+R3.4.2(arena 链 walk)在板上连续遇到三种失败:
+
+1. `Scripting in the python language is not supported in this copy of gdb` —— gdb 编译时 `--disable-python`,glibc pretty-printer 加载失败
+2. `no struct type named malloc_state` —— libc 没装 debug info,gdb 不知道结构体定义
+3. `no symbol "main_arena" in current context` —— libc 被深度 strip,连静态符号都没了
+
+每一步都对应一个 fallback(Round 4 R4.2、R3.4.2 raw 偏移版、R3.4.2 libc 偏移查表),**但越走越复杂**。本 case 的核心目标是**识别嫌疑 tid 给源码审查**,arena→tid 精确映射不是必需 —— 还有更廉价的方式抓嫌疑。
+
+> **决策规则**:如果 R3.4.2 在 < 5 分钟内没出数据,**直接跳本 Round**,别继续往 libc 符号 / 偏移路上钻。
+
+## R5.2 为什么不再钻 main_arena 偏移
+
+| 维度 | 钻 main_arena 路径 | Round 5 简化路 |
+|---|---|---|
+| 时间 | 半小时到几小时不等(找 libc 偏移、试不同 glibc 版本、可能要 gcore 离线) | < 5 分钟 |
+| 风险 | L1 gdb 反复 attach,某些卡死路径会让业务进程暂停 | 全 L0,纯 `/proc` 读 + 已有 threads.bt 解析 |
+| 精度 | 精确到 arena 编号 ↔ tid | 锁定 1-3 个候选 tid(给源码审查足够) |
+| 适用 | libc 有 debug info / 静态符号 | 任何情况(板上工具一律够用) |
+
+精确路径**值得做**当且仅当:候选 tid 多到无法人工挑(比如 50 个同名 Worker,根本看不出哪个是"那一个")。本 case 我们前期已经知道嫌疑是"一个 arena 独占 67%",候选 ≤ 3 个的概率很大。
+
+## R5.3 简化嫌疑识别(全 L0)
+
+### R5.3.1 线程名分组 + CPU 时间排行
+
+```bash
+echo "=== 线程名分组(看有没有'孤儿'名)==="
+for tid in $(ls /proc/$PID/task); do
+    cat /proc/$PID/task/$tid/comm 2>/dev/null
+done | sort | uniq -c | sort -rn
+
+echo ""
+echo "=== top 10 by CPU time(utime + stime jiffies)==="
+for tid in $(ls /proc/$PID/task); do
+    fields=$(cat /proc/$PID/task/$tid/stat 2>/dev/null) || continue
+    name=$(cat /proc/$PID/task/$tid/comm 2>/dev/null)
+    cpu=$(echo "$fields" | awk '{print $14+$15}')
+    echo "$cpu  tid=$tid  name=$name"
+done | sort -rn | head -10
+```
+
+### R5.3.2 栈顶函数分类(用 R3.4.1 已有的 threads.bt)
+
+```bash
+echo "=== 栈顶函数排行 ==="
+awk '
+  /^Thread / { in_t = 1; next }
+  in_t && /^#0/ {
+    if (match($0, / in [^ (]+/)) fn = substr($0, RSTART+4, RLENGTH-4)
+    else fn = $NF
+    print fn; in_t = 0
+  }
+' $SNAP/threads.bt | sort | uniq -c | sort -rn | head -10
+```
+
+### R5.3.3 钻取候选 tid 的完整 backtrace
+
+```bash
+SUSPECT_TID=12345    # ← 改成 R5.3.1 / R5.3.2 找出的孤儿 tid
+awk -v t="$SUSPECT_TID" '
+    /^Thread / { in_t = (index($0, "(LWP "t")") > 0) }
+    in_t { print }
+    /^$/ && in_t { exit }
+' $SNAP/threads.bt
+```
+
+## R5.4 识别要点(三个角度交叉对照)
+
+| 信号 | 解读 |
+|---|---|
+| 线程名分组里有"孤儿"(50 个 `WorkerN` + 1 个 `MetaCache`/`DataLoader`/`RouteMgr`) | 孤儿名极可能是嫌疑 |
+| CPU 时间 top 1 是 top 2 的 **10× 以上** | 它在持续干活,可能就是源头 |
+| 栈顶分类:大多数在 `pthread_cond_wait` / `epoll_wait` / `futex_wait`,3-5 个在业务代码 | 嫌疑在那 3-5 个里 |
+| 业务代码线程里**栈底 entry function 唯一** | 极可能就是嫌疑 tid;直接给内部模型 |
+
+三个信号若两两交叉指同一 tid → 直接锁定。
+
+## R5.5 仍无法识别?走 gcore 离线
+
+R5.3 / R5.4 三个信号都模糊(常见于:线程全部叫 Worker、CPU 平均、栈顶分布均匀)→ 这种 case 必须拿到精确 arena→tid 映射。直接走 **R2.7 gcore + dev 机**:
+
+```bash
+ulimit -c unlimited
+gcore -o /tmp/m $PID    # L3,3 GB 进程冻 ~30 秒
+scp /tmp/m.$PID dev:/data/
+# dev 机有 libc6-dbg,完整符号,跑 R2.7 离线分析
+```
+
+不再在板上跟 libc 符号纠缠。
+
+## R5.6 给审查方的画像
+
+R5 路径下,handoff §3 的最低画像描述:
+
+> **某个 worker 线程(身份未精确锁定但候选 ≤ 3 个)在新进程刚启动几分钟内分配并持有 ~2 GB 小对象,孤立于其他 ~56 个 worker。三个识别角度(线程名 / CPU 时间 / 栈顶分类)交叉指向 tid={X[, Y, Z]},entry function = {F1[, F2, F3]}。审查范围 = 这几个 entry function 的实现 + 它们调用链触及的 long-lived 容器。**
+
+候选范围 1-3 比"全代码库"仍然小两个数量级,内部模型能扫得动。
 
 ---
 
@@ -438,7 +543,7 @@ sort -k6 -n $SNAP/arena_addr.txt | tail -5
 
 ### R3.4.4 tid → arena 映射(L1)
 
-> **如果 R3.4.2 走不通**(libc strip 太狠、main_arena 符号没有、偏移 fallback 也失败)— 跳过本步,直接走 **R3.4.X 简化路:线程名 + CPU 时间识别嫌疑**(本节末尾)。**arena→tid 映射不是必需**,只是众多识别手段中最精确的一种。
+> **如果 R3.4.2 走不通**(libc strip 太狠、main_arena 符号没有、偏移 fallback 也失败)— **跳过本步,直接走 Round 5 简化嫌疑识别**(纯 L0,绕开 gdb)。arena→tid 是最精确的识别方式,但不是唯一。
 >
 > **不用** `$_thread_name`,容易卡。线程名走 R3.4.5 /proc。
 
@@ -498,61 +603,7 @@ awk -v t="$SUSPECT_TID" '
 
 输出的四块(arena 地址 / tid / name / backtrace)就是 handoff §3 从"某 worker 持有大量小对象"细化到 **"thread tid=X (name=Y, entry=Z) 持有 N% heap"** 的全部素材。直接贴给工作文档 §3.6 / handoff §3。
 
-### R3.4.X 简化识别(当 R3.4.2/4 任一步走不通时直接跳到这里)
-
-> **触发**:libc 被 strip 没 main_arena 符号、偏移 fallback 失败、gdb 各种卡。**arena→tid 不是必需**;线程身份还能从别的角度抓。
->
-> **风险**:全 L0(/proc 读 + 已有 threads.bt 解析)。不动 gdb。
-
-#### 步 1:线程名分布 + CPU 时间排行
-
-```bash
-echo "=== 线程名分组 ==="
-for tid in $(ls /proc/$PID/task); do
-    cat /proc/$PID/task/$tid/comm 2>/dev/null
-done | sort | uniq -c | sort -rn
-
-echo ""
-echo "=== top 10 by CPU time (utime+stime jiffies) ==="
-for tid in $(ls /proc/$PID/task); do
-    fields=$(cat /proc/$PID/task/$tid/stat 2>/dev/null) || continue
-    name=$(cat /proc/$PID/task/$tid/comm 2>/dev/null)
-    cpu=$(echo "$fields" | awk '{print $14+$15}')
-    echo "$cpu  tid=$tid  name=$name"
-done | sort -rn | head -10
-```
-
-#### 步 2:栈顶函数分类(用已有 threads.bt)
-
-```bash
-echo "=== 栈顶函数排行 ==="
-awk '
-  /^Thread / { in_t = 1; next }
-  in_t && /^#0/ {
-    if (match($0, / in [^ (]+/)) fn = substr($0, RSTART+4, RLENGTH-4)
-    else fn = $NF
-    print fn; in_t = 0
-  }
-' $SNAP/threads.bt | sort | uniq -c | sort -rn | head -10
-```
-
-#### 步 3:挑出可疑 tid,看其完整 backtrace
-
-```bash
-SUSPECT_TID=12345    # 从步 1/2 找出来的孤儿线程 tid
-awk -v t="$SUSPECT_TID" '
-    /^Thread / { in_t = (index($0, "(LWP "t")") > 0) }
-    in_t { print }
-    /^$/ && in_t { exit }
-' $SNAP/threads.bt
-```
-
-#### 识别要点
-
-- **线程名分组里有"孤儿"**(一群叫 WorkerN,一个叫 MetaCache / DataLoader / RouteMgr 这种语义化名)→ 孤儿很可能是嫌疑
-- **CPU 时间排行最高那个,跟其他差距 10× 以上** → 它在持续干活,可能就是源头
-- **栈顶分类:50 个在 `pthread_cond_wait` / `epoll_wait`,3-5 个在业务代码** → 嫌疑在那 3-5 个里
-- 三个角度交叉对照 → 通常能锁定 1-3 个候选 tid 给内部模型扫
+> **R3.4.4 / R3.4.6 走不通?** 见 **Round 5 — 简化嫌疑识别**(全 L0,绕开 gdb)。
 
 ## R3.5 多时点采样表
 
