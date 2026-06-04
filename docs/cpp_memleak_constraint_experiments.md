@@ -267,7 +267,9 @@ echo "baseline at RSS=$(grep VmRSS $SNAP/rss) saved to $SNAP"
 
 ### R3.4.2 arena 链 walk(L1)
 
-> **常见陷阱**:板上 gdb 若编译时 `--disable-python`,attach 时 glibc pretty-printer 尝试加载 Python 会让 gdb 在跑到我们的 `while` 之前就报错退出。**永远加 `--nx -iex 'set auto-load off'`** 屏蔽掉。同样,printf 用**单行**,不要在 bash 单引号里用 `\` 跨行(老 gdb 会把第二行当独立命令)。
+> **常见陷阱 1**:板上 gdb 若编译时 `--disable-python`,attach 时 glibc pretty-printer 尝试加载 Python 会让 gdb 在跑到我们的 `while` 之前就报错退出。**永远加 `--nx -iex 'set auto-load off'`** 屏蔽掉。同样,printf 用**单行**,不要在 bash 单引号里用 `\` 跨行(老 gdb 会把第二行当独立命令)。
+>
+> **常见陷阱 2**:板上 glibc 若 strip 过(没装 `libc6-dbg` / `glibc-debuginfo`),gdb 不认识 `struct malloc_state`,会报 `no struct type named malloc_state`。先跑 R4.3.2 `whatis main_arena`,若返回 `struct malloc_state` → 装包后用本节命令;若返回 incomplete type / 不认识 → **走下面"raw 偏移走链"备用方案**。
 
 ```bash
 timeout 60 gdb -batch --nx \
@@ -312,6 +314,52 @@ EOF
 timeout 60 gdb -batch --nx -iex 'set auto-load off' -p $PID -x /tmp/gdb-arena.cmd 2>&1 | \
     tee $SNAP/arena_addr.txt | tail -80
 ```
+
+**备用方案:raw 偏移走链(板上无 glibc debug info 时用)**
+
+不用 `struct malloc_state`,直接按字节偏移读 `next` / `system_mem` / `attached_threads`。glibc 2.27 - 2.39 64-bit 通用偏移:
+
+| 字段 | 偏移 | < 2.27 偏移 |
+|---|---|---|
+| `next` | 2160 (0x870) | 2152 |
+| `attached_threads` | 2176 (0x880) | 2168 |
+| `system_mem` | 2184 (0x888) | 2176 |
+
+```bash
+cat > /tmp/gdb-arena-raw.cmd <<'EOF'
+set pagination off
+set $NEXT_OFF = 2160
+set $ATT_OFF  = 2176
+set $SYS_OFF  = 2184
+
+set $ma = (unsigned long)&main_arena
+set $a = $ma
+set $n = 0
+while $n < 200
+  set $sm = *(unsigned long*)($a + $SYS_OFF)
+  set $th = *(unsigned long*)($a + $ATT_OFF)
+  printf "arena %3d  addr=0x%lx  sysmem=%9lu KB  attached=%lu\n", $n, $a, $sm/1024, $th
+  set $a = *(unsigned long*)($a + $NEXT_OFF)
+  set $n = $n + 1
+  if $a == $ma
+    loop_break
+  end
+end
+detach
+EOF
+
+timeout 60 gdb -batch --nx -iex 'set auto-load off' -p $PID -x /tmp/gdb-arena-raw.cmd 2>&1 | \
+    tee $SNAP/arena_addr.txt | tail -80
+
+# 验证偏移正确性:sum(sysmem) 应该接近 RSS,偏 50% 内
+awk '/^arena/ {sum += $6} END {printf "total sysmem = %.1f MB (compare to RSS)\n", sum/1024}' $SNAP/arena_addr.txt
+```
+
+**验证不通过怎么办**:
+
+- sum 离 RSS 数量级差距过大 → 偏移版本不对,把上面三个 `_OFF` 改成 < 2.27 偏移(2152 / 2168 / 2176)
+- 链 1-2 步就回到 main_arena → 偏移错,`next` 指针拿到了别的字段
+- 还是不行 → 跑 `ldd --version` 看 glibc 版本告诉我,我查具体偏移;或者走 R2.7 gcore 离线到 dev 机用完整符号分析
 
 ### R3.4.3 算 max/avg + 找 top arena(L0,纯 awk)
 
