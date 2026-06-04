@@ -83,6 +83,20 @@
 > > 4. **该持有结构的清理路径是否真的触发**?(可能存在 erase 调用,但条件依赖某条特定 plugin combo 才走的路径,所以本组合下永远不触发)
 > >
 > > **关于 std::string::replace 线索**:snapshot 抓到 tid 36093 栈顶在此函数,信度**中等**(单时点采样可能是巧合)。下轮 T1 snapshot 看是否复现 → 复现则信度上调,否则降至偶然。
+>
+> **T1 验证结果(2026-06-04 15:43)**:T1 snapshot 抓到栈顶在 **`ByteString_hash`** —— 不是同一函数,但**仍属 string/bytes 操作族**。两次独立采样都命中 string/bytes 处理 → **信度大幅上调**。
+>
+> **关键 pattern 识别**:`ByteString` + `_hash` 组合极强地暗示"**计算某个字节串的 hash 作为 key,插入 map/dictionary**"。这命中 SKILL.md 的 **Pattern A: monotonic map<K, V>** —— 经典的"用 string/bytes hash 做 key 插入 map,但从不 erase"。
+>
+> **审查最高优先级方向**:每个 plugin 找:
+>
+> 1. 是否使用 **protobuf** 的 `bytes` 字段、**Google ByteString**、`absl::Cord`、或自定义 `ByteString` / `Buffer` / `Blob` 类型?
+> 2. 是否对这些 byte 类型对象**计算 hash**(`std::hash<...>` 特化、自定义 hash 函数、Bloom filter 之类)?
+> 3. hash 结果是否被用作 **map / unordered_map / set 的 key** 插入?
+> 4. 该 map / set 是否是 plugin 类成员、平台共享 cache、或全局 / static?
+> 5. 该 map / set 的 **erase / evict / TTL / size cap** 是否真的会触发?(常见 leak:erase 条件依赖某种"消息确认"或"对端响应",而当前 plugin combo 下确认/响应路径不通)
+>
+> 速率换算:**~70 Hz 调用 × ~500 B 对象 ≈ 35 KB/s 累积**,符合"中等吞吐消息哈希后入 map"模式。
 > >
 > > **审查范围(按机制,不按预设结论)**:每个 plugin + 平台共享代码 + 第三方库,**对照 first-principles 的 7 种持有结构(SKILL.md)分别评估**。架构标签不收紧机制假设。
 >

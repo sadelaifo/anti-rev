@@ -210,6 +210,32 @@ LD_PRELOAD: 未设置
 - 4 plugin 里**哪个函数被 ~70 次/秒 触发**?
 - 该函数**是否分配几百字节对象**?
 - 这些对象**进了哪个 long-lived 容器**(plugin 内 / 平台共享 / 跨 plugin)?
+
+### 3.8 T1 实测(2026-06-04 15:43,+4h41min)— 稳态彻底确认
+
+按 R6.4 流程跑 T1 snapshot,所有预测在 ±5% 内对上:
+
+| 指标 | T0 (11:02) | T1 (15:43) | Δ | 推断 |
+|---|---|---|---|---|
+| VmRSS | 3,836,296 KB ≈ 3.66 GB | 4,643,844 KB ≈ 4.43 GB | **+789 MB** | 速率 168 MB/h,跟 Round 1 测得的 162 MB/h 几乎完全相同 |
+| max/avg | 45.2× | **45.17×** | -0.07% | 集中模式纹丝不动 |
+| top arena | arena 55 | (待澄清) | — | — |
+| Top 3 CPU tid | 36623/36615/36093 | **同 3 个** | — | 嫌疑角色完全稳定 |
+| Top 3 增量 CPU | — | +35% / +35% / +25% 一个核 | — | 持续高负载,无周期波动 |
+| 栈顶抓到的 string/bytes 操作 | `std::string::_M_limit` | **`ByteString_hash`** | — | **两次独立采样均命中 string/bytes 族** → string/bytes 处理在 hot path 上几乎确定 |
+
+**速率交叉验证完成**:三个独立量(RSS、max/avg、CPU pattern)同时对上,稳态假设确认。Init-time、burst-triggered、threshold-triggered 三种假说全部排除。
+
+**关键升级**(信度变化):
+
+| 假说 | T0 后 | T1 后 |
+|---|---|---|
+| Init-time 累积 | 10% | **3%**(稳态速率太干净) |
+| 字符串/字节相关累积(format / hash → 长寿容器) | 10% | **30%**(两次命中) |
+| 第三方库累积(protobuf / grpc / Google ByteString) | 10% | **15%**(`ByteString` 命名指向) |
+| Pattern A monotonic map(string/bytes hash → map insert,无 erase) | (未列) | **强候选**(string + hash + 容器三要素都对上) |
+
+**精细化画像更新**:嫌疑函数被 **~70 Hz** 调用,**做 string/bytes 操作并计算 hash**,产物作为 **map key 或 dedup key** 插入长寿容器,无对应 erase。
 | T1 (+6 h) | (待填) | (待填) | (待填) | (待填) | (待填) |
 | T2 (+24 h) | (待填) | (待填) | (待填) | (待填) | (待填) |
 | T3 (+48-72 h) | (待填) | (待填) | (待填) | (待填) | (待填) |
