@@ -255,10 +255,12 @@ LD_PRELOAD: 未设置
 按 glibc 2.34 `__malloc_info`(`total_system = Σ ar_ptr->system_mem`),上面这一组不可能并存。
 
 **剩余唯二可能**:
-1. **snapshot 路径错误**(`$SNAP_T1` 指向了 `$SNAP` 同一文件)—— `md5sum` 一行可排除
-2. **mi.xml 解析与实际格式有细微差异**(我们的 awk 假设跟实际 mi.xml 文本不完全匹配)
+1. ~~**snapshot 路径错误**(`$SNAP_T1` 指向了 `$SNAP` 同一文件)~~—— **已排除**:`md5sum` 显示两文件确实不同
+2. **mi.xml 解析与实际格式有细微差异**(我们的 awk 假设跟板上 glibc 2.34 输出的实际 mi.xml 文本不完全匹配)
 
-**两者都不解决 leak**,只解决我们诊断流程中的 bug。按 Round 8 R8.1 触发条件 #1,外部 diff 走到尽头,**转交源码审查**。
+→ 唯一剩下的解释是 #2 awk 解析 bug。但**修这个不解决 leak**;只解决诊断流程中的一个 bug。
+
+按 Round 8 R8.1 触发条件 #1,外部 diff 走到尽头,**转交源码审查**。
 
 ⚠ 注意:即便上面 #1 / #2 之一被验证为真,**结论仍然不变** —— 已经收集的 A 档硬约束(rate 168 MB/h、runtime-driven、combo-dependent、glibc 2.34 ptmalloc、已排除的方向)对源码审查充分有效。
 
