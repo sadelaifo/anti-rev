@@ -125,10 +125,44 @@ LD_PRELOAD: 未设置
 1. **新增 RSS 100% 是 live 数据**(Δrest ≈ 0,Δsystem = ΔVmRSS = 3×64MB subheap)
 2. **稳定线性增长** ~2.7 MB/min,符合最初 4 GB/天 观察
 3. **完全排除**:线程泄漏、自定义 allocator、共享内存、文件 cache、ptmalloc 碎片化、ptmalloc 不归还
-4. **唯一剩余假说**:long-lived 容器内的小对象单调累积(§3.3 中的 A 或 B,语义上不可区分)
+4. **剩余假说**(此时):long-lived 容器内的小对象单调累积(§3.3 中的 A 或 B)
 5. **要解决的问题**:源码定位到具体的 long-lived 容器 + 写入路径
 
 此结论已**交叉验证**(snapshot diff 法 + malloc_info 统计法 + smaps 段统计法 三种方法独立指向同一结论)。
+
+### 3.5 Exp-A / Exp-B 实测(2026-06-04)— 画像重大修订
+
+为防止源码审查方向走偏,按 `docs/cpp_memleak_constraint_experiments.md` 跑约束收窄实验。两组结果:
+
+| 实验 | 结果 | 含义 |
+|---|---|---|
+| **Exp-A** per-arena `<system current>` 分布 | **max/avg = 45.9×** | 一个 arena 独占 RSS 的 70%+(约 **15-16 GB**),其余 58 个 arena 共担 ~5-6 GB |
+| **Exp-B** 三个 > 64 MB 大段 ΔRSS | 三段稳定不变 | 增长**只来自新增 64 MB subheap**,确认"许多小对象累积"形态 |
+
+**§3.4 第 4 条剩余假说被推翻**:原 "all-workers 稳态路径" 画像不成立。**单 arena 集中** ≠ 所有 worker 均匀贡献。
+
+**修订后嫌疑画像**:
+
+> **一个特定线程**(arena 0 = 主线程,或某 arena N>0 = 某单个 worker)在持续累积许多小对象(~512 B 量级),~每秒 90 次,合计 ~15-16 GB。**其余 58 个线程基本无辜**。
+
+**剩余待确认**(决定下一步审查方向):
+
+1. top arena 编号 = ?(0 → 主线程 leak;N>0 → 单 worker leak)
+2. 若 N>0,该 arena 对应 tid = ?
+3. 该 tid 的栈在做什么?
+
+→ 通过 `cpp_memleak_constraint_experiments.md` 新增的 **Exp-F (arena → thread 映射)** 解决。Exp-F 结果回填到本节末尾。
+
+**Exp-F 结果区(待填)**:
+
+| 项 | 值 |
+|---|---|
+| top arena 编号 | (待填) |
+| top arena 地址 | (待填) |
+| top arena system_mem | (待填) |
+| 映射到 tid | (待填) |
+| 该 tid 的栈顶 | (待填) |
+| 该 tid 的入口 function | (待填) |
 
 ---
 

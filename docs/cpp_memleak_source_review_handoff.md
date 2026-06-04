@@ -40,6 +40,33 @@
 
 ## 3. 嫌疑代码必须满足的约束(Phase 1 输出)
 
+> ### ⚠ 2026-06-04 修订:原画像已被 Exp-A 推翻
+>
+> 跑了 `docs/cpp_memleak_constraint_experiments.md` 中的 Exp-A 后:
+>
+> - **per-arena `<system current>` 分布 max/avg = 45.9×**
+> - 大段 ΔRSS = 0(仍是许多小对象累积形态)
+>
+> 这意味着**单个 arena 独占 RSS 的 70%+(约 15-16 GB)**,其余 58 个 arena 共担 ~5-6 GB。**"所有 worker 都路过的稳态业务热路径"这条约束完全失效** — 不是 59 个线程均匀贡献,**是某 1 个线程独占累积**。
+>
+> ### 修订后画像
+>
+> **某个特定线程**(主线程 arena 0,或某 thread arena N>0)在持续向 long-lived 容器推入小对象(~512 B 量级),~每秒 90 次,合计 ~15-16 GB。**其他 58 个线程基本无辜**,不必审查。
+>
+> ### 还需要 Exp-F 进一步确认
+>
+> 待执行 `cpp_memleak_constraint_experiments.md` §9 Exp-F(arena → thread 映射)。Exp-F 给出 tid 和它的 entry function 后,本 §3 会进一步细化为:**"thread tid=X (entry function = Y) 在调用链上某处持续 alloc 小对象不释放,审查范围 = 该 tid 调用链触及的代码,而非全代码库"**。
+>
+> ### 在 Exp-F 完成前,审查方应:
+>
+> - **跳过**本 §3 下方原约束中"所有 worker 都路过的共享逻辑"那条
+> - **重点关注** §3 下方"long-lived 容器形态"(static / Singleton / Manager / 全局)中**可能被某单一线程独占**的那些
+> - 优先考虑:Singleton 主线程持有的容器、专职 worker 线程(logging thread、metric thread、background thread、gc thread)独占的容器
+>
+> ### 下方原始约束表(保留作上下文)
+
+
+
 每条约束都是对源码的**过滤器**。嫌疑代码必须**同时满足**所有约束。
 
 | 诊断事实 | 推导出的代码约束 |

@@ -240,6 +240,41 @@ Take two snapshots ≥ 30 min apart (whatever lets you observe a few hundred MB 
 
 The first row is the cleanest possible signal for a true leak — if you see it, source review is justified and tuning is wasted time.
 
+**Per-arena concentration check (high-leverage when glibc, multi-arena).**
+
+When the snapshot-delta matrix points to "100% true accumulation", do NOT yet assume "all workers contribute". The per-arena distribution decides whether the leak is **distributed** or **concentrated** — completely different source-review scopes.
+
+Parse the per-`<heap nr=N>` `<system current>` blocks out of `malloc_info`:
+
+```bash
+awk -F'"' '
+  /<heap nr=/        { a=$2; in_h=1; s=0; next }
+  /<\/heap>/         { if (in_h) printf "%4d %12d\n", a, s; in_h=0; next }
+  in_h && /<system type="current"/ { s=$4 }
+' mi.xml | sort -k2 -n
+```
+
+Compute `max / avg` across all arenas:
+
+| Ratio | Interpretation | Source-review scope |
+|---|---|---|
+| `< 2×` | Distributed evenly across arenas | "All workers contribute" picture holds — review shared dispatcher / handler code |
+| `2× – 10×` | Hot worker(s) | Picture narrows to "a small group of workers" |
+| `> 10×` | **Single arena dominant** — one thread is responsible | Map arena → tid (see below); review only that thread's code |
+| arena 0 dominant | Main thread | Review `main()`, init code, main-thread Singleton/Manager state |
+
+When `> 10×`, **map the dominant arena to a specific thread** using glibc's `thread_arena` TLS:
+
+```bash
+gdb -batch -p $PID \
+    -ex 'thread apply all printf "tid=%d arena=%p\n", $_thread, thread_arena' \
+    -ex 'detach' 2>&1 | grep ^tid=
+```
+
+Match the thread whose `arena=...` matches the top arena's address (get via `main_arena.next` walk; see runbook). The resulting tid + its backtrace's entry function is the **definitive scope** to hand to source review — typically slashes the audit area from "whole codebase" to "single thread's call tree".
+
+This technique transforms a high-arena-concentration finding from a curious data point into an actionable scope cut.
+
 **Convergence rule:** if Phase 3 says "Pattern A in ClassMyCache::add", confirm by at least one of:
 - Snapshot diff shows the rate matches estimate (~1 OOM)
 - LD_PRELOAD profiler captures `MyCache::add` as the top allocator

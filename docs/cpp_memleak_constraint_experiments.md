@@ -100,6 +100,17 @@ join -j1 -o "1.1,1.2,2.2" \
     sort -k7 -n
 ```
 
+**如果板上没有 `join`**(BusyBox / 精简 coreutils 常见),用 awk 两遍法替代:
+
+```bash
+awk 'NR==FNR{a[$1]=$2; next}
+     {printf "arena %4d: %8.1f -> %8.1f MB  (Δ %+7.1f MB)\n",
+             $1, a[$1]/1024/1024, $2/1024/1024, ($2-a[$1])/1024/1024}' \
+    $SNAP_T0/arena_sizes.txt $SNAP_T1/arena_sizes.txt | sort -k7 -n
+```
+
+如果连这都嫌麻烦,直接肉眼对照 `tail -5` 两份文件即可。
+
 看 Δ 列:增长均匀分布,还是集中在某几个 arena。
 
 ---
@@ -278,8 +289,9 @@ comm -23 $SNAP_T0/sos.txt $SNAP_T1/sos.txt
 Exp-A 跑完
  ├─ max/avg < 2×        → 画像保留;继续 Exp-B/D/E 验证
  ├─ max/avg 2-10×       → 画像收紧到"少数热 worker"
- ├─ arena 0 dominant    → 推翻 worker 画像,改查主线程
- └─ 某 thread arena 单飞 → 关联线程,查该 worker 业务路径
+ ├─ max/avg > 10×       → 单线程集中,必须做 Exp-F 映射 tid
+ ├─ arena 0 dominant    → 推翻 worker 画像,改查主线程(也走 Exp-F 确认)
+ └─ 某 thread arena 单飞 → Exp-F 映射 tid,查该 worker 业务路径
 
 Exp-B 跑完
  ├─ 大段稳定            → 多小对象路线
@@ -294,6 +306,11 @@ Exp-D 跑完
 Exp-E 跑完
  ├─ .so 数稳定          → 排除 Alt-7
  └─ .so 在涨            → 锁定 Alt-7,反复 dlopen
+
+Exp-F 跑完(仅当 Exp-A 触发集中)
+ ├─ top arena = 0        → 主线程 leak,查 init + main 上长寿对象
+ ├─ top arena = N,tid=X  → 线程 X leak,查它的 entry function 调用链
+ └─ 找不到 thread_arena   → 走 gcore + dev 机 fallback
 ```
 
 跑完上述,再决定:
@@ -303,7 +320,129 @@ Exp-E 跑完
 
 ---
 
-## 9. 配套文件
+## 9. Exp-F:单 arena 集中 → 映射到具体线程
+
+**触发条件**:Exp-A 显示 `max/avg > 10×`,或 top arena 持有占总 RSS ≥ 50%。结论:**不是 all-workers 均匀贡献**,而是**单线程独占**。下一步必须把那个 arena **映射到具体 tid**,才能进入定向源码审查。
+
+> 本 case (2026-06-04) 实测 `max/avg = 45.9×`,正是这种集中场景。
+
+### 步骤 1:列出所有 arena 的地址 + system_mem
+
+ptmalloc 的 arena 链以 `main_arena` 为头,通过 `next` 指针串成环。
+
+```bash
+gdb -batch -p $PID \
+    -ex 'set $ma = (struct malloc_state *)&main_arena' \
+    -ex 'set $a = $ma' \
+    -ex 'set $n = 0' \
+    -ex 'while 1' \
+    -ex '  printf "arena %3d  addr=%p  sysmem=%9lu KB  threads=%lu\n", \
+              $n, $a, $a->system_mem/1024, $a->attached_threads' \
+    -ex '  set $a = $a->next' \
+    -ex '  set $n = $n + 1' \
+    -ex '  if $a == $ma' \
+    -ex '    loop_break' \
+    -ex '  end' \
+    -ex 'end' \
+    -ex 'detach' 2>&1 | tail -80 > $SNAP/arena_addr.txt
+sort -k4 -nr $SNAP/arena_addr.txt | head -10   # top 10 by sysmem
+```
+
+若 `main_arena` 找不到(glibc strip 过):
+
+- 试 `ptmalloc_main_arena`
+- 试 `&main_arena_storage`
+- 终极 fallback:取 `gdb` 里 `info proc mappings` 中 `[heap]` 起始地址,glibc 的 main_arena 在 heap 起点的 sysconf 之内,可手算
+
+### 步骤 2:列出每个线程当前所在 arena
+
+glibc 用线程局部变量 `thread_arena` 标记本线程所在 arena:
+
+```bash
+gdb -batch -p $PID \
+    -ex 'thread apply all printf "tid=%d arena=%p\n", $_thread, thread_arena' \
+    -ex 'detach' 2>&1 | grep ^tid= | sort -k2 > $SNAP/tid_arena.txt
+cat $SNAP/tid_arena.txt | head -20
+```
+
+变体(符号不同 glibc 版本不一样):
+- 试 `_thread_arena`
+- 试 `__libc_thread_arena`
+- 若全部失败:用 `gdb` 在每个线程上 `print *(void**)(pthread_self() + offset)`,offset 需对 glibc 版本调试出来
+
+### 步骤 3:匹配 top arena 地址 ↔ tid
+
+把步骤 1 的 top arena 地址,跟步骤 2 里 tid 输出的 arena 列对照,确定**嫌疑 tid**。
+
+```bash
+TOP_ARENA=<填步骤 1 输出的 top arena 地址,如 0x7f1234567000>
+grep $TOP_ARENA $SNAP/tid_arena.txt
+```
+
+### 步骤 4:回看该 tid 的 backtrace
+
+回到 Exp-D 已抓的 `$SNAP/threads.bt`:
+
+```bash
+SUSPECT_TID=<填步骤 3 找到的 tid>
+awk -v t="Thread $SUSPECT_TID" '
+  $0 ~ "^"t" |\\(LWP "t"\\)" { in_t=1 }
+  in_t { print }
+  /^$/ { in_t=0 }
+' $SNAP/threads.bt
+```
+
+栈顶函数 + 栈底(线程 entry 函数)就是嫌疑代码区间。
+
+### 判读
+
+| top arena 编号 | 嫌疑线程身份 | 下一步定向审查 |
+|---|---|---|
+| **0** (`main_arena`) | **主线程** | 查 `main()` 上的 Singleton / Manager / 主事件循环里的全局状态;init 阶段创建的长寿对象 |
+| **N > 0** + 映射到 tid X | 线程 X | 该线程的 entry function(看 backtrace 底部);看它独占持有的容器、独占的 callback chain、它消费/生产的队列 |
+| 找不到映射(`thread_arena` 全 0 或全相同) | gdb 符号不可用 | 用下面的 gcore 备选离线分析 |
+
+### 备选:gcore 离线分析
+
+板上 gcore + dev 机做相同的 arena 遍历:
+
+```bash
+# 板上
+ulimit -c unlimited
+gcore -o /tmp/m $PID
+scp /tmp/m.$PID dev:/data/
+```
+
+dev 机:
+
+```bash
+gdb /path/to/binary /data/m.$PID -ex 'py
+import gdb
+ma = gdb.parse_and_eval("main_arena")
+arena = ma.address
+seen = []
+while True:
+    addr = int(arena)
+    if addr in seen: break
+    seen.append(addr)
+    sm = int(arena.dereference()["system_mem"])
+    at = int(arena.dereference()["attached_threads"])
+    print(f"arena {len(seen)-1}: addr=0x{addr:x}  sysmem={sm/1024/1024:.1f}MB  threads={at}")
+    arena = arena.dereference()["next"]
+'
+```
+
+dev 机有完整符号,容易找到 top arena;然后回板上做步骤 2-3 映射 tid。
+
+### 输出 → 修订 handoff §3
+
+把 Exp-F 结果填到 `cpp_memleak_source_review_handoff.md` §3,例如:
+
+> **修订后画像**:thread tid=X(entry function = `Foo::worker_loop`)持有 ~15 GB live 对象。其他 58 线程不参与。审查范围 = 该 tid 的调用栈所触及的代码,而非全代码库。
+
+---
+
+## 10. 配套文件
 
 - 方法论 skill:`.claude/skills/cpp-memleak/SKILL.md`(本手册属于 Phase 2-3 之间的细化步骤)
 - 完整诊断过程:`docs/cpp_aarch64_memleak_investigation.md`
