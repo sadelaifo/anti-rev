@@ -237,6 +237,31 @@ LD_PRELOAD: 未设置
 - T1 新增了 arena(用户的 awk 可能漏算新 arena)
 - 我对 malloc_info 全局字段语义的理解有偏差
 
+**追加验证(R7.4 后续)**:
+- `awk '{s+=$2} END{print int(s/1048576)}'` 直接算 per-arena 总和:**T0 和 T1 per-arena 总和差仍为 0**
+- `wc -l arena_sizes.txt`:**T0 和 T1 arena 数也相同**
+
+这两条同时成立时,"T1 出现新 arena 携带新增量"的假说**被排除**。
+
+矛盾最终态:
+| 量 | T0 | T1 | Δ |
+|---|---|---|---|
+| 全局 `<system current>` | 3,306,582,016 B | 4,127,260,672 B | **+782 MB** |
+| per-arena Σ | (= T0) | **= T0** | **0** |
+| arena 数 | N | **= N** | 0 |
+| `<total mmap>` | (constant) | **= T0** | 0 |
+| RSS | 3,836,296 KB | 4,643,844 KB | +789 MB |
+
+按 glibc 2.34 `__malloc_info`(`total_system = Σ ar_ptr->system_mem`),上面这一组不可能并存。
+
+**剩余唯二可能**:
+1. **snapshot 路径错误**(`$SNAP_T1` 指向了 `$SNAP` 同一文件)—— `md5sum` 一行可排除
+2. **mi.xml 解析与实际格式有细微差异**(我们的 awk 假设跟实际 mi.xml 文本不完全匹配)
+
+**两者都不解决 leak**,只解决我们诊断流程中的 bug。按 Round 8 R8.1 触发条件 #1,外部 diff 走到尽头,**转交源码审查**。
+
+⚠ 注意:即便上面 #1 / #2 之一被验证为真,**结论仍然不变** —— 已经收集的 A 档硬约束(rate 168 MB/h、runtime-driven、combo-dependent、glibc 2.34 ptmalloc、已排除的方向)对源码审查充分有效。
+
 按 **Round 8 体面转交规则**,触发条件 1 + 3 + 5 同时命中(数据矛盾 + 诊断主导者疲劳 + 核心硬约束已够窄),**外部诊断暂停**。
 
 **已确认硬约束**(整理到 handoff §3 A 档):
