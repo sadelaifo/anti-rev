@@ -71,12 +71,16 @@
 
 4. **能读 struct 就不 call 函数**。例:per-arena system_mem 可以直接读 `main_arena.next->system_mem`,不需要 call malloc_info()。
 
-5. **gcore (L3) 仅在低峰时段做**。3 GB 进程冻 ~30 秒,21 GB 进程冻 ~3-5 分钟。**必须**:
+5. **每个 gdb 命令加 `--nx -iex 'set auto-load off'`**。原因:很多板上 gdb 编译时 `--disable-python`,而 glibc 的 pretty-printer 是 Python 脚本 (`/usr/share/gdb/auto-load/.../libc.so.6-gdb.py`),gdb attach 时强行加载会报 `Scripting in the python language is not supported`,严重时让 gdb 在跑到我们的命令之前就退出。`--nx` 跳过 `.gdbinit`,`set auto-load off` 屏蔽自动加载,二者结合保证只跑我们指定的 -ex / 命令文件。
+
+6. **多行 printf 不要在 bash 单引号里用 `\` 跨行**。bash 把 `\<newline>` 留在字符串里,gdb 可能把第二行当成独立命令处理。**单行写完**,或用 `gdb -x cmdfile` 的命令文件方式。
+
+7. **gcore (L3) 仅在低峰时段做**。3 GB 进程冻 ~30 秒,21 GB 进程冻 ~3-5 分钟。**必须**:
     - 跟业务方确认时间窗口
     - 落盘到本地非 mmap 路径(`/tmp` 安全;不要 NFS / 远程挂载)
     - dump 完立刻 detach
 
-6. **绝不做**:
+8. **绝不做**:
     - `set var x = ...`(写业务内存)
     - `call free(...)` / `call any_business_function(...)`(L2 + 高副作用)
     - `signal SIG*` / 主动给业务发信号
@@ -263,20 +267,51 @@ echo "baseline at RSS=$(grep VmRSS $SNAP/rss) saved to $SNAP"
 
 ### R3.4.2 arena 链 walk(L1)
 
+> **常见陷阱**:板上 gdb 若编译时 `--disable-python`,attach 时 glibc pretty-printer 尝试加载 Python 会让 gdb 在跑到我们的 `while` 之前就报错退出。**永远加 `--nx -iex 'set auto-load off'`** 屏蔽掉。同样,printf 用**单行**,不要在 bash 单引号里用 `\` 跨行(老 gdb 会把第二行当独立命令)。
+
 ```bash
-timeout 60 gdb -batch -p $PID \
+timeout 60 gdb -batch --nx \
+    -iex 'set auto-load off' \
+    -p $PID \
     -ex 'set pagination off' \
     -ex 'set $ma = (struct malloc_state *)&main_arena' \
-    -ex 'set $a = $ma' -ex 'set $n = 0' \
+    -ex 'set $a = $ma' \
+    -ex 'set $n = 0' \
     -ex 'while $n < 200' \
-    -ex '  printf "arena %3d  addr=%p  sysmem=%9lu KB  attached=%lu\n", \
-              $n, $a, $a->system_mem/1024, $a->attached_threads' \
-    -ex '  set $a = $a->next' -ex '  set $n = $n + 1' \
-    -ex '  if $a == $ma' -ex '    loop_break' -ex '  end' \
-    -ex 'end' -ex 'detach' 2>&1 | tee $SNAP/arena_addr.txt | tail -80
+    -ex '  printf "arena %3d  addr=%p  sysmem=%9lu KB  attached=%lu\n", $n, $a, $a->system_mem/1024, $a->attached_threads' \
+    -ex '  set $a = $a->next' \
+    -ex '  set $n = $n + 1' \
+    -ex '  if $a == $ma' \
+    -ex '    loop_break' \
+    -ex '  end' \
+    -ex 'end' \
+    -ex 'detach' 2>&1 | tee $SNAP/arena_addr.txt | tail -80
 ```
 
 输出 N 行(N = arena 数,典型 1-64)。如果卡 / 没输出 / 报符号错,走 **R4.3 卡死诊断阶梯**。
+
+**如果仍报 "Scripting in the python language is not supported"** —— 用命令文件版本(完全绕开 `-ex` 多行处理):
+
+```bash
+cat > /tmp/gdb-arena.cmd <<'EOF'
+set pagination off
+set $ma = (struct malloc_state *)&main_arena
+set $a = $ma
+set $n = 0
+while $n < 200
+  printf "arena %3d  addr=%p  sysmem=%9lu KB  attached=%lu\n", $n, $a, $a->system_mem/1024, $a->attached_threads
+  set $a = $a->next
+  set $n = $n + 1
+  if $a == $ma
+    loop_break
+  end
+end
+detach
+EOF
+
+timeout 60 gdb -batch --nx -iex 'set auto-load off' -p $PID -x /tmp/gdb-arena.cmd 2>&1 | \
+    tee $SNAP/arena_addr.txt | tail -80
+```
 
 ### R3.4.3 算 max/avg + 找 top arena(L0,纯 awk)
 
@@ -306,7 +341,9 @@ sort -k6 -n $SNAP/arena_addr.txt | tail -5
 ### R3.4.4 tid → arena 映射(L1,**不用** `$_thread_name`)
 
 ```bash
-timeout 90 gdb -batch -p $PID \
+timeout 90 gdb -batch --nx \
+    -iex 'set auto-load off' \
+    -p $PID \
     -ex 'set pagination off' \
     -ex 'thread apply all printf "tid=%d arena=%p\n", $_thread, thread_arena' \
     -ex 'detach' 2>&1 | grep '^tid=' > $SNAP/tid_arena.txt
@@ -314,7 +351,7 @@ echo "got $(wc -l < $SNAP/tid_arena.txt) tids"
 head -5 $SNAP/tid_arena.txt
 ```
 
-如果卡:看 **R4.3.5**(线程名分离方案)。
+如果卡:看 **R4.3.5**(线程名分离方案)。如果报 Python 错:加 `--nx -iex 'set auto-load off'`(本命令已带)。
 
 ### R3.4.5 线程名(L0,走 `/proc`)
 
