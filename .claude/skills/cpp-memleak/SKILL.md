@@ -44,6 +44,61 @@ Use this framing whenever you catch yourself jumping from a contextual label ("i
 
 ---
 
+## Reliability hierarchy of observations
+
+Not every data point deserves equal weight. **Anchor your conclusions on high-reliability observations; downgrade single-snapshot artifacts to "hypothesis pointers".** This is the single most important guard against the over-narrowing trap, in which a high-confidence inference gets built on top of a medium-reliability observation.
+
+### Tier 1 — Anchor your conclusions here
+
+| Observation | Why it's reliable |
+|---|---|
+| **Steady-state growth rate, measured across ≥ 2 independent windows** | Two independent windows agreeing to ±10% is hard to fake by coincidence. Rate is also exactly the problem the operator experiences. **Anchor here.** |
+| Process uptime + rate → implied init baseline (R6) | Pure arithmetic; no interpretation |
+| `LD_PRELOAD` / `MALLOC_*` env-vars at process start | Settled at fork/exec, cannot change |
+| Thread count stable over a 30-sec window | Trivially reproducible from `/proc/PID/task` |
+| `Pss ≈ Rss` vs `Pss ≪ Rss` | Distinguishes private memory from shared |
+| `pmap` segment count + addresses | Direct kernel data |
+| RSS itself (`VmRSS` from `/proc/PID/status`) | Kernel-maintained; the actual quantity that triggers OOM |
+
+### Tier 2 — Use as hypothesis pointer, not as evidence
+
+| Observation | What can mislead you |
+|---|---|
+| **Single-snapshot arena concentration** ("arena N holds 67%") | Could be historical accumulation that stopped at T0; an active accumulator and a saturated historical one give the same single-shot signal. **Always confirm with a T0 → T1 Δ on that arena.** |
+| **Single-snapshot stack-top frequency** ("one thread caught in `std::string::replace`") | At any random moment, 1/N threads are in some specific function. One sample is coincidence; same family in 2+ samples is pattern; same exact function in 2+ samples is high-confidence |
+| CPU-time top-N tids | CPU-busy ≠ memory-busy. The leaker may be quietly allocating and sleeping (33% of the threads in this case were in `clock_nanosleep`) |
+| Average free-chunk size from `<total rest>` | Reflects past-freed object distribution, which may not match the currently-leaked object distribution |
+| `max/avg` stability across snapshots | Multiple distinct underlying scenarios produce the same ratio — confirm with absolute `max` Δ AND per-arena `Σ` Δ before drawing a conclusion |
+
+### Tier 3 — Verify before depending on
+
+| Observation | How to verify |
+|---|---|
+| User-reported "this configuration / plugin combo / load pattern leaks; others don't" | Plugin elimination experiment, or at least an independent reproduction at the same load. Until then, treat as one hypothesis among several |
+| Architecture labels (plugin host, gRPC, microservice, simulator) | Add to candidate-location list; **do not** narrow the mechanism |
+| `Σ per-arena <system current>` equals global `<system current>` | If they disagree, **your parser is broken**, not the program. Find the parser bug or accept the parser as untrustworthy and proceed using only Tier 1 data |
+
+### Pattern emergence
+
+A Tier-2 single-snapshot observation upgrades to a Tier-1 pattern when you see the same effect in ≥ 2 independent snapshots:
+
+- **Same family** of stack-top (e.g., string/bytes ops) at T0 and T1 → hot path involves that family — medium confidence
+- **Identical function** as stack-top at T0 and T1 → that function is on a high-occupancy path — high confidence
+- **Same top 3 CPU tids** at T0 and T1 → role assignment is stable, but still says nothing direct about memory ownership
+- **Same top arena number + same arena Δ direction** at T0 → T1 and T1 → T2 → that arena is genuinely the active accumulator (no longer "historical")
+
+### Worked example from the case study
+
+| Observation | Tier | Verdict |
+|---|---|---|
+| 162 / 167 / 168 MB/h measured in three independent windows | Tier 1 | leak is real, rate is firm |
+| arena 55 held 67% of heap at T0 | Tier 2 | hypothesis pointer; turned out to be historical, not active |
+| tid 36093 in `std::string::replace` at T0 | Tier 2 | coincidence-possible single sample |
+| `ByteString_hash` in T1 stack-top | Tier 2 | DIFFERENT function; same family (string/bytes) → upgrade to "hot path includes string/bytes ops" — medium confidence |
+| `<system current>` Δ ≠ Σ per-arena Δ | Tier 3 | parser is broken — do not derive new conclusions from per-arena distribution; rely on Tier 1 RSS rate instead |
+
+---
+
 ---
 
 ## When to invoke
@@ -523,8 +578,9 @@ Avoid:
 - v1 — Initial extraction from C++ aarch64 case study (2026-06)
 - v1.1 — Restart-window technique + per-arena concentration + arena→tid mapping
 - v1.2 — Safety rules (L0-L3 risk levels, 6 disciplines, hang ladder); simplified identification (thread name + CPU + bt) when arena→tid unavailable
-- **v1.3 — First-principles framing** (every leak = holder structure + add op + missing remove); Pattern G (combo-dependent) **demoted** to a note under A-F because architectural labels (plugin host, microservice, gRPC, etc.) do not narrow the leak mechanism, only enlarge candidate locations; anti-overfit checklist gains an explicit "did labels narrow your hypothesis?" check
-- Methodology: constraint-driven, multi-hypothesis, cross-verified, **label-blind to mechanism**
-- Tested-against case: aarch64 ptmalloc 21 GB RSS @ 4 GB/day growth on a plugin-host process (`simultor`); successive over-narrowing (single-arena → single-worker → plugin-interaction) was the lesson that drove v1.3
+- v1.3 — First-principles framing (every leak = holder structure + add op + missing remove); Pattern G (combo-dependent) **demoted** to a note under A-F because architectural labels do not narrow the leak mechanism, only enlarge candidate locations; anti-overfit checklist gains "did labels narrow your hypothesis?" check
+- **v1.4 — Reliability hierarchy of observations** (Tier 1 anchor / Tier 2 hypothesis pointer / Tier 3 verify-before-depending), with worked example from the case study; emphasizes **rate as the bedrock measurement** (multi-window agreement is the most reliable single quantity); explicit pattern-emergence rule (single snapshot = coincidence-possible, 2+ snapshots same family = pattern, 2+ snapshots same function = high confidence); init/runtime discrimination via R6 arithmetic; historical-vs-active accumulation distinction (R7) hardened with the `max/avg` multi-solution warning; Round 8 strategic stop when external diagnosis hits diminishing returns
+- Methodology: constraint-driven, multi-hypothesis, cross-verified, label-blind to mechanism, **rate-anchored** (rate is the Tier-1 measurement; everything else is built on top of and falsifiable against it)
+- Tested-against case: aarch64 ptmalloc 21 GB RSS @ 4 GB/day growth on a plugin-host process (`simultor`); the 8-round investigation walked through every over-narrowing trap the skill now guards against (single-arena → single-worker → plugin-interaction → string-specific) and validated the rate measurement as the only number that survived every iteration unchanged
 
-Update version when adding new patterns / tools / platform gotchas. **Resist** adding a new "Pattern X" for each new architectural circumstance encountered — first check if it's an existing A-F mechanism at a new location.
+Update version when adding new patterns / tools / platform gotchas. **Resist** adding a new "Pattern X" for each new architectural circumstance — first check if it's an existing A-F mechanism at a new location. **Resist** building conclusions on top of single-snapshot observations without an independent confirmation from a different angle or time point.
