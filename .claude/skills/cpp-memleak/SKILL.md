@@ -311,6 +311,14 @@ Match the thread whose `arena=...` matches the top arena's address (get via `mai
 
 This technique transforms a high-arena-concentration finding from a curious data point into an actionable scope cut.
 
+**Simplified identification when arena→tid mapping is unavailable.** Stripped libc (no `main_arena` symbol), gdb without Python, or no debug info can all block the precise arena→tid mapping. Rather than escalating to gcore-and-offline, fall back to three L0 signals that often pin the suspect down to 1-3 candidate tids without any gdb work:
+
+1. **Thread-name uniqueness** — `for tid in /proc/PID/task/*; do cat $tid/comm; done | sort | uniq -c`. Look for "orphan" names (1-2 instances among 50 identical workers); a semantically-named singleton (DataLoader, MetaCache, RouteMgr) is often the suspect.
+2. **CPU-time leaderboard** — `/proc/PID/task/*/stat` fields 14+15 (utime+stime). A 10× outlier vs. peers means that thread is consistently busy; on a steady-state leak it correlates with the allocator.
+3. **Stack-top frequency** — parse the existing `thread apply all bt`; most threads are in `pthread_cond_wait` / `epoll_wait` / `futex_wait`; the 3-5 that are in business code are the candidates.
+
+When all three signals point to the same small set, hand off those tids to source review. Candidate set of 1-3 (instead of "a single precise tid") is still two orders of magnitude smaller than "whole codebase" — usually good enough. Reserve the precise arena→tid path for cases where the candidate set is still too large (e.g., 50 identically-named workers with no CPU outlier).
+
 **Convergence rule:** if Phase 3 says "Pattern A in ClassMyCache::add", confirm by at least one of:
 - Snapshot diff shows the rate matches estimate (~1 OOM)
 - LD_PRELOAD profiler captures `MyCache::add` as the top allocator

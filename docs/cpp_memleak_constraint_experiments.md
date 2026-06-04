@@ -101,14 +101,51 @@ awk '
 
 ### R5.3.3 钻取候选 tid 的完整 backtrace
 
+CPU 时间排行往往不止 1 个 candidate(常见 2-5 个 tid 占 top,彼此 CPU 接近)。**全部 dump**,横向对照:
+
 ```bash
-SUSPECT_TID=12345    # ← 改成 R5.3.1 / R5.3.2 找出的孤儿 tid
-awk -v t="$SUSPECT_TID" '
-    /^Thread / { in_t = (index($0, "(LWP "t")") > 0) }
-    in_t { print }
-    /^$/ && in_t { exit }
-' $SNAP/threads.bt
+# 把 R5.3.1 / R5.3.2 找出的候选 tid 列出来(空格分隔)
+SUSPECT_TIDS="36623 36615 36093"    # ← 改成你的候选列表
+
+for tid in $SUSPECT_TIDS; do
+    echo ""
+    echo "==================="
+    echo "=== tid=$tid name=$(cat /proc/$PID/task/$tid/comm 2>/dev/null) ==="
+    echo "==================="
+    awk -v t="$tid" '
+        /^Thread / { in_t = (index($0, "(LWP "t")") > 0) }
+        in_t { print }
+        /^$/ && in_t { exit }
+    ' $SNAP/threads.bt
+done
 ```
+
+#### 看 backtrace 的三个角度
+
+| 关注 | 含义 |
+|---|---|
+| **栈底**(最深一帧,通常 `start_thread` 上面那个) | 线程的 entry function —— 嫌疑代码的入口 |
+| **栈顶**(`#0` 帧) | 当下在干什么。若是业务 function(不是 `pthread_cond_wait` / `epoll_wait`)→ 在持续工作 |
+| **多个候选间的对比** | 若 2 个候选栈完全一样 → 同任务对偶 worker(arena 集中可能落在其中之一);若各自不同 → 不同任务,需逐个评估 |
+
+#### 三种典型 backtrace pattern
+
+| Pattern | 含义 | 嫌疑度 |
+|---|---|---|
+| 栈底是某具体业务 function(如 `Foo::Loop`、`bar_worker_main`),栈顶在业务代码深处 | **强嫌疑** — 入口和顶帧都暴露了角色;Round 5 任务完成 |
+| 栈底是通用 `worker_loop`,栈顶在 STL / glibc(如 `std::string::_M_*`、`memcpy`) | **中等嫌疑** — 栈底没标签,但栈顶证明该 tid 在做 string / 内存操作。看中间帧找业务 function |
+| 栈底/栈顶都是框架代码(boost::asio、grpc、Qt) | **弱嫌疑** — 嫌疑可能在异步 callback 链路里。看 bt 16 帧深度才能展开 |
+
+如果 `bt 8` 看不清(全是框架帧),换 `bt 16` 或 `bt 30` 加深抓:
+
+```bash
+timeout 90 gdb -batch --nx -iex 'set auto-load off' -p $PID \
+    -ex 'set pagination off' \
+    -ex "thread apply $SUSPECT_TID_GDB_NUM bt 30" \
+    -ex 'detach' 2>&1
+```
+
+(注意:gdb thread 编号 `$SUSPECT_TID_GDB_NUM` 跟 LWP tid 不一样,先 `info threads | grep <tid>` 找对应的 gdb thread 号)
 
 ## R5.4 识别要点(三个角度交叉对照)
 
