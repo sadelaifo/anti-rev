@@ -320,6 +320,40 @@ cat $SNAP/tid_arena_named.txt | head -20
 - 步 2 卡 → 改 `head -10` 后跑;若仍卡,gdb 跟线程数有交互问题,考虑步 2 用 `info threads` 替代
 - 步 3 卡 → 不可能(纯 /proc 读),除非 PID 错了
 
+### R3.4.2 步 5: 从 R3.4.3 找出的 top arena 钻取嫌疑 tid + backtrace (L0)
+
+R3.4.3 给出 top arena 编号(本 case T0 = arena 55)。把它跟 R3.4.2 步 1-4 的输出 join,拿到嫌疑 tid + 线程名 + 该线程的栈帧:
+
+```bash
+TOP_ARENA_NUM=<从 R3.4.3 输出的编号,例如 55>
+
+# 1. top arena 的地址
+echo "=== top arena $TOP_ARENA_NUM 地址 ==="
+awk -v n=$TOP_ARENA_NUM '$2 == n {print}' $SNAP/arena_addr.txt
+
+# 2. 该 arena 对应的 tid(可能 1 个或多个)
+ARENA_ADDR=$(awk -v n=$TOP_ARENA_NUM '$2 == n {print $4}' $SNAP/arena_addr.txt)
+echo "top arena addr = $ARENA_ADDR"
+echo "=== tid 绑到此 arena ==="
+grep "$ARENA_ADDR" $SNAP/tid_arena.txt
+
+# 3. 嫌疑 tid 的线程名
+SUSPECT_TID=$(grep "$ARENA_ADDR" $SNAP/tid_arena.txt | head -1 | grep -oE 'tid=[0-9]+' | head -1 | cut -d= -f2)
+echo "suspect tid = $SUSPECT_TID"
+echo "=== thread name ==="
+grep "^tid=$SUSPECT_TID " $SNAP/tid_names.txt
+
+# 4. 嫌疑 tid 的 backtrace(栈顶 + 栈底 entry function)
+echo "=== suspect tid backtrace ==="
+awk -v t="$SUSPECT_TID" '
+    /^Thread / { in_t = (index($0, "(LWP "t")") > 0) }
+    in_t { print }
+    /^$/ && in_t { exit }
+' $SNAP/threads.bt
+```
+
+输出的四块 (arena 地址 / tid / name / backtrace) 就是把 handoff §3 画像从"某 worker 持有大量小对象"细化到 **"thread tid=X (name=Y, entry=Z) 持有 N% heap"** 的全部素材。直接贴回工作文档 §3.6 / handoff §3。
+
 ### R3.4.3 检查现在是否已经集中
 
 ```bash
