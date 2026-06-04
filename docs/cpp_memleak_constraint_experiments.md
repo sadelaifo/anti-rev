@@ -122,6 +122,117 @@ T1 时 top arena    = T0 top arena + R_top × (T1 - T0)   ← R_top 是 top aren
 
 **总结**:T1 真正会变的只 4 样 — **RSS / arena 分布 / CPU 时间 / threads.bt**。其余 T0 已采到的稳态信息不重复。
 
+### T1 实际跑的命令(copy-paste,< 5 分钟)
+
+#### T1 采集
+
+```bash
+# 前置:确保 $PID 还是 T0 的同一进程,$SNAP 是 T0 目录
+echo "T0 SNAP = $SNAP, PID = $PID"
+ls $SNAP/rss $SNAP/arena_sizes.txt 2>&1   # 确认 T0 数据在
+
+T=$(date +%Y%m%d_%H%M)_T1
+SNAP_T1=/tmp/mem_snap/$T
+mkdir -p $SNAP_T1
+echo "T1 SNAP = $SNAP_T1"
+
+# 1. RSS
+grep -E 'VmRSS|VmSize' /proc/$PID/status > $SNAP_T1/rss
+
+# 2. malloc_info(arena 分布)
+timeout 30 gdb -batch --nx -iex 'set auto-load off' -p $PID \
+    -ex "set \$f = (void *)fopen(\"$SNAP_T1/mi.xml\", \"w\")" \
+    -ex 'call (void) malloc_info(0, $f)' \
+    -ex 'call (int) fflush($f)' \
+    -ex 'call (int) fclose($f)' \
+    -ex 'detach' > /dev/null 2>&1 || echo "malloc_info skipped (timeout)"
+
+# 3. threads.bt
+timeout 90 gdb -batch --nx -iex 'set auto-load off' -p $PID \
+    -ex 'set pagination off' \
+    -ex 'thread apply all bt 8' -ex 'detach' > $SNAP_T1/threads.bt 2>&1
+
+# arena 分布解析(从 mi.xml,跟 T0 同方法)
+awk -F'"' '
+  /<heap nr=/ { a=$2; in_h=1; s=0; next }
+  /<\/heap>/  { if (in_h) printf "%4d %12d\n", a, s; in_h=0; next }
+  in_h && /<system type="current"/ { s=$4 }
+' $SNAP_T1/mi.xml | sort -k2 -n > $SNAP_T1/arena_sizes.txt
+
+echo "T1 snapshot done at $SNAP_T1"
+```
+
+#### T1 对比 + 判读(贴回输出)
+
+```bash
+SUSPECT_TIDS="36623 36615 36093"   # ← 你的 Round 5 候选
+
+echo "=========================="
+echo "=== A. RSS 对比 ==="
+echo "=========================="
+echo "T0: $(grep VmRSS $SNAP/rss)"
+echo "T1: $(grep VmRSS $SNAP_T1/rss)"
+
+echo ""
+echo "=========================="
+echo "=== B. arena 55 单独对比 ==="
+echo "=========================="
+T0_55=$(awk '$1 == 55 {print $2}' $SNAP/arena_sizes.txt 2>/dev/null)
+T1_55=$(awk '$1 == 55 {print $2}' $SNAP_T1/arena_sizes.txt)
+echo "T0 arena 55: $((T0_55 / 1024 / 1024)) MB"
+echo "T1 arena 55: $((T1_55 / 1024 / 1024)) MB"
+echo "Δ:           $(( (T1_55 - T0_55) / 1024 / 1024 )) MB"
+
+echo ""
+echo "=========================="
+echo "=== C. T1 top 5 arena + max/avg ==="
+echo "=========================="
+tail -5 $SNAP_T1/arena_sizes.txt | awk '{printf "TOP arena %4d : %.1f MB\n", $1, $2/1024/1024}'
+echo "---"
+awk '{n++; s=$2; sum+=s; if(s>mx)mx=s; if(mn==""||s<mn)mn=s}
+     END{printf "arenas=%d  total=%.1f GB  avg=%.0f MB  max=%.0f MB  max/avg=%.2fx\n",
+         n, sum/1024/1024/1024, sum/n/1024/1024, mx/1024/1024, mx/(sum/n)}' \
+    $SNAP_T1/arena_sizes.txt
+
+echo ""
+echo "=========================="
+echo "=== D. T1 top 10 by CPU time ==="
+echo "=========================="
+for tid in $(ls /proc/$PID/task); do
+    fields=$(cat /proc/$PID/task/$tid/stat 2>/dev/null) || continue
+    name=$(cat /proc/$PID/task/$tid/comm 2>/dev/null)
+    cpu=$(echo "$fields" | awk '{print $14+$15}')
+    echo "$cpu  tid=$tid  name=$name"
+done | sort -rn | head -10
+
+echo ""
+echo "=========================="
+echo "=== E. T1 栈顶函数排行 ==="
+echo "=========================="
+awk '
+  /^Thread / { in_t = 1; next }
+  in_t && /^#0/ {
+    if (match($0, / in [^ (]+/)) fn = substr($0, RSTART+4, RLENGTH-4)
+    else fn = $NF
+    print fn; in_t = 0
+  }
+' $SNAP_T1/threads.bt | sort | uniq -c | sort -rn | head -10
+
+echo ""
+echo "=========================="
+echo "=== F. 嫌疑 tid 当前栈顶 ==="
+echo "=========================="
+for tid in $SUSPECT_TIDS; do
+    echo "--- tid=$tid ---"
+    awk -v t="$tid" '
+        /^Thread / { in_t = (index($0, "(LWP "t")") > 0) }
+        in_t && /^#0/ { print; in_t=0 }
+    ' $SNAP_T1/threads.bt
+done
+```
+
+把 A-F 六块输出贴回给我。
+
 ### 预测不对(> 30% 偏差)的几种情形
 
 | 偏差 | 解读 |
