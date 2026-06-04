@@ -67,14 +67,24 @@
 >
 > ### 修订后画像(给审查方)
 >
-> > simultor 平台进程加载了 4 个业务 `.so`(组合 P1+P2+P3+P4),此组合下出现 leak,其他组合不出现。leak 表现为:**3 个 worker 线程(tid 36623/36615/36093,均来自 41 个 generic worker 池)CPU 远超其他 ~10×;其中 tid 36093 snapshot 时栈顶在 `std::string::replace`**。单 arena 持有 ~67% heap(2 GB/3 GB)。
+> > simultor 平台进程加载了 4 个业务 `.so`,此组合下出现 leak,其他组合不出现(此前提强度待 elimination 验证)。leak 在**运行时稳态累积**(已交叉验证,见下),不是 init-time。
 > >
-> > **审查范围(按优先级)**:
-> > 1. **4 plugin 互相注册的 callback / observer / event handler**,看是否有 P_A `Subscribe`/`Register` 但 P_B 端没真正消费(或 unsubscribe 路径不通)
-> > 2. **plugin 类成员持有的容器**(`std::vector / unordered_map / deque / list`),看每个 plugin 的 step/tick/update 是否 push 进容器后没清,或清理依赖某条 plugin combo 才走的路径
-> > 3. **plugin 之间通过平台 message bus / shared queue 的 producer-consumer 失衡**(本组合下消费者 plugin 不在 / 没正确处理)
-> > 4. **string::replace 这条线索**:每个 plugin 找 hot loop 里反复对 string 做 replace/format/sanitize 后存到长寿容器的位置
-> > 5. **(防过拟合)平台暴露给 plugin 的接口本身**:即使其他组合不漏,也可能是平台特定 routing/cache 路径只在这组合下激活;plugin 都看不出嫌疑就回头看平台
+> > **量化画像**(关键):
+> > - 总累积速率 **~162 MB/h**(两个独立观察点一致)
+> > - 主要落在 **单一 arena**(arena 55,即一个 worker 线程的 arena),该 arena 速率 **~125 MB/h ≈ 35 KB/s**
+> > - 若累积对象平均 ~500 B → 嫌疑代码被 **~每秒 70 次** 触发,每次留下一个 ~500 B 对象不释放
+> > - 触发频率 70 Hz **匹配**:simulator tick (20-100 Hz)、gRPC 中等吞吐请求、周期心跳/状态报告、定时 metric 收集
+> > - snapshot 时 3 个 worker(tid 36623/36615/36093)CPU 远超其他 ~10×,但**注意**:CPU 高 ≠ 内存高,真正的累积者可能在低 CPU 线程里
+> >
+> > **审查时找的具体问题**:
+> > 1. **4 plugin(以及平台代码)里,有没有函数被 ~70 次/秒 调用**?(常见:tick / step / on_event / process_message / publish / handle_request)
+> > 2. **该函数是否分配 ~几百字节对象**?(`std::string`、protobuf message、小 struct、连接 state)
+> > 3. **这些对象进入哪个 long-lived 持有结构**?(plugin 内成员容器 / 平台 cache / 跨 plugin 队列 / callback registry)
+> > 4. **该持有结构的清理路径是否真的触发**?(可能存在 erase 调用,但条件依赖某条特定 plugin combo 才走的路径,所以本组合下永远不触发)
+> >
+> > **关于 std::string::replace 线索**:snapshot 抓到 tid 36093 栈顶在此函数,信度**中等**(单时点采样可能是巧合)。下轮 T1 snapshot 看是否复现 → 复现则信度上调,否则降至偶然。
+> >
+> > **审查范围(按机制,不按预设结论)**:每个 plugin + 平台共享代码 + 第三方库,**对照 first-principles 的 7 种持有结构(SKILL.md)分别评估**。架构标签不收紧机制假设。
 >
 > ### 配套验证:plugin elimination 实验
 >
