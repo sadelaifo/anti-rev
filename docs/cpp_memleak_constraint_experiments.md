@@ -234,7 +234,7 @@ awk 'NR==FNR{name[$1]=$2; next}
 > **风险**:L0(/proc 读)+ L1(gdb 只读 thread bt)+ **L2 可选(call malloc_info)**。malloc_info 卡住可跳过,主要数据靠 R3.4.2 struct walk。
 
 ```bash
-PID=<新进程 PID>
+PID=12345          # ← 填新进程 PID。不要用 <...> 占位,bash 把它当重定向
 T=$(date +%Y%m%d_%H%M)_baseline
 SNAP=/tmp/mem_snap/$T
 mkdir -p $SNAP
@@ -330,7 +330,7 @@ head -5 $SNAP/tid_names.txt
 用 R3.4.3 给出的 top arena 编号(本 case T0 = arena 55)钻进去:
 
 ```bash
-TOP_ARENA_NUM=<从 R3.4.3 输出的编号,例如 55>
+TOP_ARENA_NUM=55       # ← 填 R3.4.3 输出的编号。不要写 <...>,bash 把它当重定向 → 变量会变空
 
 # 1. top arena 的地址
 echo "=== top arena $TOP_ARENA_NUM ==="
@@ -482,7 +482,7 @@ cat $SNAP/tid_arena.txt | head -20
 把步骤 1 的 top arena 地址,跟步骤 2 里 tid 输出的 arena 列对照,确定**嫌疑 tid**。
 
 ```bash
-TOP_ARENA=<填步骤 1 输出的 top arena 地址,如 0x7f1234567000>
+TOP_ARENA=0x7f1234567000   # ← 填步骤 1 输出的 top arena 地址。不要写 <...>,bash 把它当重定向
 grep $TOP_ARENA $SNAP/tid_arena.txt
 ```
 
@@ -491,7 +491,7 @@ grep $TOP_ARENA $SNAP/tid_arena.txt
 回到 Round 1 — Exp-D 已抓的 `$SNAP/threads.bt`:
 
 ```bash
-SUSPECT_TID=<填步骤 3 找到的 tid>
+SUSPECT_TID=12345   # ← 填步骤 3 找到的 tid。不要写 <...>,bash 把它当重定向
 awk -v t="Thread $SUSPECT_TID" '
   $0 ~ "^"t" |\\(LWP "t"\\)" { in_t=1 }
   in_t { print }
@@ -571,7 +571,7 @@ dev 机有完整符号,容易找到 top arena;然后回板上做步骤 2-3 映�
 > **风险**:L0(/proc 读)+ L1(gdb 只读)+ **L2(call malloc_info)**。L2 那条带 `timeout` 保护,卡住可跳过;per-arena 用 R4.3.4 struct walk 替代不丢主要信息。
 
 ```bash
-PID=<填进程 PID>
+PID=12345          # ← 填进程 PID。不要用 <...>,bash 把它当重定向
 T=$(date +%Y%m%d_%H%M)              # T0 / T1 各跑一次
 SNAP=/tmp/mem_snap/$T
 mkdir -p $SNAP
