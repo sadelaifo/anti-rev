@@ -100,7 +100,29 @@ T1 时 top arena    = T0 top arena + R_top × (T1 - T0)   ← R_top 是 top aren
 
 预测对得上(±20% 内)= **速率稳态彻底确认**,排除 burst / threshold-triggered 假说。
 
-预测不对(>30% 偏差)的几种情形:
+### T1 最小必要集(don't re-run everything)
+
+**T1 只跑会变的部分**,T0 已采到且稳定的数据不重复:
+
+| Rx.x | T1 跑不跑 | 理由 |
+|---|---|---|
+| R3.4.1 baseline 减肥版(RSS + threads.bt + mi.xml) | ✅ | 三样都变 |
+| R3.4.2 arena 链 walk(若 T0 用了 gdb 路径成功) | ✅ | 验证集中演化 |
+| R3.4.2 arena 链 walk(若 T0 用 mi.xml 替代) | ❌ | 用 mi.xml 也行,见 R3.4.3 |
+| R3.4.3 集中度 | ✅ | 验证 max/avg 是否稳定、top arena 是否变 |
+| R3.4.4 tid → arena | ❌ | tid-arena 绑定稳定,不重跑 |
+| R3.4.5 线程名 | ❌ | 名字短时间不变 |
+| R3.4.6 钻取嫌疑 tid | ❌ | 已锁定,不重跑 |
+| R5.3.1 CPU 时间 top 10 | ✅ | 验证 top 3 tid 还是不是这 3 个 |
+| R5.3.2 栈顶分布 | ✅ | 验证模式;看有没有又抓到 string 系列 |
+| R5.3.3 候选 tid 栈顶帧 | ✅ | 看每个候选当前在干啥,有无变化 |
+| R6.2 进程运行时长 | ❌ | 中途无重启就是 T0 + Δt |
+| pmap full / 大段 | ❌ | 段稳定 → 单一确认即可,不重跑 |
+| `.so` 列表 | ❌ | plugin 不变(除非业务真的 reload) |
+
+**总结**:T1 真正会变的只 4 样 — **RSS / arena 分布 / CPU 时间 / threads.bt**。其余 T0 已采到的稳态信息不重复。
+
+### 预测不对(> 30% 偏差)的几种情形
 
 | 偏差 | 解读 |
 |---|---|
