@@ -1,8 +1,30 @@
 # 约束收窄实验手册 — 在源码审查之前/同时做
 
+> ## 重要更新(2026-06-04):重启 = 诊断窗口
+>
+> 目标进程**在调查中被重启了**(可能由 OOM-kill、手动 kill、定期维护、压力测试 触发),RSS 从 21 GB 回落到 3 GB。
+>
+> **不要把重启当成数据损失** —— 这反而是抓 leak 起源**信噪比最高的时刻**。理由:
+>
+> - **21 GB 稳态** 下,新增 100 MB/h 的 leak 信号被 200× 的稳态历史数据淹没,集中度信号已被压缩成"既成事实"
+> - **3 GB 起步** 时,从 3 → 6 → 10 → 15 GB 这段增长曲线**正在发生**,集中度**演化过程**可见,leak 起源更容易锁定
+> - **线程名还干净**:fork / exec / pthread_setname 链还没覆盖初始 entry function 命名,Exp-F 的 arena→tid 映射更可读
+> - **过去一轮(21 GB)的证据仍然成立**(arena max/avg = 45.9× 集中 + 大段稳定 + 3.88 GB/天),作为前一轮独立观察可与本轮做**复现验证**
+>
+> ### 立刻该做的事
+>
+> 1. **采 baseline snapshot**(§1 命令在新 PID 上跑一遍)
+> 2. **立刻做 Exp-F**(§9)— 现在 arena→tid 映射比 21 GB 时容易,而且能在 leak 起源前就有早期 layout
+> 3. **检查现在 max/avg 是不是已经 > 5×**(§2)—— 决定下一步等待 vs 立即追踪
+> 4. **后续按 6 / 24 / 48 h 节奏多点采样**(详见 §11)
+>
+> 详细 playbook 见 **§11 重启诊断窗口**。
+>
+> ---
+
 > **位置**:`cpp-memleak` skill 的 Phase 2-3 之间;handoff 文档的 §3 约束**收紧/可能修订**的依据。
 > **触发场景**:Phase 0-1 已完成、已得出"long-lived 容器 + 小对象 + 漏清理"类初步画像,但**还没把源码交给审查方之前**,有必要再做一次廉价的多假设交叉验证,避免画像收得过紧导致内部审查走错方向。
-> **执行条件**:板上有 `gdb`、`pmap`、`awk`、`grep` 即可。**全程不重启,不改业务代码**。
+> **执行条件**:板上有 `gdb`、`pmap`、`awk`、`grep` 即可。**全程不重启,不改业务代码**(§11 重启诊断窗口除外 —— 那是借重启发生的机会做额外采样,不是新增重启)。
 
 ---
 
@@ -442,7 +464,145 @@ dev 机有完整符号,容易找到 top arena;然后回板上做步骤 2-3 映�
 
 ---
 
-## 10. 配套文件
+## 11. 重启诊断窗口 playbook
+
+### 11.1 触发条件
+
+进程在调查期间被重启,或可以借调度窗口主动安排一次重启。**两种情形都按本节做**。
+
+### 11.2 为什么重启反而是机会
+
+| 维度 | 长稳态 (21 GB) | 新进程 (3 GB) |
+|---|---|---|
+| arena 集中度信号 | 已经成形,是"既成事实" | **演化中**,可见 leak 起源从均匀到集中的过程 |
+| 线程名 (`pthread_name`) | 可能已被覆盖 / 失语义 | 仍是初始 entry,可读 |
+| `pmap` 段数 | 庞杂,几百个 64 MB 段 + 多个大段 | 段少且清晰,diff 显眼 |
+| 多 baseline 可用 | 单点采样 | 可连续采 3-5 个时点,描出**完整增长曲线** |
+| 复现验证 | 单轮观察 | 跟前一轮 21 GB 时的数据 **可对比、可证伪** |
+| 对照实验 | 不能改 env(无重启窗口) | 可借此次重启加 `MALLOC_ARENA_MAX=2` / jemalloc 等做 A/B |
+
+### 11.3 立刻做(< 30 min)
+
+#### 11.3.1 baseline snapshot
+
+```bash
+PID=<新进程 PID>
+T=$(date +%Y%m%d_%H%M)_baseline
+SNAP=/tmp/mem_snap/$T
+mkdir -p $SNAP
+
+# §1 的完整采集
+grep -E 'VmRSS|VmSize' /proc/$PID/status > $SNAP/rss
+gdb -batch -p $PID \
+    -ex "set \$f = (void *)fopen(\"$SNAP/mi.xml\", \"w\")" \
+    -ex 'call (void) malloc_info(0, $f)' \
+    -ex 'call (int) fflush($f)' \
+    -ex 'call (int) fclose($f)' > /dev/null 2>&1
+pmap -x $PID > $SNAP/pmap.full
+awk '$2 > 65536 {print $1, $2, $3}' $SNAP/pmap.full | sort > $SNAP/big_segs.txt
+gdb -batch -p $PID -ex 'set pagination off' \
+    -ex 'thread apply all bt 8' -ex 'detach' > $SNAP/threads.bt 2>&1
+awk '/\.so/{print $NF}' /proc/$PID/maps | sort -u > $SNAP/sos.txt
+ls /proc/$PID/task | wc -l > $SNAP/threads
+echo "baseline at RSS=$(grep VmRSS $SNAP/rss) saved to $SNAP"
+```
+
+#### 11.3.2 立刻做 Exp-F (arena→tid 映射 + 抓线程名)
+
+```bash
+# arena 链 + system_mem
+gdb -batch -p $PID \
+    -ex 'set $ma = (struct malloc_state *)&main_arena' \
+    -ex 'set $a = $ma' -ex 'set $n = 0' \
+    -ex 'while 1' \
+    -ex '  printf "arena %3d  addr=%p  sysmem=%9lu KB  attached=%lu\n", \
+              $n, $a, $a->system_mem/1024, $a->attached_threads' \
+    -ex '  set $a = $a->next' -ex '  set $n = $n + 1' \
+    -ex '  if $a == $ma' -ex '    loop_break' -ex '  end' \
+    -ex 'end' -ex 'detach' 2>&1 | tee $SNAP/arena_addr.txt | tail -80
+
+# tid → arena 映射 + 线程名(关键:这时候名字最干净)
+gdb -batch -p $PID \
+    -ex 'thread apply all printf "tid=%d arena=%p name=", $_thread, thread_arena' \
+    -ex 'thread apply all printf "%s\n", $_thread_name' \
+    -ex 'detach' 2>&1 | grep -E '^tid=' > $SNAP/tid_arena.txt
+cat $SNAP/tid_arena.txt
+```
+
+#### 11.3.3 检查现在是否已经集中
+
+```bash
+awk -F'"' '
+  /<heap nr=/ { a=$2; in_h=1; s=0; next }
+  /<\/heap>/  { if (in_h) printf "%4d %12d\n", a, s; in_h=0; next }
+  in_h && /<system type="current"/ { s=$4 }
+' $SNAP/mi.xml | sort -k2 -n > $SNAP/arena_sizes.txt
+tail -5 $SNAP/arena_sizes.txt | awk '{printf "TOP arena %4d : %.1f MB\n", $1, $2/1024/1024}'
+```
+
+判读:
+- **现在 max/avg > 5×** → leak 重启后立刻集中,**当前 top arena 就是嫌疑** → 直接拿 tid 给审查方
+- **现在 max/avg ≈ 1**(均匀) → 集中是时间累积出来的,等下次涨到 5-6 GB 再观察 — 这本身也是有用结论:某 1 个 tid 在某段业务下开始独跑
+
+### 11.4 多时点采样表
+
+按 3.88 GB/天 速率推算(rate 来自前一轮 §3.4):
+
+| 时点 | 预期 RSS | 行动 |
+|---|---|---|
+| **T0** (现在) | 3 GB | baseline (§11.3.1) + Exp-F (§11.3.2) + 集中度 (§11.3.3) |
+| **T1** (+6 h) | ~4 GB | 重跑 §11.3.1 + §11.3.3;对比 arena Δ |
+| **T2** (+24 h) | ~7 GB | 同上;集中度应该已经明显 |
+| **T3** (+48-72 h) | ~10-15 GB | 同上;跟前一轮 21 GB 时的 top arena **应当一致** —— 证实复现 |
+
+T0 → T1 / T2 / T3 之间用 §2.3 的 `awk` 两遍法做 Δ 对比:
+
+```bash
+awk 'NR==FNR{a[$1]=$2; next}
+     {printf "arena %4d: %7.1f -> %7.1f MB  (Δ %+6.1f MB)\n",
+             $1, a[$1]/1024/1024, $2/1024/1024, ($2-a[$1])/1024/1024}' \
+    $SNAP_T0/arena_sizes.txt $SNAP_T1/arena_sizes.txt | sort -k7 -nr | head -10
+```
+
+**Δ 排序第一名 = 增长最快的 arena**。把它的 sysmem 涨幅跟总 ΔRSS 比:
+- top arena Δ ≈ 总 ΔRSS → **单 arena leak 复现**,锁定 tid
+- top arena Δ ≪ 总 ΔRSS → 多 arena 都在涨,跟前一轮不同 → **必须重新审视前一轮结论**
+
+### 11.5 可选:借此次重启做对照实验
+
+如果**还有一次重启窗口可用**(下次维护时段、灰度环境、镜像副本),用这个机会做对照实验。每个实验都需要**单独一次重启**:
+
+| 实验 env | 验证什么 | 判读 |
+|---|---|---|
+| `MALLOC_ARENA_MAX=2 MALLOC_TRIM_THRESHOLD_=131072` | leak 是 ptmalloc 多 arena 分布问题还是用户代码层真累积 | 若 RSS 仍以原速率涨且 max/avg 仍 > 5× → **真 leak**(arena 数被强制压到 2,集中必然落 main 或唯一 thread arena);若涨势缓和 50%+ → 前一轮看到的高利用率有相当一部分其实是多 arena 的不归还 |
+| `LD_PRELOAD=$JEMALLOC` | 换 allocator 是否改变 RSS 行为 | jemalloc 通常更激进归还内存。若涨势照旧 → 真 leak;若 RSS 平稳 → ptmalloc 特有问题 |
+| `LD_PRELOAD=./malloc_track.so`(自编 wrapper)+ 业务跑 1 h + `kill -SIGUSR1` 触发 dump | 真实 leak stack trace | 拿到 stack → addr2line → 跟 handoff 嫌疑表对照 |
+
+**不要一次重启同时改多个 env** —— 隔离变量,每次只动一项。
+
+### 11.6 跟原 §2-§9 实验的复用关系
+
+| 原章节 | 在重启窗口怎么复用 |
+|---|---|
+| §2 Exp-A (per-arena) | **多时点重跑** — 观察集中度的演化曲线 |
+| §3 Exp-B (大段) | 多时点重跑 — 看大段什么时候出现/长大 |
+| §4 Exp-C (in-use 直方图) | 若 §11.4 T2 / T3 时已锁定单 arena,可做一次 gcore 拿确凿对象大小分布 |
+| §5 Exp-D (线程 bt) | T0 做一次(线程名干净);T2 再做一次(看同一 tid 行为变化) |
+| §6 Exp-E (.so) | T0 / T3 各做一次比较,排除 Alt-7 |
+| §9 Exp-F (arena→tid) | **T0 必做** —— 早期映射;以后每次重跑可对比"tid 是否还绑在同一 arena" |
+
+### 11.7 失败模式
+
+| 现象 | 含义 | 处理 |
+|---|---|---|
+| T0 时 max/avg ≈ 1,过 24 h 仍 ≈ 1 | leak **不集中**,跟前一轮 45.9× 矛盾 | 前一轮的集中是**进程多日老化的副产品**而非 leak 本质 — 回头看是不是其他场景触发(具体业务高峰、长时积压);改回 all-workers 画像 |
+| T0 / T1 / T2 总 ΔRSS 远低于 162 MB/h | 触发 leak 的业务流量没回来 | 等业务流量恢复,或主动触发负载 |
+| 重启后 RSS 一直涨到 30 GB+ 不被 OOM | 内存超额比上次还宽 | 跟内核 OOM 配置无关,leak 行为可继续观察 |
+| 重启的进程**没复现 leak**(RSS 长期稳定 ≤ 5 GB) | 前一轮可能是**特定环境/数据/时段**触发,不是普遍稳态 leak | 重要负面结论 — 重看前一轮的触发条件,可能是某次特殊业务事件触发的"半永久累积" |
+
+---
+
+## 12. 配套文件
 
 - 方法论 skill:`.claude/skills/cpp-memleak/SKILL.md`(本手册属于 Phase 2-3 之间的细化步骤)
 - 完整诊断过程:`docs/cpp_aarch64_memleak_investigation.md`

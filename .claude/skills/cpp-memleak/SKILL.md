@@ -92,6 +92,20 @@ grep -E '<system|<total type' /tmp/mi.xml
 
 **Anti-pattern to avoid in Phase 0:** jumping straight to "run Valgrind" without confirming the platform can run a profiler, or recommending tools the user already said they don't have.
 
+**Strategic note: a restart is a diagnostic opportunity, not a setback.** If the target process is restarted mid-investigation — OOM-killed, manually restarted, periodic-maintenance restart — do NOT treat it as data loss. The early-growth phase has the highest signal-to-noise ratio for catching the leak:
+
+- At 21 GB steady state, ~100 MB/h of new leak signal is buried under 200× the steady history.
+- At 3 GB just after restart, the same 100 MB/h growth is visible as a clean trajectory; the concentration of allocations into a specific arena is **happening, not finished**, so the cause is observable in motion.
+- Thread names (`pthread_name`) are still at their initial entry-function values before fork/exec chains overwrite them, making arena → tid mapping (cross-verification step) far more readable.
+- A restart also opens a window for **controlled-comparison experiments**: change one `MALLOC_*` env or `LD_PRELOAD` per restart and observe whether RSS behavior changes. Without a restart, these experiments are unavailable.
+
+When a restart occurs:
+1. Capture baseline snapshot **immediately** at low RSS (full Phase 0 + Phase 1 data).
+2. Run the concentration check + arena→tid mapping **now** — it's far cheaper here than at saturation.
+3. Re-sample at multiple time points along the growth curve (1×, 2×, 3× initial RSS) to track which arena grows fastest.
+4. Evidence from prior runs (before the restart) remains valid as an **independent observation** to cross-verify the new run's findings.
+5. If another restart window is available, run ONE allocator-tuning experiment (e.g., `MALLOC_ARENA_MAX=2`) per window — never combine multiple env changes in the same restart.
+
 ### Phase 1: Translate diagnostics into constraints
 
 This is the highest-leverage step. Each diagnostic number is a **filter** on what the leaking code can look like. Done well, this phase eliminates 90%+ of code from suspicion before any source review.
