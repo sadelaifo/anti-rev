@@ -55,7 +55,7 @@
 >
 > ### 还需要 Exp-F 进一步确认
 >
-> 待执行 `cpp_memleak_constraint_experiments.md` §9 Exp-F(arena → thread 映射)。Exp-F 给出 tid 和它的 entry function 后,本 §3 会进一步细化为:**"thread tid=X (entry function = Y) 在调用链上某处持续 alloc 小对象不释放,审查范围 = 该 tid 调用链触及的代码,而非全代码库"**。
+> 待执行 `cpp_memleak_constraint_experiments.md` **Round 2 — Exp-F**(arena → thread 映射)。Exp-F 给出 tid 和它的 entry function 后,本 §3 会进一步细化为:**"thread tid=X (entry function = Y) 在调用链上某处持续 alloc 小对象不释放,审查范围 = 该 tid 调用链触及的代码,而非全代码库"**。
 >
 > ### 在 Exp-F 完成前,审查方应:
 >

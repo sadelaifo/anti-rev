@@ -151,7 +151,7 @@ LD_PRELOAD: 未设置
 2. 若 N>0,该 arena 对应 tid = ?
 3. 该 tid 的栈在做什么?
 
-→ 通过 `cpp_memleak_constraint_experiments.md` 新增的 **Exp-F (arena → thread 映射)** 解决。Exp-F 结果回填到本节末尾。
+→ 通过 `cpp_memleak_constraint_experiments.md` **Round 2 — Exp-F (arena → thread 映射)** 解决。Exp-F 结果回填到本节末尾。
 
 **Exp-F 结果区(待填)**:
 
@@ -168,7 +168,7 @@ LD_PRELOAD: 未设置
 
 调查期间目标进程被重启,RSS 从 21 GB 回落到约 3 GB。
 
-**前一轮(21 GB)数据仍然有效**作为独立观察(arena 集中 45.9×、大段稳定、3.88 GB/天速率);本轮(3 GB 起)按**重启诊断窗口** playbook 继续(见 `cpp_memleak_constraint_experiments.md` §11)。
+**前一轮(21 GB)数据仍然有效**作为独立观察(arena 集中 45.9×、大段稳定、3.88 GB/天速率);本轮(3 GB 起)按**重启诊断窗口** playbook 继续(见 `cpp_memleak_constraint_experiments.md` **Round 3 — 重启诊断窗口 playbook**)。
 
 **两轮交叉验证逻辑**:
 
