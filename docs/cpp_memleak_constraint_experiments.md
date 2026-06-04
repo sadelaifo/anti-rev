@@ -32,7 +32,7 @@
 
 | Round | 日期 | 触发 | 加入了什么 | 同步改动 |
 |---|---|---|---|---|
-| **Round 4** | 2026-06-04 | 在执行 R3.4.2(Exp-F 重启版)时 gdb 卡住,意识到原命令没有迭代上限 / 超时保护,gdb 卡住后强杀风险大 | 操作安全规则(L0-L3 风险分级、6 条纪律);卡住诊断阶梯;已有命令的安全版替换 | 所有 Round 的 gdb 命令统一加 `timeout` 包裹 + `while $n < N` 迭代上限;`call malloc_info` 标 L2 风险并给出 L1 替代 |
+| **Round 4** | 2026-06-04 | 在执行 R3.4 Exp-F 时 gdb 卡住,意识到原命令没有迭代上限 / 超时保护,gdb 卡住后强杀风险大;另发现 R3.4 子步骤顺序(原 R3.4.2 中间穿插 R3.4.3 集中度,再跳回 R3.4.2 步 5)逻辑不连贯 → 整段重排为 R3.4.1 ~ R3.4.6 线性流 | 操作安全规则(L0-L3 风险分级、6 条纪律);卡住诊断阶梯;已有命令的安全版替换;R3.4 线性化 | 所有 Round 的 gdb 命令统一加 `timeout` 包裹 + `while $n < N` 迭代上限;`call malloc_info` 标 L2 风险并给出 L1 替代;R3.4 拆成 6 步(baseline / arena walk / 集中度 / tid→arena / 线程名 / 钻取) |
 | **Round 3** | 2026-06-04 | 目标进程被重启,RSS 21 GB → 3 GB | 重启诊断窗口 playbook(多时点采样、对照实验、失败模式) | SKILL.md Phase 0 strategic note;工作文档 §3.6 |
 | **Round 2** | 2026-06-04 | Exp-A 实测 max/avg = 45.9× + 大段稳定 → 推翻"all-workers"画像 | Exp-F (arena → tid 映射);决策树补 Exp-F 分支;Exp-A 增量对照加 awk fallback (板上无 `join`) | handoff §3 加修订 callout;SKILL.md Phase 4 加 per-arena concentration check |
 | **Round 1** | 2026-06-03 | 怀疑初步"long-lived 容器小对象漏 erase"画像过窄,可能漏 Alt-1 单大对象、Alt-2 pool、Alt-3 背压、Alt-7 dlopen 等 | Exp-A~E 五件套(per-arena、大段、in-use 直方图、线程 bt、dlopen);修订表;决策树 | 创建本文档 |
@@ -174,7 +174,7 @@ awk 'NR==FNR{name[$1]=$2; next}
 |---|---|---|---|
 | R1.1 `call malloc_info` | gdb call,L2 | gdb 卡住 / 强杀 → 业务 arena 锁可能死锁 | **优先**走 R4.3.4 的 struct walk 拿 per-arena system_mem;**只有**需要完整 fastbin/rest histogram 才用 malloc_info,且预先确认 `timeout 60` 够 |
 | R2.2 arena 链遍历 | `while 1` | gdb,L1 但循环无上限 | 改为 `while $n < 200` + `timeout 60`(R4.3.4 的版本) |
-| R3.4.2 Exp-F 重启版 | 同 R2.2 + 取 `$_thread_name` | gdb,L1 但循环无上限 + 老 gdb 可能挂在 `$_thread_name` | 同 R4.3.4 / R4.3.5;线程名走 `/proc/PID/task/*/comm`(L0) |
+| R3.4.2 arena 链 walk / R3.4.4 tid→arena | 同 R2.2 + 取 `$_thread_name` | gdb,L1 但循环无上限 + 老 gdb 可能挂在 `$_thread_name` | 同 R4.3.4 / R4.3.5;线程名走 `/proc/PID/task/*/comm`(L0,R3.4.5) |
 | 所有 `gdb -batch -p $PID ...` | gdb attach | L1 | 全部包 `timeout 60` |
 | R2.7 gcore | gcore | L3 (冻 30 s ~ 5 min) | 仅在窗口期做;3 GB 进程当前可接受,21 GB 进程必须协调 |
 | `pkill -f "gdb..."` | gdb 清理 | 默认 SIGTERM,L0 | 保持默认信号,**禁止** `-9` / `-KILL` |
@@ -218,9 +218,20 @@ awk 'NR==FNR{name[$1]=$2; next}
 
 ## R3.4 立刻做(< 30 min)
 
+操作顺序线性,**从上往下跑**:
+
+| 步 | 干什么 | 输出文件 | 风险 |
+|---|---|---|---|
+| R3.4.1 | baseline snapshot (proc 读 + 全线程 bt) | `rss / pmap.full / big_segs.txt / sos.txt / threads / threads.bt` (+ 可选 `mi.xml`) | L0 + L1 (+ L2 可选) |
+| R3.4.2 | arena 链 walk (`main_arena.next`) | `arena_addr.txt` | L1 |
+| R3.4.3 | 算 max/avg + 找 top arena 编号 | (stdout) | L0 |
+| R3.4.4 | tid → arena 映射 (`thread_arena`) | `tid_arena.txt` | L1 |
+| R3.4.5 | 线程名 (走 `/proc/PID/task/*/comm`) | `tid_names.txt` | L0 |
+| R3.4.6 | 钻取嫌疑 tid + backtrace (4 块数据) | (stdout,贴给工作文档 §3.6) | L0 |
+
 ### R3.4.1 baseline snapshot
 
-> **风险等级**:大部分 L0/L1。**只有 `call malloc_info` 是 L2**(劫持线程跑 glibc 函数,可能锁 arena mutex)。如果不放心 L2,跳过 malloc_info 那一步,改用 Round 4 R4.3.4 的 struct walk 拿 per-arena system_mem;丢的只是 `<size>` 直方图细分。
+> **风险**:L0(/proc 读)+ L1(gdb 只读 thread bt)+ **L2 可选(call malloc_info)**。malloc_info 卡住可跳过,主要数据靠 R3.4.2 struct walk。
 
 ```bash
 PID=<新进程 PID>
@@ -235,41 +246,22 @@ awk '$2 > 65536 {print $1, $2, $3}' $SNAP/pmap.full | sort > $SNAP/big_segs.txt
 awk '/\.so/{print $NF}' /proc/$PID/maps | sort -u > $SNAP/sos.txt
 ls /proc/$PID/task | wc -l > $SNAP/threads
 
-# L1: gdb 只读 + 全部加 timeout
+# L1: gdb 只读 — 线程 backtrace
 timeout 90 gdb -batch -p $PID -ex 'set pagination off' \
     -ex 'thread apply all bt 8' -ex 'detach' > $SNAP/threads.bt 2>&1
 
-# L2: malloc_info — 劫持线程 call 函数,带 timeout 保护
-# 卡住时 Ctrl-C(不要 -9),拿不到 mi.xml 不影响其他指标
+# L2 可选: malloc_info(卡住 Ctrl-C,不要 -9)
 timeout 30 gdb -batch -p $PID \
     -ex "set \$f = (void *)fopen(\"$SNAP/mi.xml\", \"w\")" \
     -ex 'call (void) malloc_info(0, $f)' \
     -ex 'call (int) fflush($f)' \
     -ex 'call (int) fclose($f)' \
-    -ex 'detach' > /dev/null 2>&1 || echo "malloc_info 超时,跳过"
+    -ex 'detach' > /dev/null 2>&1 || echo "malloc_info skipped (L2 timeout)"
 
 echo "baseline at RSS=$(grep VmRSS $SNAP/rss) saved to $SNAP"
 ```
 
-如果 malloc_info 超时被跳过,可用 R4.3.4 替代拿 per-arena system_mem(只是没有 fast/rest bins 细分):
-
-```bash
-timeout 60 gdb -batch -p $PID \
-    -ex 'set pagination off' \
-    -ex 'set $ma = (struct malloc_state *)&main_arena' \
-    -ex 'set $a = $ma' -ex 'set $n = 0' \
-    -ex 'while $n < 200' \
-    -ex '  printf "arena %3d sysmem=%lu\n", $n, $a->system_mem' \
-    -ex '  set $a = $a->next' -ex '  set $n = $n + 1' \
-    -ex '  if $a == $ma' -ex '    loop_break' -ex '  end' \
-    -ex 'end' -ex 'detach' 2>&1 | grep '^arena ' > $SNAP/arena_sizes.txt
-```
-
-### R3.4.2 立刻做 Exp-F(arena→tid 映射 + 抓线程名)
-
-> **风险**:全部 L1(只读 + gdb attach)。已遵循 Round 4 R4.2 操作纪律:`timeout` 包裹、`while` 有迭代上限、线程名走 `/proc/.../comm` 而非 gdb 内置变量。
-
-#### 步 1: arena 链 + system_mem(L1)
+### R3.4.2 arena 链 walk(L1)
 
 ```bash
 timeout 60 gdb -batch -p $PID \
@@ -284,56 +276,69 @@ timeout 60 gdb -batch -p $PID \
     -ex 'end' -ex 'detach' 2>&1 | tee $SNAP/arena_addr.txt | tail -80
 ```
 
-#### 步 2: tid → arena(L1,**不取** `$_thread_name`,老 gdb 会卡)
+输出 N 行(N = arena 数,典型 1-64)。如果卡 / 没输出 / 报符号错,走 **R4.3 卡死诊断阶梯**。
+
+### R3.4.3 算 max/avg + 找 top arena(L0,纯 awk)
+
+```bash
+awk '/^arena / {
+    n++; s = $6; sum += s;
+    if (s > mx) { mx = s; mxn = $2; mxaddr = $4 }
+    if (mn == "" || s < mn) mn = s
+}
+END {
+    printf "arenas=%d  total=%.1f MB  avg=%.1f MB  max/avg=%.2fx  top=arena %s addr=%s (%.1f MB)\n",
+        n, sum/1024, sum/n/1024, mx/(sum/n), mxn, mxaddr, mx/1024
+}' $SNAP/arena_addr.txt
+
+# top 5
+echo "--- top 5 by sysmem ---"
+sort -k6 -n $SNAP/arena_addr.txt | tail -5
+```
+
+判读:
+
+- **max/avg > 5×** → 集中,当前 top arena 是嫌疑 → 继续 R3.4.4 找 tid
+- **max/avg ≈ 1**(均匀) → 重启后还没出现集中,等 T1 (+6h) 再跑 R3.4.2 + R3.4.3
+- **top 是 arena 0(main)** → 主线程在涨;继续 R3.4.4-6,但嫌疑代码区是 main 上的 manager / singleton
+- **top 是 arena N > 0** → 某 worker 在涨;R3.4.4 找出 tid,R3.4.5/6 给它身份
+
+### R3.4.4 tid → arena 映射(L1,**不用** `$_thread_name`)
 
 ```bash
 timeout 90 gdb -batch -p $PID \
     -ex 'set pagination off' \
     -ex 'thread apply all printf "tid=%d arena=%p\n", $_thread, thread_arena' \
     -ex 'detach' 2>&1 | grep '^tid=' > $SNAP/tid_arena.txt
-head -10 $SNAP/tid_arena.txt
+echo "got $(wc -l < $SNAP/tid_arena.txt) tids"
+head -5 $SNAP/tid_arena.txt
 ```
 
-#### 步 3: 线程名(L0,走 `/proc`,不需要 gdb)
+如果卡:看 **R4.3.5**(线程名分离方案)。
+
+### R3.4.5 线程名(L0,走 `/proc`)
 
 ```bash
 for tid in $(ls /proc/$PID/task); do
     echo "tid=$tid name=$(cat /proc/$PID/task/$tid/comm 2>/dev/null)"
 done > $SNAP/tid_names.txt
-head -10 $SNAP/tid_names.txt
+head -5 $SNAP/tid_names.txt
 ```
 
-#### 步 4: 合并 arena 映射 + 线程名
+### R3.4.6 钻取嫌疑 tid + backtrace(L0,合并所有上面)
 
-```bash
-awk 'NR==FNR { match($0, /tid=([0-9]+) name=(.*)/, m); name[m[1]]=m[2]; next }
-     { match($0, /tid=([0-9]+) arena=(.+)/, m);
-       printf "tid=%-5s arena=%-18s name=%s\n", m[1], m[2], name[m[1]] }' \
-    $SNAP/tid_names.txt $SNAP/tid_arena.txt > $SNAP/tid_arena_named.txt
-cat $SNAP/tid_arena_named.txt | head -20
-```
-
-#### 出问题怎么办
-
-参见 **R4.3 卡住诊断阶梯**。最常见:
-- 步 1 卡 → main_arena 符号不可见,看 R4.3.2
-- 步 2 卡 → 改 `head -10` 后跑;若仍卡,gdb 跟线程数有交互问题,考虑步 2 用 `info threads` 替代
-- 步 3 卡 → 不可能(纯 /proc 读),除非 PID 错了
-
-### R3.4.2 步 5: 从 R3.4.3 找出的 top arena 钻取嫌疑 tid + backtrace (L0)
-
-R3.4.3 给出 top arena 编号(本 case T0 = arena 55)。把它跟 R3.4.2 步 1-4 的输出 join,拿到嫌疑 tid + 线程名 + 该线程的栈帧:
+用 R3.4.3 给出的 top arena 编号(本 case T0 = arena 55)钻进去:
 
 ```bash
 TOP_ARENA_NUM=<从 R3.4.3 输出的编号,例如 55>
 
 # 1. top arena 的地址
-echo "=== top arena $TOP_ARENA_NUM 地址 ==="
+echo "=== top arena $TOP_ARENA_NUM ==="
 awk -v n=$TOP_ARENA_NUM '$2 == n {print}' $SNAP/arena_addr.txt
-
-# 2. 该 arena 对应的 tid(可能 1 个或多个)
 ARENA_ADDR=$(awk -v n=$TOP_ARENA_NUM '$2 == n {print $4}' $SNAP/arena_addr.txt)
 echo "top arena addr = $ARENA_ADDR"
+
+# 2. 该 arena 对应的 tid(可能 1 个或多个)
 echo "=== tid 绑到此 arena ==="
 grep "$ARENA_ADDR" $SNAP/tid_arena.txt
 
@@ -343,7 +348,7 @@ echo "suspect tid = $SUSPECT_TID"
 echo "=== thread name ==="
 grep "^tid=$SUSPECT_TID " $SNAP/tid_names.txt
 
-# 4. 嫌疑 tid 的 backtrace(栈顶 + 栈底 entry function)
+# 4. 嫌疑 tid 的 backtrace
 echo "=== suspect tid backtrace ==="
 awk -v t="$SUSPECT_TID" '
     /^Thread / { in_t = (index($0, "(LWP "t")") > 0) }
@@ -352,23 +357,7 @@ awk -v t="$SUSPECT_TID" '
 ' $SNAP/threads.bt
 ```
 
-输出的四块 (arena 地址 / tid / name / backtrace) 就是把 handoff §3 画像从"某 worker 持有大量小对象"细化到 **"thread tid=X (name=Y, entry=Z) 持有 N% heap"** 的全部素材。直接贴回工作文档 §3.6 / handoff §3。
-
-### R3.4.3 检查现在是否已经集中
-
-```bash
-awk -F'"' '
-  /<heap nr=/ { a=$2; in_h=1; s=0; next }
-  /<\/heap>/  { if (in_h) printf "%4d %12d\n", a, s; in_h=0; next }
-  in_h && /<system type="current"/ { s=$4 }
-' $SNAP/mi.xml | sort -k2 -n > $SNAP/arena_sizes.txt
-tail -5 $SNAP/arena_sizes.txt | awk '{printf "TOP arena %4d : %.1f MB\n", $1, $2/1024/1024}'
-```
-
-判读:
-
-- **现在 max/avg > 5×** → leak 重启后立刻集中,**当前 top arena 就是嫌疑** → 直接拿 tid 给审查方
-- **现在 max/avg ≈ 1**(均匀) → 集中是时间累积出来的,等下次涨到 5-6 GB 再观察 — 这本身也是有用结论:某 1 个 tid 在某段业务下开始独跑
+输出的四块(arena 地址 / tid / name / backtrace)就是 handoff §3 从"某 worker 持有大量小对象"细化到 **"thread tid=X (name=Y, entry=Z) 持有 N% heap"** 的全部素材。直接贴给工作文档 §3.6 / handoff §3。
 
 ## R3.5 多时点采样表
 
@@ -376,8 +365,8 @@ tail -5 $SNAP/arena_sizes.txt | awk '{printf "TOP arena %4d : %.1f MB\n", $1, $2
 
 | 时点 | 预期 RSS | 行动 |
 |---|---|---|
-| **T0** (现在) | 3 GB | baseline (R3.4.1) + Exp-F (R3.4.2) + 集中度 (R3.4.3) |
-| **T1** (+6 h) | ~4 GB | 重跑 R3.4.1 + R3.4.3;对比 arena Δ |
+| **T0** (现在) | 3 GB | 全套 R3.4.1 → R3.4.6 跑完(含 tid 锁定) |
+| **T1** (+6 h) | ~4 GB | R3.4.1 + R3.4.2 + R3.4.3(看集中度演化);若 top arena 跟 T0 一致,不需要重做 R3.4.4-6 |
 | **T2** (+24 h) | ~7 GB | 同上;集中度应该已经明显 |
 | **T3** (+48-72 h) | ~10-15 GB | 同上;跟前一轮 21 GB 时的 top arena **应当一致** —— 证实复现 |
 
