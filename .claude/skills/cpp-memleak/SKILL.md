@@ -466,6 +466,40 @@ If any box is unchecked, you have a partial answer; communicate uncertainty to t
 
 ---
 
+## Strategic note: when to stop external diagnosis
+
+External (process-not-yet-instrumented) diagnosis — snapshot diffing, `/proc` reads, gdb attach with no business symbols — has a sharp diminishing-returns curve. Recognize when you've hit it. Continuing past the inflection point doesn't fail loudly; it silently wastes the diagnosis driver's energy and accumulates plausible-looking but unverified narrative around real constraints.
+
+Signs you've hit the inflection:
+
+1. **Data self-contradicts under the constraints of the allocator's data model.** (E.g. the global `<system current>` Δ should equal Σ per-arena Δ in glibc's malloc_info; if they disagree, you've reached the limit of external introspection — the next step needs `LD_PRELOAD` allocator wrapping or `gcore` offline, not more snapshots.)
+2. **Each new round of snapshots narrows the constraint set by less than half the previous round.** Diminishing returns.
+3. **The driver of the diagnosis says they're tired / can't sustain it.** Human attention is the scarce resource; respect it.
+4. **Commands are getting more complex but the value-per-command is dropping.** You're now answering meta-questions ("why doesn't my awk add up?") rather than substantive ones ("where is the leak?").
+5. **The core hard constraints are tight enough for source review to act on.** Don't keep refining when the next step already has enough.
+
+When any one triggers, package and hand off. The hand-off doc should structure findings into three tiers:
+
+- **A. Confirmed hard constraints** (high confidence, multiple independent observations)
+- **B. Single-point observations** (medium confidence, could be coincidence — one snapshot caught the suspect thread mid-`std::string::replace` is NOT the same as confirmed evidence of string-based accumulation)
+- **C. Unresolved contradictions / open questions** (explicitly call out what you couldn't resolve; the source-review team should know which mysteries are yours and which are theirs)
+
+Resist the urge to bundle in the speculative narratives you built and discarded along the way. The clean three-tier hand-off is more useful than a chronological story of your investigation.
+
+Acceptable next steps when external diagnosis is exhausted, ranked by cost:
+
+| Next step | Cost | When to choose |
+|---|---|---|
+| Source review (hand off to whoever has source) | 0 | Default |
+| LD_PRELOAD allocator wrapper with backtrace dump | ~hundreds of LOC C + one restart | Source review is 2-3 weeks without result |
+| `gcore` + dev-machine offline analysis | ~30 s to several minutes process freeze | Need to confirm actual in-use object distribution / container size |
+| `MALLOC_ARENA_MAX=2` experiment | One restart | Suspect your own diagnostic picture is biased |
+| jemalloc + heap profiling | One restart + build jemalloc | Need real allocation stack traces; ptmalloc has no built-in profiler |
+
+Stopping external diagnosis is not failure — it's transferring the work to the right tool. The investigation continues; the diagnosis driver just rotates out.
+
+---
+
 ## Output format expectations
 
 When concluding an investigation, present to the user:

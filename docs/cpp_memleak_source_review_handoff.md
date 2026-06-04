@@ -40,6 +40,52 @@
 
 ## 3. 嫌疑代码必须满足的约束(Phase 1 输出)
 
+> ### 最终版(2026-06-04 #3)— 外部诊断已停,转交源码审查
+>
+> 经过 7 轮 snapshot diff 与多组实验,外部诊断到达边际收益递减点(详见 `cpp_memleak_constraint_experiments.md` Round 8)。下面分**三档置信度**列结论。**审查时优先采信 A 档**;B 档作为线索辅助;C 档是已知未解,可能源码审查能直接解开。
+>
+> ### A. 已确认硬约束(高置信)
+>
+> | 事实 | 凭据 |
+> |---|---|
+> | leak 速率 = **~168 MB/h ≈ 4 GB/天** | 两个独立时段、不同 RSS 水位 (21 GB / 3-4 GB) 测得 167 / 162 / 168 MB/h,误差 < 5% |
+> | leak 是**真累积**(非碎片) | T0→T1 Δrest ≈ 0 而 Δsystem ≈ ΔRSS;ptmalloc 利用率 97.7% |
+> | 是 **runtime-driven 不是 init-time** | 16 h uptime × 162 MB/h 推算的 baseline ≈ 400 MB,合理 |
+> | 是 **稳态线性**(非 burst / 阈值触发) | T0 → T1 4.7 h 预测准 ±5% |
+> | **plugin combo 特定**:4 个 plugin 这个组合下漏,其他组合不漏 | 用户报告(强度 = 用户观察,需源码侧二次确认) |
+> | **不是线程泄漏 / 自定义 allocator / 共享内存 / 第三方 mmap 大段** | Round 1 全部排除(线程数稳定、无 LD_PRELOAD、Pss ≈ Rss、mmap 段稳定) |
+> | **glibc 2.34 ptmalloc** | `ldd --version` |
+>
+> ### B. 单点观察(中等置信,可能巧合,不要单独依赖)
+>
+> | 观察 | 警告 |
+> |---|---|
+> | T0 snapshot:arena 55 持有 2 GB(占 67%) | 这是**历史累积**(从 process start 到 T0 的 16 h 间累积),T0 → T1 期间它**没再涨**;**当前活跃 leak 不在 arena 55** |
+> | T0 高 CPU 三胞胎 tid {36623, 36615, 36093},持续吃 25-35% 一个核 | 角色稳定(T0/T1 都是这 3 个);但 CPU 高 ≠ 内存高,不能直接断定它们就是 leak 源 |
+> | T0 抓到栈顶 `std::string::_M_limit`;T1 抓到栈顶 `ByteString_hash` | 两次都命中 string/bytes 操作族 → 这条线索**信度从单次的"偶然"提升到"模式可能存在"**,但**没到"确定"** —— 业务里 string 操作通常很普遍,1/59 几率随机抓到也不算异常 |
+> | 单线程业务名 `worker` 全是同名(41 个) | 嫌疑 tid 不能从名字判断,只能靠 CPU + 栈 |
+>
+> ### C. 未解矛盾(留给审查方或下一波工具)
+>
+> | 问题 | 状态 |
+> |---|---|
+> | T0 → T1 全局 `<system current>` Δ = +782 MB,但 per-arena Δ 报"全是 0",数学上 glibc malloc_info 不可能两者并存 | 用户的诊断流可能漏算(top 10 排序的视觉误判);或 mi.xml 抓取有问题;或我对 malloc_info 全局字段的理解偏差 |
+> | arena 55 = 67% 是历史累积,**当下活跃 leak 落在哪儿不明** | 可能多 arena 分散涨;可能新 arena 在 T0 后创建;可能 mmap 大对象路径(`<total mmap>` 未变排除这个);源码审查或 LD_PRELOAD wrapper 能直接解 |
+> | "其他 plugin 组合不漏"的强度 | 用户观察,未做严格 elimination 实验。如果源码审查没找到明显嫌疑,**先做 elimination 实验**比继续审查更高效 |
+>
+> ### 给审查方的指南
+>
+> **不要** 围绕"arena 55"或"`std::string::replace`"做窄化搜索。**要** 按 SKILL.md "First principles" 的方法对每个**长寿持有结构**(plugin / 平台 / 第三方库的任何 vector / map / queue / callback registry / cycle)做语义对称性分析:
+>
+> 1. 该结构在**每秒接受多少次 push**?(目标:找 ~70 Hz 量级)
+> 2. 推入对象的平均字节数?(目标:~500 B)
+> 3. **erase / 清理路径是否真的触发**?(尤其要看清理条件**是否依赖某条 4-plugin combo 才走的代码**)
+> 4. 累积 16 小时后,该结构能否填到 ~ 几 GB?
+>
+> 任何一个结构同时满足这 4 条,就是强嫌疑。
+
+
+
 > ### ⚠ 2026-06-04 修订:原画像已被 Exp-A 推翻
 >
 > 跑了 `docs/cpp_memleak_constraint_experiments.md` 中的 Exp-A 后:

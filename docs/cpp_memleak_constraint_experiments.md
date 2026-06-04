@@ -32,6 +32,7 @@
 
 | Round | 日期 | 触发 | 加入了什么 | 同步改动 |
 |---|---|---|---|---|
+| **Round 8** | 2026-06-04 | Round 7 跑 R7.4 后数据自相矛盾(全局 system Δ +782 MB 但 per-arena Δ 报"全是 0",数学不可能并存);继续追细节会让诊断主导者疲劳(用户原话:"我已经定位的顶不住了"),边际收益递减 | 诊断转交 playbook:识别"该停了"的 5 个信号;**硬约束打包**的格式;源码审查方接力的清单;何时考虑 escalate 到 gcore / LD_PRELOAD 而非继续外部 diff | SKILL.md 加 "Strategic note: when to stop external diagnosis";handoff §3 重写为"已知 vs 未知"清单 |
 | **Round 7** | 2026-06-04 | T1 实测发现一个我之前没考虑到的解:**arena 55 数值锁定(2048 → 2047 MB)同时 max/avg 不变(45.2 → 45.17)** —— 我先把这解读成"arena 55 继续主导",其实是"arena 55 锁定 + 增长在别处"。**单 snapshot 的 arena 集中 ≠ 活跃累积者**,这个区分之前所有 Round 都没明确写过 | "历史累积 vs 活跃累积"判别 playbook;max/avg 跨 snapshot 解读规则(同一数字有多解);定位活跃累积者的 3 个角度(per-arena Δ / 全局 system mmap Δ / pmap 大段 Δ) | SKILL.md Phase 1 加 max/avg 多解警告;防过拟合 checklist 加"是否实际算了 per-arena Δ" |
 | **Round 6** | 2026-06-04 | Round 5 锁定嫌疑 tid 后,意识到还缺一个关键判别:**leak 是 init-time(进程启动一次性分配)还是 runtime(持续累积)**,两者修复方向截然不同;同时发现"snapshot 取的时点 = 进程刚重启"的隐含假设没验证;**纯 process uptime 这一个数据点能砍掉大量假设** | 多 snapshot 速率交叉验证 playbook:进程运行时长反推 init baseline / 用已知速率预测下一次 snapshot 并校验 / 速率换算成"函数频率 × 对象大小"的精细化画像 | SKILL.md Phase 4 加 "multi-snapshot rate validation" 作为通用 cross-verification 方法;工作文档 §3.7 记录本 case 实测 |
 | **Round 5** | 2026-06-04 | R3.4.2 在板上连续踩三个坑(gdb 无 Python → 无 struct malloc_state → 无 main_arena 符号),发现 libc 被深度 strip 时精确 arena→tid 映射代价过高,而本 case 主要目的(识别嫌疑 tid)用更廉价的方式也能达到 | 简化嫌疑识别 playbook(纯 L0:线程名分组 + CPU 时间排行 + 栈顶分类);何时跳过精确 arena 映射的判断标准 | R3.4.4 doc header 加 "走不通时跳 Round 5" 提示;识别失败兜底指向 gcore 离线(R2.7) |
@@ -39,6 +40,81 @@
 | **Round 3** | 2026-06-04 | 目标进程被重启,RSS 21 GB → 3 GB | 重启诊断窗口 playbook(多时点采样、对照实验、失败模式) | SKILL.md Phase 0 strategic note;工作文档 §3.6 |
 | **Round 2** | 2026-06-04 | Exp-A 实测 max/avg = 45.9× + 大段稳定 → 推翻"all-workers"画像 | Exp-F (arena → tid 映射);决策树补 Exp-F 分支;Exp-A 增量对照加 awk fallback (板上无 `join`) | handoff §3 加修订 callout;SKILL.md Phase 4 加 per-arena concentration check |
 | **Round 1** | 2026-06-03 | 怀疑初步"long-lived 容器小对象漏 erase"画像过窄,可能漏 Alt-1 单大对象、Alt-2 pool、Alt-3 背压、Alt-7 dlopen 等 | Exp-A~E 五件套(per-arena、大段、in-use 直方图、线程 bt、dlopen);修订表;决策树 | 创建本文档 |
+
+---
+
+# Round 8 (2026-06-04 #6) — 体面转交:何时停止外部诊断
+
+## R8.1 触发
+
+外部 snapshot diff 跑了多轮后,出现至少一种:
+
+1. **数据自相矛盾**(本 case:全局 system Δ +782 MB,而 per-arena Δ 报"全是 0",glibc 数学定义不可能并存) —— 进一步追问需要 LD_PRELOAD allocator wrapper 或 gcore 离线,**外部 diff 本身已达极限**
+2. **每轮 snapshot 收窄到的新约束 < 上轮的一半** —— 边际收益递减
+3. **诊断主导者疲劳**(用户原话:"我已经定位的顶不住了") —— 人的精力是稀缺资源
+4. **命令复杂度增长但产出价值降低**(开始追"为什么 awk 数学不对"而不是"嫌疑代码在哪")
+5. **核心硬约束已经够窄**,内部审查能直接动手
+
+**任一信号触发** → 进入 R8.2 转交,**不要继续追外部 diff**。
+
+## R8.2 硬约束打包格式
+
+把已经确认的事实结构化交给源码审查方,**不要混进未验证的猜测**:
+
+```
+## A. 已确认硬约束(高置信)
+- [量化指标]:速率 / 集中度 / 时间窗
+- [已排除]:线程泄漏 / 碎片化 / 共享内存 / init-time / ...
+- [机制]:从 SKILL.md first principles 看落到 A-F 的哪个或哪几个候选
+
+## B. 单点观察(中等置信,可能是巧合)
+- 单次 snapshot 抓到的栈顶函数
+- 单次抓到的 arena 集中数字(可能历史 + 活跃混合)
+
+## C. 未确认(给审查方做开放调查)
+- arena 55 是历史累积 vs 活跃累积(数据矛盾未解)
+- combo-dependent 是真互动 vs 配置触发
+- 字符串处理是因果 vs 巧合
+```
+
+## R8.3 转交后的下一步选项(按代价排序)
+
+| 选项 | 代价 | 何时选 |
+|---|---|---|
+| **源码审查**(交给有源码权限的人 / 内部模型) | 0 | 默认 |
+| **LD_PRELOAD malloc wrapper** + backtrace | 几百行 C + 一次重启 | 源码审查 2-3 周无果 |
+| **gcore + dev 机离线**(完整符号 + heap walk) | 一次冻 30 s ~ 几分钟 | 需要确认嫌疑容器实际 size / 实际 in-use 对象分布 |
+| **MALLOC_ARENA_MAX=2 实验** | 一次重启 | 怀疑诊断画像本身有偏差,想用对照实验 reset |
+| **换 jemalloc + profiling** | 一次重启 + 装 jemalloc-prof | 真要捕获 leak stack;ptmalloc 没有内置 profiler |
+
+**建议默认:源码审查打头 + 给一个 LD_PRELOAD wrapper 待用**(打包好,审查不快出结果就跑)。
+
+## R8.4 转交不该附带的东西
+
+| 不要附 | 原因 |
+|---|---|
+| 你过程中提出过但已被推翻的假说 | 信息污染,审查方会被带偏 |
+| 单点 snapshot 没复现的"smoking gun" | 单次抓到的栈顶可能巧合(本 case `std::string::replace` 没在 T1 复现成同名函数) |
+| 你的猜测拼凑的"故事" | 审查方应基于事实自己构造解释 |
+| "可能是 X" 的发散列表 | 列硬约束,把"可能"留给审查方判断 |
+
+## R8.5 不要让自己跌入的陷阱
+
+1. **完美主义**:追问"为什么这个数据不对"到底,常常徒劳。承认有些数据点解释不了,但**不影响主结论**。
+2. **沉没成本**:已经投入十几小时,再追一小时也无所谓 → 错。每次决定下一步都用"价值 vs 代价"重新评估
+3. **微小新发现**:T1 抓到 `ByteString_hash` 单次很兴奋,但要警惕**单次抓到 = 巧合**;两次同族抓到 = 模式;三次抓到 = 高置信
+4. **不愿承认混乱**:数据矛盾时硬解释比"我承认这里我不懂"更危险
+5. **不愿停**:停止外部诊断不是失败,是把工作交给更合适的工具(源码 / wrapper / 离线)
+
+## R8.6 本 case 实例化
+
+R8.1 触发条件 1 + 3 + 5 同时命中。诊断转入源码审查阶段。打包成:
+
+- **硬约束**:rate 168 MB/h、~70 Hz、~500 B/对象、3 个高 CPU worker、两次抓到 string/bytes 操作族、combo-dependent(用户报告)
+- **单点观察(降权)**:arena 55 集中 / std::string::replace / ByteString_hash 各自不可单独依赖
+- **未解矛盾**:per-arena Δ 报零但全局 Δ +782 MB(转交后由源码审查或 LD_PRELOAD wrapper 解)
+
+→ 写入 `handoff §3` 最终版,把"已确认 / 单点 / 未解"三档分开。**审查方接力**,外部诊断暂停。
 
 ---
 

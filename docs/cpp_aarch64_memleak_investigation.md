@@ -219,6 +219,48 @@ LD_PRELOAD: 未设置
 >
 > 嫌疑画像(包括 handoff §3 的"Pattern A monotonic map")**需要在下面 §3.9 数据出来后重新评估**。先不要按现有画像扫源码。
 
+### 3.9 外部诊断停止,转入源码审查(2026-06-04 #6)
+
+跑 R7.4 三个角度后,数据出现**自相矛盾**:
+
+| 量 | T0 | T1 | Δ |
+|---|---|---|---|
+| 全局 `<system type="current">` | 3,306,582,016 B | 4,127,260,672 B | **+782 MB** ✓ |
+| `<total type="mmap">` | (unchanged) | (same) | 0 |
+| per-arena Δ(用户报告) | — | — | **报告全为 0** ✗ |
+| RSS | 3,836,296 KB | 4,643,844 KB | +789 MB |
+
+按 glibc 2.34 malloc_info 定义,**全局 `<system current>` = Σ(per-arena `system_mem`)**(mmap 部分另算)。所以"+782 MB 全局 Δ"和"per-arena Δ 全是 0"数学上不可能并存。
+
+**未解释的可能**:
+- 用户的 per-arena Δ 检查在 top-10 排序里的视觉误判(实际是分散小幅涨,合起来 782 MB)
+- T1 新增了 arena(用户的 awk 可能漏算新 arena)
+- 我对 malloc_info 全局字段语义的理解有偏差
+
+按 **Round 8 体面转交规则**,触发条件 1 + 3 + 5 同时命中(数据矛盾 + 诊断主导者疲劳 + 核心硬约束已够窄),**外部诊断暂停**。
+
+**已确认硬约束**(整理到 handoff §3 A 档):
+1. leak 速率 **~168 MB/h ≈ 4 GB/天**,稳态
+2. runtime-driven(不是 init-time)
+3. plugin combo 特定(此组合漏,其他不漏 —— 用户观察)
+4. 已排除:线程泄漏、自定义 allocator、共享内存、第三方库 mmap 大段
+5. glibc 2.34 ptmalloc
+
+**单点观察(降权,handoff §3 B 档)**:
+- arena 55 是**历史累积**(T0 时的 67% 集中度),T0 之后未涨,**当前活跃 leak 不在 arena 55**
+- 高 CPU 三胞胎 tid {36623, 36615, 36093}(可能是 leak 源也可能只是恰好繁忙)
+- 两次抓到栈顶 string/bytes 操作(`std::string::_M_limit`、`ByteString_hash`)
+
+**未解矛盾(handoff §3 C 档)**:
+- T0 → T1 per-arena Δ 与全局 Δ 的算术不一致
+- 当前活跃 leak 的精确落点(per-arena 分散 / 新 arena / 其他)
+
+**下一步**(按代价排序):
+1. **源码审查**(默认):内部模型按 SKILL.md first principles + 4 个量化约束(70 Hz × 500 B × 长寿持有 × combo-dependent erase 不触发)对每个 plugin / 平台 / 第三方库扫
+2. **Plugin elimination 实验**(轻量,推荐并行):验证"其他组合不漏"前提强度
+3. **LD_PRELOAD malloc wrapper**(中等代价):若 1-2 周源码审查无果,捕获真实 leak 的 stack trace
+4. **gcore + dev 机**(中等代价):确认 in-use 对象实际 size 分布
+
 按 R6.4 流程跑 T1 snapshot,所有预测在 ±5% 内对上:
 
 | 指标 | T0 (11:02) | T1 (15:43) | Δ | 推断 |
