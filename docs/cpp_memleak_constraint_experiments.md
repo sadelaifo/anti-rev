@@ -12,7 +12,19 @@
 - **加入了什么**(新的实验/playbook/技巧)
 - **同步改动**(其他文档跟着变了什么)
 
-但**操作流程**上,新读者仍应**先读 Round 1 的"同步采集"**(它是所有实验的基础),然后按当前 case 状态跳到对应 Round。
+但**操作流程**上,新读者仍应**先读 Round 4 操作安全规则**,再读 Round 1 的"同步采集"(它是所有实验的基础),然后按当前 case 状态跳到对应 Round。
+
+---
+
+## 第一原则:不能把业务进程搞挂
+
+**诊断的目的是观察,不是修改**。本文档所有命令都**默认运行在生产或类生产环境**,业务进程不能因为诊断动作出现:
+- 崩溃 / 段错误
+- 业务线程死锁(被 gdb 操作锁住的 mutex 没被释放)
+- 长时间停顿(gcore 类除外,需明确选窗口)
+- 内存被写入修改
+
+所有 Round 的命令都必须通过 **Round 4 操作安全规则**(R4.1-R4.4)的审视后才能执行。
 
 ---
 
@@ -20,9 +32,152 @@
 
 | Round | 日期 | 触发 | 加入了什么 | 同步改动 |
 |---|---|---|---|---|
+| **Round 4** | 2026-06-04 | 在执行 R3.4.2(Exp-F 重启版)时 gdb 卡住,意识到原命令没有迭代上限 / 超时保护,gdb 卡住后强杀风险大 | 操作安全规则(L0-L3 风险分级、6 条纪律);卡住诊断阶梯;已有命令的安全版替换 | 所有 Round 的 gdb 命令统一加 `timeout` 包裹 + `while $n < N` 迭代上限;`call malloc_info` 标 L2 风险并给出 L1 替代 |
 | **Round 3** | 2026-06-04 | 目标进程被重启,RSS 21 GB → 3 GB | 重启诊断窗口 playbook(多时点采样、对照实验、失败模式) | SKILL.md Phase 0 strategic note;工作文档 §3.6 |
 | **Round 2** | 2026-06-04 | Exp-A 实测 max/avg = 45.9× + 大段稳定 → 推翻"all-workers"画像 | Exp-F (arena → tid 映射);决策树补 Exp-F 分支;Exp-A 增量对照加 awk fallback (板上无 `join`) | handoff §3 加修订 callout;SKILL.md Phase 4 加 per-arena concentration check |
 | **Round 1** | 2026-06-03 | 怀疑初步"long-lived 容器小对象漏 erase"画像过窄,可能漏 Alt-1 单大对象、Alt-2 pool、Alt-3 背压、Alt-7 dlopen 等 | Exp-A~E 五件套(per-arena、大段、in-use 直方图、线程 bt、dlopen);修订表;决策树 | 创建本文档 |
+
+---
+
+# Round 4 (2026-06-04 #2) — 操作安全规则 + 卡死诊断
+
+## R4.1 风险等级
+
+每条命令的风险等级 **必须** 在文档里标注。L2 / L3 命令需要明确判断后才执行。
+
+| 等级 | 含义 | 例子 | 是否会影响业务 |
+|---|---|---|---|
+| **L0 — 无风险** | 只读 `/proc/PID/*` 文件 | `grep VmRSS`,`pmap -x`,`ls /proc/PID/task`,`cat /proc/PID/maps` | 否 |
+| **L1 — 低风险** | gdb attach + **只读取**(不 call、不 set) | `info threads`,`info proc`,struct field 读取(`p main_arena.system_mem`),`thread apply all bt`,arena 链遍历 | gdb attach 时进程被短暂 ptrace-stop(典型 100 ms-数秒);gdb 安全退出后恢复 |
+| **L2 — 中风险** | gdb **call 业务进程内函数**,劫持某个线程跑代码 | `call (void) malloc_info(0, $f)`,`call (void) malloc_stats()`,任何 `call ...` | call 期间该线程被劫持执行;**强杀 gdb 可能让线程栈帧损坏 + arena 锁不释放 → 业务死锁** |
+| **L3 — 高风险** | 改业务进程状态 / 写内存 / 长时间冻结 | `set var x = ...`,`gcore`(冻 3-300 秒不等) | 直接改业务,或长时间停服;**只在明确窗口期做** |
+
+**规则**:本文档默认所有命令 ≤ L1。**L2 / L3 命令必须在标题里显式标注**,执行前确认 OK 才跑。
+
+## R4.2 操作纪律(必读)
+
+1. **绝不强杀 gdb**(没有 `kill -9`)。gdb 被 SIGKILL 时如果正在 call 业务函数,目标线程栈帧可能损坏,持有的 arena 锁也不会释放 → **其他线程后续 malloc 时会死锁**。
+   - 卡住时:**先 Ctrl-C**(gdb 会清理 pending call)
+   - 等 30 秒还不返回:`pkill -TERM -f "gdb.*-p $PID"`(默认 SIGTERM,gdb 能处理)
+   - 仍不返回:**接受这个 gdb 卡着,不要再 kill**。gdb 不退出 ptrace 锁定就维持,业务在 ptrace 锁下不会因为多卡几分钟出问题。让它自然超时或后续运维介入。
+
+2. **每个 gdb 命令都包 `timeout`**:
+    ```bash
+    timeout 60 gdb -batch -p $PID -ex '...' -ex 'detach'
+    ```
+    `timeout` 默认发 SIGTERM,gdb 能干净退出。**禁止用 `timeout -s KILL`**。
+
+3. **每个 gdb while 循环加迭代上限**:`while $n < 200`,**禁止 `while 1`**。万一指针损坏,最多打印 N 行就退出,不会无限循环。
+
+4. **能读 struct 就不 call 函数**。例:per-arena system_mem 可以直接读 `main_arena.next->system_mem`,不需要 call malloc_info()。
+
+5. **gcore (L3) 仅在低峰时段做**。3 GB 进程冻 ~30 秒,21 GB 进程冻 ~3-5 分钟。**必须**:
+    - 跟业务方确认时间窗口
+    - 落盘到本地非 mmap 路径(`/tmp` 安全;不要 NFS / 远程挂载)
+    - dump 完立刻 detach
+
+6. **绝不做**:
+    - `set var x = ...`(写业务内存)
+    - `call free(...)` / `call any_business_function(...)`(L2 + 高副作用)
+    - `signal SIG*` / 主动给业务发信号
+    - 同时跑多个 gdb attach 到同一 PID(ptrace 互斥,后到的卡死)
+
+## R4.3 卡住诊断阶梯
+
+任何 gdb 命令卡住 30 秒以上,**先 Ctrl-C 让 gdb 退**,再走下面阶梯排查根因。每一步独立跑,出问题打住。
+
+### R4.3.1 gdb 能不能 attach(L1,2-3 秒返回)
+
+```bash
+timeout 15 gdb -batch -p $PID -ex 'info proc' -ex 'detach' 2>&1 | head -20
+```
+
+- **几秒返回 + process info** → attach 正常,继续 R4.3.2
+- **超时 / 无返回** → ptrace 被锁住。检查:
+    - 是否别的 gdb 还 attach 着:`ps aux | grep "gdb.*$PID"`
+    - ptrace_scope 是否禁了:`cat /proc/sys/kernel/yama/ptrace_scope`(0 / 1 ok;2 / 3 受限)
+    - 进程是否还活着:`kill -0 $PID && echo alive`
+
+### R4.3.2 `main_arena` 符号能不能看到(L1,2 秒)
+
+```bash
+timeout 15 gdb -batch -p $PID -ex 'p &main_arena' -ex 'detach' 2>&1 | grep -v '^\[' | tail -5
+```
+
+- **看到 `$1 = (struct malloc_state *) 0x7fxxxxxxxxxx`** → 符号可见,继续 R4.3.3
+- **`No symbol "main_arena"` / `Cannot access memory`** → glibc 被 strip。装 `libc6-dbg` (Debian/Ubuntu) / `glibc-debuginfo` (CentOS),或走 R2.7 gcore 离线方案
+- **卡住** → gdb 自身有问题,看 dmesg / 重启 gdb
+
+### R4.3.3 `info threads` 能不能跑(L1,10-30 秒,~59 线程)
+
+```bash
+timeout 60 gdb -batch -p $PID -ex 'set pagination off' -ex 'info threads' -ex 'detach' 2>&1 | wc -l
+```
+
+- 输出 ~60 行 → 正常,继续 R4.3.4
+- **超时** → 线程数过多或部分线程在不响应的 syscall。**不再尝试 thread apply 全集**,改用 `info threads | head -10` 只看头部样本
+
+### R4.3.4 简化的 arena 链遍历(L1,带迭代上限)
+
+```bash
+timeout 60 gdb -batch -p $PID \
+    -ex 'set pagination off' \
+    -ex 'set $ma = (struct malloc_state *)&main_arena' \
+    -ex 'set $a = $ma' \
+    -ex 'set $n = 0' \
+    -ex 'while $n < 200' \
+    -ex '  printf "arena %3d  addr=%p  sysmem=%9lu KB  threads=%lu\n", \
+              $n, $a, $a->system_mem/1024, $a->attached_threads' \
+    -ex '  set $a = $a->next' \
+    -ex '  set $n = $n + 1' \
+    -ex '  if $a == $ma' \
+    -ex '    loop_break' \
+    -ex '  end' \
+    -ex 'end' \
+    -ex 'detach' 2>&1 | tail -80
+```
+
+唯一改动相对原 R2.2 / R3.4.2:`while 1` → `while $n < 200`,**最多 200 行就 break**,加 `timeout 60`。
+
+### R4.3.5 线程映射 — 不取 `$_thread_name`
+
+老 gdb 没有 `$_thread_name`,如果原命令在这里卡,把它去掉:
+
+```bash
+timeout 90 gdb -batch -p $PID \
+    -ex 'set pagination off' \
+    -ex 'thread apply all printf "tid=%d arena=%p\n", $_thread, thread_arena' \
+    -ex 'detach' 2>&1 | grep '^tid=' | head -100
+```
+
+线程名后面单独用 `/proc/$PID/task/*/comm` 读(L0,不需要 gdb):
+
+```bash
+for tid in $(ls /proc/$PID/task); do
+    echo "tid=$tid name=$(cat /proc/$PID/task/$tid/comm)"
+done > $SNAP/tid_names.txt
+```
+
+然后用 awk merge 这两份输出:
+
+```bash
+awk 'NR==FNR{name[$1]=$2; next}
+     {match($0, /tid=([0-9]+)/, m); t=m[1]; print $0, "name="name["tid="t]}' \
+    $SNAP/tid_names.txt $SNAP/tid_arena.txt
+```
+
+## R4.4 已有命令的安全版替换
+
+下表对照 Round 1-3 各命令的风险等级,以及发现问题后需替换的版本。
+
+| 原章节 | 命令 | 风险 | 安全替换 |
+|---|---|---|---|
+| R1.1 `call malloc_info` | gdb call,L2 | gdb 卡住 / 强杀 → 业务 arena 锁可能死锁 | **优先**走 R4.3.4 的 struct walk 拿 per-arena system_mem;**只有**需要完整 fastbin/rest histogram 才用 malloc_info,且预先确认 `timeout 60` 够 |
+| R2.2 arena 链遍历 | `while 1` | gdb,L1 但循环无上限 | 改为 `while $n < 200` + `timeout 60`(R4.3.4 的版本) |
+| R3.4.2 Exp-F 重启版 | 同 R2.2 + 取 `$_thread_name` | gdb,L1 但循环无上限 + 老 gdb 可能挂在 `$_thread_name` | 同 R4.3.4 / R4.3.5;线程名走 `/proc/PID/task/*/comm`(L0) |
+| 所有 `gdb -batch -p $PID ...` | gdb attach | L1 | 全部包 `timeout 60` |
+| R2.7 gcore | gcore | L3 (冻 30 s ~ 5 min) | 仅在窗口期做;3 GB 进程当前可接受,21 GB 进程必须协调 |
+| `pkill -f "gdb..."` | gdb 清理 | 默认 SIGTERM,L0 | 保持默认信号,**禁止** `-9` / `-KILL` |
 
 ---
 
@@ -65,49 +220,105 @@
 
 ### R3.4.1 baseline snapshot
 
+> **风险等级**:大部分 L0/L1。**只有 `call malloc_info` 是 L2**(劫持线程跑 glibc 函数,可能锁 arena mutex)。如果不放心 L2,跳过 malloc_info 那一步,改用 Round 4 R4.3.4 的 struct walk 拿 per-arena system_mem;丢的只是 `<size>` 直方图细分。
+
 ```bash
 PID=<新进程 PID>
 T=$(date +%Y%m%d_%H%M)_baseline
 SNAP=/tmp/mem_snap/$T
 mkdir -p $SNAP
 
-# Round 1 — 同步采集 的完整命令
+# L0: /proc 只读
 grep -E 'VmRSS|VmSize' /proc/$PID/status > $SNAP/rss
-gdb -batch -p $PID \
+pmap -x $PID > $SNAP/pmap.full
+awk '$2 > 65536 {print $1, $2, $3}' $SNAP/pmap.full | sort > $SNAP/big_segs.txt
+awk '/\.so/{print $NF}' /proc/$PID/maps | sort -u > $SNAP/sos.txt
+ls /proc/$PID/task | wc -l > $SNAP/threads
+
+# L1: gdb 只读 + 全部加 timeout
+timeout 90 gdb -batch -p $PID -ex 'set pagination off' \
+    -ex 'thread apply all bt 8' -ex 'detach' > $SNAP/threads.bt 2>&1
+
+# L2: malloc_info — 劫持线程 call 函数,带 timeout 保护
+# 卡住时 Ctrl-C(不要 -9),拿不到 mi.xml 不影响其他指标
+timeout 30 gdb -batch -p $PID \
     -ex "set \$f = (void *)fopen(\"$SNAP/mi.xml\", \"w\")" \
     -ex 'call (void) malloc_info(0, $f)' \
     -ex 'call (int) fflush($f)' \
-    -ex 'call (int) fclose($f)' > /dev/null 2>&1
-pmap -x $PID > $SNAP/pmap.full
-awk '$2 > 65536 {print $1, $2, $3}' $SNAP/pmap.full | sort > $SNAP/big_segs.txt
-gdb -batch -p $PID -ex 'set pagination off' \
-    -ex 'thread apply all bt 8' -ex 'detach' > $SNAP/threads.bt 2>&1
-awk '/\.so/{print $NF}' /proc/$PID/maps | sort -u > $SNAP/sos.txt
-ls /proc/$PID/task | wc -l > $SNAP/threads
+    -ex 'call (int) fclose($f)' \
+    -ex 'detach' > /dev/null 2>&1 || echo "malloc_info 超时,跳过"
+
 echo "baseline at RSS=$(grep VmRSS $SNAP/rss) saved to $SNAP"
+```
+
+如果 malloc_info 超时被跳过,可用 R4.3.4 替代拿 per-arena system_mem(只是没有 fast/rest bins 细分):
+
+```bash
+timeout 60 gdb -batch -p $PID \
+    -ex 'set pagination off' \
+    -ex 'set $ma = (struct malloc_state *)&main_arena' \
+    -ex 'set $a = $ma' -ex 'set $n = 0' \
+    -ex 'while $n < 200' \
+    -ex '  printf "arena %3d sysmem=%lu\n", $n, $a->system_mem' \
+    -ex '  set $a = $a->next' -ex '  set $n = $n + 1' \
+    -ex '  if $a == $ma' -ex '    loop_break' -ex '  end' \
+    -ex 'end' -ex 'detach' 2>&1 | grep '^arena ' > $SNAP/arena_sizes.txt
 ```
 
 ### R3.4.2 立刻做 Exp-F(arena→tid 映射 + 抓线程名)
 
+> **风险**:全部 L1(只读 + gdb attach)。已遵循 Round 4 R4.2 操作纪律:`timeout` 包裹、`while` 有迭代上限、线程名走 `/proc/.../comm` 而非 gdb 内置变量。
+
+#### 步 1: arena 链 + system_mem(L1)
+
 ```bash
-# arena 链 + system_mem
-gdb -batch -p $PID \
+timeout 60 gdb -batch -p $PID \
+    -ex 'set pagination off' \
     -ex 'set $ma = (struct malloc_state *)&main_arena' \
     -ex 'set $a = $ma' -ex 'set $n = 0' \
-    -ex 'while 1' \
+    -ex 'while $n < 200' \
     -ex '  printf "arena %3d  addr=%p  sysmem=%9lu KB  attached=%lu\n", \
               $n, $a, $a->system_mem/1024, $a->attached_threads' \
     -ex '  set $a = $a->next' -ex '  set $n = $n + 1' \
     -ex '  if $a == $ma' -ex '    loop_break' -ex '  end' \
     -ex 'end' -ex 'detach' 2>&1 | tee $SNAP/arena_addr.txt | tail -80
-
-# tid → arena 映射 + 线程名(关键:这时候名字最干净)
-gdb -batch -p $PID \
-    -ex 'thread apply all printf "tid=%d arena=%p name=", $_thread, thread_arena' \
-    -ex 'thread apply all printf "%s\n", $_thread_name' \
-    -ex 'detach' 2>&1 | grep -E '^tid=' > $SNAP/tid_arena.txt
-cat $SNAP/tid_arena.txt
 ```
+
+#### 步 2: tid → arena(L1,**不取** `$_thread_name`,老 gdb 会卡)
+
+```bash
+timeout 90 gdb -batch -p $PID \
+    -ex 'set pagination off' \
+    -ex 'thread apply all printf "tid=%d arena=%p\n", $_thread, thread_arena' \
+    -ex 'detach' 2>&1 | grep '^tid=' > $SNAP/tid_arena.txt
+head -10 $SNAP/tid_arena.txt
+```
+
+#### 步 3: 线程名(L0,走 `/proc`,不需要 gdb)
+
+```bash
+for tid in $(ls /proc/$PID/task); do
+    echo "tid=$tid name=$(cat /proc/$PID/task/$tid/comm 2>/dev/null)"
+done > $SNAP/tid_names.txt
+head -10 $SNAP/tid_names.txt
+```
+
+#### 步 4: 合并 arena 映射 + 线程名
+
+```bash
+awk 'NR==FNR { match($0, /tid=([0-9]+) name=(.*)/, m); name[m[1]]=m[2]; next }
+     { match($0, /tid=([0-9]+) arena=(.+)/, m);
+       printf "tid=%-5s arena=%-18s name=%s\n", m[1], m[2], name[m[1]] }' \
+    $SNAP/tid_names.txt $SNAP/tid_arena.txt > $SNAP/tid_arena_named.txt
+cat $SNAP/tid_arena_named.txt | head -20
+```
+
+#### 出问题怎么办
+
+参见 **R4.3 卡住诊断阶梯**。最常见:
+- 步 1 卡 → main_arena 符号不可见,看 R4.3.2
+- 步 2 卡 → 改 `head -10` 后跑;若仍卡,gdb 跟线程数有交互问题,考虑步 2 用 `info threads` 替代
+- 步 3 卡 → 不可能(纯 /proc 读),除非 PID 错了
 
 ### R3.4.3 检查现在是否已经集中
 
@@ -194,14 +405,17 @@ Round 1 — Exp-A 显示 `max/avg > 10×`,或 top arena 持有占总 RSS ≥ 50%
 
 ## R2.2 步骤 1:列出所有 arena 的地址 + system_mem
 
+> **风险**:L1。已遵循 Round 4 R4.2:`timeout` 包裹 + `while $n < 200` 迭代上限。
+
 ptmalloc 的 arena 链以 `main_arena` 为头,通过 `next` 指针串成环。
 
 ```bash
-gdb -batch -p $PID \
+timeout 60 gdb -batch -p $PID \
+    -ex 'set pagination off' \
     -ex 'set $ma = (struct malloc_state *)&main_arena' \
     -ex 'set $a = $ma' \
     -ex 'set $n = 0' \
-    -ex 'while 1' \
+    -ex 'while $n < 200' \
     -ex '  printf "arena %3d  addr=%p  sysmem=%9lu KB  threads=%lu\n", \
               $n, $a, $a->system_mem/1024, $a->attached_threads' \
     -ex '  set $a = $a->next' \
@@ -210,8 +424,8 @@ gdb -batch -p $PID \
     -ex '    loop_break' \
     -ex '  end' \
     -ex 'end' \
-    -ex 'detach' 2>&1 | tail -80 > $SNAP/arena_addr.txt
-sort -k4 -nr $SNAP/arena_addr.txt | head -10   # top 10 by sysmem
+    -ex 'detach' 2>&1 | tee $SNAP/arena_addr.txt | tail -80
+sort -k6 -nr $SNAP/arena_addr.txt | head -10   # top 10 by sysmem
 ```
 
 若 `main_arena` 找不到(glibc strip 过):
@@ -222,10 +436,13 @@ sort -k4 -nr $SNAP/arena_addr.txt | head -10   # top 10 by sysmem
 
 ## R2.3 步骤 2:列出每个线程当前所在 arena
 
+> **风险**:L1。
+
 glibc 用线程局部变量 `thread_arena` 标记本线程所在 arena:
 
 ```bash
-gdb -batch -p $PID \
+timeout 90 gdb -batch -p $PID \
+    -ex 'set pagination off' \
     -ex 'thread apply all printf "tid=%d arena=%p\n", $_thread, thread_arena' \
     -ex 'detach' 2>&1 | grep ^tid= | sort -k2 > $SNAP/tid_arena.txt
 cat $SNAP/tid_arena.txt | head -20
@@ -328,33 +545,44 @@ dev 机有完整符号,容易找到 top arena;然后回板上做步骤 2-3 映�
 
 ## R1.1 同步采集 T0 / T1 snapshot
 
+> **风险**:L0(/proc 读)+ L1(gdb 只读)+ **L2(call malloc_info)**。L2 那条带 `timeout` 保护,卡住可跳过;per-arena 用 R4.3.4 struct walk 替代不丢主要信息。
+
 ```bash
 PID=<填进程 PID>
 T=$(date +%Y%m%d_%H%M)              # T0 / T1 各跑一次
 SNAP=/tmp/mem_snap/$T
 mkdir -p $SNAP
 
-# Exp-A: malloc_info(走 gdb 注入)
-gdb -batch -p $PID \
+# L0: /proc 只读
+grep -E 'VmRSS|VmSize' /proc/$PID/status > $SNAP/rss
+pmap -x $PID > $SNAP/pmap.full
+awk '$2 > 65536 {print $1, $2, $3}' $SNAP/pmap.full | sort > $SNAP/big_segs.txt
+awk '/\.so/{print $NF}' /proc/$PID/maps | sort -u > $SNAP/sos.txt
+ls /proc/$PID/task | wc -l > $SNAP/threads
+
+# L1: gdb 只读 — 线程 backtrace
+timeout 90 gdb -batch -p $PID -ex 'set pagination off' \
+    -ex 'thread apply all bt 8' -ex 'detach' > $SNAP/threads.bt 2>&1
+
+# L2: malloc_info(call 业务函数,优先级最低,卡住可跳过)
+# 若不放心 L2,直接注释这段,改用下面 struct walk
+timeout 30 gdb -batch -p $PID \
     -ex "set \$f = (void *)fopen(\"$SNAP/mi.xml\", \"w\")" \
     -ex 'call (void) malloc_info(0, $f)' \
     -ex 'call (int) fflush($f)' \
-    -ex 'call (int) fclose($f)' > /dev/null 2>&1
+    -ex 'call (int) fclose($f)' \
+    -ex 'detach' > /dev/null 2>&1 || echo "malloc_info skipped (L2 timeout)"
 
-# Exp-B: pmap 完整 + 大段提取
-pmap -x $PID > $SNAP/pmap.full
-awk '$2 > 65536 {print $1, $2, $3}' $SNAP/pmap.full | sort > $SNAP/big_segs.txt
+# L1 替代(无论 L2 是否跑了都建议同时收集 — 校验用)
+timeout 60 gdb -batch -p $PID -ex 'set pagination off' \
+    -ex 'set $ma = (struct malloc_state *)&main_arena' \
+    -ex 'set $a = $ma' -ex 'set $n = 0' \
+    -ex 'while $n < 200' \
+    -ex '  printf "arena %3d sysmem=%lu\n", $n, $a->system_mem' \
+    -ex '  set $a = $a->next' -ex '  set $n = $n + 1' \
+    -ex '  if $a == $ma' -ex '    loop_break' -ex '  end' \
+    -ex 'end' -ex 'detach' 2>&1 | grep '^arena ' > $SNAP/arena_sysmem.txt
 
-# Exp-D: 所有线程 backtrace
-gdb -batch -p $PID -ex 'set pagination off' \
-    -ex 'thread apply all bt 8' -ex 'detach' > $SNAP/threads.bt 2>&1
-
-# Exp-E: 当前加载的 .so 列表
-awk '/\.so/{print $NF}' /proc/$PID/maps | sort -u > $SNAP/sos.txt
-
-# 基础三件套
-grep -E 'VmRSS|VmSize' /proc/$PID/status > $SNAP/rss
-ls /proc/$PID/task | wc -l > $SNAP/threads
 echo "snap done at $SNAP"
 ```
 

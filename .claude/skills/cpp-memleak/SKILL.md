@@ -92,6 +92,28 @@ grep -E '<system|<total type' /tmp/mi.xml
 
 **Anti-pattern to avoid in Phase 0:** jumping straight to "run Valgrind" without confirming the platform can run a profiler, or recommending tools the user already said they don't have.
 
+**Safety principle: observation must not break the patient.**
+
+The diagnostic target is almost always a production / pre-production process the user cannot afford to crash. Tag every command with a risk level and never blindly issue L2/L3:
+
+| Risk | Definition | Examples |
+|---|---|---|
+| **L0** | Reads `/proc/PID/*` only | `grep VmRSS`, `pmap`, `cat /proc/PID/maps` |
+| **L1** | gdb attach + reads only — no `call`, no `set` | `info threads`, struct field reads (`p main_arena.system_mem`), arena chain walk, `thread apply all bt` |
+| **L2** | gdb `call` of a function in the target — hijacks one of its threads | `call malloc_info(0, f)`, `call malloc_stats()` |
+| **L3** | Mutates target or freezes it for an extended period | `set var ...`, `gcore` (process frozen 30 s to several minutes) |
+
+Hard rules:
+
+1. **Default to L0/L1.** Only escalate when the data they can't provide is essential. Prefer struct walks over `call` whenever the field is directly readable.
+2. **Never `kill -9` a hung gdb attached to a live process.** If gdb was mid-`call`, killing it leaves the hijacked thread in the called function's frame — any glibc mutex (e.g., `malloc_info` takes per-arena locks) acquired but not released will deadlock the rest of the process the next time it allocates. Use `Ctrl-C` first; if that fails, `kill -TERM` (default signal) so gdb can clean up. If it still hangs, accept the hung gdb — the process is in ptrace-stop until it cleans up, but stays alive.
+3. **Wrap every gdb invocation in `timeout 60`.** Default `timeout` sends SIGTERM, which gdb handles cleanly.
+4. **Every gdb `while` loop must have an iteration cap** (`while $n < 200`), never `while 1`. A bad pointer in an arena chain walk otherwise loops forever.
+5. **`gcore` is L3** — coordinate the freeze window with the operator before running. RSS-proportional: a 3 GB process freezes ~30 s; a 21 GB process freezes minutes.
+6. **One gdb at a time per PID.** ptrace is mutex-style; a second concurrent attach blocks indefinitely.
+
+The cost of a deadlocked production process from an unsafe diagnostic command is days of incident response. The benefit of one extra data field is rarely worth it.
+
 **Strategic note: a restart is a diagnostic opportunity, not a setback.** If the target process is restarted mid-investigation — OOM-killed, manually restarted, periodic-maintenance restart — do NOT treat it as data loss. The early-growth phase has the highest signal-to-noise ratio for catching the leak:
 
 - At 21 GB steady state, ~100 MB/h of new leak signal is buried under 200× the steady history.
