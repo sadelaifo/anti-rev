@@ -51,6 +51,17 @@ Before any analysis, get hard numbers. Push back if the user only has anecdotes 
 - Platform: arch (x86_64/aarch64/…), kernel version, OS
 - What tools are available on the target (grep, gdb, pmap is usually a yes; bcc-tools / heaptrack / valgrind often a no)
 
+**Architecture question to ask up front — is the target a plugin host?**
+
+Before going further, ask whether the process loads `.so` / `.dll` plugins via `dlopen`, or is otherwise a multi-tenant host (game engine, simulator platform, RPC fabric loading per-service handlers, web framework loading modules). A "yes" significantly changes the suspect picture:
+
+- Leaks often live at the platform-plugin boundary (callbacks, observer registrations, shared message buses) rather than inside a single plugin
+- A leak that appears only under a specific combination of loaded plugins points at cross-plugin interaction (e.g., plugin A's producer with no consumer because the consumer plugin in this combo doesn't process those events)
+- Single-arena concentration in a plugin host often means a fixed scheduler/dispatcher worker is handling all plugin events, not that one plugin is solely responsible
+- Plugin elimination experiment (load N-1 of N plugins, rotate which one is left out) is a high-information, low-cost verification step — often the cheapest way to localize the leak to a plugin pair before any source review
+
+If yes, plan to use Pattern G (combo-dependent) in Phase 3 alongside the standard A-F.
+
 **Strongly recommended additional snapshot:**
 
 ```bash
@@ -217,6 +228,7 @@ For H1, H2, H6, H10 — source review with the suspect profile as filter.
 | **D. Subscribe without unsubscribe** | Long-lived broker + small closures | `subscribe`/`register`/`addListener` count > matching unsubscribe count |
 | **E. `thread_local` container** | Per-thread balanced growth | `thread_local` declaration + container type, no reset across cycles |
 | **F. Third-party library hot spots** | Specific to lib | protobuf Arena no Reset; libcurl handle no cleanup; SSL_CTX session cache no cap; spdlog async buffer; nlohmann::json Parse reuse |
+| **G. Plugin / multi-tenant platform combo-dependent** | Leak only with specific combination of loaded plugins; one plugin's expected consumer (another plugin) doesn't consume properly in this combo | Process is a plugin host (`.so` / dlopen-based platform, game-engine-style scenario loader, simulator, request-routing fabric); leak appears only under specific plugin set; single arena dominant suggests work is funneled to a fixed scheduler worker. Investigate plugin-to-plugin interactions: registered callbacks (plugin A registers via platform, plugin B emits, B's events get buffered if A's consumer never fires); shared message buses where one topic has a producer but no active consumer in this combo; plugin lifecycle (init order, callback chains established at load time and never torn down) |
 
 **To invoke source review programmatically** (e.g., paste into an LLM with the source):
 
@@ -260,6 +272,7 @@ Independent methods:
 | Source semantic review with rate estimate | Identifies specific code + predicts rate |
 | Live profiler (bcc memleak, perf uprobe, custom LD_PRELOAD wrapper) | Captures actual leak stack traces |
 | Env-var experiment (`MALLOC_ARENA_MAX`, `MALLOC_TRIM_THRESHOLD_`, jemalloc preload) | Changes allocator behavior; if RSS changes, leak hypothesis was wrong |
+| **Plugin elimination experiment** (plugin host only) | Load N-1 of N plugins, rotate omission; combo where RSS stays flat identifies the involved plugin(s). Often the cheapest way to localize a combo-dependent leak. Cost: each rotation needs a restart + observation window |
 | Code modification + redeploy | The most definitive: fix → observe → confirm growth stops |
 
 **Snapshot-delta decision matrix (high-leverage, zero-overhead method for glibc).**

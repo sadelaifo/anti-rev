@@ -57,6 +57,36 @@
 >
 > 待执行 `cpp_memleak_constraint_experiments.md` **Round 2 — Exp-F**(arena → thread 映射)。Exp-F 给出 tid 和它的 entry function 后,本 §3 会进一步细化为:**"thread tid=X (entry function = Y) 在调用链上某处持续 alloc 小对象不释放,审查范围 = 该 tid 调用链触及的代码,而非全代码库"**。
 >
+> ### 2026-06-04 #2 修订:plugin 平台架构
+>
+> 业务进程 **`simultor` 是一个 plugin platform**(通过 `dlopen` 加载业务 `.so`)。**本 case 只在 4 个特定 plugin 组合下 leak**,其他组合不漏。这一条彻底改变嫌疑模型:
+>
+> - leak 极可能在 **plugin 间互动**(plugin A publish → plugin B 应消费但当前组合下没消费),而非单个 plugin 内部
+> - 41 worker 是平台调度线程池,plugin code 在它们上面跑;arena 55 集中 = 平台把这 4 plugin 的活儿调度到固定 worker 上
+> - tid 36093 栈顶 `std::string::replace` 说明热路径在做字符串原地操作,可能是 plugin 间消息格式化或事件处理
+>
+> ### 修订后画像(给审查方)
+>
+> > simultor 平台进程加载了 4 个业务 `.so`(组合 P1+P2+P3+P4),此组合下出现 leak,其他组合不出现。leak 表现为:**3 个 worker 线程(tid 36623/36615/36093,均来自 41 个 generic worker 池)CPU 远超其他 ~10×;其中 tid 36093 snapshot 时栈顶在 `std::string::replace`**。单 arena 持有 ~67% heap(2 GB/3 GB)。
+> >
+> > **审查范围(按优先级)**:
+> > 1. **4 plugin 互相注册的 callback / observer / event handler**,看是否有 P_A `Subscribe`/`Register` 但 P_B 端没真正消费(或 unsubscribe 路径不通)
+> > 2. **plugin 类成员持有的容器**(`std::vector / unordered_map / deque / list`),看每个 plugin 的 step/tick/update 是否 push 进容器后没清,或清理依赖某条 plugin combo 才走的路径
+> > 3. **plugin 之间通过平台 message bus / shared queue 的 producer-consumer 失衡**(本组合下消费者 plugin 不在 / 没正确处理)
+> > 4. **string::replace 这条线索**:每个 plugin 找 hot loop 里反复对 string 做 replace/format/sanitize 后存到长寿容器的位置
+> > 5. **(防过拟合)平台暴露给 plugin 的接口本身**:即使其他组合不漏,也可能是平台特定 routing/cache 路径只在这组合下激活;plugin 都看不出嫌疑就回头看平台
+>
+> ### 配套验证:plugin elimination 实验
+>
+> 强烈推荐**与源码审查并行**做这个实验(成本低,信息量大):
+>
+> - 轮换加载 4 plugin 里的任意 3 个(共 4 组合),每组合跑 1-2 h 观察 RSS
+> - 哪次组合**不再涨** → 去掉的那个 plugin 是嫌疑;
+> - 若多个组合都涨 → leak 在公共 plugin 上;
+> - 若只有这一个组合涨 → 是**互动 leak**,看哪两个 plugin 总在嫌疑组合里
+>
+> elimination 实验结果直接缩小审查范围至 1-2 个 plugin。
+>
 > ### 在 Exp-F 完成前,审查方应:
 >
 > - **跳过**本 §3 下方原约束中"所有 worker 都路过的共享逻辑"那条
