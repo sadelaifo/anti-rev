@@ -14,6 +14,7 @@
 |---|---|
 | 平台 | Linux aarch64,GPB 板(嵌入式/服务器板) |
 | 程序 | C++ 业务进程(长跑型,有源码) |
+| glibc 版本 | **2.34**(`ldd --version`)— ptmalloc struct offsets `next=2160 / attached_threads=2176 / system_mem=2184`(实验手册 R3.4.2 raw 偏移版用) |
 | 现象 | RSS 持续增长 |
 | 速率 | 昨天 17 GB,今天 21 GB,**~4 GB / 24 小时** |
 | 板上可用工具 | gdb、pmap、grep、awk;**无** bcc-tools、heaptrack、valgrind、nproc |
