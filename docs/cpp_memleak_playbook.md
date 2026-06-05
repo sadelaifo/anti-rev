@@ -444,6 +444,93 @@ less /tmp/leak_resolved.txt
 
 ---
 
+## 关键检测:wrapper 抓到的够不够?(不是 malloc 怎么办)
+
+wrapper 只能抓 `malloc / calloc / realloc / free`。如果业务的 leak 走**别的路径**(`mmap`、`shmget`、JIT、线程栈、文件映射等),wrapper 会**抓不全**。
+
+**Step 9.5 — 检测 wrapper 抓全没**(强烈建议跑):
+
+```bash
+# wrapper 抓到的 outstanding 总和
+WRAPPER_TOTAL=$(awk -F'[ =]' '/outstanding=/ {sum += $3} END {print sum}' /tmp/alloc_track.$PID)
+echo "wrapper outstanding total = $((WRAPPER_TOTAL / 1024 / 1024)) MB"
+
+# 实际 RSS 增量(LD_PRELOAD 启动到 dump 之间)
+echo "请手动确认 ΔRSS:启动时 RSS vs 现在 RSS"
+grep VmRSS /proc/$PID/status
+```
+
+| WRAPPER_TOTAL / ΔRSS | 含义 | 下一步 |
+|---|---|---|
+| **> 70%** | leak 在 malloc 路径,wrapper 抓全了 | Step 10 解析 top stack 即可 |
+| **30-70%** | malloc 一部分 + 其他路径一部分 | Step 10 + 下面 Plan A 或 B |
+| **< 30%** | leak NOT in malloc | 跳过 Step 10,直接走 Plan A/B/C |
+
+### Plan A — 扩展 wrapper 加 mmap 跟踪
+
+在 `malloc_track.c` 加这两段:
+
+```c
+// 加在顶部
+#include <sys/mman.h>
+
+static void *(*real_mmap)(void*, size_t, int, int, int, off_t) = NULL;
+static int (*real_munmap)(void*, size_t) = NULL;
+
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    if (!real_mmap) real_mmap = dlsym(RTLD_NEXT, "mmap");
+    void *p = real_mmap(addr, length, prot, flags, fd, offset);
+    // 只跟匿名 + 私有 mmap(过滤文件映射、共享内存)
+    if (p != MAP_FAILED && (flags & MAP_ANONYMOUS) && (flags & MAP_PRIVATE) && fd < 0) {
+        track_alloc(p, length);
+    }
+    return p;
+}
+
+int munmap(void *addr, size_t length) {
+    if (!real_munmap) real_munmap = dlsym(RTLD_NEXT, "munmap");
+    track_free(addr);
+    return real_munmap(addr, length);
+}
+```
+
+重编 wrapper 再跑一遍 Step 7-10。
+
+**注意**:LD_PRELOAD 拦不到 glibc 内部 `mmap`(它走 vdso 或直接 syscall),所以不会跟 malloc 的内部 mmap 冲突。**只会捕获业务代码显式 `mmap()` 调用**。
+
+### Plan B — pmap diff 找新增 mmap 段(不重启)
+
+```bash
+# wrapper 跑业务前
+pmap -x $PID > /tmp/pmap_before.txt
+
+# 跑 30 分钟业务
+
+# wrapper 跑业务后
+pmap -x $PID > /tmp/pmap_after.txt
+
+# 找新增的大段(> 1 MB)
+diff /tmp/pmap_before.txt /tmp/pmap_after.txt | grep -E '^>' | awk '$3 > 1000'
+```
+
+新增段的**地址 + 大小**就是 mmap 的产物。再用 strace 抓哪个 syscall 创建的:
+
+```bash
+# 抓后续的 mmap 调用,带 stack
+strace -p $PID -e mmap,munmap -f -k 2>&1 | head -50
+```
+
+`-k` 在新版 strace 里打印 stack(老版没这个,只能看 syscall args 推 caller)。
+
+### Plan C — 各种 fallback
+
+| 工具 | 适用 |
+|---|---|
+| `ltrace` | 跟 libc / 其他库调用,看业务用了哪些 alloc API |
+| eBPF `funccount` / `funclatency` | 板上有 bcc 才行 |
+| `gcore` + 离线 | core 文件里能看每个 VMA 的实际数据,推断来源 |
+| 直接看 `/proc/PID/smaps` | 大段的 `Anonymous` / `Shared_Clean` / `Private_Dirty` 分类能区分类型 |
+
 ## 故障排查
 
 | 现象 | 原因 | 修法 |

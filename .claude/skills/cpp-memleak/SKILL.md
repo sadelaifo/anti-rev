@@ -146,6 +146,25 @@ If you find yourself iterating multiple snapshot rounds chasing a structural pic
 
 **Common reason this skill's authors and users have over-iterated**: the user reports "no Valgrind, no bcc, no heaptrack" early on, and we read that as "no instrumentation available". But `LD_PRELOAD` and `gcore` are usually still available. Confirm explicitly before committing to the snapshot-diff substitute path.
 
+**Critical check before committing to an allocator wrapper**: confirm the leak is actually in `malloc`-family allocations. The wrapper only catches what goes through `malloc` / `calloc` / `realloc` / `free`. Common leak sources that bypass these:
+
+| Source | Symptoms |
+|---|---|
+| Direct `mmap` for large buffers | Large `[anon]` segments in pmap; `<total mmap>` grows in malloc_info |
+| `shmget` / `shm_open` shared memory | Shared mappings in `/proc/PID/maps` |
+| mmap'd files (configs, model weights) | File-backed mappings growing |
+| JIT-generated code | Executable anonymous mappings |
+| Thread stack growth (deep recursion, large `alloca`) | `[stack]` segments large or numerous |
+| Custom allocator that calls `mmap` directly | Could be invisible to malloc wrapper |
+| Kernel-side: eBPF maps, io_uring buffers | RSS accounting can include some kernel allocations |
+
+**How to confirm before deployment**: compare the wrapper's total outstanding bytes with observed ΔRSS:
+- `wrapper_outstanding / ΔRSS > 70%` → leak is in malloc path; wrapper top stacks are the answer
+- `30% – 70%` → mixed; wrapper finds part of it; also chase mmap segments via `pmap` diff
+- `< 30%` → leak is NOT in malloc; abandon wrapper, extend to mmap tracking or use `pmap` diff + `strace -e mmap -k` to find the actual source
+
+Always run this check before declaring "wrapper failed, allocator not the leak". Often the wrapper is fine and you just need to also instrument `mmap`.
+
 ---
 
 ## Process
