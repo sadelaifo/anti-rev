@@ -56,10 +56,11 @@ cd ~/leak_test
 #include <string.h>
 #include <unistd.h>
 
-#define STACK_DEPTH    6
-#define STACK_BUCKETS  4096
-#define PTR_BUCKETS    (1<<20)
-#define DUMP_TOP_N     30
+#define STACK_DEPTH         6
+#define STACK_BUCKETS       4096
+#define PTR_BUCKETS         (1<<20)
+#define DUMP_TOP_N          30
+#define MAX_STACK_ENTRIES   16384   // 静态 dump buffer 容量,够装所有 stack
 
 typedef struct stack_entry {
     uint64_t        hash;
@@ -80,6 +81,10 @@ typedef struct ptr_entry {
 static stack_entry_t *stack_buckets[STACK_BUCKETS];
 static ptr_entry_t   *ptr_buckets[PTR_BUCKETS];
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+
+// 静态 buffer + flag,避免在 signal handler 里 malloc / pthread_mutex_lock(不 async-safe)
+static stack_entry_t *g_dump_buf[MAX_STACK_ENTRIES];
+static volatile sig_atomic_t dump_requested = 0;
 
 static void *(*real_malloc)(size_t)  = NULL;
 static void  (*real_free)(void*)     = NULL;
@@ -216,52 +221,78 @@ static int cmp_outstanding_desc(const void *a, const void *b) {
     return 0;
 }
 
+// signal handler 只置 flag(sig_atomic_t async-safe),真正的 dump 在后台线程做
 static void dump_handler(int sig) {
     (void)sig;
-    char path[64];
-    snprintf(path, sizeof(path), "/tmp/alloc_track.%d", getpid());
-    FILE *f = fopen(path, "w");
-    if (!f) return;
+    dump_requested = 1;
+}
 
-    pthread_mutex_lock(&mu);
-    stack_entry_t **all = real_malloc(sizeof(void*) * STACK_BUCKETS * 64);
-    if (!all) { pthread_mutex_unlock(&mu); fclose(f); return; }
-    int n_all = 0;
-    for (int i = 0; i < STACK_BUCKETS; i++) {
-        for (stack_entry_t *e = stack_buckets[i]; e; e = e->next) {
-            if (e->outstanding_bytes > 0) {
-                all[n_all++] = e;
+static void *dump_thread_fn(void *arg) {
+    (void)arg;
+    while (1) {
+        if (dump_requested) {
+            dump_requested = 0;
+
+            char path[64];
+            snprintf(path, sizeof(path), "/tmp/alloc_track.%d", getpid());
+            FILE *f = fopen(path, "w");
+            if (!f) {
+                char buf[64];
+                int n = snprintf(buf, sizeof(buf), "[malloc_track] fopen %s failed\n", path);
+                write(2, buf, n);
+                usleep(100 * 1000);
+                continue;
             }
-        }
-    }
-    qsort(all, n_all, sizeof(void*), cmp_outstanding_desc);
 
-    int n_dump = n_all < DUMP_TOP_N ? n_all : DUMP_TOP_N;
-    fprintf(f, "=== alloc_track dump pid=%d ===\n", getpid());
-    fprintf(f, "Top %d allocation stacks by outstanding bytes:\n\n", n_dump);
-    for (int i = 0; i < n_dump; i++) {
-        stack_entry_t *e = all[i];
-        fprintf(f, "[#%d] outstanding=%lu bytes (%lu live alloc, %lu total)\n",
-                i + 1, e->outstanding_bytes, e->count, e->total_alloc_count);
-        for (int j = 0; j < STACK_DEPTH; j++) {
-            if (e->frames[j])
-                fprintf(f, "    frame[%d] = %p\n", j, e->frames[j]);
-        }
-        fprintf(f, "\n");
-    }
-    real_free(all);
-    pthread_mutex_unlock(&mu);
+            pthread_mutex_lock(&mu);
+            int n_all = 0;
+            for (int i = 0; i < STACK_BUCKETS && n_all < MAX_STACK_ENTRIES; i++) {
+                for (stack_entry_t *e = stack_buckets[i]; e && n_all < MAX_STACK_ENTRIES; e = e->next) {
+                    if (e->outstanding_bytes > 0) {
+                        g_dump_buf[n_all++] = e;
+                    }
+                }
+            }
+            qsort(g_dump_buf, n_all, sizeof(void*), cmp_outstanding_desc);
 
-    fflush(f); fclose(f);
-    char buf[128];
-    int n = snprintf(buf, sizeof(buf), "[malloc_track] dump written to %s\n", path);
-    write(2, buf, n);
+            int n_dump = n_all < DUMP_TOP_N ? n_all : DUMP_TOP_N;
+            fprintf(f, "=== alloc_track dump pid=%d ===\n", getpid());
+            fprintf(f, "Total tracked stack entries: %d\n", n_all);
+            fprintf(f, "Top %d allocation stacks by outstanding bytes:\n\n", n_dump);
+            for (int i = 0; i < n_dump; i++) {
+                stack_entry_t *e = g_dump_buf[i];
+                fprintf(f, "[#%d] outstanding=%lu bytes (%lu live alloc, %lu total)\n",
+                        i + 1, e->outstanding_bytes, e->count, e->total_alloc_count);
+                for (int j = 0; j < STACK_DEPTH; j++) {
+                    if (e->frames[j])
+                        fprintf(f, "    frame[%d] = %p\n", j, e->frames[j]);
+                }
+                fprintf(f, "\n");
+            }
+            pthread_mutex_unlock(&mu);
+            fflush(f);
+            fclose(f);
+
+            char buf[128];
+            int n = snprintf(buf, sizeof(buf),
+                             "[malloc_track] dump written to %s (%d entries)\n",
+                             path, n_all);
+            write(2, buf, n);
+        }
+        usleep(100 * 1000);  // 100 ms 轮询
+    }
+    return NULL;
 }
 
 __attribute__((constructor))
 static void setup(void) {
     init_real();
     signal(SIGUSR1, dump_handler);
+    pthread_t dt;
+    if (pthread_create(&dt, NULL, dump_thread_fn, NULL) == 0) {
+        pthread_detach(dt);
+    }
+    write(2, "[malloc_track] wrapper loaded\n", 30);
 }
 ```
 
@@ -340,16 +371,23 @@ ls -la malloc_track.so   # 应该看到 .so 生成
 ### Step 2 — 编译测试程序(1 min)
 
 ```bash
-gcc -O0 -g -o leak_test leak_test.c -lpthread
+# -fno-omit-frame-pointer + -rdynamic 让 aarch64 上 backtrace() 能拿到完整栈
+gcc -O0 -g -fno-omit-frame-pointer -rdynamic -o leak_test leak_test.c -lpthread
 ls -la leak_test
 ```
 
 ### Step 3 — 启动测试(LD_PRELOAD 注入 wrapper)
 
 ```bash
-LD_PRELOAD=$PWD/malloc_track.so ./leak_test &
+# 注意:用绝对路径(LD_PRELOAD 在某些 shell 下不解析相对路径)
+LD_PRELOAD=$PWD/malloc_track.so ./leak_test 2>/tmp/leak_test.stderr &
 PID=$!
 echo "test pid = $PID"
+sleep 1
+# 校验 wrapper 真的加载了
+grep malloc_track /proc/$PID/maps && echo "wrapper loaded OK" || echo "WARNING: wrapper not in maps"
+cat /tmp/leak_test.stderr
+# 期望:看到 "[malloc_track] wrapper loaded"
 ```
 
 ### Step 4 — 等 5 秒 + 触发 dump
@@ -357,7 +395,7 @@ echo "test pid = $PID"
 ```bash
 sleep 5
 kill -SIGUSR1 $PID
-sleep 1   # 让 dump 写完
+sleep 1   # 让后台 dump 线程的 100ms 轮询能跑到(改用 flag 模式后必须)
 ```
 
 ### Step 5 — 看 dump,验证 top stack 是 inner_leak
@@ -600,7 +638,8 @@ strace -p $PID -e mmap,munmap -f -k 2>&1 | head -50
 |---|---|---|
 | Step 3 起不来,报 `undefined symbol: backtrace` | wrapper 链接缺 libc | gcc 加 `-rdynamic` |
 | Step 5 dump 文件不存在 | SIGUSR1 handler 没注册 | 检查 wrapper 的 `__attribute__((constructor))` |
-| Step 5 dump 是空 | 全在 `inside` 递归保护 | 调试 `inside` 标志,加打印看流程 |
+| Step 5 dump 是 0 字节空文件 | **signal handler async-unsafe 失败**(v2 已修:flag + 后台轮询线程);**或** wrapper 没加载 | 1)`grep malloc_track /proc/$PID/maps` 确认 .so 加载;2)stderr 里应当有 "[malloc_track] wrapper loaded";3)`kill -SIGUSR1` 后 `sleep 1` 必须(轮询周期 100ms) |
+| stderr 有 "wrapper loaded" 但 dump 仍空 | `backtrace()` 在 aarch64 无 frame pointer 时失败 | 测试程序加 `-fno-omit-frame-pointer -funwind-tables -rdynamic` 重编 |
 | Step 6 全是 `??` | 测试程序没带 debug info | 重编时确认 `-g` |
 | Step 7 LD_PRELOAD 没生效 | 业务被 setuid / sandbox / wrapper 吃掉 env | 看 `/proc/PID/environ` 确认;改 wrapper 启动方式 |
 | Step 9 dump 文件很大但 top 1 outstanding 远小于预期 | 哈希冲突 / wrapper bug | `STACK_BUCKETS` 加大到 16384;或检查 `track_free` 逻辑 |
