@@ -312,11 +312,19 @@ static void do_dump(const char *trigger_label) {
 
 static void atexit_dump(void) { do_dump("atexit"); }
 static void sig_dump(int sig) { (void)sig; do_dump("sigusr1"); }
+// SIGTERM / SIGINT 时也 dump 一次,然后默认终止
+static void term_dump(int sig) {
+    do_dump(sig == SIGTERM ? "sigterm" : "sigint");
+    signal(sig, SIG_DFL);     // 恢复默认处置
+    raise(sig);                // 重新发,让默认动作(终止)生效
+}
 
 __attribute__((constructor))
 static void setup(void) {
     init_real();
     signal(SIGUSR1, sig_dump);
+    signal(SIGTERM, term_dump);
+    signal(SIGINT,  term_dump);
     atexit(atexit_dump);
     int fd = open("/tmp/malloc_track.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
     if (fd >= 0) {
