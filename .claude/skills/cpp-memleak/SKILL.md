@@ -120,6 +120,34 @@ Do **not** trigger for:
 
 ---
 
+## Default workflow: characterize, then instrument (don't substitute)
+
+Before walking through the phases, set expectations on the right shape of an effective C++ leak investigation:
+
+```
+Phase 0  characterize externally     (1-2 hours of /proc, pmap, malloc_info)
+Phase 1  pin a rough constraint set  (rate, init vs runtime, mechanism family)
+─────────────────────────────────────────
+DECISION POINT:
+  - Can you run an allocator profiler? (Valgrind / ASan / heaptrack / bcc memleak
+    / jemalloc prof / LD_PRELOAD wrapper / gcore + offline heap walker)
+  - If YES → JUMP to instrumentation. The profiler gives ground-truth allocation
+    stacks. Reading the top-N stacks for 10 minutes typically beats a week of
+    snapshot diffing and source review.
+  - If NO  → continue with Phase 2-4 as a substitute path (multi-snapshot
+    constraint tightening + targeted source review). Expect this path to take
+    significantly longer and to produce only structural constraints, not
+    pinpoint identification.
+```
+
+**The skill's Phases 2-4 are a substitute, not the gold standard.** Snapshot diffing and source review are powerful for *characterizing* a leak (rate, scope, init vs runtime, single-thread vs distributed, family of mechanism). They are *not* a substitute for instrumented allocation stacks when the goal is to identify the specific code path.
+
+If you find yourself iterating multiple snapshot rounds chasing a structural picture, ask: "Could I just instrument and read top stacks instead?" A LD_PRELOAD wrapper is ~150 lines of C and typically takes 2-4 hours to write. One restart + one hour of business workload usually pinpoints the leak.
+
+**Common reason this skill's authors and users have over-iterated**: the user reports "no Valgrind, no bcc, no heaptrack" early on, and we read that as "no instrumentation available". But `LD_PRELOAD` and `gcore` are usually still available. Confirm explicitly before committing to the snapshot-diff substitute path.
+
+---
+
 ## Process
 
 ### Phase 0: Establish ground truth (do NOT skip)

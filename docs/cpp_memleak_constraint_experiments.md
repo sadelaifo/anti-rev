@@ -32,6 +32,7 @@
 
 | Round | 日期 | 触发 | 加入了什么 | 同步改动 |
 |---|---|---|---|---|
+| **Round 9** | 2026-06-05 | Round 8 转交给内部模型扫源码后,模型给了候选,但用户审视都觉得不像。**source review 第一轮空手** —— 这是常见拐点,4 种可能原因混在一起,需要系统地拆 | source review 空手的 4 种解读(候选对但 subtle / 漏扫 / 不在 plugin / 约束有偏);5 步行动顺序(挤压候选用速率核 → plugin elimination → 扩范围到平台/第三方 → LD_PRELOAD wrapper → reset constraints) | SKILL.md Phase 3 加 "When the first source-review pass returns empty";新增 "rate-based candidate filtering" 作为审查产出的强制后处理 |
 | **Round 8** | 2026-06-04 | Round 7 跑 R7.4 后数据自相矛盾(全局 system Δ +782 MB 但 per-arena Δ 报"全是 0",数学不可能并存);继续追细节会让诊断主导者疲劳(用户原话:"我已经定位的顶不住了"),边际收益递减 | 诊断转交 playbook:识别"该停了"的 5 个信号;**硬约束打包**的格式;源码审查方接力的清单;何时考虑 escalate 到 gcore / LD_PRELOAD 而非继续外部 diff | SKILL.md 加 "Strategic note: when to stop external diagnosis";handoff §3 重写为"已知 vs 未知"清单 |
 | **Round 7** | 2026-06-04 | T1 实测发现一个我之前没考虑到的解:**arena 55 数值锁定(2048 → 2047 MB)同时 max/avg 不变(45.2 → 45.17)** —— 我先把这解读成"arena 55 继续主导",其实是"arena 55 锁定 + 增长在别处"。**单 snapshot 的 arena 集中 ≠ 活跃累积者**,这个区分之前所有 Round 都没明确写过 | "历史累积 vs 活跃累积"判别 playbook;max/avg 跨 snapshot 解读规则(同一数字有多解);定位活跃累积者的 3 个角度(per-arena Δ / 全局 system mmap Δ / pmap 大段 Δ) | SKILL.md Phase 1 加 max/avg 多解警告;防过拟合 checklist 加"是否实际算了 per-arena Δ" |
 | **Round 6** | 2026-06-04 | Round 5 锁定嫌疑 tid 后,意识到还缺一个关键判别:**leak 是 init-time(进程启动一次性分配)还是 runtime(持续累积)**,两者修复方向截然不同;同时发现"snapshot 取的时点 = 进程刚重启"的隐含假设没验证;**纯 process uptime 这一个数据点能砍掉大量假设** | 多 snapshot 速率交叉验证 playbook:进程运行时长反推 init baseline / 用已知速率预测下一次 snapshot 并校验 / 速率换算成"函数频率 × 对象大小"的精细化画像 | SKILL.md Phase 4 加 "multi-snapshot rate validation" 作为通用 cross-verification 方法;工作文档 §3.7 记录本 case 实测 |
@@ -40,6 +41,141 @@
 | **Round 3** | 2026-06-04 | 目标进程被重启,RSS 21 GB → 3 GB | 重启诊断窗口 playbook(多时点采样、对照实验、失败模式) | SKILL.md Phase 0 strategic note;工作文档 §3.6 |
 | **Round 2** | 2026-06-04 | Exp-A 实测 max/avg = 45.9× + 大段稳定 → 推翻"all-workers"画像 | Exp-F (arena → tid 映射);决策树补 Exp-F 分支;Exp-A 增量对照加 awk fallback (板上无 `join`) | handoff §3 加修订 callout;SKILL.md Phase 4 加 per-arena concentration check |
 | **Round 1** | 2026-06-03 | 怀疑初步"long-lived 容器小对象漏 erase"画像过窄,可能漏 Alt-1 单大对象、Alt-2 pool、Alt-3 背压、Alt-7 dlopen 等 | Exp-A~E 五件套(per-arena、大段、in-use 直方图、线程 bt、dlopen);修订表;决策树 | 创建本文档 |
+
+---
+
+# Round 9 (2026-06-05) — Source review 第一轮空手后怎么办
+
+## R9.1 触发
+
+转交源码审查后(Round 8 handoff §3),内部模型 / 人工审查给了候选,但**主导者审视后都觉得不像**。这是常见拐点,**不要默认源码审查就此失效**;先用本节流程系统排查。
+
+## R9.2 空手的 4 种解读(混在一起,要拆开)
+
+| 情形 | 表现 | 验证手段 |
+|---|---|---|
+| **A. 候选是对的,只是"看不出来"** | 模型给的位置,erase 路径"看起来"合理,但实际有 subtle bug(异常路径、条件依赖未达、TTL 远超观察窗) | 用 Tier 1 **速率**约束量化核对(R9.3)。能撑住 168 MB/h 的才留 |
+| **B. leak 在 plugin 内,但 model 第一轮没扫到** | 模型覆盖不完整、prompt 没引导到对的方向、template 重展开导致 model 漏掉真正的热点 | 切片重扫 + 提示"找清理条件依赖外部事件的容器";若仍不出,转 C/D |
+| **C. leak 在 plugin 之外** | 用户只把 plugin 源码喂给 model,没扫**平台代码 / 第三方库的用法** | 扩展审查范围;尤其当 Tier 2 线索指向第三方库典型函数(如 `ByteString_hash` 强烈暗示 gRPC/protobuf)时,优先 |
+| **D. 我们对 leak 画像的约束本身有偏** | 70 Hz × 500 B 是从 ptmalloc free-pool 推的,可能跟真实 leak 对象毫无关系 | 拿 ground truth(LD_PRELOAD wrapper)或放宽对象大小搜不同 Hz 范围 |
+
+## R9.3 第 1 步(0 成本):用速率挤压候选
+
+对 model 给的**每个候选**,要求(或自己算):
+
+```
+预期速率 = 调用频率 (Hz) × 单次分配字节数
+```
+
+跟实测 168 MB/h ≈ 46.7 KB/s 比:
+
+| 候选预期速率 | 处置 |
+|---|---|
+| 0.1 × ~ 10 × 观察速率(同量级)| **保留**,继续细看 |
+| > 10 × | 太快,实际负载下做不到这么高 → **降权**,除非有明确触发限制 |
+| < 0.1 × | 太慢,撑不起观察速率 → **淘汰**(除非是若干个候选合起来的子项) |
+| 无法估算频率 | 让 model 重算 + 告诉它频率必须能解释 168 MB/h |
+
+通常**~一半候选**在这一步被淘汰。剩下的才是真嫌疑。
+
+## R9.4 第 2 步(中等成本,信息量大):Plugin elimination 实验
+
+本 case 一直在 backlog 未做。**source review 第一轮空手后这是最强招**。
+
+| 实验组合 | 跑多久 | 判读 |
+|---|---|---|
+| 4 个 plugin 各去掉 1 个(共 4 组合) | 每组 2 h | 不漏的组合 → 去掉的 plugin 是嫌疑;**4 组合都漏 → leak 在平台 / 第三方**(R9.5 升权);**全不漏 → 互动 leak,审查接口层** |
+| 只加载 1 个 plugin + 中等负载 | 1 h | 单 plugin 漏 → 锁定到那一个 |
+
+实验跑 8 小时给出**比再读一周源码更确定的答案**。
+
+## R9.5 第 3 步(并行做):扩展审查范围
+
+R9.4 实验如果指向"4 组合都漏" / 用户怀疑不在 plugin 内,**显式把以下范围交给 model**:
+
+| 候选范围 | 重点看 |
+|---|---|
+| **平台框架本身**(本 case = simultor) | plugin 加载 / 卸载 / 切换;message bus / event 路由;plugin 间共享状态管理;周期性 tick 调度 |
+| **gRPC** | server connection cache;metadata map;stream state 未清;health check 累积;async callback 队列 |
+| **protobuf** | `Arena` 未 Reset;descriptor 缓存;反复 parse 不 clear;text-format serialization 缓冲 |
+| **OPC UA / open62541** | session 不清;subscription 未注销;monitored item 累积 |
+| **boost::asio** | strand / timer / connection 长期持有;io_context::work 未撤 |
+| **日志库**(spdlog/log4cxx/glog) | 异步 backlog;rolling appender;sink 累积 |
+| **JSON / 序列化**(RapidJSON / nlohmann) | Document 反复 Parse 不 Clear |
+
+第一轮**没扫这些范围**,等价于"假装它们不存在"。空手时优先补这一刀。
+
+## R9.6 第 4 步(中等代价,ground truth):LD_PRELOAD malloc wrapper
+
+R9.3 + R9.4 + R9.5 三步都没收住时,准备**一次重启窗口**跑 wrapper:
+
+```c
+// ~150 行 C,核心逻辑
+// 1. wrap malloc / free / realloc
+// 2. 每次 malloc 调 backtrace(buf, 6) 取 stack 顶 6 帧
+// 3. 用 stack hash 聚合 "未释放总字节数" 到固定大小桶
+// 4. ptr -> bucket 的小哈希表,free 时减回
+// 5. SIGUSR1 触发 dump:top-N 桶 + stack frames 到 /tmp/alloc_track.<pid>
+```
+
+跑业务 1 h → `kill -SIGUSR1` → dump → `addr2line` 解析 frame addr → **真实 leak 来源就在前 3-5 名 stack**。
+
+这是**唯一不依赖源码推理的 ground truth 方法**。一旦 dump 出来,跟之前所有候选对照:
+- 命中前 3 名 stack 在已有候选里 → A 情形(候选是对的)
+- 命中前 3 名 stack 在第三方库 / 平台 → C 情形(范围错了)
+- 命中前 3 名 stack 在你完全没扫的 plugin 内部 → B 情形(漏扫)
+
+## R9.7 第 5 步(reset constraints):重审"~70 Hz × ~500 B"
+
+前 4 步都空 → **常量假设错了**。70 Hz × 500 B 是从 ptmalloc free-pool 推的,**可能跟真实 leak 对象毫无关系**。
+
+放宽对象大小搜不同 Hz 范围:
+
+| 假设对象大小 | 对应 Hz | 典型代码 pattern |
+|---|---|---|
+| 50 KB | 0.93 Hz | 慢任务 / 周期 GC / 配置 reload / 大消息批处理 |
+| 5 KB | 9.3 Hz | 中频 RPC 应答缓冲 / protobuf 中等 message |
+| 500 B | 70 Hz | 仿真器 tick / 心跳 / 小消息(基础假设) |
+| 50 B | 700 Hz | 细粒度高频回调 / 字符串 fragment |
+| 10 B | 3500 Hz | string char 累加 / vector 单元素 push |
+
+让 model **按这 5 种范围分别给候选**,而不是只在 70 Hz 那一档找。
+
+## R9.8 决策树(配套上面 5 步)
+
+```
+内部模型出候选,你审视都不像
+ │
+ ├─ R9.3 用 168 MB/h 速率挤压候选(0 成本)
+ │     │
+ │     ├─ 有 1-3 个能撑住 → 这些就是 A 情形真嫌疑,深审
+ │     └─ 全部淘汰 → 进入下面分支
+ │
+ ├─ R9.4 跑 plugin elimination(8 h 实测)
+ │     │
+ │     ├─ 某组合不漏 → 锁定嫌疑 plugin,重审
+ │     ├─ 全部漏 → leak 公共代码,跳 R9.5
+ │     └─ 单 plugin 也漏 → 锁定该 plugin
+ │
+ ├─ R9.5 扩范围到平台 + 第三方(再扫一遍源码)
+ │     │
+ │     ├─ 出新候选 → 回 R9.3 用速率挤压
+ │     └─ 仍空 → R9.6
+ │
+ ├─ R9.6 LD_PRELOAD wrapper(一次重启 + 1 h 跑)
+ │     │
+ │     └─ dump 出 top stacks → 必然命中真嫌疑
+ │
+ └─ R9.7(并行)重审对象大小假设,跨 Hz 范围重搜
+```
+
+## R9.9 别让自己跌入的陷阱
+
+1. **不要直接二次扫同一份源码** —— 跟第一轮 prompt 类似,产出也会类似,纯浪费精力
+2. **不要花一周读源码硬撑** —— R9.6 LD_PRELOAD 的产出比一周阅读更确定
+3. **不要把候选都堆给审查方"再看看"** —— 用速率先砍掉一半,聚焦剩下的
+4. **不要忽视"4 组合都漏"这种负面信号** —— 它告诉你 leak 不在 plugin 内,直接跳过 B 节省时间
+5. **不要假设第三方库不会漏** —— 用户最常忽略的就是 gRPC / protobuf / boost 这类大库内部的累积
 
 ---
 
