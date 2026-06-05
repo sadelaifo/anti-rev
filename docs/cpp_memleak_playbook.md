@@ -4,6 +4,30 @@
 
 ---
 
+## 跑之前的 5 项检查(< 2 分钟)
+
+```bash
+# 1. 板上 gcc 可用
+gcc --version | head -1
+
+# 2. addr2line 可用(后面解析 frame 用)
+which addr2line
+
+# 3. /tmp 可写,有空间(dump 几十 KB,日志几 MB)
+df -h /tmp | tail -1
+
+# 4. 业务 binary 路径(后面 addr2line 要)
+ls -la /path/to/simultor
+
+# 5. 业务 binary 有没有符号(没符号 frame 全是 ??,要拷未 strip 版本)
+file /path/to/simultor   # 看 "stripped" 还是 "with debug_info"
+nm /path/to/simultor 2>/dev/null | head -5
+```
+
+如果业务 binary **strip 过** → 现在就请内部团队**准备一份未 strip 版**(同源、同 commit、同 flags 的 build 产物),否则 Step 10 出来全是 `??` 看不懂。
+
+---
+
 ## 准备:在板上建工作目录
 
 ```bash
@@ -426,7 +450,7 @@ cat /tmp/alloc_track.$PID | head -100
 ### Step 10 — addr2line 解析 top 3 stack,**就是真嫌疑代码**
 
 ```bash
-SIMULTOR_BIN=/path/to/simultor   # 业务 binary
+SIMULTOR_BIN=/path/to/simultor   # 业务 binary(最好未 strip)
 awk '/frame\[/ {print $4}' /tmp/alloc_track.$PID | sort -u | while read addr; do
     echo "$addr  $(addr2line -e $SIMULTOR_BIN -f -C $addr 2>/dev/null)"
 done > /tmp/leak_resolved.txt
@@ -441,6 +465,45 @@ less /tmp/leak_resolved.txt
 如果 frame 全是 `??`(simultor binary 也 strip 过):
 - 拿到 dev 机上用未 strip 的 simultor binary 跑 addr2line
 - 或用 `nm` / `objdump -d` 反查地址附近的符号
+
+---
+
+## Step 10.5 — 怎么读 top stack(几种情形)
+
+dump 出来 top 3 大概率落在以下几种 pattern,**对应不同结论**:
+
+| top stack 形态(frame[0..5] 解析后) | 含义 | 修法方向 |
+|---|---|---|
+| frame[0] = `malloc`, frame[1..5] **全在 plugin 业务代码**(如 `MyPlugin::Foo::handle`) | **纯 plugin leak** | 内部模型 re-review 那个具体函数,找 `push` 没 `erase` |
+| frame[0..1] = `malloc` + `libgrpc.so` 或 `libprotobuf.so`,**frame[2..5] 回到 plugin 代码** | **plugin 错误使用框架对象**(B 情形,最常见) | plugin 在 new/Arena/subscribe 框架对象后没释放;查 frame[2] 所在 plugin 函数的 long-lived 对象 |
+| frame[0..5] **全在 `libgrpc` / `libprotobuf` / `libabsl`** 内部 | **框架内部 leak**(A 情形,较少) | 升级框架版本 / 检查 gRPC channel arg 配置 / 用 `GRPC_ARG_*` 调超时 |
+| frame[0..1] = `malloc` + `libstdc++.so`(如 `std::string` / `std::map`), frame[2..5] 在 plugin | **plugin 的容器单调累积** | 找该容器的 erase 路径,看 combo-dependent 触发 |
+| frame[0..2] 在 **simultor 平台代码**(不在 plugin) | **平台 leak 不在 plugin** | 内部模型扫 simultor 而不是 4 plugin |
+| top 1-3 outstanding 都很小(< 10% ΔRSS) | 没有"单一大头",**leak 分散在很多 stack** | 看 top 30,找语义相同的多个 stack 合并(都属同模块就是该模块的问题) |
+
+**关键规则**:**永远看 frame[1..5] 而不只是 frame[0]**。frame[0] 是 `malloc` 本身,意义不大;frame[1] 才是直接调用者;frame[2..5] 沿着调用链上溯找语义。
+
+## Step 11(可选)— 多时点 dump 看趋势
+
+跑过程中可以**多次 `kill -SIGUSR1`**,每次 dump 都会覆盖 `/tmp/alloc_track.$PID`。建议:
+
+```bash
+# 30 min dump
+sleep 1800
+kill -SIGUSR1 $PID
+cp /tmp/alloc_track.$PID /tmp/alloc_track.$PID.30min
+
+# 60 min dump
+sleep 1800
+kill -SIGUSR1 $PID
+cp /tmp/alloc_track.$PID /tmp/alloc_track.$PID.60min
+
+# 对比看 top 1 outstanding 是不是按 ΔRSS 比例涨
+diff <(grep outstanding /tmp/alloc_track.$PID.30min) \
+     <(grep outstanding /tmp/alloc_track.$PID.60min)
+```
+
+top 1 outstanding 从 30 min 到 60 min **应该接近翻倍** —— 这是它确实是 leak 源的强证据(而不是"启动时一次性分配")。
 
 ---
 
@@ -543,6 +606,9 @@ strace -p $PID -e mmap,munmap -f -k 2>&1 | head -50
 | Step 9 dump 文件很大但 top 1 outstanding 远小于预期 | 哈希冲突 / wrapper bug | `STACK_BUCKETS` 加大到 16384;或检查 `track_free` 逻辑 |
 | Step 10 frame 全是 `??` | simultor binary 没符号 | 用 dev 机的未 strip 版本跑 addr2line |
 | 进程 segfault | wrapper 内 malloc 递归;dlsym 时序 | `inside` 标志没生效;检查 `init_real` 调用时机 |
+| Step 9 SIGUSR1 后业务挂住几秒 | dump_handler 在 signal context 跑 `fopen/fprintf`,严格说不 async-signal-safe;有些 stdio 状态冲突会让业务卡 | 通常会自己恢复;若反复挂起,把 dump_handler 改为只置一个 flag,另起线程轮询 flag 后做 fopen 写 |
+| Step 7 simultor 是被 supervisor / systemd 拉起 | env 在父进程加 LD_PRELOAD,但 systemd unit / shell wrapper 可能 sanitize 掉 | 把 `LD_PRELOAD=...` 写进 simultor 的 wrapper 脚本 / systemd unit 的 `Environment=`;或者改写 systemd 启动入口 |
+| simultor 是静态链接的 binary | LD_PRELOAD 对静态 binary **完全无效** | 必须重新动态链接业务,或换 gcore + 离线分析 |
 
 ---
 
