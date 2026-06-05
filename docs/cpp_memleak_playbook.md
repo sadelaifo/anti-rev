@@ -222,15 +222,20 @@ static int cmp_outstanding_desc(const void *a, const void *b) {
 }
 
 // signal handler 只置 flag(sig_atomic_t async-safe),真正的 dump 在后台线程做
+// 注意:这版加了密集 stderr 打印,方便定位卡在哪一步
 static void dump_handler(int sig) {
     (void)sig;
+    write(2, "[mt] SIGUSR1 received in handler\n", 33);
     dump_requested = 1;
 }
 
 static void *dump_thread_fn(void *arg) {
     (void)arg;
+    write(2, "[mt] dump_thread STARTED, polling flag every 100ms\n", 51);
+    int iter = 0;
     while (1) {
         if (dump_requested) {
+            write(2, "[mt] dump_thread saw flag, dumping\n", 35);
             dump_requested = 0;
 
             char path[64];
@@ -279,6 +284,9 @@ static void *dump_thread_fn(void *arg) {
                              path, n_all);
             write(2, buf, n);
         }
+        if (++iter % 50 == 0) {  // 每 5 秒打印一次心跳,证明线程活着
+            write(2, "[mt] dump_thread heartbeat (5s)\n", 32);
+        }
         usleep(100 * 1000);  // 100 ms 轮询
     }
     return NULL;
@@ -286,11 +294,27 @@ static void *dump_thread_fn(void *arg) {
 
 __attribute__((constructor))
 static void setup(void) {
+    write(2, "[mt] constructor entered\n", 25);
     init_real();
-    signal(SIGUSR1, dump_handler);
+    if (real_malloc) {
+        write(2, "[mt] real_malloc resolved\n", 26);
+    } else {
+        write(2, "[mt] ERROR: real_malloc NULL\n", 29);
+    }
+    if (signal(SIGUSR1, dump_handler) == SIG_ERR) {
+        write(2, "[mt] ERROR: signal() failed\n", 28);
+    } else {
+        write(2, "[mt] signal handler registered\n", 31);
+    }
     pthread_t dt;
-    if (pthread_create(&dt, NULL, dump_thread_fn, NULL) == 0) {
+    int rc = pthread_create(&dt, NULL, dump_thread_fn, NULL);
+    if (rc == 0) {
         pthread_detach(dt);
+        write(2, "[mt] pthread_create OK\n", 23);
+    } else {
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "[mt] ERROR: pthread_create failed rc=%d\n", rc);
+        write(2, buf, n);
     }
     write(2, "[malloc_track] wrapper loaded\n", 30);
 }
