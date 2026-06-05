@@ -48,12 +48,14 @@ cd ~/leak_test
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define STACK_DEPTH         6
@@ -93,6 +95,9 @@ static void *(*real_realloc)(void*, size_t) = NULL;
 
 static int initialized = 0;
 static __thread int inside = 0;
+
+// 前向声明,因为 malloc() 里要调用,而定义在文件后面
+static void maybe_periodic_dump(void);
 
 static uint64_t hash_frames(void **frames, int n) {
     uint64_t h = 14695981039346656037ULL;
@@ -189,6 +194,7 @@ void *malloc(size_t size) {
     init_real();
     void *p = real_malloc(size);
     track_alloc(p, size);
+    maybe_periodic_dump();
     return p;
 }
 
@@ -202,6 +208,7 @@ void *calloc(size_t n, size_t s) {
     init_real();
     void *p = real_calloc(n, s);
     track_alloc(p, n * s);
+    maybe_periodic_dump();
     return p;
 }
 
@@ -210,6 +217,7 @@ void *realloc(void *old, size_t size) {
     if (old) track_free(old);
     void *p = real_realloc(old, size);
     if (p) track_alloc(p, size);
+    maybe_periodic_dump();
     return p;
 }
 
@@ -221,102 +229,88 @@ static int cmp_outstanding_desc(const void *a, const void *b) {
     return 0;
 }
 
-// signal handler 只置 flag(sig_atomic_t async-safe),真正的 dump 在后台线程做
-// 注意:这版加了密集 stderr 打印,方便定位卡在哪一步
-static void dump_handler(int sig) {
-    (void)sig;
-    write(2, "[mt] SIGUSR1 received in handler\n", 33);
-    dump_requested = 1;
-}
+// =================================================================
+// v4: 完全不用 signal、不用 thread。dump 由两种途径触发:
+//   (1) 每 100K 次 malloc 自动 dump 一次
+//   (2) atexit 退出时 dump 最终态
+// 全程只用 open/write 写 /tmp/alloc_track.<pid>,不依赖 fopen/fprintf/mutex
+// =================================================================
 
-static void *dump_thread_fn(void *arg) {
-    (void)arg;
-    write(2, "[mt] dump_thread STARTED, polling flag every 100ms\n", 51);
-    int iter = 0;
-    while (1) {
-        if (dump_requested) {
-            write(2, "[mt] dump_thread saw flag, dumping\n", 35);
-            dump_requested = 0;
+static long g_alloc_count = 0;
 
-            char path[64];
-            snprintf(path, sizeof(path), "/tmp/alloc_track.%d", getpid());
-            FILE *f = fopen(path, "w");
-            if (!f) {
-                char buf[64];
-                int n = snprintf(buf, sizeof(buf), "[malloc_track] fopen %s failed\n", path);
-                write(2, buf, n);
-                usleep(100 * 1000);
-                continue;
+static void do_dump(const char *trigger_label) {
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/alloc_track.%d", getpid());
+    int fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if (fd < 0) return;
+
+    int n_all = 0;
+    for (int i = 0; i < STACK_BUCKETS && n_all < MAX_STACK_ENTRIES; i++) {
+        for (stack_entry_t *e = stack_buckets[i]; e && n_all < MAX_STACK_ENTRIES; e = e->next) {
+            if (e->outstanding_bytes > 0) {
+                g_dump_buf[n_all++] = e;
             }
-
-            pthread_mutex_lock(&mu);
-            int n_all = 0;
-            for (int i = 0; i < STACK_BUCKETS && n_all < MAX_STACK_ENTRIES; i++) {
-                for (stack_entry_t *e = stack_buckets[i]; e && n_all < MAX_STACK_ENTRIES; e = e->next) {
-                    if (e->outstanding_bytes > 0) {
-                        g_dump_buf[n_all++] = e;
-                    }
-                }
-            }
-            qsort(g_dump_buf, n_all, sizeof(void*), cmp_outstanding_desc);
-
-            int n_dump = n_all < DUMP_TOP_N ? n_all : DUMP_TOP_N;
-            fprintf(f, "=== alloc_track dump pid=%d ===\n", getpid());
-            fprintf(f, "Total tracked stack entries: %d\n", n_all);
-            fprintf(f, "Top %d allocation stacks by outstanding bytes:\n\n", n_dump);
-            for (int i = 0; i < n_dump; i++) {
-                stack_entry_t *e = g_dump_buf[i];
-                fprintf(f, "[#%d] outstanding=%lu bytes (%lu live alloc, %lu total)\n",
-                        i + 1, e->outstanding_bytes, e->count, e->total_alloc_count);
-                for (int j = 0; j < STACK_DEPTH; j++) {
-                    if (e->frames[j])
-                        fprintf(f, "    frame[%d] = %p\n", j, e->frames[j]);
-                }
-                fprintf(f, "\n");
-            }
-            pthread_mutex_unlock(&mu);
-            fflush(f);
-            fclose(f);
-
-            char buf[128];
-            int n = snprintf(buf, sizeof(buf),
-                             "[malloc_track] dump written to %s (%d entries)\n",
-                             path, n_all);
-            write(2, buf, n);
         }
-        if (++iter % 50 == 0) {  // 每 5 秒打印一次心跳,证明线程活着
-            write(2, "[mt] dump_thread heartbeat (5s)\n", 32);
-        }
-        usleep(100 * 1000);  // 100 ms 轮询
     }
-    return NULL;
+    qsort(g_dump_buf, n_all, sizeof(void*), cmp_outstanding_desc);
+
+    char buf[256];
+    int len = snprintf(buf, sizeof(buf),
+        "=== alloc_track dump pid=%d trigger=%s entries=%d ===\n\n",
+        getpid(), trigger_label, n_all);
+    write(fd, buf, len);
+
+    int n_dump = n_all < DUMP_TOP_N ? n_all : DUMP_TOP_N;
+    for (int i = 0; i < n_dump; i++) {
+        stack_entry_t *e = g_dump_buf[i];
+        len = snprintf(buf, sizeof(buf),
+            "[#%d] outstanding=%lu bytes (%lu live, %lu total)\n",
+            i + 1, e->outstanding_bytes, e->count, e->total_alloc_count);
+        write(fd, buf, len);
+        for (int j = 0; j < STACK_DEPTH; j++) {
+            if (e->frames[j]) {
+                len = snprintf(buf, sizeof(buf), "    frame[%d] = %p\n", j, e->frames[j]);
+                write(fd, buf, len);
+            }
+        }
+        write(fd, "\n", 1);
+    }
+    close(fd);
+
+    int logfd = open("/tmp/malloc_track.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+    if (logfd >= 0) {
+        len = snprintf(buf, sizeof(buf),
+            "[mt] dump done: %s (entries=%d, trigger=%s)\n", path, n_all, trigger_label);
+        write(logfd, buf, len);
+        close(logfd);
+    }
 }
+
+static void atexit_dump(void) { do_dump("atexit"); }
+static void sig_dump(int sig) { (void)sig; do_dump("sigusr1"); }
 
 __attribute__((constructor))
 static void setup(void) {
-    write(2, "[mt] constructor entered\n", 25);
     init_real();
-    if (real_malloc) {
-        write(2, "[mt] real_malloc resolved\n", 26);
-    } else {
-        write(2, "[mt] ERROR: real_malloc NULL\n", 29);
+    signal(SIGUSR1, sig_dump);
+    atexit(atexit_dump);
+    int fd = open("/tmp/malloc_track.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+    if (fd >= 0) {
+        char buf[80];
+        int n = snprintf(buf, sizeof(buf),
+            "[mt] wrapper loaded pid=%d real_malloc=%p\n", getpid(), real_malloc);
+        write(fd, buf, n);
+        close(fd);
     }
-    if (signal(SIGUSR1, dump_handler) == SIG_ERR) {
-        write(2, "[mt] ERROR: signal() failed\n", 28);
-    } else {
-        write(2, "[mt] signal handler registered\n", 31);
+}
+
+// 在 malloc 钩子里加自动 dump 触发(每 100K 次一次)
+// 注意:track_alloc 已经持有 inside 保护,直接放进 malloc 末尾
+static void maybe_periodic_dump(void) {
+    long c = __sync_add_and_fetch(&g_alloc_count, 1);
+    if (c % 100000 == 0) {
+        do_dump("periodic");
     }
-    pthread_t dt;
-    int rc = pthread_create(&dt, NULL, dump_thread_fn, NULL);
-    if (rc == 0) {
-        pthread_detach(dt);
-        write(2, "[mt] pthread_create OK\n", 23);
-    } else {
-        char buf[64];
-        int n = snprintf(buf, sizeof(buf), "[mt] ERROR: pthread_create failed rc=%d\n", rc);
-        write(2, buf, n);
-    }
-    write(2, "[malloc_track] wrapper loaded\n", 30);
 }
 ```
 
@@ -414,19 +408,35 @@ cat /tmp/leak_test.stderr
 # 期望:看到 "[malloc_track] wrapper loaded"
 ```
 
-### Step 4 — 等 5 秒 + 触发 dump
+### Step 4 — 等业务跑一会儿(每 100K 次 malloc 自动 dump)
 
 ```bash
-sleep 5
-kill -SIGUSR1 $PID
-sleep 1   # 让后台 dump 线程的 100ms 轮询能跑到(改用 flag 模式后必须)
+# v4 不再依赖 SIGUSR1。每 100K 次 malloc 调用自动写一次 dump。
+# leak_test 跑 1000 次/秒,所以约 100 秒后第一次 dump。
+sleep 110
+
+# 也可以仍然用 SIGUSR1 触发(留作兼容,可选)
+kill -SIGUSR1 $PID 2>/dev/null
+sleep 1
 ```
 
 ### Step 5 — 看 dump,验证 top stack 是 inner_leak
 
 ```bash
+# 先看 wrapper log,确认 dump 真的写了
+cat /tmp/malloc_track.log
+
+# 看 dump 内容
 cat /tmp/alloc_track.$PID
 ```
+
+**期望 `/tmp/malloc_track.log` 至少有这两行**:
+```
+[mt] wrapper loaded pid=<PID> real_malloc=0x...
+[mt] dump done: /tmp/alloc_track.<PID> (entries=N, trigger=periodic)
+```
+
+如果只有 "wrapper loaded" 没有 "dump done" → 业务跑得不够久(< 100K malloc),`sleep` 时间再加长或确认 malloc hook 真的被调用了。
 
 **预期看到**:
 
