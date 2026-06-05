@@ -268,10 +268,34 @@ static void do_dump(const char *trigger_label) {
             i + 1, e->outstanding_bytes, e->count, e->total_alloc_count);
         write(fd, buf, len);
         for (int j = 0; j < STACK_DEPTH; j++) {
-            if (e->frames[j]) {
-                len = snprintf(buf, sizeof(buf), "    frame[%d] = %p\n", j, e->frames[j]);
-                write(fd, buf, len);
+            if (!e->frames[j]) continue;
+            // 用 dladdr 解析符号(零外部依赖,在 libdl 里)
+            Dl_info info;
+            if (dladdr(e->frames[j], &info) && info.dli_sname) {
+                long off_in_sym = (char*)e->frames[j] - (char*)info.dli_saddr;
+                const char *fname = info.dli_fname ? info.dli_fname : "?";
+                // 路径太长只留 basename
+                const char *bn = strrchr(fname, '/');
+                bn = bn ? bn + 1 : fname;
+                len = snprintf(buf, sizeof(buf),
+                    "    frame[%d] = %p  %s+0x%lx  [%s]\n",
+                    j, e->frames[j], info.dli_sname, off_in_sym, bn);
+            } else if (dladdr(e->frames[j], &info)) {
+                // 没找到 symbol,但找到了 .so 范围
+                long off_in_so = (char*)e->frames[j] - (char*)info.dli_fbase;
+                const char *fname = info.dli_fname ? info.dli_fname : "?";
+                const char *bn = strrchr(fname, '/');
+                bn = bn ? bn + 1 : fname;
+                len = snprintf(buf, sizeof(buf),
+                    "    frame[%d] = %p  (no symbol) [%s+0x%lx]\n",
+                    j, e->frames[j], bn, off_in_so);
+            } else {
+                // dladdr 也没找到
+                len = snprintf(buf, sizeof(buf),
+                    "    frame[%d] = %p  (unresolved)\n",
+                    j, e->frames[j]);
             }
+            write(fd, buf, len);
         }
         write(fd, "\n", 1);
     }
@@ -437,6 +461,37 @@ cat /tmp/alloc_track.$PID
 ```
 
 如果只有 "wrapper loaded" 没有 "dump done" → 业务跑得不够久(< 100K malloc),`sleep` 时间再加长或确认 malloc hook 真的被调用了。
+
+### Step 5.5 — dump 里的函数名怎么读
+
+v4 wrapper 用 `dladdr()` 内置解析 —— **dump 直接给函数名**(只要 binary 有 `.dynsym`,strip 过的也通常有)。每个 frame 看起来像:
+
+```
+frame[2] = 0x55a0c2345678  _ZN3Foo14handle_messageERKNS_3MsgE+0x42  [simultor]
+```
+
+格式:`地址  mangled符号名+在符号里的偏移  [所在的 .so/binary]`
+
+函数名是 **mangled**(C++ 编译器加的前缀),用 `c++filt` 转回可读:
+
+```bash
+cat /tmp/alloc_track.$PID | c++filt
+```
+
+输出会变成:
+
+```
+frame[2] = 0x55a0c2345678  Foo::handle_message(Foo::Msg const&)+0x42  [simultor]
+```
+
+### Step 5.6 — 三种符号信息级别 vs dump 可读性
+
+| binary 状态 | wrapper dump 给的 | 还需 addr2line 吗 |
+|---|---|---|
+| 完全 strip(无 `.dynsym`) | "no symbol" + `[.so+offset]` | 必须;dev 机用未 strip 副本 |
+| 默认 strip(保留 `.dynsym`) | **函数名 + 偏移**(本 case 默认级别) | 不需要,c++filt 即可 |
+| 未 strip(`.symtab` 全套) | 函数名 + 偏移(包括 static 函数) | 不需要 |
+| `-g` DWARF | 函数名 + 偏移(同上) | **要行号**才用 addr2line(dladdr 拿不到行号) |
 
 **预期看到**:
 
