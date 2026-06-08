@@ -501,21 +501,27 @@ cat /tmp/alloc_track.$PID
 | `outstanding=420 MB (5000 live, 5050 total)` ratio=99%,avg=84 KB | **强 leak,中对象**(可能是 protobuf message / buffer) |
 | `outstanding=50 MB (50000 live, 5000000 total)` ratio=1%,avg=1 KB | **正常**(频繁 alloc+free,可能是连接池 / 临时 buffer) |
 
-#### 一行命令按 leak 嫌疑排序
+#### 一行命令按 leak 嫌疑排序(POSIX 版,任何 awk 都跑得通)
 
 ```bash
 awk '
   /^\[#/ {
-    if (match($0, /outstanding=([0-9]+) bytes \(([0-9]+) live, ([0-9]+) total\)/, m)) {
-      out=m[1]+0; live=m[2]+0; total=m[3]+0
-      ratio = total>0 ? live/total : 0
-      avg = live>0 ? out/live : 0
-      printf "ratio=%.3f  outstanding=%-10d  avg=%-5d  %s\n",
-             ratio, out, avg, $0
-    }
+    line = $0
+    gsub(/=|\(|,|\)/, " ", line)
+    split(line, f, /[ \t]+/)
+    # 替换后字段:[#N] outstanding 820123456 bytes  1640000 live  1641200 total
+    out   = f[3] + 0
+    live  = f[5] + 0
+    total = f[7] + 0
+    ratio = total > 0 ? live/total : 0
+    avg   = live > 0 ? out/live : 0
+    printf "ratio=%.3f  outstanding=%-12d  avg=%-6d  %s\n",
+           ratio, out, avg, $0
   }
 ' /tmp/alloc_track.$PID | sort -k1.7 -rn | head -10
 ```
+
+> **注意**:前一版本用了 `match($0, /.../, m)` 的三参形式,这是 **gawk 扩展**;板上常用的 mawk / busybox awk 不支持,会让 ratio/avg/outstanding 全 0。本版用 `gsub + split` 走 POSIX 接口,所有 awk 实现都能跑。
 
 **优先看 `ratio > 0.9` 且 `outstanding` 大的几条** —— 这些就是真嫌疑。其余跳过。
 
