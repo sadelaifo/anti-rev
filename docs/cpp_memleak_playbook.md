@@ -470,6 +470,55 @@ cat /tmp/alloc_track.$PID
 
 如果只有 "wrapper loaded" 没有 "dump done" → 业务跑得不够久(< 100K malloc),`sleep` 时间再加长或确认 malloc hook 真的被调用了。
 
+### Step 5.4 — dump 里 `outstanding=... (live, total)` 三个数字的含义
+
+每条 stack 第一行长这样:
+
+```
+[#1] outstanding=820 MB (1640000 live, 1641200 total)
+                ①              ②           ③
+```
+
+| # | 字段 | 含义 |
+|---|---|---|
+| ① | **outstanding** | 这条 stack 累计分配的对象里,**当前还没被 free 的总字节** |
+| ② | **live** | 当前还活着(未释放)的**对象个数** |
+| ③ | **total** | 进程启动到现在,这条 stack **累计 alloc 过多少次**(含已释放) |
+
+派生 3 个关键指标:
+
+| 派生 | 算法 | 用途 |
+|---|---|---|
+| **平均对象大小** | `outstanding / live` | 例:820 MB / 1640000 = **524 B/个** —— 告诉你 leak 对象的尺寸量级,对照源码 struct |
+| **live/total 比例** | `live / total` | **最重要的 leak 判别**:接近 1 → 几乎全没释放 → 强 leak;< 0.5 → 大量 alloc+free,正常使用,跳过 |
+| **释放数** | `total - live` | 1641200 − 1640000 = 1200 个释放过 → 200 万次 alloc 只 free 1200 次 = 单调累积 |
+
+#### 三种典型读法
+
+| 示例 | 含义 |
+|---|---|
+| `outstanding=820 MB (1640000 live, 1641200 total)` ratio=99.9%,avg=524 B | **强 leak,小对象累积**(典型 unordered_map / vector 单调 push) |
+| `outstanding=420 MB (5000 live, 5050 total)` ratio=99%,avg=84 KB | **强 leak,中对象**(可能是 protobuf message / buffer) |
+| `outstanding=50 MB (50000 live, 5000000 total)` ratio=1%,avg=1 KB | **正常**(频繁 alloc+free,可能是连接池 / 临时 buffer) |
+
+#### 一行命令按 leak 嫌疑排序
+
+```bash
+awk '
+  /^\[#/ {
+    if (match($0, /outstanding=([0-9]+) bytes \(([0-9]+) live, ([0-9]+) total\)/, m)) {
+      out=m[1]+0; live=m[2]+0; total=m[3]+0
+      ratio = total>0 ? live/total : 0
+      avg = live>0 ? out/live : 0
+      printf "ratio=%.3f  outstanding=%-10d  avg=%-5d  %s\n",
+             ratio, out, avg, $0
+    }
+  }
+' /tmp/alloc_track.$PID | sort -k1.7 -rn | head -10
+```
+
+**优先看 `ratio > 0.9` 且 `outstanding` 大的几条** —— 这些就是真嫌疑。其余跳过。
+
 ### Step 5.5 — dump 里的函数名怎么读
 
 v4 wrapper 用 `dladdr()` 内置解析 —— **dump 直接给函数名**(只要 binary 有 `.dynsym`,strip 过的也通常有)。每个 frame 看起来像:
