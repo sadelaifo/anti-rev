@@ -1,0 +1,157 @@
+#!/bin/bash
+# Step-1 gating test for antirevfs: per-process decrypt authorization by an
+# allow-list of executable paths (gate.c).  Demonstrates the *design* is correct
+# end to end:
+#   1. an authorized program (its exe path is in the allow-list) reads decrypted
+#      content through the mount                                     (allow)
+#   2. `cp`/`cat` (exe not listed) get -EACCES — cannot exfiltrate plaintext (deny)
+#   3. a byte-identical loader NOT in the list is also denied -> it's the
+#      *identity* that gates, not the action                        (identity)
+#   4. an authorized program that fork+exec's `cp` still can't copy: the child's
+#      execve drops authorization (current->mm->exe_file changes)   (lifecycle)
+#   5. with gate_enforce=0, `cp` succeeds and yields plaintext -> proves the gate
+#      is what's enforcing, not some unrelated failure              (control)
+#   6. the lower .enc file is always ciphertext                     (sanity)
+#
+# Requires root (insmod/mount).  Run:  sudo bash test_gate.sh
+set -uo pipefail
+
+# Share one real session keyring across keyctl + mount (see test_antirevfs.sh).
+if [[ -z "${ANTIREVFS_TEST_SESSION:-}" ]]; then
+	if command -v keyctl >/dev/null 2>&1; then
+		export ANTIREVFS_TEST_SESSION=1
+		exec keyctl session - bash "$0" "$@"
+	fi
+	echo "warning: keyctl not found; cannot guarantee a shared session keyring" >&2
+fi
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+KMOD="$HERE/.."
+ROOT="$KMOD/.."
+MOD="$KMOD/module/antirevfs.ko"
+PROTECT="$ROOT/encryptor/protect.py"
+KEYCTL="$KMOD/tools/antirev-keyctl"
+PARAM=/sys/module/antirevfs/parameters/gate_enforce
+
+PASS=0; FAIL=0
+ok()  { echo "  [PASS] $*"; PASS=$((PASS+1)); }
+bad() { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
+
+[[ $EUID -eq 0 ]] || { echo "must run as root (insmod/mount)"; exit 1; }
+[[ -f "$MOD" ]] || { echo "module not built: $MOD (run: make -C $KMOD/module CC=gcc-12)"; exit 1; }
+
+WORK="$(mktemp -d /tmp/antirevfs_gate.XXXXXX)"
+ENC="$WORK/.enc/lib"; MP="$WORK/lib"; AUTHZ="$WORK/authorized_apps.txt"
+mkdir -p "$ENC" "$MP"
+
+cleanup() {
+	mountpoint -q "$MP" && umount "$MP"
+	rmmod antirevfs 2>/dev/null
+	"$KEYCTL" clear >/dev/null 2>&1
+	rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+echo "== build test artifacts =="
+cat > "$WORK/libtest.c" <<'EOF'
+int antirevfs_answer(void) { return 42; }
+EOF
+gcc -shared -fPIC -o "$WORK/libtest.so" "$WORK/libtest.c"
+cp "$WORK/libtest.so" "$WORK/libtest.plain.so"   # reference plaintext
+
+python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+	--libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
+
+# An authorized loader (dlopen+dlsym+call) and a byte-identical unlisted twin.
+cat > "$WORK/loader.c" <<'EOF'
+#include <dlfcn.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+	void *h = dlopen(argv[1], RTLD_NOW);
+	if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 2; }
+	int (*f)(void) = dlsym(h, "antirevfs_answer");
+	if (!f) { fprintf(stderr, "dlsym fail\n"); return 3; }
+	printf("answer=%d\n", f());
+	return f() == 42 ? 0 : 4;
+}
+EOF
+gcc -o "$WORK/loader"      "$WORK/loader.c" -ldl
+cp "$WORK/loader" "$WORK/loader_evil"             # identical bytes, NOT listed
+
+# An authorized program that shells out to cp (to test the execve lifecycle).
+cat > "$WORK/forkcopy.c" <<'EOF'
+#include <stdlib.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+	char cmd[1024];
+	snprintf(cmd, sizeof cmd, "cp '%s' '%s'", argv[1], argv[2]);
+	return system(cmd);   /* the cp child's exe is /bin/cp, not authorized */
+}
+EOF
+gcc -o "$WORK/forkcopy" "$WORK/forkcopy.c"
+
+# Allow-list: only the two authorized programs (full paths).  loader_evil and
+# the system cp/cat are deliberately absent.
+cat > "$AUTHZ" <<EOF
+# antirevfs step-1 allow-list (exe paths or bare basenames)
+$WORK/loader
+$WORK/forkcopy
+EOF
+chmod 0644 "$AUTHZ"
+
+echo "== load module (gate_enforce=1) + key + mount =="
+insmod "$MOD" gate_enforce=1 authz_path="$AUTHZ" || { echo "insmod failed"; exit 1; }
+"$KEYCTL" unlock --keyfile "$WORK/key.hex" >/dev/null
+mount -t antirevfs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
+mount | grep -q "$MP" && ok "mounted antirevfs (gating enforced)" || bad "mount missing"
+
+echo "== 1. authorized program may read decrypted content =="
+OUT="$("$WORK/loader" "$MP/libtest.so" 2>&1)"; RC=$?
+echo "    loader: $OUT (rc=$RC)"
+[[ $RC -eq 0 ]] && ok "authorized loader dlopen'd + called (answer=42)" \
+	|| bad "authorized loader failed (rc=$RC)"
+
+echo "== 2. cp / cat (unlisted) are denied =="
+if cp "$MP/libtest.so" "$WORK/out_cp" 2>"$WORK/cp.err"; then
+	bad "cp of mount succeeded (gate broken)"; cmp -s "$WORK/out_cp" "$WORK/libtest.plain.so" && echo "    -> and it was PLAINTEXT"
+else
+	grep -qi "permission denied" "$WORK/cp.err" \
+		&& ok "cp denied with EACCES (no plaintext exfiltration)" \
+		|| { ok "cp denied"; echo "    ($(cat "$WORK/cp.err"))"; }
+fi
+cat "$MP/libtest.so" >/dev/null 2>&1 && bad "cat of mount succeeded" || ok "cat denied"
+
+echo "== 3. identity, not action: unlisted twin loader is denied =="
+OUT="$("$WORK/loader_evil" "$MP/libtest.so" 2>&1)"; RC=$?
+echo "    loader_evil: $OUT (rc=$RC)"
+[[ $RC -ne 0 ]] && echo "$OUT" | grep -qi "denied\|dlopen" \
+	&& ok "byte-identical-but-unlisted loader denied (gates on exe identity)" \
+	|| bad "unlisted twin loader was allowed (gate keys on the wrong thing)"
+
+echo "== 4. execve lifecycle: authorized parent, cp child still denied =="
+# forkcopy IS authorized, but the cp it exec's is not -> child drops authz.
+if "$WORK/forkcopy" "$MP/libtest.so" "$WORK/out_fork" 2>/dev/null; then
+	bad "fork+exec cp copied plaintext (lifecycle broken)"
+else
+	[[ ! -s "$WORK/out_fork" ]] \
+		&& ok "cp child denied though parent authorized (execve drops authz)" \
+		|| bad "out_fork is non-empty: $(wc -c <"$WORK/out_fork") bytes"
+fi
+
+echo "== 5. control: gate_enforce=0 lets cp through (and it's plaintext) =="
+echo 0 > "$PARAM"
+if cp "$MP/libtest.so" "$WORK/out_off" 2>/dev/null && cmp -s "$WORK/out_off" "$WORK/libtest.plain.so"; then
+	ok "with gating off, cp yields plaintext -> the gate was the enforcer"
+else
+	bad "gate-off cp did not yield plaintext (test setup issue?)"
+fi
+echo 1 > "$PARAM"
+cp "$MP/libtest.so" "$WORK/out_reon" 2>/dev/null && bad "cp still works after re-enable" || ok "re-enabling gate denies cp again"
+
+echo "== 6. lower .enc file is ciphertext =="
+cmp -s "$ENC/libtest.so" "$WORK/libtest.plain.so" && bad "lower file is plaintext!" \
+	|| ok "lower .enc file is ciphertext"
+
+echo
+echo "== RESULT: $PASS passed, $FAIL failed =="
+[[ $FAIL -eq 0 ]]

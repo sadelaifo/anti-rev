@@ -129,8 +129,22 @@ static int antirevfs_readpage(struct file *file, struct page *page)
 
 static int antirevfs_file_open(struct inode *inode, struct file *file)
 {
-	if (!ANTIREVFS_I(inode)->open_ok)
+	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
+
+	if (!ii->open_ok)
 		return -EIO;	/* strict mode: unencrypted, non-whitelisted */
+
+	/*
+	 * Decrypt-authorization gate: only an authorized process may open an
+	 * encrypted file (and thus reach plaintext via the shared page cache).
+	 * Gating at open — before any read/mmap/splice — is what keeps `cp`,
+	 * backups, and file managers on ciphertext while the business app loads
+	 * natively.  Non-encrypted (passthrough-whitelisted) files are not
+	 * secret and are never gated.
+	 */
+	if (ii->encrypted && !antirevfs_task_authorized())
+		return -EACCES;
+
 	return 0;
 }
 

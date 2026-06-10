@@ -6,7 +6,7 @@
 #   make clean
 
 obj-m += antirevfs.o
-antirevfs-objs := super.o inode.o file.o crypto.o
+antirevfs-objs := super.o inode.o file.o crypto.o gate.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)

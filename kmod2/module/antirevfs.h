@@ -78,6 +78,9 @@ extern const struct file_operations antirevfs_dir_fops;
 extern const struct file_operations antirevfs_file_fops;
 extern const struct address_space_operations antirevfs_aops;
 
+/* gate.c — per-process decrypt authorization (the one seam swapped in step 2) */
+bool antirevfs_task_authorized(void);
+
 /* crypto.c */
 int antirevfs_has_magic(struct file *lower_file);	/* >0 yes, 0 no, <0 err */
 int antirevfs_decrypt_file(struct super_block *sb, struct file *lower_file,
