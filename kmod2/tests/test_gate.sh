@@ -82,10 +82,13 @@ cp "$WORK/loader" "$WORK/loader_evil"             # identical bytes, NOT listed
 cat > "$WORK/forkcopy.c" <<'EOF'
 #include <stdlib.h>
 #include <stdio.h>
+#include <sys/wait.h>
 int main(int argc, char **argv) {
 	char cmd[1024];
 	snprintf(cmd, sizeof cmd, "cp '%s' '%s'", argv[1], argv[2]);
-	return system(cmd);   /* the cp child's exe is /bin/cp, not authorized */
+	int rc = system(cmd);   /* the cp child's exe is /bin/cp, not authorized */
+	if (rc == -1) return 2;
+	return WIFEXITED(rc) ? WEXITSTATUS(rc) : 3;  /* propagate cp's real exit code */
 }
 EOF
 gcc -o "$WORK/forkcopy" "$WORK/forkcopy.c"
@@ -130,12 +133,14 @@ echo "    loader_evil: $OUT (rc=$RC)"
 
 echo "== 4. execve lifecycle: authorized parent, cp child still denied =="
 # forkcopy IS authorized, but the cp it exec's is not -> child drops authz.
-if "$WORK/forkcopy" "$MP/libtest.so" "$WORK/out_fork" 2>/dev/null; then
-	bad "fork+exec cp copied plaintext (lifecycle broken)"
+# Check the ARTIFACT (did plaintext actually escape?), not the child's exit
+# code: system() returns a wait-status, so an exit-code check is unreliable.
+rm -f "$WORK/out_fork"
+"$WORK/forkcopy" "$MP/libtest.so" "$WORK/out_fork" 2>/dev/null
+if [[ -s "$WORK/out_fork" ]] && cmp -s "$WORK/out_fork" "$WORK/libtest.plain.so"; then
+	bad "fork+exec cp copied PLAINTEXT (lifecycle broken)"
 else
-	[[ ! -s "$WORK/out_fork" ]] \
-		&& ok "cp child denied though parent authorized (execve drops authz)" \
-		|| bad "out_fork is non-empty: $(wc -c <"$WORK/out_fork") bytes"
+	ok "cp child got no plaintext though parent authorized (execve drops authz)"
 fi
 
 echo "== 5. control: gate_enforce=0 lets cp through (and it's plaintext) =="
