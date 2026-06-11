@@ -150,7 +150,7 @@ static int antirevfs_file_open(struct inode *inode, struct file *file)
 	 *    process's exe identity, which is what keeps cp on ciphertext.
 	 */
 	if (ii->encrypted) {
-		if (file->f_mode & FMODE_EXEC) {
+		if (arev_is_exec_open(file)) {
 			if (!antirevfs_file_authorized(file))
 				return -EACCES;
 		} else if (!antirevfs_task_authorized()) {

@@ -54,4 +54,47 @@ static inline ssize_t arev_kernel_read(struct file *f, void *buf, size_t count,
 #endif
 }
 
+/*
+ * get_mm_exe_file() is defined in kernel/fork.c but is NOT exported to modules
+ * on every kernel (e.g. Ubuntu's 6.8.0-x generic build drops the EXPORT_SYMBOL
+ * while SLES 4.12 keeps it), so linking against it fails modpost with an
+ * "undefined" error on those kernels.  Open-code the same refcount dance the
+ * kernel does internally, using the always-exported get_file_rcu().  The
+ * get_file_rcu() prototype changed in 6.7 (commit 0ede61d8589c) from a
+ * try-get-on-a-bare-pointer macro to a function taking the __rcu slot address.
+ */
+static inline struct file *arev_get_mm_exe_file(struct mm_struct *mm)
+{
+	struct file *exe_file;
+
+	rcu_read_lock();
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+	exe_file = get_file_rcu(&mm->exe_file);
+#else
+	exe_file = rcu_dereference(mm->exe_file);
+	if (exe_file && !get_file_rcu(exe_file))
+		exe_file = NULL;
+#endif
+	rcu_read_unlock();
+	return exe_file;
+}
+
+/*
+ * True when `file` is being opened by the kernel to load it AS a program
+ * (execve / load_elf_binary), as opposed to a plain data read (cp, cat, a
+ * library open).  The exec-load gate uses this to authorize on the program's
+ * OWN path instead of the caller's exe identity.
+ *
+ * The signal moved across kernels: SLES 4.12 sets FMODE_EXEC in f_mode by the
+ * time a stacked fs's ->open runs, but mainline 6.8 reaches ->open with
+ * FMODE_EXEC clear (f_mode 0x801d) and the intent surviving only as
+ * __FMODE_EXEC in f_flags (0x8020).  current->in_execve is NOT usable here:
+ * the kernel opens the binary in alloc_bprm() *before* bprm_execve() sets
+ * in_execve=1, so it still reads 0 at this point.  Test both flag homes.
+ */
+static inline bool arev_is_exec_open(struct file *file)
+{
+	return (file->f_mode & FMODE_EXEC) || (file->f_flags & __FMODE_EXEC);
+}
+
 #endif /* _ANTIREVFS_COMPAT_H */

@@ -143,7 +143,7 @@ static bool authz_exe_allowed(void)
 	if (!current->mm)			/* kernel thread: never authorized */
 		return false;
 
-	exe = get_mm_exe_file(current->mm);
+	exe = arev_get_mm_exe_file(current->mm);
 	if (!exe)
 		return false;
 
