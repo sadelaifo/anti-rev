@@ -118,11 +118,26 @@ static bool authz_list_matches(char *list, const char *exe_path)
 	return false;
 }
 
+/* Match a resolved path against the freshly-read allow-list; deny on any error
+ * or a missing/unreadable list. */
+static bool authz_path_listed(const char *path)
+{
+	char *list;
+	bool ok;
+
+	list = authz_read_list();
+	if (!list)
+		return false;		/* enforce + no/unreadable list => deny */
+	ok = authz_list_matches(list, path);
+	kfree(list);
+	return ok;
+}
+
 /* Resolve the calling process's executable path and test it against the list. */
 static bool authz_exe_allowed(void)
 {
 	struct file *exe;
-	char *pathbuf, *exe_path, *list;
+	char *pathbuf, *exe_path;
 	bool ok = false;
 
 	if (!current->mm)			/* kernel thread: never authorized */
@@ -140,23 +155,18 @@ static bool authz_exe_allowed(void)
 
 	exe_path = d_path(&exe->f_path, pathbuf, PATH_MAX);
 	fput(exe);
-	if (IS_ERR(exe_path))
-		goto out;
+	if (!IS_ERR(exe_path))
+		ok = authz_path_listed(exe_path);
 
-	list = authz_read_list();
-	if (!list)
-		goto out;			/* enforce + no/unreadable list => deny */
-
-	ok = authz_list_matches(list, exe_path);
-	kfree(list);
-out:
 	kfree(pathbuf);
 	return ok;
 }
 
 /*
- * The gate seam.  antirevfs_file_open() calls this for every open of an
- * encrypted file; returns true if the caller may read decrypted content.
+ * Data-read gate (libraries, cp, source, ...).  antirevfs_file_open() calls
+ * this for every NON-exec open of an encrypted file; returns true if the
+ * calling process may read decrypted content.  Gates on the calling process's
+ * executable identity, which is what keeps cp/backups on ciphertext.
  *
  * Step 2 replaces the authz_exe_allowed() body with a signature check; this
  * function's contract and every caller stay identical.
@@ -166,4 +176,33 @@ bool antirevfs_task_authorized(void)
 	if (!gate_enforce)
 		return true;		/* gating off: behave exactly as before */
 	return authz_exe_allowed();
+}
+
+/*
+ * Exec-load gate.  At execve the kernel opens the program BEFORE
+ * current->mm->exe_file becomes this program (it is still the caller, e.g. the
+ * shell), so the task gate above would wrongly deny a perfectly authorized
+ * binary and make every encrypted executable un-runnable.  For an exec-load we
+ * therefore gate on the program's OWN path.  Running a program is not a
+ * plaintext-FILE exfiltration vector — no readable plaintext copy is produced;
+ * the bytes land only in the new process's executable mapping.
+ */
+bool antirevfs_file_authorized(struct file *file)
+{
+	char *pathbuf, *fpath;
+	bool ok = false;
+
+	if (!gate_enforce)
+		return true;
+
+	pathbuf = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!pathbuf)
+		return false;
+
+	fpath = d_path(&file->f_path, pathbuf, PATH_MAX);
+	if (!IS_ERR(fpath))
+		ok = authz_path_listed(fpath);
+
+	kfree(pathbuf);
+	return ok;
 }
