@@ -33,6 +33,7 @@ struct antirevfs_sb_info {
 	u8		key[ANTREV_KEY_LEN];	/* mount-resident AES key */
 	bool		have_key;
 	char		*passthrough;		/* comma list of extensions, or NULL */
+	bool		pass_nonelf;		/* passdata: serve ANY non-magic file plaintext */
 };
 
 /* Per-inode state.  One antirevfs inode per lower inode (iget5 cached) so the
@@ -71,6 +72,7 @@ extern const struct super_operations antirevfs_sops;
 /* inode.c */
 extern const struct inode_operations antirevfs_dir_iops;
 extern const struct inode_operations antirevfs_file_iops;
+extern const struct inode_operations antirevfs_symlink_iops;
 struct inode *antirevfs_iget(struct super_block *sb, struct dentry *lower_dentry);
 
 /* file.c */
@@ -79,7 +81,8 @@ extern const struct file_operations antirevfs_file_fops;
 extern const struct address_space_operations antirevfs_aops;
 
 /* gate.c — per-process decrypt authorization (the one seam swapped in step 2) */
-bool antirevfs_task_authorized(void);
+bool antirevfs_task_authorized(void);		/* data reads: gate on caller's exe */
+bool antirevfs_file_authorized(struct file *file);	/* exec-load: gate on file's own path */
 
 /* crypto.c */
 int antirevfs_has_magic(struct file *lower_file);	/* >0 yes, 0 no, <0 err */

@@ -98,6 +98,8 @@ static int antirevfs_show_options(struct seq_file *m, struct dentry *root)
 
 	if (sbi->passthrough)
 		seq_printf(m, ",passthrough=%s", sbi->passthrough);
+	if (sbi->pass_nonelf)
+		seq_printf(m, ",passdata");
 	return 0;
 }
 
@@ -167,6 +169,14 @@ static int antirevfs_parse_opts(struct antirevfs_sb_info *sbi, char *opts)
 				if (*c == ':')
 					*c = ',';
 			sbi->passthrough = list;
+		} else if (!strcmp(p, "passdata")) {
+			/* serve ANY non-ANTREV01 file as plaintext passthrough
+			 * (data files, scripts, third-party plaintext libs).
+			 * For complete mixed-content read-only trees produced by
+			 * antirev-fs-pack.py with mirror_plaintext.  Encrypted
+			 * (ANTREV01) files are still decrypted + gated as usual.
+			 */
+			sbi->pass_nonelf = true;
 		}
 		/* unknown options (ro, relatime, ...) ignored */
 	}

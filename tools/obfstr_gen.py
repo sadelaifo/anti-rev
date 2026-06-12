@@ -354,6 +354,15 @@ def transform_source(src: str) -> str:
             arg_start, arg_end, arg_raw = args[ti]
             decoded = parse_string_literal_arg(arg_raw)
             if decoded is None:
+                # Not a bare string literal, but it may CONTAIN a nested
+                # transform-macro call — e.g. strcmp(p, OBFSTR("...")) or
+                # EXPECT(..., OBFSTR("...")).  Recurse so the inner literal
+                # still gets obfuscated instead of being skipped when we
+                # advance past this outer call.
+                recursed = transform_source(arg_raw)
+                if recursed != arg_raw:
+                    new_args[ti] = (arg_start, arg_end, recursed)
+                    any_replaced = True
                 continue
             replacement = '_OBF(' + encode_bytes(decoded) + ')' if decoded else '_OBF()'
             # Preserve any leading whitespace from the original arg so the

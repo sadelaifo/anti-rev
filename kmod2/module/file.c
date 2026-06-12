@@ -135,15 +135,28 @@ static int antirevfs_file_open(struct inode *inode, struct file *file)
 		return -EIO;	/* strict mode: unencrypted, non-whitelisted */
 
 	/*
-	 * Decrypt-authorization gate: only an authorized process may open an
-	 * encrypted file (and thus reach plaintext via the shared page cache).
-	 * Gating at open — before any read/mmap/splice — is what keeps `cp`,
-	 * backups, and file managers on ciphertext while the business app loads
-	 * natively.  Non-encrypted (passthrough-whitelisted) files are not
-	 * secret and are never gated.
+	 * Decrypt-authorization gate.  Gating at open — before any read/mmap/
+	 * splice — is what keeps `cp`, backups, and file managers on ciphertext
+	 * while the business app loads natively.  Non-encrypted (passthrough-
+	 * whitelisted) files are not secret and are never gated.
+	 *
+	 * Exec-load vs data-read need DIFFERENT identities:
+	 *  - FMODE_EXEC (kernel loading this file AS a program): at exec-open
+	 *    current->mm->exe_file is still the caller (the shell), not this
+	 *    program, so the task gate would deny every encrypted executable.
+	 *    Gate on the program's OWN path instead — running a program is not a
+	 *    plaintext-file exfiltration vector.
+	 *  - everything else (lib loads, cp, source): gate on the calling
+	 *    process's exe identity, which is what keeps cp on ciphertext.
 	 */
-	if (ii->encrypted && !antirevfs_task_authorized())
-		return -EACCES;
+	if (ii->encrypted) {
+		if (arev_is_exec_open(file)) {
+			if (!antirevfs_file_authorized(file))
+				return -EACCES;
+		} else if (!antirevfs_task_authorized()) {
+			return -EACCES;
+		}
+	}
 
 	return 0;
 }

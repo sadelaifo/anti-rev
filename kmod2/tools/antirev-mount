@@ -2,8 +2,11 @@
 # antirev-mount — mount an encrypted .enc/ subtree as a decrypted antirevfs view.
 #
 # Usage:
-#   antirev-mount <lowerdir> <mountpoint> [passthrough-exts]
+#   antirev-mount [--passdata] <lowerdir> <mountpoint> [passthrough-exts]
 #
+#   --passdata        serve ANY non-ANTREV01 file as plaintext passthrough — for
+#                     complete mixed-content read-only trees (antirev-fs-pack.py
+#                     with mirror_plaintext).  Supersedes [passthrough-exts].
 #   <lowerdir>        ciphertext tree (e.g. /root/proj/.enc/lib)
 #   <mountpoint>      where the plaintext view appears (e.g. /root/proj/lib)
 #   passthrough-exts  optional colon-separated extensions served verbatim
@@ -15,13 +18,17 @@ set -euo pipefail
 
 die() { echo "antirev-mount: $*" >&2; exit 1; }
 
-[[ $# -ge 2 ]] || die "usage: antirev-mount <lowerdir> <mountpoint> [passthrough-exts]"
+passdata=0
+if [[ "${1:-}" == "--passdata" ]]; then passdata=1; shift; fi
+
+[[ $# -ge 2 ]] || die "usage: antirev-mount [--passdata] <lowerdir> <mountpoint> [passthrough-exts]"
 lower="$1"; mp="$2"; pass="${3:-}"
 
 [[ -d "$lower" ]] || die "lowerdir not a directory: $lower"
 [[ -d "$mp" ]]    || die "mountpoint not a directory: $mp"
 
 opts="ro"
+[[ "$passdata" -eq 1 ]] && opts="$opts,passdata"
 [[ -n "$pass" ]] && opts="$opts,passthrough=$pass"
 [[ -n "${ANTIREV_MOUNT_OPTS:-}" ]] && opts="$opts,$ANTIREV_MOUNT_OPTS"
 

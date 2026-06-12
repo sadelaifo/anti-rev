@@ -4,10 +4,12 @@
 # Verifies the kmod2 ciphertext-tree packer:
 #   1. every ELF (lib + exe) is encrypted into the mirrored .enc tree (ANTREV01)
 #   2. ciphertext != plaintext, and decrypts back byte-identically
-#   3. non-ELF files are left untouched (NOT copied into the tree)
-#   4. blacklisted ELFs are left plaintext (NOT in the tree)
+#   3. non-ELF data files (.json/.py/.txt) are mirrored VERBATIM (plaintext) into
+#      the tree (mirror_plaintext default) — visible under a `passdata` mount
+#   4. blacklisted ELFs are mirrored plaintext (in tree, no ANTREV01 magic)
 #   5. symlinks are mirrored verbatim (SONAME chains survive)
-#   6. a manifest is written outside the .enc tree
+#   6. a manifest (with the plaintext list) is written outside the .enc tree
+#   7. mirror_plaintext: false reverts to a minimal pure-secret tree
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -36,7 +38,9 @@ ln -s libtest.so.1   "$PROJ/lib/libtest.so"
 printf 'int main(void){return 0;}\n' > "$WORK/m.c"
 gcc -o "$PROJ/bin/app" "$WORK/m.c"                     # an executable ELF
 gcc -shared -fPIC -o "$PROJ/lib/libthird.so" "$WORK/t.c"  # to be blacklisted
-echo '{"cfg":1}' > "$PROJ/lib/data.json"               # non-ELF, must be untouched
+echo '{"cfg":1}' > "$PROJ/lib/data.json"               # non-ELF data file
+printf '#!/usr/bin/env python3\nprint("hi")\n' > "$PROJ/bin/run.py"  # script
+printf 'generated\n' > "$PROJ/lib/notes.txt"           # non-ELF text
 
 cat > "$WORK/config.yaml" <<EOF
 install_dir: $PROJ
@@ -74,12 +78,24 @@ sys.exit(0 if dec == open(plain, "rb").read() else 1)
 PY
 [[ $? -eq 0 ]] && ok "decrypt round-trips to original plaintext" || bad "decrypt mismatch"
 
-echo "== 3. non-ELF untouched (NOT in tree) =="
-[[ ! -e "$ENC/lib/data.json" ]] && ok "data.json not copied into tree" || bad "data.json leaked into tree"
-[[ -f "$PROJ/lib/data.json" ]]  && ok "original data.json untouched"   || bad "original data.json modified"
+echo "== 3. non-ELF data files mirrored VERBATIM (plaintext, in tree) =="
+for f in lib/data.json bin/run.py lib/notes.txt; do
+	if [[ -f "$ENC/$f" ]] && cmp -s "$ENC/$f" "$PROJ/$f" \
+		&& ! head -c8 "$ENC/$f" | grep -q "ANTREV01"; then
+		ok "mirrored plaintext (no magic): $f"
+	else
+		bad "not mirrored byte-identically / has magic: $f"
+	fi
+done
+[[ -f "$PROJ/lib/data.json" ]] && ok "original data.json untouched" || bad "original data.json modified"
 
-echo "== 4. blacklisted ELF left out of tree =="
-[[ ! -e "$ENC/lib/libthird.so" ]] && ok "libthird.so (blacklisted) not in tree" || bad "blacklisted lib in tree"
+echo "== 4. blacklisted ELF mirrored plaintext (in tree, no ANTREV01) =="
+if [[ -f "$ENC/lib/libthird.so" ]] && cmp -s "$ENC/lib/libthird.so" "$PROJ/lib/libthird.so" \
+	&& ! head -c8 "$ENC/lib/libthird.so" | grep -q "ANTREV01"; then
+	ok "libthird.so (blacklisted) mirrored plaintext"
+else
+	bad "blacklisted lib not mirrored plaintext / has magic"
+fi
 
 echo "== 5. symlinks mirrored verbatim =="
 if [[ -L "$ENC/lib/libtest.so" && "$(readlink "$ENC/lib/libtest.so")" == "libtest.so.1" ]]; then
@@ -88,11 +104,37 @@ else
 	bad "symlink not mirrored"
 fi
 
-echo "== 6. manifest written outside the .enc tree =="
-if [[ -f "$WORK/antirev-fs-manifest.json" ]] && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$WORK/antirev-fs-manifest.json"; then
-	ok "manifest present and valid JSON, outside the tree"
+echo "== 6. manifest written outside the .enc tree, lists plaintext mirror =="
+if [[ -f "$WORK/antirev-fs-manifest.json" ]] && python3 - "$WORK/antirev-fs-manifest.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+pt = set(m.get("plaintext", []))
+need = {"lib/data.json", "bin/run.py", "lib/notes.txt", "lib/libthird.so"}
+sys.exit(0 if need <= pt else 1)
+PY
+then
+	ok "manifest valid JSON, plaintext list includes data + blacklisted ELF"
 else
-	bad "manifest missing/invalid"
+	bad "manifest missing/invalid or plaintext list incomplete"
+fi
+
+echo "== 7. mirror_plaintext: false -> minimal pure-secret tree =="
+ENC2="$WORK/proj/.enc2"
+cat > "$WORK/config2.yaml" <<EOF
+install_dir: $PROJ
+output_dir:  $ENC2
+key:         key.hex
+mirror_plaintext: false
+blacklist:
+  - libthird.so*
+EOF
+python3 "$PACK" "$WORK/config2.yaml" >/dev/null || { echo "packer (mode2) failed"; exit 1; }
+if [[ -f "$ENC2/lib/libtest.so.1.0" && ! -e "$ENC2/lib/data.json" \
+	&& ! -e "$ENC2/bin/run.py" && ! -e "$ENC2/lib/libthird.so" \
+	&& -L "$ENC2/lib/libtest.so" ]]; then
+	ok "data files + blacklisted ELF omitted; ELFs + symlinks kept"
+else
+	bad "mirror_plaintext:false did not produce a minimal tree"
 fi
 
 echo

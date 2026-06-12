@@ -10,6 +10,8 @@
 #   4. a plaintext file under the lower tree returns -EIO         (strict mode)
 #   5. a whitelisted .json file is served verbatim               (passthrough)
 #   6. two processes mmapping the file share physical pages      (page cache)
+#   7. passdata serves any non-magic file plaintext              (mixed tree)
+#   8. symlinks (chains, ->encrypted lib, ->data) resolve        (get_link)
 #
 # Requires root (insmod/mount).  Run:  sudo bash test_antirevfs.sh
 set -uo pipefail
@@ -47,10 +49,11 @@ bad()  { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 [[ -f "$MOD" ]] || { echo "module not built: $MOD (run: make -C $KMOD/module CC=gcc-12)"; exit 1; }
 
 WORK="$(mktemp -d /tmp/antirevfs_test.XXXXXX)"
-ENC="$WORK/.enc/lib"; MP="$WORK/lib"
-mkdir -p "$ENC" "$MP"
+ENC="$WORK/.enc/lib"; MP="$WORK/lib"; MP2="$WORK/lib_pd"
+mkdir -p "$ENC" "$MP" "$MP2"
 
 cleanup() {
+	mountpoint -q "$MP2" && umount "$MP2"
 	mountpoint -q "$MP" && umount "$MP"
 	rmmod antirevfs 2>/dev/null
 	"$KEYCTL" clear >/dev/null 2>&1
@@ -72,6 +75,16 @@ python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
 # Mixed content: a plaintext .so (strict-mode reject) and a whitelisted .json.
 echo "not encrypted" > "$ENC/plain.so"
 echo '{"ok":true}'   > "$ENC/data.json"
+# A real plaintext ELF (third-party lib that coexists) + a script with no
+# whitelisted extension — both rejected by strict mode, both served by passdata.
+cp "$WORK/libtest.plain.so" "$ENC/thirdparty.so"
+printf '#!/bin/sh\necho hi\n' > "$ENC/run.sh"
+# Symlinks mirrored into the lower tree (as the packer does): a chain to the
+# ENCRYPTED lib, a link to a passthrough data file, and a genuinely broken link.
+ln -s libtest.so   "$ENC/lib_link.so"     # symlink -> encrypted lib (decrypts)
+ln -s lib_link.so  "$ENC/lib_link2.so"    # chained symlink (SONAME-style)
+ln -s data.json    "$ENC/data_link.json"  # symlink -> passthrough data file
+ln -s nonexistent  "$ENC/broken_link"     # genuinely dangling target
 
 echo "== load module + key + mount =="
 insmod "$MOD" || { echo "insmod failed"; exit 1; }
@@ -167,6 +180,59 @@ if [[ -n "$pfn1" && "$pfn1" != "0" && "$pfn1" == "$pfn2" ]]; then
 	ok "two processes share the same physical page (PFN $pfn1)"
 else
 	bad "page not shared (pfn1=$pfn1 pfn2=$pfn2) — may need CAP_SYS_ADMIN for pagemap PFNs"
+fi
+
+echo "== 7. passdata mode (complete mixed-content read-only tree) =="
+# Same lower tree, mounted with passdata: ANY non-ANTREV01 file is served
+# plaintext (data files, scripts, third-party plaintext ELFs), while encrypted
+# libs still decrypt.  This is the mixed bin/lib case from antirev-fs-pack.py
+# with mirror_plaintext.  Strict mode rejected thirdparty.so / run.sh above;
+# passdata serves them.
+if mount -t antirevfs -o "ro,passdata" "$ENC" "$MP2" 2>/dev/null; then
+	ok "mounted antirevfs with passdata"
+	# encrypted lib still decrypts
+	cmp -s "$MP2/libtest.so" "$WORK/libtest.plain.so" \
+		&& ok "passdata: encrypted lib still decrypts" \
+		|| bad "passdata: encrypted lib decrypt broke"
+	# third-party plaintext ELF served byte-identically (strict mode rejected it)
+	cmp -s "$MP2/thirdparty.so" "$WORK/libtest.plain.so" \
+		&& ok "passdata: plaintext third-party ELF served verbatim" \
+		|| bad "passdata: third-party ELF not served"
+	# script with no whitelisted extension served plaintext
+	cmp -s "$MP2/run.sh" "$ENC/run.sh" \
+		&& ok "passdata: unlisted-extension script served verbatim" \
+		|| bad "passdata: script not served"
+	umount "$MP2"
+else
+	bad "passdata mount failed"
+	dmesg | tail -5
+fi
+
+echo "== 8. symlinks resolve through the mount =="
+# readlink must work (regression: module used to reject S_IFLNK with -EINVAL,
+# so every symlink showed l????????? and dangled).
+if [[ "$(readlink "$MP/lib_link.so" 2>/dev/null)" == "libtest.so" ]]; then
+	ok "readlink through mount returns the target"
+else
+	bad "readlink through mount empty/wrong (symlink not served)"
+fi
+# symlink -> encrypted lib resolves AND decrypts
+cmp -s "$MP/lib_link.so" "$WORK/libtest.plain.so" \
+	&& ok "symlink -> encrypted lib resolves + decrypts" \
+	|| bad "symlink -> encrypted lib broken"
+# chained symlink (lib_link2 -> lib_link.so -> libtest.so)
+cmp -s "$MP/lib_link2.so" "$WORK/libtest.plain.so" \
+	&& ok "chained symlink resolves (SONAME-style)" \
+	|| bad "chained symlink broken"
+# symlink -> passthrough data file
+cmp -s "$MP/data_link.json" "$ENC/data.json" \
+	&& ok "symlink -> passthrough data resolves" \
+	|| bad "symlink -> data broken"
+# a genuinely broken link must still dangle (not crash, not falsely resolve)
+if readlink "$MP/broken_link" >/dev/null 2>&1 && ! cat "$MP/broken_link" >/dev/null 2>&1; then
+	ok "genuinely-broken link readable as a link but dangles (correct)"
+else
+	bad "broken link misbehaved"
 fi
 
 echo
