@@ -21,7 +21,8 @@ kmod2/
 │   └── dkms.conf        DKMS packaging (auto-rebuild on kernel upgrade)
 ├── tools/
 │   ├── antirev-keyctl   install/clear the AES key in the kernel keyring
-│   └── antirev-mount    thin `mount -t antirevfs` wrapper
+│   ├── antirev-mount    thin `mount -t antirevfs` wrapper (read-only view)
+│   └── antirev-mount-rw writable view: overlayfs upper over the antirevfs lower
 └── tests/
     └── test_antirevfs.sh end-to-end test (needs root)
 ```
@@ -111,8 +112,61 @@ sudo kmod2/tools/antirev-mount /root/proj/.enc/lib /root/proj/lib json:md
   (encrypted ELFs + `.py`/`.sh`/`.txt`/`.json` data + third-party plaintext
   libs), produced by `antirev-fs-pack.py` with `mirror_plaintext` (default).
   The mount is read-only: redirect any runtime-written files to a writable path
-  outside the mount (e.g. an overlayfs upper).
+  outside the mount (e.g. an overlayfs upper — see "Writable view" below).
 - For ad-hoc testing without the keyring, pass `key=<64 hex chars>` in `-o`.
+
+### Writable view (overlayfs upper) — `antirev-mount-rw`
+
+A bare antirevfs mount is **read-only** (decrypt-on-read only; no write path), so
+business software that writes lock/log/temp files *inside* `bin/` or `lib/` —
+next to the protected executables — fails with `-EROFS`. `antirev-mount-rw`
+fixes this by stacking a writable `overlayfs` upper on top of the decrypted
+antirevfs lower:
+
+```
+overlayfs(upper = writable ext4)   ← what the app sees (read-write)
+    │
+antirevfs(ro, decrypt-on-read)     ← lower (ciphertext under .enc/)
+```
+
+Reads of encrypted `.so`/`.elf` fall through to the antirevfs lower and decrypt;
+anything the app writes lands in the overlay's writable upper and **never
+touches the ciphertext tree**.
+
+```bash
+# mount: writable decrypted view of .enc/bin at bin/
+sudo kmod2/tools/antirev-mount-rw --passdata /root/proj/.enc/bin /root/proj/bin
+
+# tear down (unmounts overlay then antirevfs, preserves the upper)
+sudo kmod2/tools/antirev-mount-rw --down /root/proj/bin
+
+# where do the app's writes (logs/locks/temp) live? — works mounted or not
+sudo kmod2/tools/antirev-mount-rw --status /root/proj/bin
+```
+
+**Where written files persist / retrieving logs after unmount.** While mounted,
+the app reads/writes them at the natural path (`/root/proj/bin/run.log`), exactly
+as in plaintext mode. After `--down`, `bin/` is just the bare mountpoint again,
+but the files are **not lost** — they stay on disk in the upper at
+`/root/proj/.antirev-rw/bin/upper/` (the default upper is disk-backed ext4,
+matching plaintext write semantics; `--down` never deletes it). Use
+`antirev-mount-rw --status <mountpoint>` to print the upper path and list what
+the app has written, or just re-mount to expose them at `bin/` again. In
+production the overlay normally stays mounted (fstab/systemd), so `bin/run.log`
+is always live; teardown is a maintenance action.
+
+By default the three overlay layers (`dec/` decrypted lower, `upper/` writable,
+`work/`) live under `<dirname mountpoint>/.antirev-rw/<basename mountpoint>`;
+override with `--state <dir>` (point it at a tmpfs path to wipe writes on
+reboot). `--passthrough <exts>` and `ANTIREV_MOUNT_OPTS` (e.g. `key=<64hex>`)
+work the same as for `antirev-mount`. Covered by `tests/test_antirevfs_overlay_rw.sh`.
+
+> **Copy-up caveat.** overlayfs copies a file *up* into the writable upper on
+> first modification — and the copy is the **decrypted plaintext**. This only
+> triggers if the app *rewrites an existing encrypted `.so`/`.elf`*, which
+> business code does not do at runtime; new lock/log/temp files never copy up.
+> If an app does rewrite a protected file, that one file becomes plaintext in
+> the upper, so keep the upper on an access-controlled / reboot-wiped path.
 
 ### Key custody / keyring caveat
 

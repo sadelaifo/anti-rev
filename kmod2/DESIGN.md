@@ -101,9 +101,21 @@ static int antirevfs_open(struct inode *inode, struct file *file) {
 
 This makes mixed `bin/` and `lib/` contents work cleanly while keeping strict-mode safety: a file that *should* have been encrypted but slipped through the packer is loud, not silent.
 
-### Read-only by design
+### Read-only by design — and the writable-overlay escape hatch
 
-The module exposes `read_folio` only. No `write_folio`, no `writepage`. Mounts are `ro` (or RW for non-encrypted files only — TBD). Business code does not write `.so` or `.elf` files at runtime, so this is fine. Config writes go to the unprotected `config/` tree.
+The module exposes `read_folio` only. No `write_folio`, no `writepage`. The superblock is mounted `SB_RDONLY` and the directory `inode_operations` carry no `.create`/`.mkdir`/`.unlink`/`.rename`, so the mount is read-only three ways over — any write returns `-EROFS`. Business code does not write `.so` or `.elf` files at runtime, and config writes go to the unprotected `config/` tree.
+
+**But some business software writes lock/log/temp files *inside* `bin/` or `lib/`** (next to the executables), which a bare antirevfs mount rejects. The supported fix keeps the module read-only and adds a writable layer *above* it with stock `overlayfs` (`tools/antirev-mount-rw`):
+
+```
+overlayfs(upper = writable ext4)   ← what the app sees (read-write)
+    │
+antirevfs(ro, decrypt-on-read)     ← lower (ciphertext under .enc/)
+```
+
+Decrypted `.so`/`.elf` reads fall through to the antirevfs lower; the app's runtime writes land in the overlay upper and never reach the `.enc/` ciphertext. Validated end-to-end by `tests/test_antirevfs_overlay_rw.sh` (overlayfs accepts antirevfs as a lowerdir, decrypted read + dlopen still work, writes land in the upper, `.enc/` untouched). This keeps the kernel module minimal — no write path, no RW-passthrough complexity in the FS itself — and leans on a well-audited in-tree filesystem for the writable semantics.
+
+**Copy-up caveat**: overlayfs copies a file up into the writable upper on first modification, and the copy is the *decrypted plaintext*. This only triggers when an app *rewrites an existing encrypted file* (business code does not); new files never copy up. Keep the upper on an access-controlled / reboot-wiped (tmpfs) path if any app might rewrite a protected `.so`/`.elf`.
 
 ### Why stacked overlay (not custom-aops-on-existing-FS)
 
@@ -319,7 +331,7 @@ systemctl start business-*
 
 1. **Kernel version support range.** Need confirmed kernel versions for both customer arches. VFS interfaces have changed across releases (e.g., `read_folio` is new, older kernels have `readpage`). Decision: do we maintain one module per major kernel series, or a single source with compat shims?
 2. **Stacked FS vs direct aops hook** — chosen stacked FS, but worth a PoC to confirm no glibc-side surprises (path-identity in link-map dedup, dlopen path resolution under stacked-mount).
-3. **Read-write or read-only mounts?** Business code presumably doesn't write `.so` files at runtime. Confirm with team. If yes, ro is simpler and safer.
+3. **Read-write or read-only mounts?** ~~Business code presumably doesn't write `.so` files at runtime.~~ **RESOLVED.** The module stays strictly read-only (simpler, safer — no write path to audit). Some business software *does* write lock/log/temp files inside `bin/`/`lib/` though, so a writable view is provided by stacking a stock `overlayfs` upper over the antirevfs lower (`tools/antirev-mount-rw`, `tests/test_antirevfs_overlay_rw.sh`) rather than by adding a write path to the FS. See "Read-only by design — and the writable-overlay escape hatch" above for the copy-up caveat.
 4. **Module signing.** Enforced module signing (Secure Boot / lockdown mode) requires shipping a signed `.ko` or installing the customer's signing key. Add to install pre-flight.
 5. **Key rotation.** How to add a new key to the keyring and re-encrypt artifacts without taking the mount offline. Probably: dual-key support, mount accepts either key, packer rotates on next build.
 6. **fsck / disk-integrity tooling.** Customers running periodic fsck or backup tools will see ciphertext under `.enc/` — confirm no operational surprise (e.g., antivirus alerting on high-entropy files).
