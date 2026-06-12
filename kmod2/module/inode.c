@@ -59,7 +59,12 @@ static int antirevfs_classify(struct inode *inode, struct dentry *lower_dentry,
 		ii->encrypted = true;
 		ii->open_ok = true;
 		*plain_len = i_size_read(lower_inode) - ANTREV_HDR_LEN;
-	} else if (antirevfs_ext_whitelisted(sbi, lower_dentry->d_name.name)) {
+	} else if (sbi->pass_nonelf ||
+		   antirevfs_ext_whitelisted(sbi, lower_dentry->d_name.name)) {
+		/* Plaintext passthrough: an explicit-extension match, or (with
+		 * the `passdata` mount option) any non-ANTREV01 file.  These are
+		 * not secret and are never gated — read at full speed.
+		 */
 		ii->encrypted = false;
 		ii->open_ok = true;
 		*plain_len = i_size_read(lower_inode);

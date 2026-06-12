@@ -20,12 +20,22 @@
 #     - libprotobuf.so*              #   (third-party libs that coexist plaintext)
 #     - libdopra.so
 #     - third_party/                 #   trailing '/' = path prefix
+#   mirror_plaintext: true           # optional, default true — see below
 #
-# Non-ELF files (configs, .json, resources) are deliberately NOT touched:
-# they are neither encrypted nor copied into the .enc tree.  Consequently they
-# will NOT appear under the antirevfs mount (the mount shows only what is in the
-# lower dir).  Point this tool at pure-ELF dirs (lib/, bin/) or plan to surface
-# data files through a separate mount / passthrough whitelist.
+# mirror_plaintext (default true): produce a COMPLETE mixed-content tree.  ELFs
+# are encrypted; every other regular file (configs, .py, .pyc, .sh, .txt, .json,
+# resources) AND blacklisted (intentionally-plaintext third-party) ELFs are
+# mirrored VERBATIM (plaintext) into the tree, and symlinks are re-created.  So
+# a real install dir (lib/, bin/ with mixed content) appears in full under the
+# mount.  Mount it with `antirev-mount --passdata` so the module serves every
+# non-ANTREV01 file as plaintext passthrough (read-only); encrypted ELFs are
+# still decrypted + gated.  Because the mount is read-only, any file the app
+# WRITES at runtime (e.g. python-generated .txt, __pycache__) must be redirected
+# to a writable path outside the mount — antirevfs hosts only shipped content.
+#
+# Set mirror_plaintext: false for a minimal pure-secret tree: only encrypted
+# ELFs + symlinks land in the tree; data files and blacklisted ELFs are omitted
+# (they then will NOT appear under the mount — point it at pure-ELF subtrees).
 #
 # Symlinks are re-created verbatim in the mirror so SONAME version chains
 # (libfoo.so -> libfoo.so.1 -> libfoo.so.1.2.3) keep resolving through the mount.
@@ -97,6 +107,25 @@ def encrypt_one(src: Path, dst: Path, key: bytes) -> int:
     return len(data)
 
 
+def copy_verbatim(src: Path, dst: Path) -> int:
+    """Mirror src -> dst byte-for-byte (plaintext). Returns byte count.
+
+    Used for non-ELF data files and blacklisted (intentionally-plaintext) ELFs
+    so a complete mixed-content read-only tree appears under the mount.  The
+    module serves these via the `passdata` mount option (any non-ANTREV01 file
+    is plaintext passthrough); they carry no ANTREV01 magic so they are never
+    decrypted or gated.
+    """
+    data = src.read_bytes()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(data)
+    try:
+        dst.chmod(src.stat().st_mode & 0o777)
+    except OSError:
+        pass
+    return len(data)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="antirevfs (kmod2) config-driven ciphertext-tree packer")
@@ -124,6 +153,12 @@ def main() -> int:
     output_dir = Path(_expand(cfg["output_dir"])).resolve()
     key_path = (cfg_path.parent / _expand(cfg.get("key", "antirev.key"))).resolve()
     patterns = [p.replace("\\", "/") for p in (cfg.get("blacklist") or [])]
+    # mirror_plaintext (default True): copy non-ELF data files and blacklisted
+    # ELFs verbatim into the tree so a complete mixed-content read-only dir
+    # (lib/, bin/ with .py/.sh/.txt/.json + third-party plaintext libs) is fully
+    # visible under the mount (mount with `passdata`).  Set False for a minimal
+    # pure-secret tree (only encrypted ELFs + symlinks appear under the mount).
+    mirror_plaintext = bool(cfg.get("mirror_plaintext", True))
     workers = args.jobs if args.jobs > 0 else (os.cpu_count() or 4)
 
     if not install_dir.is_dir():
@@ -134,6 +169,7 @@ def main() -> int:
     key = load_or_create_key(key_path) if not args.dry_run else b"\0" * 32
 
     enc_jobs: list[tuple[Path, Path]] = []
+    copy_jobs: list[tuple[Path, Path]] = []
     skipped_blacklist: list[str] = []
     skipped_nonelf: list[str] = []
     symlinks: list[str] = []
@@ -158,10 +194,18 @@ def main() -> int:
                     os.symlink(os.readlink(src), dst)
                 continue
             if blacklisted(rel, patterns):
-                skipped_blacklist.append(rel)
+                # intentionally plaintext (third-party libs that coexist): mirror
+                # verbatim so they stay loadable through the mount, or drop them
+                # from the tree entirely when not mirroring.
+                if mirror_plaintext:
+                    copy_jobs.append((src, dst))
+                else:
+                    skipped_blacklist.append(rel)
                 continue
             if is_elf(src):
                 enc_jobs.append((src, dst))
+            elif mirror_plaintext:
+                copy_jobs.append((src, dst))
             else:
                 skipped_nonelf.append(rel)
 
@@ -175,12 +219,23 @@ def main() -> int:
                 except Exception as e:  # noqa: BLE001
                     sys.exit(f"[error] encrypting {futs[fut]}: {e}")
 
+    if not args.dry_run and copy_jobs:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(copy_verbatim, s, d): s for s, d in copy_jobs}
+            for fut in concurrent.futures.as_completed(futs):
+                try:
+                    fut.result()
+                except Exception as e:  # noqa: BLE001
+                    sys.exit(f"[error] mirroring {futs[fut]}: {e}")
+
     # ── manifest (written OUTSIDE the .enc tree so it is not under the mount) ──
     manifest = {
         "install_dir": str(install_dir),
         "output_dir": str(output_dir),
         "encrypted": sorted(s.relative_to(install_dir).as_posix()
                             for s, _ in enc_jobs),
+        "plaintext": sorted(s.relative_to(install_dir).as_posix()
+                            for s, _ in copy_jobs),
         "symlinks": sorted(symlinks),
         "skipped_blacklist": sorted(skipped_blacklist),
         "skipped_nonelf": sorted(skipped_nonelf),
@@ -194,27 +249,38 @@ def main() -> int:
     print(f"{tag}: {len(enc_jobs)} ELF(s)"
           + ("" if args.dry_run else f"  ({total_in:,} plaintext bytes)"))
     print(f"          symlinks mirrored: {len(symlinks)}")
-    print(f"          blacklisted (left plaintext, NOT in tree): "
-          f"{len(skipped_blacklist)}")
-    print(f"          non-ELF (untouched, NOT in tree): {len(skipped_nonelf)}")
+    if mirror_plaintext:
+        print(f"          plaintext mirrored (data + blacklisted ELF, IN tree): "
+              f"{len(copy_jobs)}")
+    else:
+        print(f"          blacklisted (left plaintext, NOT in tree): "
+              f"{len(skipped_blacklist)}")
+        print(f"          non-ELF (untouched, NOT in tree): "
+              f"{len(skipped_nonelf)}")
     if not args.dry_run:
         print(f"          manifest: {man_path}")
 
-    if skipped_nonelf or skipped_blacklist:
+    if mirror_plaintext and copy_jobs:
+        print("  NOTE: plaintext files are mirrored into the tree — mount with "
+              "`passdata`\n        so non-ANTREV01 files are served as plaintext "
+              "passthrough (read-only).")
+    if not mirror_plaintext and (skipped_nonelf or skipped_blacklist):
         print("  NOTE: untouched / blacklisted files do NOT appear under the "
-              "antirevfs mount.\n        Mount pure-ELF subtrees, or surface "
+              "antirevfs mount.\n        Set mirror_plaintext: true, or surface "
               "data files via a separate mount / passthrough= list.")
 
-    # Suggested mount commands per immediate subdir that got ciphertext.
+    # Suggested mount commands per immediate subdir that has any mirrored
+    # content (ciphertext and/or mirrored plaintext).
+    flag = "--passdata " if mirror_plaintext else ""
     subs = sorted({Path(s.relative_to(install_dir).as_posix()).parts[0]
-                   for s, _ in enc_jobs
+                   for s, _ in (enc_jobs + copy_jobs)
                    if s.relative_to(install_dir).parts})
     if subs:
         print("\n  Suggested mount (run unlock + mount in ONE session keyring):")
         print(f"    sudo keyctl session - bash -c '")
         print(f"      antirev-keyctl unlock --keyfile {key_path}")
         for sub in subs:
-            print(f"      antirev-mount {output_dir/sub} {install_dir/sub}")
+            print(f"      antirev-mount {flag}{output_dir/sub} {install_dir/sub}")
         print(f"    '")
     return 0
 

@@ -33,6 +33,7 @@ struct antirevfs_sb_info {
 	u8		key[ANTREV_KEY_LEN];	/* mount-resident AES key */
 	bool		have_key;
 	char		*passthrough;		/* comma list of extensions, or NULL */
+	bool		pass_nonelf;		/* passdata: serve ANY non-magic file plaintext */
 };
 
 /* Per-inode state.  One antirevfs inode per lower inode (iget5 cached) so the

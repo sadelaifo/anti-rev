@@ -47,10 +47,11 @@ bad()  { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 [[ -f "$MOD" ]] || { echo "module not built: $MOD (run: make -C $KMOD/module CC=gcc-12)"; exit 1; }
 
 WORK="$(mktemp -d /tmp/antirevfs_test.XXXXXX)"
-ENC="$WORK/.enc/lib"; MP="$WORK/lib"
-mkdir -p "$ENC" "$MP"
+ENC="$WORK/.enc/lib"; MP="$WORK/lib"; MP2="$WORK/lib_pd"
+mkdir -p "$ENC" "$MP" "$MP2"
 
 cleanup() {
+	mountpoint -q "$MP2" && umount "$MP2"
 	mountpoint -q "$MP" && umount "$MP"
 	rmmod antirevfs 2>/dev/null
 	"$KEYCTL" clear >/dev/null 2>&1
@@ -72,6 +73,10 @@ python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
 # Mixed content: a plaintext .so (strict-mode reject) and a whitelisted .json.
 echo "not encrypted" > "$ENC/plain.so"
 echo '{"ok":true}'   > "$ENC/data.json"
+# A real plaintext ELF (third-party lib that coexists) + a script with no
+# whitelisted extension — both rejected by strict mode, both served by passdata.
+cp "$WORK/libtest.plain.so" "$ENC/thirdparty.so"
+printf '#!/bin/sh\necho hi\n' > "$ENC/run.sh"
 
 echo "== load module + key + mount =="
 insmod "$MOD" || { echo "insmod failed"; exit 1; }
@@ -167,6 +172,32 @@ if [[ -n "$pfn1" && "$pfn1" != "0" && "$pfn1" == "$pfn2" ]]; then
 	ok "two processes share the same physical page (PFN $pfn1)"
 else
 	bad "page not shared (pfn1=$pfn1 pfn2=$pfn2) — may need CAP_SYS_ADMIN for pagemap PFNs"
+fi
+
+echo "== 7. passdata mode (complete mixed-content read-only tree) =="
+# Same lower tree, mounted with passdata: ANY non-ANTREV01 file is served
+# plaintext (data files, scripts, third-party plaintext ELFs), while encrypted
+# libs still decrypt.  This is the mixed bin/lib case from antirev-fs-pack.py
+# with mirror_plaintext.  Strict mode rejected thirdparty.so / run.sh above;
+# passdata serves them.
+if mount -t antirevfs -o "ro,passdata" "$ENC" "$MP2" 2>/dev/null; then
+	ok "mounted antirevfs with passdata"
+	# encrypted lib still decrypts
+	cmp -s "$MP2/libtest.so" "$WORK/libtest.plain.so" \
+		&& ok "passdata: encrypted lib still decrypts" \
+		|| bad "passdata: encrypted lib decrypt broke"
+	# third-party plaintext ELF served byte-identically (strict mode rejected it)
+	cmp -s "$MP2/thirdparty.so" "$WORK/libtest.plain.so" \
+		&& ok "passdata: plaintext third-party ELF served verbatim" \
+		|| bad "passdata: third-party ELF not served"
+	# script with no whitelisted extension served plaintext
+	cmp -s "$MP2/run.sh" "$ENC/run.sh" \
+		&& ok "passdata: unlisted-extension script served verbatim" \
+		|| bad "passdata: script not served"
+	umount "$MP2"
+else
+	bad "passdata mount failed"
+	dmesg | tail -5
 fi
 
 echo

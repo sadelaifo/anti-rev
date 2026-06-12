@@ -106,6 +106,12 @@ sudo kmod2/tools/antirev-mount /root/proj/.enc/lib /root/proj/lib json:md
 - `passthrough=` (colon-separated extensions — `,` is the mount-option
   separator) serves matching files verbatim for mixed-content dirs. Any other
   file lacking the `ANTREV01` magic is rejected with `-EIO` (strict mode).
+- `passdata` (`antirev-mount --passdata …`) serves **any** non-`ANTREV01` file
+  as plaintext passthrough — for a complete mixed read-only `lib/`/`bin/` tree
+  (encrypted ELFs + `.py`/`.sh`/`.txt`/`.json` data + third-party plaintext
+  libs), produced by `antirev-fs-pack.py` with `mirror_plaintext` (default).
+  The mount is read-only: redirect any runtime-written files to a writable path
+  outside the mount (e.g. an overlayfs upper).
 - For ad-hoc testing without the keyring, pass `key=<64 hex chars>` in `-o`.
 
 ### Key custody / keyring caveat
