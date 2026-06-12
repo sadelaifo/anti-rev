@@ -72,6 +72,7 @@ extern const struct super_operations antirevfs_sops;
 /* inode.c */
 extern const struct inode_operations antirevfs_dir_iops;
 extern const struct inode_operations antirevfs_file_iops;
+extern const struct inode_operations antirevfs_symlink_iops;
 struct inode *antirevfs_iget(struct super_block *sb, struct dentry *lower_dentry);
 
 /* file.c */

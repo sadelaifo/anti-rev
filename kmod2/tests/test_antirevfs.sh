@@ -10,6 +10,8 @@
 #   4. a plaintext file under the lower tree returns -EIO         (strict mode)
 #   5. a whitelisted .json file is served verbatim               (passthrough)
 #   6. two processes mmapping the file share physical pages      (page cache)
+#   7. passdata serves any non-magic file plaintext              (mixed tree)
+#   8. symlinks (chains, ->encrypted lib, ->data) resolve        (get_link)
 #
 # Requires root (insmod/mount).  Run:  sudo bash test_antirevfs.sh
 set -uo pipefail
@@ -77,6 +79,12 @@ echo '{"ok":true}'   > "$ENC/data.json"
 # whitelisted extension — both rejected by strict mode, both served by passdata.
 cp "$WORK/libtest.plain.so" "$ENC/thirdparty.so"
 printf '#!/bin/sh\necho hi\n' > "$ENC/run.sh"
+# Symlinks mirrored into the lower tree (as the packer does): a chain to the
+# ENCRYPTED lib, a link to a passthrough data file, and a genuinely broken link.
+ln -s libtest.so   "$ENC/lib_link.so"     # symlink -> encrypted lib (decrypts)
+ln -s lib_link.so  "$ENC/lib_link2.so"    # chained symlink (SONAME-style)
+ln -s data.json    "$ENC/data_link.json"  # symlink -> passthrough data file
+ln -s nonexistent  "$ENC/broken_link"     # genuinely dangling target
 
 echo "== load module + key + mount =="
 insmod "$MOD" || { echo "insmod failed"; exit 1; }
@@ -198,6 +206,33 @@ if mount -t antirevfs -o "ro,passdata" "$ENC" "$MP2" 2>/dev/null; then
 else
 	bad "passdata mount failed"
 	dmesg | tail -5
+fi
+
+echo "== 8. symlinks resolve through the mount =="
+# readlink must work (regression: module used to reject S_IFLNK with -EINVAL,
+# so every symlink showed l????????? and dangled).
+if [[ "$(readlink "$MP/lib_link.so" 2>/dev/null)" == "libtest.so" ]]; then
+	ok "readlink through mount returns the target"
+else
+	bad "readlink through mount empty/wrong (symlink not served)"
+fi
+# symlink -> encrypted lib resolves AND decrypts
+cmp -s "$MP/lib_link.so" "$WORK/libtest.plain.so" \
+	&& ok "symlink -> encrypted lib resolves + decrypts" \
+	|| bad "symlink -> encrypted lib broken"
+# chained symlink (lib_link2 -> lib_link.so -> libtest.so)
+cmp -s "$MP/lib_link2.so" "$WORK/libtest.plain.so" \
+	&& ok "chained symlink resolves (SONAME-style)" \
+	|| bad "chained symlink broken"
+# symlink -> passthrough data file
+cmp -s "$MP/data_link.json" "$ENC/data.json" \
+	&& ok "symlink -> passthrough data resolves" \
+	|| bad "symlink -> data broken"
+# a genuinely broken link must still dangle (not crash, not falsely resolve)
+if readlink "$MP/broken_link" >/dev/null 2>&1 && ! cat "$MP/broken_link" >/dev/null 2>&1; then
+	ok "genuinely-broken link readable as a link but dangles (correct)"
+else
+	bad "broken link misbehaved"
 fi
 
 echo

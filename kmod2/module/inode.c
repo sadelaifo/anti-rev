@@ -124,8 +124,15 @@ struct inode *antirevfs_iget(struct super_block *sb, struct dentry *lower_dentry
 		inode->i_mapping->a_ops = &antirevfs_aops;
 		ii->plain_len = plain_len;
 		i_size_write(inode, plain_len);
+	} else if (S_ISLNK(lower_inode->i_mode)) {
+		/* Symlinks are mirrored verbatim by the packer (SONAME chains,
+		 * version links).  Proxy get_link to the lower symlink so they
+		 * resolve through the mount; size is the link-target length.
+		 */
+		inode->i_op = &antirevfs_symlink_iops;
+		i_size_write(inode, i_size_read(lower_inode));
 	} else {
-		/* devices/symlinks/etc. not supported under an antirevfs mount */
+		/* devices/sockets/fifos not supported under an antirevfs mount */
 		iget_failed(inode);
 		return ERR_PTR(-EINVAL);
 	}
@@ -205,5 +212,27 @@ const struct inode_operations antirevfs_dir_iops = {
 };
 
 const struct inode_operations antirevfs_file_iops = {
+	.getattr	= antirevfs_getattr,
+};
+
+/*
+ * Follow a symlink by proxying to the lower (.enc/) symlink's body.  The packer
+ * mirrors symlinks verbatim, so the target string is identical to the original
+ * — relative SONAME chains resolve through the mount, absolute / out-of-tree
+ * targets behave exactly as on the underlying fs (i.e. they may dangle, same as
+ * without antirevfs).  vfs_get_link() arranges the cleanup via @done.
+ */
+static const char *antirevfs_get_link(struct dentry *dentry, struct inode *inode,
+				      struct delayed_call *done)
+{
+	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
+
+	if (!dentry)			/* RCU lookup — fall back to ref-walk */
+		return ERR_PTR(-ECHILD);
+	return vfs_get_link(ii->lower_path.dentry, done);
+}
+
+const struct inode_operations antirevfs_symlink_iops = {
+	.get_link	= antirevfs_get_link,
 	.getattr	= antirevfs_getattr,
 };
