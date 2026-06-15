@@ -77,8 +77,12 @@ sweep_proj_mounts() {
 }
 
 log "tearing down existing mounts"
-"$MOUNTRW_BIN" --down "$BIN_MOUNT" 2>/dev/null || true   # collapse writable overlay if present
-[ "$LIB_WRITABLE" = 1 ] && "$MOUNTRW_BIN" --down "$LIB_MOUNT" 2>/dev/null || true
+# Always try to collapse a writable overlay on BOTH mountpoints, regardless of
+# this run's mode — a leftover overlay from a previous run (possibly the other
+# mode) must be torn down (overlay then its antirevfs 'dec' lower) before the
+# sweep, or the 'dec' mount stays pinned and rmmod fails. Harmless if absent.
+"$MOUNTRW_BIN" --down "$BIN_MOUNT" 2>/dev/null || true
+"$MOUNTRW_BIN" --down "$LIB_MOUNT" 2>/dev/null || true
 sweep_proj_mounts
 
 # ---- reload module -----------------------------------------------------------
@@ -86,9 +90,13 @@ sweep_proj_mounts
 if [ -d /sys/module/antirevfs ]; then
     log "removing antirevfs module"
     if ! rmmod antirevfs 2>/dev/null; then
-        log "rmmod failed — these mounts still reference the module:"
-        grep -E 'antirevfs|overlay' /proc/mounts || true
-        die "unmount the above (or widen sweep_proj_mounts' path filter), then re-run"
+        log "rmmod failed — module in use (refcnt=$(cat /sys/module/antirevfs/refcnt 2>/dev/null))"
+        log "antirevfs mounts still present in this namespace:"
+        grep antirevfs /proc/mounts || log "  (none — likely a lazy-unmounted mount still held by a"
+        log "   running process, or an antirevfs mount inside a container namespace)"
+        log "processes whose mount namespace still references antirevfs:"
+        grep -l antirevfs /proc/*/mountinfo 2>/dev/null || true
+        die "stop the business stack (mmap'd .so files pin the module), then re-run"
     fi
 fi
 [ -d /sys/module/antirevfs ] && die "antirevfs still loaded after rmmod"
