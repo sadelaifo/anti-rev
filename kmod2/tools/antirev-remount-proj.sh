@@ -82,10 +82,16 @@ log "tearing down existing mounts"
 sweep_proj_mounts
 
 # ---- reload module -----------------------------------------------------------
-if lsmod | grep -q '^antirevfs'; then
+# /sys/module/antirevfs is authoritative (independent of lsmod / PATH).
+if [ -d /sys/module/antirevfs ]; then
     log "removing antirevfs module"
-    rmmod antirevfs || die "rmmod failed — a mount still references the module (check /proc/mounts)"
+    if ! rmmod antirevfs 2>/dev/null; then
+        log "rmmod failed — these mounts still reference the module:"
+        grep -E 'antirevfs|overlay' /proc/mounts || true
+        die "unmount the above (or widen sweep_proj_mounts' path filter), then re-run"
+    fi
 fi
+[ -d /sys/module/antirevfs ] && die "antirevfs still loaded after rmmod"
 log "loading antirevfs (gate_enforce=$GATE_ENFORCE authz_path=$AUTHZ_PATH)"
 insmod "$KO" gate_enforce="$GATE_ENFORCE" authz_path="$AUTHZ_PATH" || die "insmod failed"
 
