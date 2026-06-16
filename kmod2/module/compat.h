@@ -13,6 +13,29 @@
 
 #include <linux/version.h>
 #include <linux/fs.h>
+#include <linux/mm.h>
+
+/*
+ * call_mmap() (the f_op->mmap dispatch helper) was added in 4.18, and
+ * vma_set_file() (swap a vma's backing file, fixing the refcounts) in 5.11.
+ * The ciphertext-passthrough path routes an unauthorized reader's mmap to the
+ * lower .enc/ file, so it needs both on the SLES 4.12 target.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 18, 0)
+static inline int call_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	return file->f_op->mmap(file, vma);
+}
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
+static inline void vma_set_file(struct vm_area_struct *vma, struct file *file)
+{
+	get_file(file);
+	fput(vma->vm_file);
+	vma->vm_file = file;
+}
+#endif
 
 /* hex2bin() moved from linux/kernel.h to linux/hex.h in 5.18. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)

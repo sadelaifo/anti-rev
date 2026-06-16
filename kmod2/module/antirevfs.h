@@ -83,6 +83,7 @@ extern const struct address_space_operations antirevfs_aops;
 /* gate.c — per-process decrypt authorization (the one seam swapped in step 2) */
 bool antirevfs_task_authorized(void);		/* data reads: gate on caller's exe */
 bool antirevfs_file_authorized(struct file *file);	/* exec-load: gate on file's own path */
+bool antirevfs_gate_passthrough_cipher(void);	/* deny-mode: serve ciphertext vs -EACCES */
 
 /* crypto.c */
 int antirevfs_has_magic(struct file *lower_file);	/* >0 yes, 0 no, <0 err */

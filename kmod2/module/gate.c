@@ -50,6 +50,25 @@ MODULE_PARM_DESC(authz_path,
 	"Allow-list file: newline-separated authorized exe paths or basenames");
 
 /*
+ * When gating denies a data read, do we hard-fail it (-EACCES, default) or
+ * quietly serve the lower .enc/ ciphertext?  Passthrough is the stealthier
+ * posture: `cp`/`vim`/`objdump` "succeed" but get a valid-but-useless ANTREV01
+ * container instead of a permission error that advertises the gate.  Security
+ * is identical either way — an unauthorized reader never reaches plaintext.
+ * Only affects DATA reads of encrypted files; exec-load of an unlisted program
+ * is still -EACCES (running ciphertext can't work and isn't a read-exfil path).
+ */
+static bool gate_passthrough_cipher;
+module_param(gate_passthrough_cipher, bool, 0644);
+MODULE_PARM_DESC(gate_passthrough_cipher,
+	"On deny, serve lower ciphertext instead of -EACCES (0 = deny, default)");
+
+bool antirevfs_gate_passthrough_cipher(void)
+{
+	return gate_passthrough_cipher;
+}
+
+/*
  * Read the whole allow-list file into a NUL-terminated kmalloc buffer.
  * Returns the buffer (caller kfree()s) or NULL on any error / empty / oversize.
  *

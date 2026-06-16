@@ -203,6 +203,23 @@ static int antirevfs_getattr(AREV_GETATTR_PROTO)
 	/* report the plaintext (logical) size, never the ciphertext length */
 	stat->size = i_size_read(inode);
 	stat->blocks = (stat->size + 511) >> 9;
+
+	/*
+	 * Under gate_passthrough_cipher an unauthorized caller reads the lower
+	 * .enc/ ciphertext (longer than the plaintext by the ANTREV01 header).
+	 * Report THAT length to such callers so size-honoring copiers (cp via
+	 * copy_file_range/sendfile) read the whole container, not a truncation.
+	 * getattr runs in the caller's context, so this varies per reader while
+	 * the shared inode keeps reporting plaintext size to authorized ones.
+	 */
+	if (ANTIREVFS_I(inode)->encrypted &&
+	    antirevfs_gate_passthrough_cipher() &&
+	    !antirevfs_task_authorized()) {
+		loff_t csz = i_size_read(antirevfs_lower_inode(inode));
+
+		stat->size = csz;
+		stat->blocks = (csz + 511) >> 9;
+	}
 	return 0;
 }
 

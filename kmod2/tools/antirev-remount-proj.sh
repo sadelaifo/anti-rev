@@ -3,9 +3,13 @@
 # antirev-remount-proj.sh — tear down and re-establish the antirevfs mounts
 # for the business stack, reloading the module with the decrypt-auth gate.
 #
-#   /root/proj_protect/lib  (ciphertext) -> /root/proj/lib  (read-only, decrypt-on-read)
-#   /root/proj_protect/bin  (ciphertext) -> /root/proj/bin  (WRITABLE view: overlay over antirevfs,
-#                                                            so GUI/pid/lock/log writes succeed)
+#   /root/proj_protect/lib  (ciphertext) -> /root/proj/lib  (WRITABLE view: overlay over antirevfs)
+#   /root/proj_protect/bin  (ciphertext) -> /root/proj/bin  (WRITABLE view: overlay over antirevfs)
+#
+# Both trees are mounted as WRITABLE overlay views: decrypted .so/.elf reads
+# fall through to the antirevfs lower, while any runtime write (GUI pid/lock/log
+# files next to the binaries) lands in the overlay's writable upper and NEVER
+# touches the ciphertext tree.
 #
 # Everything that needs the AES key (unlock + mount) runs inside ONE session
 # keyring, so the module's request_key() finds it (see CLAUDE.md
@@ -26,7 +30,7 @@ BIN_MOUNT=/root/proj/bin
 GATE_ENFORCE=1                           # 1 = enforce /etc/authorized_apps.txt, 0 = allow all
 AUTHZ_PATH=/etc/authorized_apps.txt
 MOUNT_FLAG=--passdata                    # or:  --passthrough so:py:pyc   (see antirev-mount -h)
-LIB_WRITABLE=0                           # set 1 if lib also needs runtime writes (overlay)
+LIB_WRITABLE=1                           # 1 = lib is a writable overlay view too (set 0 for read-only lib)
 ##### ---------------------------------------------------------------------------
 
 KO="$KMOD_DIR/antirevfs.ko"

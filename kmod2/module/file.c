@@ -154,10 +154,145 @@ static int antirevfs_file_open(struct inode *inode, struct file *file)
 			if (!antirevfs_file_authorized(file))
 				return -EACCES;
 		} else if (!antirevfs_task_authorized()) {
-			return -EACCES;
+			/*
+			 * Unauthorized data read.  Default: deny (-EACCES).  With
+			 * gate_passthrough_cipher: serve the lower .enc/ ciphertext
+			 * by stashing an O_RDONLY lower file in ->private_data — the
+			 * read/mmap/splice ops below route to it, bypassing this
+			 * inode's (possibly plaintext) page cache entirely.
+			 */
+			struct file *lower;
+
+			if (!antirevfs_gate_passthrough_cipher())
+				return -EACCES;
+
+			lower = dentry_open(&ii->lower_path, O_RDONLY,
+					    current_cred());
+			if (IS_ERR(lower))
+				return PTR_ERR(lower);
+			file->private_data = lower;
 		}
 	}
 
+	return 0;
+}
+
+/*
+ * Below: the ciphertext-passthrough data ops.  They are reached only when
+ * antirevfs_file_open() put a lower file in ->private_data (an unauthorized
+ * read under gate_passthrough_cipher); otherwise ->private_data is NULL and we
+ * fall through to the normal decrypt-via-page-cache generics.  Routing every
+ * data path (read, mmap, splice/sendfile, seek) to the lower file is mandatory:
+ * touching this inode's i_mapping would hand back decrypted pages a concurrent
+ * authorized reader may have cached.
+ */
+
+/* Bounce the lower (ciphertext) file into the reader's iter, page at a time.
+ * Built on arev_kernel_read + copy_to_iter — the lowest-common-denominator
+ * primitives present on both the 4.12 and 6.8 targets. */
+static ssize_t antirevfs_passthrough_read(struct file *lower,
+					  struct iov_iter *to, loff_t *ppos)
+{
+	size_t want = iov_iter_count(to);
+	ssize_t total = 0;
+	void *buf;
+
+	if (!want)
+		return 0;
+	buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	while (want) {
+		size_t chunk = min(want, (size_t)PAGE_SIZE);
+		loff_t pos = *ppos;
+		ssize_t n = arev_kernel_read(lower, buf, chunk, &pos);
+		size_t copied;
+
+		if (n <= 0) {
+			if (n < 0 && total == 0)
+				total = n;
+			break;
+		}
+		copied = copy_to_iter(buf, n, to);
+		total += copied;
+		*ppos += copied;
+		want -= copied;
+		if (copied < (size_t)n)		/* iter full */
+			break;
+		if (n < (ssize_t)chunk)		/* lower EOF */
+			break;
+	}
+
+	kfree(buf);
+	return total;
+}
+
+static ssize_t antirevfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
+{
+	struct file *lower = iocb->ki_filp->private_data;
+
+	if (lower) {
+		loff_t pos = iocb->ki_pos;
+		ssize_t ret = antirevfs_passthrough_read(lower, to, &pos);
+
+		iocb->ki_pos = pos;
+		return ret;
+	}
+	return generic_file_read_iter(iocb, to);
+}
+
+static int antirevfs_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct file *lower = file->private_data;
+
+	if (lower) {
+		if (!lower->f_op->mmap)
+			return -ENODEV;
+		/* Re-point the vma at the lower file so faults map ciphertext
+		 * pages from the lower inode, then run its mmap. */
+		vma_set_file(vma, lower);
+		return call_mmap(lower, vma);
+	}
+	return generic_file_mmap(file, vma);
+}
+
+static ssize_t antirevfs_splice_read(struct file *in, loff_t *ppos,
+				     struct pipe_inode_info *pipe,
+				     size_t len, unsigned int flags)
+{
+	struct file *lower = in->private_data;
+
+	if (lower) {
+		if (!lower->f_op->splice_read)
+			return -EINVAL;
+		return lower->f_op->splice_read(lower, ppos, pipe, len, flags);
+	}
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+	return filemap_splice_read(in, ppos, pipe, len, flags);
+#else
+	return generic_file_splice_read(in, ppos, pipe, len, flags);
+#endif
+}
+
+static loff_t antirevfs_llseek(struct file *file, loff_t offset, int whence)
+{
+	struct file *lower = file->private_data;
+
+	/* Seek against the ciphertext length so SEEK_END is correct. */
+	if (lower)
+		return vfs_llseek(lower, offset, whence);
+	return generic_file_llseek(file, offset, whence);
+}
+
+static int antirevfs_file_release(struct inode *inode, struct file *file)
+{
+	struct file *lower = file->private_data;
+
+	if (lower) {
+		file->private_data = NULL;
+		fput(lower);
+	}
 	return 0;
 }
 
@@ -189,14 +324,11 @@ const struct address_space_operations antirevfs_aops = {
 
 const struct file_operations antirevfs_file_fops = {
 	.open		= antirevfs_file_open,
-	.read_iter	= generic_file_read_iter,
-	.mmap		= generic_file_mmap,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
-	.splice_read	= filemap_splice_read,
-#else
-	.splice_read	= generic_file_splice_read,
-#endif
-	.llseek		= generic_file_llseek,
+	.release	= antirevfs_file_release,
+	.read_iter	= antirevfs_read_iter,
+	.mmap		= antirevfs_mmap,
+	.splice_read	= antirevfs_splice_read,
+	.llseek		= antirevfs_llseek,
 };
 
 const struct file_operations antirevfs_dir_fops = {
