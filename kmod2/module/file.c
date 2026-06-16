@@ -17,6 +17,7 @@
 #include <linux/pagemap.h>
 #include <linux/highmem.h>
 #include <linux/vmalloc.h>
+#include <linux/slab.h>
 #include <linux/uio.h>
 
 #include "compat.h"
@@ -127,6 +128,17 @@ static int antirevfs_readpage(struct file *file, struct page *page)
 }
 #endif
 
+/*
+ * Per-open passthrough state for an UNAUTHORIZED reader (gate_passthrough_cipher
+ * on).  Holds the lower (ciphertext) file plus the byte LIMIT we expose: the
+ * lower size minus the key trailer, so the embedded key is never served.  The
+ * unauthorized reader thus gets a valid-looking but keyless ANTREV01 container.
+ */
+struct antirevfs_passthrough {
+	struct file	*lower;
+	loff_t		limit;		/* lower_size - ANTREV_TRAILER_LEN */
+};
+
 static int antirevfs_file_open(struct inode *inode, struct file *file)
 {
 	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
@@ -157,20 +169,34 @@ static int antirevfs_file_open(struct inode *inode, struct file *file)
 			/*
 			 * Unauthorized data read.  Default: deny (-EACCES).  With
 			 * gate_passthrough_cipher: serve the lower .enc/ ciphertext
-			 * by stashing an O_RDONLY lower file in ->private_data — the
-			 * read/mmap/splice ops below route to it, bypassing this
-			 * inode's (possibly plaintext) page cache entirely.
+			 * WITH THE KEY TRAILER STRIPPED — stash an O_RDONLY lower
+			 * file plus an exposure limit in ->private_data; the
+			 * read/splice ops below route to it capped at the limit
+			 * (mmap is refused), bypassing this inode's (possibly
+			 * plaintext) page cache entirely.  The withheld trailer is
+			 * what keeps the embedded key out of the reader's hands.
 			 */
+			struct antirevfs_passthrough *pd;
 			struct file *lower;
+			loff_t lsz;
 
 			if (!antirevfs_gate_passthrough_cipher())
 				return -EACCES;
 
+			pd = kmalloc(sizeof(*pd), GFP_KERNEL);
+			if (!pd)
+				return -ENOMEM;
 			lower = dentry_open(&ii->lower_path, O_RDONLY,
 					    current_cred());
-			if (IS_ERR(lower))
+			if (IS_ERR(lower)) {
+				kfree(pd);
 				return PTR_ERR(lower);
-			file->private_data = lower;
+			}
+			lsz = i_size_read(antirevfs_lower_inode(inode));
+			pd->lower = lower;
+			pd->limit = lsz > ANTREV_TRAILER_LEN ?
+				    lsz - ANTREV_TRAILER_LEN : 0;
+			file->private_data = pd;
 		}
 	}
 
@@ -179,26 +205,34 @@ static int antirevfs_file_open(struct inode *inode, struct file *file)
 
 /*
  * Below: the ciphertext-passthrough data ops.  They are reached only when
- * antirevfs_file_open() put a lower file in ->private_data (an unauthorized
- * read under gate_passthrough_cipher); otherwise ->private_data is NULL and we
- * fall through to the normal decrypt-via-page-cache generics.  Routing every
- * data path (read, mmap, splice/sendfile, seek) to the lower file is mandatory:
- * touching this inode's i_mapping would hand back decrypted pages a concurrent
- * authorized reader may have cached.
+ * antirevfs_file_open() put an antirevfs_passthrough in ->private_data (an
+ * unauthorized read under gate_passthrough_cipher); otherwise ->private_data is
+ * NULL and we fall through to the normal decrypt-via-page-cache generics.
+ * Every data path is served from the lower file but CAPPED at pd->limit (lower
+ * size minus the key trailer) so the embedded key is never exposed; touching
+ * this inode's i_mapping is also avoided (a concurrent authorized reader may
+ * have cached decrypted pages there).  mmap is refused outright — a file-backed
+ * mapping of the lower file would expose the trailer in its final page.
  */
 
-/* Bounce the lower (ciphertext) file into the reader's iter, page at a time.
- * Built on arev_kernel_read + copy_to_iter — the lowest-common-denominator
- * primitives present on both the 4.12 and 6.8 targets. */
-static ssize_t antirevfs_passthrough_read(struct file *lower,
+/* Bounce the lower (ciphertext) file into the reader's iter, page at a time,
+ * but never past `limit`.  Built on arev_kernel_read + copy_to_iter — the
+ * lowest-common-denominator primitives present on both the 4.12 and 6.8 targets. */
+static ssize_t antirevfs_passthrough_read(struct file *lower, loff_t limit,
 					  struct iov_iter *to, loff_t *ppos)
 {
 	size_t want = iov_iter_count(to);
 	ssize_t total = 0;
 	void *buf;
 
+	/* clamp the request to the exposed (trailer-stripped) region */
+	if (*ppos >= limit)
+		return 0;
+	if ((loff_t)want > limit - *ppos)
+		want = limit - *ppos;
 	if (!want)
 		return 0;
+
 	buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
@@ -230,11 +264,12 @@ static ssize_t antirevfs_passthrough_read(struct file *lower,
 
 static ssize_t antirevfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
-	struct file *lower = iocb->ki_filp->private_data;
+	struct antirevfs_passthrough *pd = iocb->ki_filp->private_data;
 
-	if (lower) {
+	if (pd) {
 		loff_t pos = iocb->ki_pos;
-		ssize_t ret = antirevfs_passthrough_read(lower, to, &pos);
+		ssize_t ret = antirevfs_passthrough_read(pd->lower, pd->limit,
+							 to, &pos);
 
 		iocb->ki_pos = pos;
 		return ret;
@@ -244,16 +279,11 @@ static ssize_t antirevfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 static int antirevfs_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	struct file *lower = file->private_data;
-
-	if (lower) {
-		if (!lower->f_op->mmap)
-			return -ENODEV;
-		/* Re-point the vma at the lower file so faults map ciphertext
-		 * pages from the lower inode, then run its mmap. */
-		vma_set_file(vma, lower);
-		return call_mmap(lower, vma);
-	}
+	/* Unauthorized passthrough: refuse mmap.  A file-backed mapping of the
+	 * lower file would surface the key trailer in the final page (it can't
+	 * be capped the way read/splice are).  Readers fall back to read(). */
+	if (file->private_data)
+		return -ENODEV;
 	return generic_file_mmap(file, vma);
 }
 
@@ -261,12 +291,18 @@ static ssize_t antirevfs_splice_read(struct file *in, loff_t *ppos,
 				     struct pipe_inode_info *pipe,
 				     size_t len, unsigned int flags)
 {
-	struct file *lower = in->private_data;
+	struct antirevfs_passthrough *pd = in->private_data;
 
-	if (lower) {
-		if (!lower->f_op->splice_read)
+	if (pd) {
+		if (!pd->lower->f_op->splice_read)
 			return -EINVAL;
-		return lower->f_op->splice_read(lower, ppos, pipe, len, flags);
+		/* never let splice/sendfile read into the key trailer */
+		if (*ppos >= pd->limit)
+			return 0;
+		if ((loff_t)len > pd->limit - *ppos)
+			len = pd->limit - *ppos;
+		return pd->lower->f_op->splice_read(pd->lower, ppos, pipe,
+						    len, flags);
 	}
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
 	return filemap_splice_read(in, ppos, pipe, len, flags);
@@ -277,21 +313,24 @@ static ssize_t antirevfs_splice_read(struct file *in, loff_t *ppos,
 
 static loff_t antirevfs_llseek(struct file *file, loff_t offset, int whence)
 {
-	struct file *lower = file->private_data;
+	struct antirevfs_passthrough *pd = file->private_data;
 
-	/* Seek against the ciphertext length so SEEK_END is correct. */
-	if (lower)
-		return vfs_llseek(lower, offset, whence);
+	/* Seek against the exposed (trailer-stripped) length so SEEK_END lands
+	 * at the limit, not the real ciphertext end. */
+	if (pd)
+		return generic_file_llseek_size(file, offset, whence,
+						MAX_LFS_FILESIZE, pd->limit);
 	return generic_file_llseek(file, offset, whence);
 }
 
 static int antirevfs_file_release(struct inode *inode, struct file *file)
 {
-	struct file *lower = file->private_data;
+	struct antirevfs_passthrough *pd = file->private_data;
 
-	if (lower) {
+	if (pd) {
 		file->private_data = NULL;
-		fput(lower);
+		fput(pd->lower);
+		kfree(pd);
 	}
 	return 0;
 }

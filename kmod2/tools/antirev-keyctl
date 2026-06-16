@@ -1,10 +1,16 @@
 #!/bin/bash
-# antirev-keyctl — load the antirevfs AES-256 key into the kernel keyring.
+# antirev-keyctl — load an AES-256 key into the kernel keyring.
 #
-# The antirevfs module looks up a "user"-type key named "antirevfs:default" in
-# the mounting process's keyrings.  This tool installs that key so `mount -t
-# antirevfs` (run by the same user, normally root) finds it — keeping the key
-# out of the mount command line and out of any process's heap after load.
+# DEPRECATED for antirevfs: the module no longer reads a mount-time key.  Each
+# encrypted file now embeds its own key in a trailer (see antirev-fs-pack.py /
+# protect.py encrypt-lib --embed-key), which the module reads at decrypt time,
+# so `antirev-mount`/`antirev-mount-rw` need no unlock step.  This tool is kept
+# only for legacy/experimental flows; it has no effect on a current antirevfs
+# mount.
+#
+# (Historical behaviour) The module used to look up a "user"-type key named
+# "antirevfs:default" in the mounting process's keyrings; this tool installed
+# that key so `mount -t antirevfs` found it.
 #
 # Usage:
 #   antirev-keyctl unlock --keyfile <hexkeyfile>   # 64 hex chars (protect.py keyfile)

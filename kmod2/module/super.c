@@ -2,12 +2,12 @@
 /*
  * antirevfs superblock / mount / module glue.
  *
- * mount -t antirevfs <lowerdir> <mountpoint> -o key=<64hex>[,passthrough=json:md]
+ * mount -t antirevfs <lowerdir> <mountpoint> [-o passthrough=json:md|passdata]
  *
- * The lower directory is the ciphertext .enc/ subtree.  The AES key comes from
- * a mount option (key=<hex>, mainly for testing) or, by default, from the
- * mounting process's kernel keyring (a "user" key named "antirevfs:default"),
- * so production deployments never expose the key on the mount command line.
+ * The lower directory is the ciphertext .enc/ subtree.  There is NO mount-time
+ * key: every encrypted file embeds its own AES key in a trailer, which the
+ * module reads at decrypt time (see crypto.c / antirevfs.h).  So mounting is
+ * key-free — no key= option, no keyring lookup, no session-keyring dance.
  */
 #include <linux/module.h>
 #include <linux/version.h>
@@ -18,16 +18,12 @@
 #include <linux/vmalloc.h>
 #include <linux/pagemap.h>
 #include <linux/string.h>
-#include <linux/key.h>
 #include <linux/seq_file.h>
-#include <keys/user-type.h>
 
 #include "compat.h"
 #include "antirevfs.h"
 
 struct kmem_cache *antirevfs_inode_cachep;
-
-#define ANTIREVFS_KEY_DESC	"antirevfs:default"
 
 struct antirevfs_mount_ctx {
 	const char	*lowerdir;
@@ -115,31 +111,6 @@ const struct super_operations antirevfs_sops = {
 	.show_options	= antirevfs_show_options,
 };
 
-/* ---- key acquisition ---- */
-
-static int antirevfs_key_from_keyring(struct antirevfs_sb_info *sbi)
-{
-	const struct user_key_payload *payload;
-	struct key *key;
-	int ret = 0;
-
-	key = request_key(&key_type_user, ANTIREVFS_KEY_DESC, NULL);
-	if (IS_ERR(key))
-		return PTR_ERR(key);
-
-	down_read(&key->sem);
-	payload = user_key_payload_locked(key);
-	if (!payload || payload->datalen != ANTREV_KEY_LEN) {
-		ret = -EINVAL;
-	} else {
-		memcpy(sbi->key, payload->data, ANTREV_KEY_LEN);
-		sbi->have_key = true;
-	}
-	up_read(&key->sem);
-	key_put(key);
-	return ret;
-}
-
 /* ---- option parsing ---- */
 
 static int antirevfs_parse_opts(struct antirevfs_sb_info *sbi, char *opts)
@@ -149,15 +120,7 @@ static int antirevfs_parse_opts(struct antirevfs_sb_info *sbi, char *opts)
 	while ((p = strsep(&opts, ",")) != NULL) {
 		if (!*p)
 			continue;
-		if (!strncmp(p, "key=", 4)) {
-			const char *hex = p + 4;
-
-			if (strlen(hex) != ANTREV_KEY_LEN * 2)
-				return -EINVAL;
-			if (hex2bin(sbi->key, hex, ANTREV_KEY_LEN))
-				return -EINVAL;
-			sbi->have_key = true;
-		} else if (!strncmp(p, "passthrough=", 12)) {
+		if (!strncmp(p, "passthrough=", 12)) {
 			char *list, *c;
 
 			kfree(sbi->passthrough);
@@ -210,13 +173,6 @@ static int antirevfs_fill_super(struct super_block *sb, void *data, int silent)
 	if (err)
 		return err;
 
-	if (!sbi->have_key) {
-		err = antirevfs_key_from_keyring(sbi);
-		if (err)
-			pr_warn("antirevfs: no key (opt or keyring): %d; encrypted reads will fail\n",
-				err);
-	}
-
 	sb->s_magic = ANTIREVFS_MAGIC;
 	sb->s_op = &antirevfs_sops;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
@@ -257,7 +213,6 @@ static void antirevfs_kill_sb(struct super_block *sb)
 	if (sbi) {
 		if (sbi->lower_root.dentry)
 			path_put(&sbi->lower_root);
-		memzero_explicit(sbi->key, sizeof(sbi->key));
 		kfree(sbi->passthrough);
 		kfree(sbi);
 	}

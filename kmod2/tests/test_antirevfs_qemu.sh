@@ -121,9 +121,9 @@ EOF
 "$ACC" -o "$WORK/armapp" "$WORK/armapp.c"
 
 # encrypt both the ARM .so and the ARM exe (encryption is arch-agnostic)
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --embed-key --key "$WORK/key.hex" \
 	--libs "$WORK/libtest_arm.so" --output-dir "$ENC" >/dev/null
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --embed-key --key "$WORK/key.hex" \
 	--libs "$WORK/armapp" --output-dir "$ENC" >/dev/null
 chmod +x "$ENC/armapp"      # mount mirrors lower mode; exec needs +x
 
@@ -132,7 +132,6 @@ echo "    emulator basename to whitelist: $QBASE"
 
 echo "== load module + key + mount (gate off first: validate pure emulation) =="
 insmod "$MOD" gate_enforce=0 authz_path="$AUTHZ" || { echo "insmod failed"; exit 1; }
-"$KEYCTL" unlock --keyfile "$WORK/key.hex" >/dev/null
 mount -t antirevfs -o ro,passdata "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
 mount | grep -q "$MP" && ok "mounted antirevfs (passdata)" || bad "mount missing"
 

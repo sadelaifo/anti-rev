@@ -77,6 +77,26 @@ int antirevfs_has_magic(struct file *lower_file)
 	return memcmp(buf, ANTREV_MAGIC, ANTREV_MAGIC_LEN) == 0 ? 1 : 0;
 }
 
+/* True if the file's last 8 bytes are the ANTREV magic — i.e. it carries the
+ * embedded-key trailer (key + trailing magic).  Used to confirm a header-magic
+ * file is a complete antirevfs container before computing the plaintext size. */
+int antirevfs_has_trailer(struct file *lower_file, loff_t size)
+{
+	char buf[ANTREV_MAGIC_LEN];
+	loff_t pos;
+	ssize_t n;
+
+	if (size < ANTREV_HDR_LEN + ANTREV_TRAILER_LEN)
+		return 0;
+	pos = size - ANTREV_MAGIC_LEN;
+	n = arev_kernel_read(lower_file, buf, sizeof(buf), &pos);
+	if (n < 0)
+		return n;
+	if (n < ANTREV_MAGIC_LEN)
+		return 0;
+	return memcmp(buf, ANTREV_MAGIC, ANTREV_MAGIC_LEN) == 0 ? 1 : 0;
+}
+
 bool antirevfs_ext_whitelisted(struct antirevfs_sb_info *sbi, const char *name)
 {
 	const char *dot, *list = sbi->passthrough;
@@ -109,12 +129,12 @@ bool antirevfs_ext_whitelisted(struct antirevfs_sb_info *sbi, const char *name)
 int antirevfs_decrypt_file(struct super_block *sb, struct file *lower_file,
 			   loff_t lower_size, void *out, size_t out_len)
 {
-	struct antirevfs_sb_info *sbi = ANTIREVFS_SB(sb);
 	struct crypto_aead *tfm;
 	struct aead_request *req;
 	struct scatterlist sg;
 	AREV_DECLARE_WAIT(wait);
 	u8 iv[ANTREV_IV_LEN];
+	u8 key[ANTREV_KEY_LEN];		/* read fresh from this file's trailer */
 	u8 *buf = NULL;			/* [ct||tag], decrypted in place */
 	size_t ct_len = out_len;
 	size_t buf_len = ct_len + ANTREV_TAG_LEN;
@@ -122,21 +142,33 @@ int antirevfs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	ssize_t n;
 	int ret;
 
-	if (!sbi->have_key)
-		return -ENOKEY;
-	if (lower_size < ANTREV_HDR_LEN ||
-	    (size_t)(lower_size - ANTREV_HDR_LEN) != ct_len)
+	/* No mount key: the AES key lives in this file's trailer.  Layout is
+	 * [hdr:36][ct:ct_len][key:32][magic:8], so out_len (plaintext) ==
+	 * lower_size - HDR - TRAILER. */
+	if (lower_size < ANTREV_HDR_LEN + ANTREV_TRAILER_LEN ||
+	    (size_t)(lower_size - ANTREV_HDR_LEN - ANTREV_TRAILER_LEN) != ct_len)
 		return -EINVAL;
+
+	/* Read the embedded key from the trailer (just before the trailing
+	 * magic).  Read it each decrypt; never cached in the inode/sb. */
+	pos = lower_size - ANTREV_TRAILER_LEN;
+	n = arev_kernel_read(lower_file, key, ANTREV_KEY_LEN, &pos);
+	if (n != ANTREV_KEY_LEN)
+		return n < 0 ? n : -EIO;
 
 	/* Read IV (after the magic). */
 	pos = ANTREV_MAGIC_LEN;
 	n = arev_kernel_read(lower_file, iv, ANTREV_IV_LEN, &pos);
-	if (n != ANTREV_IV_LEN)
-		return n < 0 ? n : -EIO;
+	if (n != ANTREV_IV_LEN) {
+		ret = n < 0 ? n : -EIO;
+		goto out_key;
+	}
 
 	buf = vmalloc(buf_len);
-	if (!buf)
-		return -ENOMEM;
+	if (!buf) {
+		ret = -ENOMEM;
+		goto out_key;
+	}
 
 	/* tag first (file layout), then ciphertext after it: build [ct||tag]. */
 	pos = ANTREV_MAGIC_LEN + ANTREV_IV_LEN;
@@ -157,7 +189,7 @@ int antirevfs_decrypt_file(struct super_block *sb, struct file *lower_file,
 		ret = PTR_ERR(tfm);
 		goto out_buf;
 	}
-	ret = crypto_aead_setkey(tfm, sbi->key, ANTREV_KEY_LEN);
+	ret = crypto_aead_setkey(tfm, key, ANTREV_KEY_LEN);
 	if (ret)
 		goto out_tfm;
 	ret = crypto_aead_setauthsize(tfm, ANTREV_TAG_LEN);
@@ -191,5 +223,7 @@ out_buf:
 	/* wipe transient ciphertext/plaintext copy */
 	memzero_explicit(buf, buf_len);
 	vfree(buf);
+out_key:
+	memzero_explicit(key, sizeof(key));	/* don't leave the key on the stack */
 	return ret;
 }

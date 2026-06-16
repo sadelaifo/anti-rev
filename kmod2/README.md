@@ -27,19 +27,35 @@ kmod2/
     └── test_antirevfs.sh end-to-end test (needs root)
 ```
 
-## On-disk format
+## On-disk format (embedded-key trailer)
 
-Reuses the existing `encryptor/protect.py encrypt-lib` container, unchanged:
+antirevfs has **no mount-time key**: each encrypted file embeds its own AES-256
+key in a trailer (mirroring the master-branch stub trailer), and the module
+reads it at decrypt time. Produced by `antirev-fs-pack.py` or `protect.py
+encrypt-lib --embed-key`:
 
 ```
-[magic "ANTREV01" : 8][iv : 12][tag : 16][ciphertext ...]
+[magic "ANTREV01" : 8][iv : 12][tag : 16][ciphertext ...][key : 32][magic "ANTREV01" : 8]
+ └──────────── header ───────────┘                       └────────── trailer ───────────┘
 ```
 
-The whole plaintext is one AES-256-GCM message (no chunking). `read_folio` does
-a one-shot whole-file decrypt into a per-inode buffer on first fault (tag
-verified once), then serves every page from it. The decrypt-the-whole-file
-approach is required because GCM authenticates the entire message — per-page
-random access cannot verify the tag in isolation.
+The trailing magic makes the trailer self-marking (the module confirms a
+header-magic file is a complete container by checking the last 8 bytes). The
+whole plaintext is one AES-256-GCM message (no chunking). `read_folio` does a
+one-shot whole-file decrypt into a per-inode buffer on first fault (tag verified
+once, key read fresh from the trailer and never cached), then serves every page
+from it. Decrypt-the-whole-file is required because GCM authenticates the entire
+message — per-page random access cannot verify the tag in isolation.
+
+An **unauthorized** reader (decrypt-auth gate denies; see below) is served the
+file **with the trailer stripped** — a valid-looking but keyless, undecryptable
+`[magic][iv][tag][ct]` container, so neither plaintext nor the key escapes.
+
+> **Tradeoff.** Embedding the key in the file means the lower `.enc/` tree now
+> *contains the keys*: a raw copy of `.enc/` (bypassing the mount) is
+> decryptable. Protection rests on (a) the mount stripping the trailer for
+> unauthorized readers and (b) the `.enc/` tree staying namespace-isolated —
+> exactly the master-branch posture (key embedded in the shipped artifact).
 
 ## Kernel compatibility
 
@@ -95,10 +111,8 @@ which on SLES points into `/usr/src/...`) must be installed.
 # 1. load the module
 sudo insmod kmod2/module/antirevfs.ko        # or: modprobe antirevfs (after dkms install)
 
-# 2. put the AES key in the kernel keyring (same key protect.py encrypted with)
-sudo kmod2/tools/antirev-keyctl unlock --keyfile /path/to/key.hex
-
-# 3. mount the ciphertext .enc/ tree as a decrypted view
+# 2. mount the ciphertext .enc/ tree as a decrypted view — NO key step
+#    (each file carries its own key in a trailer; the module reads it on decrypt)
 sudo kmod2/tools/antirev-mount /root/proj/.enc/lib /root/proj/lib json:md
 #   equivalently:
 #   mount -t antirevfs -o ro,passthrough=json:md /root/proj/.enc/lib /root/proj/lib
@@ -113,7 +127,7 @@ sudo kmod2/tools/antirev-mount /root/proj/.enc/lib /root/proj/lib json:md
   libs), produced by `antirev-fs-pack.py` with `mirror_plaintext` (default).
   The mount is read-only: redirect any runtime-written files to a writable path
   outside the mount (e.g. an overlayfs upper — see "Writable view" below).
-- For ad-hoc testing without the keyring, pass `key=<64 hex chars>` in `-o`.
+- No `key=` option and no keyring: keys are embedded per file (above).
 
 ### Writable view (overlayfs upper) — `antirev-mount-rw`
 
@@ -168,17 +182,21 @@ work the same as for `antirev-mount`. Covered by `tests/test_antirevfs_overlay_r
 > If an app does rewrite a protected file, that one file becomes plaintext in
 > the upper, so keep the upper on an access-controlled / reboot-wiped path.
 
-### Key custody / keyring caveat
+### Key custody (embedded-key trailer)
 
-The module looks up a `user`-type key named `antirevfs:default` via
-`request_key()` from the mount path, which searches the mounting task's
-**session keyring**. So the `antirev-keyctl unlock` and the `mount` must run in
-the **same session** (same shell / same systemd unit). A key added to the
-per-UID `@u` keyring is *not* reliably found, because `sudo`/login
-(`pam_keyinit`) installs a fresh session keyring that does not link `@u`. For an
-unlock-now / mount-later-in-another-session flow, use the `key=` mount option in
-`/etc/fstab`, or link `@u` into the unit's session keyring. Production
-TPM/PKCS#11/dongle unseal wires into `antirev-keyctl unlock-from-tpm`.
+There is **no mount-time key** — no keyring, no `key=`, no session-keyring
+dance. Every encrypted file embeds its AES key in a trailer (see *On-disk
+format* above), and the module reads it fresh per file at decrypt time (never
+caching it in the superblock/inode). Mounting is therefore key-free, and an
+unauthorized reader gets the container with that trailer stripped.
+
+The cost is that the key now lives **inside each ciphertext file**: a raw copy
+of the `.enc/` lower tree is decryptable, so the lower tree must stay
+namespace-isolated and the plaintext exposure is bounded by the mount's
+decrypt-auth gate. This matches the master-branch model (key shipped, obfuscated,
+inside the artifact). Hardening the embedded key (obfuscation / K-of-N split /
+TPM-wrapping the per-file key) is future work; `antirev-keyctl` is retained only
+for legacy flows and has no effect on a current mount.
 
 ## Test
 

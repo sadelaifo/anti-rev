@@ -85,7 +85,7 @@ gcc -o "$WORK/listed"   "$WORK/listed.c"
 gcc -o "$WORK/unlisted" "$WORK/unlisted.c"
 printf 'TOPSECRET42' > "$WORK/secret.dat"
 
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --embed-key --key "$WORK/key.hex" \
 	--libs "$WORK/listed" "$WORK/unlisted" "$WORK/secret.dat" \
 	--output-dir "$ENC" >/dev/null
 chmod +x "$ENC/listed" "$ENC/unlisted"          # mount mirrors the lower mode
@@ -98,7 +98,6 @@ sed 's/^/    /' "$AUTHZ"
 
 echo "== load module (gate_enforce=1, authz_path=$AUTHZ) + key + mount (ro) =="
 insmod "$MOD" gate_enforce=1 authz_path="$AUTHZ" || { echo "insmod failed"; exit 1; }
-"$KEYCTL" unlock --keyfile "$WORK/key.hex" >/dev/null
 mount -t antirevfs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
 mount | grep -q "$MP" && ok "mounted antirevfs (gating enforced, read-only)" || bad "mount missing"
 

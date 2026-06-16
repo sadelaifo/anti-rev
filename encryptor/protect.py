@@ -77,6 +77,24 @@ def encrypt_data(data: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
     return iv, tag, ct
 
 
+def make_container(data: bytes, key: bytes, embed_key: bool = False) -> bytes:
+    """Build the on-disk encrypted container for `data`.
+
+    Default (keyless, daemon/shim form):
+        MAGIC + iv + tag + ct
+    With embed_key=True (antirevfs form): append a key trailer (the key plus a
+    second MAGIC so the trailer is self-marking), mirroring the master-branch
+    stub trailer.  The antirevfs kernel module reads the key from this trailer
+    at decrypt time, so there is no mount-time key:
+        MAGIC + iv + tag + ct + key + MAGIC
+    """
+    iv, tag, ct = encrypt_data(data, key)
+    blob = MAGIC + iv + tag + ct
+    if embed_key:
+        blob += key + MAGIC
+    return blob
+
+
 # ── Bundle building ────────────────────────────────────────────────
 
 BFLAG_HAS_MAIN    = 0x01
@@ -293,10 +311,8 @@ def cmd_encrypt_lib(args):
         if not lib.exists():
             sys.exit(f"[error] library not found: {lib}")
 
-        data         = lib.read_bytes()
-        iv, tag, ct  = encrypt_data(data, key)
-
-        enc_data = MAGIC + iv + tag + ct
+        data     = lib.read_bytes()
+        enc_data = make_container(data, key, embed_key=args.embed_key)
 
         dest = (out_dir / lib.name) if out_dir else lib
         dest.write_bytes(enc_data)
@@ -335,6 +351,9 @@ def main():
     el.add_argument("--key",        required=True,       help="Key file (hex); created if absent")
     el.add_argument("--libs",       required=True, nargs="+", metavar="LIB")
     el.add_argument("--output-dir", default=None,        help="Write encrypted libs here (default: in-place)")
+    el.add_argument("--embed-key",  action="store_true",
+                    help="Append the AES key as a file trailer (antirevfs form; "
+                         "module reads the key per-file, no mount-time key)")
 
     args = p.parse_args()
 

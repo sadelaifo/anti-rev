@@ -1,12 +1,13 @@
 #!/bin/bash
-# gate_passthrough_cipher test for antirevfs: when an unauthorized process reads
-# an encrypted file, instead of -EACCES it is served the lower .enc/ ciphertext.
-# Security is unchanged (no plaintext escapes); the difference is posture — the
-# read "succeeds" with a useless ANTREV01 container rather than a permission
-# error that advertises the gate.  Proves:
+# gate_passthrough_cipher test for antirevfs (embedded-key format): when an
+# unauthorized process reads an encrypted file, instead of -EACCES it is served
+# the lower .enc/ ciphertext WITH THE KEY TRAILER STRIPPED — a valid-looking but
+# keyless, undecryptable ANTREV01 container.  Security is unchanged (no plaintext
+# AND no key escapes); the difference is posture — the read "succeeds" with
+# useless bytes rather than a permission error that advertises the gate.  Proves:
 #   1. an authorized program still reads DECRYPTED content through the mount
-#   2. cp (unlisted) now SUCCEEDS but yields the on-disk CIPHERTEXT, byte-for-
-#      byte equal to the lower .enc file (full container, not a truncation)
+#   2. cp (unlisted) SUCCEEDS but yields the container minus the 40-byte key
+#      trailer (key + trailing magic), and the embedded key is NOT in the output
 #   3. cat (unlisted) yields ciphertext (ANTREV01 magic, not the plaintext ELF)
 #   4. an unauthorized objdump sees "not an ELF" — no symbols leak
 #   5. flipping gate_passthrough_cipher=0 restores the -EACCES deny
@@ -58,7 +59,7 @@ EOF
 gcc -shared -fPIC -o "$WORK/libtest.so" "$WORK/libtest.c"
 cp "$WORK/libtest.so" "$WORK/libtest.plain.so"   # reference plaintext
 
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --embed-key --key "$WORK/key.hex" \
 	--libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
 
 # An authorized loader (dlopen+dlsym+call).
@@ -85,7 +86,6 @@ chmod 0644 "$AUTHZ"
 echo "== load module (gate_enforce=1, gate_passthrough_cipher=1) + key + mount =="
 insmod "$MOD" gate_enforce=1 gate_passthrough_cipher=1 authz_path="$AUTHZ" \
 	|| { echo "insmod failed"; exit 1; }
-"$KEYCTL" unlock --keyfile "$WORK/key.hex" >/dev/null
 mount -t antirevfs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
 mount | grep -q "$MP" && ok "mounted antirevfs (passthrough-cipher on)" || bad "mount missing"
 
@@ -95,18 +95,25 @@ echo "    loader: $OUT (rc=$RC)"
 [[ $RC -eq 0 ]] && ok "authorized loader dlopen'd + called (answer=42)" \
 	|| bad "authorized loader failed (rc=$RC)"
 
-echo "== 2. cp (unlisted) succeeds but yields the lower CIPHERTEXT =="
+echo "== 2. cp (unlisted) succeeds but yields TRAILER-STRIPPED ciphertext (no key) =="
+ENCSZ="$(stat -c%s "$ENC/libtest.so")"
 if cp "$MP/libtest.so" "$WORK/out_cp" 2>"$WORK/cp.err"; then
+	OUTSZ="$(stat -c%s "$WORK/out_cp")"
 	if cmp -s "$WORK/out_cp" "$WORK/libtest.plain.so"; then
 		bad "cp yielded PLAINTEXT (passthrough leaked decrypted content!)"
-	elif cmp -s "$WORK/out_cp" "$ENC/libtest.so"; then
-		ok "cp succeeded and copied the full .enc ciphertext byte-for-byte"
+	elif [[ "$OUTSZ" -eq "$((ENCSZ - 40))" ]]; then
+		ok "cp output is the .enc container minus the 40-byte key trailer ($OUTSZ = $ENCSZ-40)"
 	else
-		bad "cp output matches neither plaintext nor the lower ciphertext"
-		echo "    sizes: out=$(stat -c%s "$WORK/out_cp") enc=$(stat -c%s "$ENC/libtest.so") plain=$(stat -c%s "$WORK/libtest.plain.so")"
+		bad "cp output size $OUTSZ != enc-40 ($((ENCSZ - 40)))"
+	fi
+	# the embedded AES key (key.hex) must NOT appear anywhere in the stripped copy
+	if python3 -c "import sys; d=open('$WORK/out_cp','rb').read(); k=bytes.fromhex(open('$WORK/key.hex').read().strip()); sys.exit(0 if k in d else 1)"; then
+		bad "the embedded key LEAKED into the cp output"
+	else
+		ok "embedded key absent from the cp output (trailer withheld)"
 	fi
 else
-	bad "cp was denied (expected success with ciphertext): $(cat "$WORK/cp.err")"
+	bad "cp was denied (expected success with stripped ciphertext): $(cat "$WORK/cp.err")"
 fi
 
 echo "== 3. cat (unlisted) yields ciphertext (ANTREV01 magic, not the ELF) =="

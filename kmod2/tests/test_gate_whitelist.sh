@@ -74,7 +74,7 @@ int main(void){ printf("RAN_$name\n"); return 0; }
 EOF
 	gcc -o "$WORK/$name" "$WORK/$name.c"
 done
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --embed-key --key "$WORK/key.hex" \
 	--libs "$WORK/alpha" "$WORK/beta" "$WORK/gamma" "$WORK/rogue" \
 	--output-dir "$ENC" >/dev/null
 chmod +x "$ENC"/alpha "$ENC"/beta "$ENC"/gamma "$ENC"/rogue   # mount mirrors lower mode
@@ -89,7 +89,6 @@ cat "$AUTHZ" | sed 's/^/    /'
 
 echo "== load module (gate_enforce=1, default authz_path) + key + mount =="
 insmod "$MOD" gate_enforce=1 || { echo "insmod failed"; exit 1; }
-"$KEYCTL" unlock --keyfile "$WORK/key.hex" >/dev/null
 mount -t antirevfs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
 mount | grep -q "$MP" && ok "mounted antirevfs (gating enforced)" || bad "mount missing"
 

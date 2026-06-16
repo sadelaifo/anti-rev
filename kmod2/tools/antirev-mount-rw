@@ -35,10 +35,10 @@
 #   <encdir>      ciphertext tree (e.g. /root/proj/.enc/bin)
 #   <mountpoint>  where the writable decrypted view appears (e.g. /root/proj/bin)
 #
-# The AES key must already be in the kernel keyring (see antirev-keyctl unlock),
-# unless you pass ,key=<64hex> via ANTIREV_MOUNT_OPTS.  The upper/work layers
-# must live on a writable filesystem (the default state dir does); for a tmpfs
-# upper that is wiped on reboot, point --state at a tmpfs path.
+# No mount-time key is needed — each encrypted file embeds its own AES key in a
+# trailer (pack with antirev-fs-pack.py / protect.py encrypt-lib --embed-key).
+# The upper/work layers must live on a writable filesystem (the default state dir
+# does); for a tmpfs upper that is wiped on reboot, point --state at a tmpfs path.
 set -euo pipefail
 
 die() { echo "antirev-mount-rw: $*" >&2; exit 1; }

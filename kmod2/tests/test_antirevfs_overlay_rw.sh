@@ -65,12 +65,11 @@ int antirevfs_answer(void){ return 42; }
 EOF
 gcc -shared -fPIC -o "$WORK/libtest.so" "$WORK/libtest.c"
 cp "$WORK/libtest.so" "$WORK/libtest.plain.so"
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --embed-key --key "$WORK/key.hex" \
 	--libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
 
 echo "== load module + key =="
 insmod "$MOD" || { echo "insmod failed"; exit 1; }
-"$KEYCTL" unlock --keyfile "$WORK/key.hex" >/dev/null
 
 echo "== 0. failure mode: bare antirevfs mount rejects writes =="
 mount -t antirevfs -o "ro,passdata" "$ENC" "$BARE" || { echo "bare mount failed"; dmesg|tail -5; exit 1; }

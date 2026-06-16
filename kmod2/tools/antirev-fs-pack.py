@@ -56,7 +56,7 @@ _HERE = Path(__file__).resolve()
 _REPO = _HERE.parents[2]
 sys.path.insert(0, str(_REPO / "encryptor"))
 try:
-    from protect import MAGIC, encrypt_data, load_or_create_key  # noqa: E402
+    from protect import make_container, load_or_create_key  # noqa: E402
 except ImportError as e:
     sys.exit(f"[error] cannot import encryptor/protect.py ({e}); "
              f"expected at {_REPO / 'encryptor' / 'protect.py'}")
@@ -95,11 +95,15 @@ def blacklisted(rel: str, patterns: list[str]) -> bool:
 
 
 def encrypt_one(src: Path, dst: Path, key: bytes) -> int:
-    """Encrypt src -> dst (ANTREV01 container). Returns plaintext byte count."""
+    """Encrypt src -> dst (ANTREV01 container with embedded-key trailer).
+
+    antirevfs has no mount-time key, so each file carries its own AES key in a
+    trailer (MAGIC + iv + tag + ct + key + MAGIC); the module reads it at
+    decrypt time.  Returns plaintext byte count.
+    """
     data = src.read_bytes()
-    iv, tag, ct = encrypt_data(data, key)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_bytes(MAGIC + iv + tag + ct)
+    dst.write_bytes(make_container(data, key, embed_key=True))
     try:
         dst.chmod(src.stat().st_mode & 0o777)
     except OSError:
@@ -276,12 +280,9 @@ def main() -> int:
                    for s, _ in (enc_jobs + copy_jobs)
                    if s.relative_to(install_dir).parts})
     if subs:
-        print("\n  Suggested mount (run unlock + mount in ONE session keyring):")
-        print(f"    sudo keyctl session - bash -c '")
-        print(f"      antirev-keyctl unlock --keyfile {key_path}")
+        print("\n  Suggested mount (key-free — each file embeds its own key):")
         for sub in subs:
-            print(f"      antirev-mount {flag}{output_dir/sub} {install_dir/sub}")
-        print(f"    '")
+            print(f"    sudo antirev-mount {flag}{output_dir/sub} {install_dir/sub}")
     return 0
 
 

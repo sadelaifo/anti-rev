@@ -49,18 +49,33 @@ static int antirevfs_classify(struct inode *inode, struct dentry *lower_dentry,
 		return PTR_ERR(lower_file);
 
 	magic = antirevfs_has_magic(lower_file);
-	fput(lower_file);
-	if (magic < 0)
+	if (magic < 0) {
+		fput(lower_file);
 		return magic;
+	}
 
 	if (magic) {
-		if (i_size_read(lower_inode) < ANTREV_HDR_LEN)
+		loff_t sz = i_size_read(lower_inode);
+		int trailer = antirevfs_has_trailer(lower_file, sz);
+
+		fput(lower_file);
+		/* An antirevfs container must carry the embedded-key trailer
+		 * (key + trailing magic); a header-magic file without it is a
+		 * keyless/legacy or truncated container we cannot decrypt
+		 * (there is no mount key). */
+		if (trailer < 0)
+			return trailer;
+		if (!trailer || sz < ANTREV_HDR_LEN + ANTREV_TRAILER_LEN)
 			return -EIO;
 		ii->encrypted = true;
 		ii->open_ok = true;
-		*plain_len = i_size_read(lower_inode) - ANTREV_HDR_LEN;
-	} else if (sbi->pass_nonelf ||
-		   antirevfs_ext_whitelisted(sbi, lower_dentry->d_name.name)) {
+		*plain_len = sz - ANTREV_HDR_LEN - ANTREV_TRAILER_LEN;
+		return 0;
+	}
+
+	fput(lower_file);
+	if (sbi->pass_nonelf ||
+	    antirevfs_ext_whitelisted(sbi, lower_dentry->d_name.name)) {
 		/* Plaintext passthrough: an explicit-extension match, or (with
 		 * the `passdata` mount option) any non-ANTREV01 file.  These are
 		 * not secret and are never gated — read at full speed.
@@ -205,18 +220,22 @@ static int antirevfs_getattr(AREV_GETATTR_PROTO)
 	stat->blocks = (stat->size + 511) >> 9;
 
 	/*
-	 * Under gate_passthrough_cipher an unauthorized caller reads the lower
-	 * .enc/ ciphertext (longer than the plaintext by the ANTREV01 header).
-	 * Report THAT length to such callers so size-honoring copiers (cp via
-	 * copy_file_range/sendfile) read the whole container, not a truncation.
+	 * Under gate_passthrough_cipher an unauthorized caller is served the
+	 * lower .enc/ ciphertext with the key TRAILER stripped — i.e. the first
+	 * (lower_size - TRAILER) bytes.  Report THAT length to such callers so
+	 * size-honoring copiers (cp via copy_file_range/sendfile) read the whole
+	 * keyless container and stop before the (already withheld) trailer.
 	 * getattr runs in the caller's context, so this varies per reader while
 	 * the shared inode keeps reporting plaintext size to authorized ones.
 	 */
 	if (ANTIREVFS_I(inode)->encrypted &&
 	    antirevfs_gate_passthrough_cipher() &&
 	    !antirevfs_task_authorized()) {
-		loff_t csz = i_size_read(antirevfs_lower_inode(inode));
+		loff_t csz = i_size_read(antirevfs_lower_inode(inode)) -
+			     ANTREV_TRAILER_LEN;
 
+		if (csz < 0)
+			csz = 0;
 		stat->size = csz;
 		stat->blocks = (csz + 511) >> 9;
 	}

@@ -12,8 +12,10 @@
 #   passthrough-exts  optional colon-separated extensions served verbatim
 #                     (e.g. json:md) for mixed-content directories
 #
-# The AES key must already be in the kernel keyring (see antirev-keyctl unlock).
-# For ad-hoc testing you can instead append ,key=<64hex> to ANTIREV_MOUNT_OPTS.
+# No key is needed to mount: each encrypted file embeds its own AES key in a
+# trailer, which the module reads at decrypt time (antirevfs has no mount-time
+# key / keyring lookup).  Pack the tree with antirev-fs-pack.py (it writes the
+# embedded-key container) or protect.py encrypt-lib --embed-key.
 set -euo pipefail
 
 die() { echo "antirev-mount: $*" >&2; exit 1; }

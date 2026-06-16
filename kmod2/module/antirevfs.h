@@ -16,9 +16,14 @@
 #define ANTIREVFS_NAME		"antirevfs"
 #define ANTIREVFS_MAGIC		0x416E5246	/* "AnRF" */
 
-/* On-disk container format (matches encryptor/protect.py encrypt-lib):
- *   [magic:8][iv:12][tag:16][ciphertext...]
- * The whole plaintext is one AES-256-GCM message (no chunking).
+/* On-disk container format (antirev-fs-pack.py / protect.py --embed-key):
+ *   [magic:8][iv:12][tag:16][ciphertext...][key:32][magic:8]
+ * The whole plaintext is one AES-256-GCM message (no chunking).  Unlike the
+ * keyless daemon/shim container, antirevfs embeds the AES key in a per-file
+ * TRAILER (key + a second magic), mirroring the master branch's stub trailer.
+ * There is no mount-time key: the module reads each file's key from its own
+ * trailer at decrypt time.  An unauthorized reader is served the file with the
+ * trailer stripped — a valid-looking but keyless, undecryptable container.
  */
 #define ANTREV_MAGIC		"ANTREV01"
 #define ANTREV_MAGIC_LEN	8
@@ -26,12 +31,12 @@
 #define ANTREV_TAG_LEN		16
 #define ANTREV_HDR_LEN		(ANTREV_MAGIC_LEN + ANTREV_IV_LEN + ANTREV_TAG_LEN)
 #define ANTREV_KEY_LEN		32	/* AES-256 */
+/* Trailer = embedded key + a trailing magic (so the trailer is self-marking). */
+#define ANTREV_TRAILER_LEN	(ANTREV_KEY_LEN + ANTREV_MAGIC_LEN)
 
-/* Per-mount state. */
+/* Per-mount state.  No key here — keys live in each file's trailer. */
 struct antirevfs_sb_info {
 	struct path	lower_root;		/* the .enc/ subtree */
-	u8		key[ANTREV_KEY_LEN];	/* mount-resident AES key */
-	bool		have_key;
 	char		*passthrough;		/* comma list of extensions, or NULL */
 	bool		pass_nonelf;		/* passdata: serve ANY non-magic file plaintext */
 };
@@ -87,6 +92,7 @@ bool antirevfs_gate_passthrough_cipher(void);	/* deny-mode: serve ciphertext vs 
 
 /* crypto.c */
 int antirevfs_has_magic(struct file *lower_file);	/* >0 yes, 0 no, <0 err */
+int antirevfs_has_trailer(struct file *lower_file, loff_t size);  /* >0/0/<0: trailing magic? */
 int antirevfs_decrypt_file(struct super_block *sb, struct file *lower_file,
 			   loff_t lower_size, void *out, size_t out_len);
 bool antirevfs_ext_whitelisted(struct antirevfs_sb_info *sbi, const char *name);
