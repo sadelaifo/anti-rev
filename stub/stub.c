@@ -2633,6 +2633,85 @@ static void exec_target(int main_fd, char *const *argv, char **new_env, const ch
 }
 
 /* ------------------------------------------------------------------ */
+/*  Key-split derivation                                               */
+/*                                                                     */
+/*  The trailer no longer holds the AES key — only part1 (a 32-byte    */
+/*  share).  The real key is derived from three sources that live in   */
+/*  different places, so no single artifact carries the whole key:     */
+/*                                                                     */
+/*    real_key = SHA256( part1 || SHA256(lrxd file) || version )       */
+/*                                                                     */
+/*    part1   : trailer[8..40] (same share in every protected binary)  */
+/*    lrxd    : $HOME/SA/bin/sa/lrxd, whole file (binds the key to     */
+/*              lrxd's integrity — patch lrxd and derivation breaks)   */
+/*    version : $HOME/SA/version, ASCII-whitespace-stripped both ends  */
+/*              (matches Python bytes.strip()); binds to deployment     */
+/*                                                                     */
+/*  Hard-fail (return -1) if a source is missing/unreadable: the       */
+/*  caller aborts rather than fall back to any usable key.  Must stay  */
+/*  byte-for-byte identical to encryptor/protect.py:derive_real_key    */
+/*  and tools/antirev_client.py.                                       */
+/* ------------------------------------------------------------------ */
+static int is_ascii_ws(uint8_t c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+}
+
+static int home_join(const char *rel, char *buf, size_t bufsz) {
+    const char *home = getenv("HOME");
+    if (!home || !*home)
+        return -1;
+    if ((size_t) snprintf(buf, bufsz, "%s/%s", home, rel) >= bufsz)
+        return -1;
+    return 0;
+}
+
+static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SIZE]) {
+    char path[4096];
+
+    /* part2 = SHA256(lrxd file), streamed so a large binary isn't slurped. */
+    if (home_join(OBFSTR("SA/bin/sa/lrxd"), path, sizeof(path)) != 0) {
+        LOG_INFO("[antirev] keysplit: HOME unset or path too long\n");
+        return -1;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { PERR_INFO("[antirev] keysplit: open lrxd"); return -1; }
+    sha256_ctx lc;
+    sha256_init(&lc);
+    uint8_t rbuf[65536];
+    ssize_t n;
+    while ((n = read(fd, rbuf, sizeof(rbuf))) > 0)
+        sha256_update(&lc, rbuf, (size_t) n);
+    int read_err = (n < 0);
+    close(fd);
+    if (read_err) { PERR_INFO("[antirev] keysplit: read lrxd"); return -1; }
+    uint8_t part2[32];
+    sha256_final(&lc, part2);
+
+    /* version = $HOME/SA/version, whitespace-stripped both ends.  A
+     * version string is tiny; one read into a generous buffer suffices. */
+    if (home_join(OBFSTR("SA/version"), path, sizeof(path)) != 0)
+        return -1;
+    int vfd = open(path, O_RDONLY);
+    if (vfd < 0) { PERR_INFO("[antirev] keysplit: open version"); return -1; }
+    uint8_t vbuf[4096];
+    ssize_t vn = read(vfd, vbuf, sizeof(vbuf));
+    close(vfd);
+    if (vn < 0) { PERR_INFO("[antirev] keysplit: read version"); return -1; }
+    size_t vs = 0, ve = (size_t) vn;
+    while (vs < ve && is_ascii_ws(vbuf[vs]))   vs++;
+    while (ve > vs && is_ascii_ws(vbuf[ve - 1])) ve--;
+
+    /* real_key = SHA256(part1 || part2 || version) */
+    sha256_ctx kc;
+    sha256_init(&kc);
+    sha256_update(&kc, part1, KEY_SIZE);
+    sha256_update(&kc, part2, sizeof(part2));
+    sha256_update(&kc, vbuf + vs, ve - vs);
+    sha256_final(&kc, out_key);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  main                                                               */
 /* ------------------------------------------------------------------ */
 int main(int argc, char *argv[], char *envp[])
@@ -2676,9 +2755,15 @@ int main(int argc, char *argv[], char *envp[])
 
     uint64_t bundle_off = u64le(trailer);
 
-    /* 2. Extract key from trailer */
+    /* 2. Derive the real key from the three split parts.  The trailer
+     *    holds only part1; derive_real_key() combines it with
+     *    SHA256(lrxd) and the SA/version string.  Hard-fail on any
+     *    missing source — never fall back to a usable key. */
     uint8_t key[KEY_SIZE];
-    memcpy(key, trailer + 8, KEY_SIZE);
+    if (derive_real_key(trailer + 8, key) != 0) {
+        LOG_INFO("[antirev] key derivation failed — aborting\n");
+        return 1;
+    }
 
     /* ----------------------------------------------------------------
      * Phase 1: scan bundle headers — collect metadata for every file.

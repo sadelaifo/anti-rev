@@ -77,7 +77,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from protect import (load_or_create_key, encrypt_data, MAGIC,
-                     BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS)
+                     BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS, derive_real_key)
 
 # ELF magic and type constants
 ELF_MAGIC = b'\x7fELF'
@@ -750,31 +750,20 @@ def main():
     # Encrypt libs individually to output_dir as standalone encrypted files,
     # and create a lightweight daemon binary (stub + key, no bundled libs)
     # that reads encrypted libs from disk at runtime
-    if libs_mode == 'encrypt' and lib_files:
-        print(f"[pack] Encrypting {len(lib_files)} lib(s) individually...")
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    _encrypt_lib_worker,
-                    str(src),
-                    str(output_dir / src.relative_to(install_dir)),
-                    key,
-                ): src.name
-                for src in lib_files
-            }
-            for fut in as_completed(futures):
-                try:
-                    print(fut.result())
-                except Exception as e:
-                    sys.exit(f"[error] encrypt lib failed for {futures[fut]}: {e}")
+    # Real AES key for every artifact.  Under key-split it is *derived*
+    # from the freshly-built lrxd + the version file (below), so it stays
+    # None until the daemon exists.  The trailer in each binary embeds
+    # part1 (`key`), never the real key.
+    real_key = None
 
-        # Build lightweight daemon per architecture.  Multi-arch deploys
-        # get suffixed filenames (lrxd-x86_64 / -aarch64); single-arch
-        # builds keep the unsuffixed lrxd.  Renamed from ".antirev-libd*"
-        # so `ls /opt/biz/` / `ps aux` doesn't fingerprint the daemon as
-        # antirev's.  No leading dot: a hidden executable is itself
-        # suspicious, and dotfiles get skipped by glob/rsync copies;
-        # plain "lrxd" blends in.  No wrapper binary — wrapper mode retired.
+    if libs_mode == 'encrypt' and lib_files:
+        # Build the lightweight daemon(s) FIRST — the real key is derived
+        # from SHA256(lrxd), so lrxd must exist before anything is
+        # encrypted.  Multi-arch deploys get suffixed names (lrxd-x86_64 /
+        # -aarch64); single-arch keeps the unsuffixed lrxd.  (Renamed from
+        # ".antirev-libd*" so `ls`/`ps` doesn't fingerprint it; no leading
+        # dot — a hidden executable is itself suspicious and dotfiles get
+        # skipped by rsync/glob copies; plain "lrxd" blends in.)
         for arch, stub_path in stubs.items():
             stub_data = stub_path.read_bytes()
             suffix = f'-{arch}' if len(stubs) > 1 else ''
@@ -788,9 +777,48 @@ def main():
             os.chmod(str(daemon_path), 0o755)
             print(f"[pack] Daemon binary: {daemon_path.name}  "
                   f"({daemon_path.stat().st_size:,} bytes, {arch})")
+
+        # Key-split: derive the real key from the lrxd that deploys to
+        # $HOME/SA/bin/sa/lrxd + the version file.  Runtime reads the
+        # version from $HOME/SA/version; at pack time it lives at
+        # $HOME/SA2/version (same content).  Single-arch only: the runtime
+        # hashes one fixed lrxd, so there must be exactly one unsuffixed
+        # lrxd to bind to.
+        lrxd_built = output_dir / 'lrxd'
+        if not lrxd_built.exists():
+            sys.exit("[error] keysplit: expected a single unsuffixed daemon at "
+                     f"{lrxd_built} to bind the key to; multi-arch key-split is "
+                     "not supported (runtime hashes one $HOME/SA/bin/sa/lrxd)")
+        version_path = Path(_expand(cfg.get('version', '$HOME/SA2/version')))
+        if not version_path.exists():
+            sys.exit(f"[error] keysplit: version file not found at {version_path}")
+        real_key = derive_real_key(key, lrxd_built, version_path)
+        print(f"[pack] key-split: real key derived from {lrxd_built.name} "
+              f"+ {version_path}")
+
+        print(f"[pack] Encrypting {len(lib_files)} lib(s) individually...")
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _encrypt_lib_worker,
+                    str(src),
+                    str(output_dir / src.relative_to(install_dir)),
+                    real_key,
+                ): src.name
+                for src in lib_files
+            }
+            for fut in as_completed(futures):
+                try:
+                    print(fut.result())
+                except Exception as e:
+                    sys.exit(f"[error] encrypt lib failed for {futures[fut]}: {e}")
         print()
 
     if exe_files:
+        if real_key is None:
+            sys.exit("[error] keysplit requires daemon mode (libs: encrypt with "
+                     "libs present) so the lrxd the key binds to exists; "
+                     "exe-only packing is unsupported under key-split")
         print(f"[pack] Protecting {len(exe_files)} executable(s)...")
         # Arch-vs-stubs mismatch is filtered out earlier in the scan
         # phase (see 'unsupported_arch'), so every entry here has a
@@ -831,7 +859,7 @@ def main():
                     str(src),
                     str(stubs[arch]),
                     str(output_dir / rel),
-                    key,
+                    real_key,
                     exe_daemon_libs,
                     exe_needed.get(rel, []),
                 ): rel

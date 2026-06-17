@@ -77,6 +77,31 @@ def encrypt_data(data: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
     return iv, tag, ct
 
 
+def derive_real_key(part1: bytes, lrxd_path: Path, version_path: Path) -> bytes:
+    """Key-split derivation — the actual AES key is never stored whole.
+
+        real_key = SHA256( part1[32] || SHA256(lrxd file) || version )
+
+    part1        : the 32-byte share embedded in every trailer (what
+                   load_or_create_key returns).
+    lrxd_path    : the daemon binary deployed at $HOME/SA/bin/sa/lrxd,
+                   hashed whole — binds the key to lrxd's integrity.
+    version_path : the file deployed at $HOME/SA/version; its content is
+                   stripped of leading/trailing ASCII whitespace, binding
+                   the key to the deployment's version string.
+
+    MUST stay byte-for-byte identical to stub.c derive_real_key() and
+    tools/antirev_client.py.  bytes.strip() strips the same six ASCII
+    whitespace bytes the C side does (\\t\\n\\v\\f\\r space).
+    """
+    import hashlib
+    if len(part1) != KEY_SIZE:
+        sys.exit("[error] keysplit: part1 must be 32 bytes")
+    part2 = hashlib.sha256(Path(lrxd_path).read_bytes()).digest()
+    version_bytes = Path(version_path).read_bytes().strip()
+    return hashlib.sha256(part1 + part2 + version_bytes).digest()
+
+
 # ── Bundle building ────────────────────────────────────────────────
 
 BFLAG_HAS_MAIN    = 0x01
