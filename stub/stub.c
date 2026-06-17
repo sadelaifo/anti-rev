@@ -2576,11 +2576,15 @@ static void exec_target(int main_fd, char *const *argv, char **new_env, const ch
      * __r_FX forces the explicit-QEMU dispatch below (which passes
      * "-0 <binname>" so the guest keeps its real argv[0]).  It is opt-in:
      * set __r_FX=1 in the deployment env (one global var, like __r_NP) for
-     * the docker+qemu deployment.  qemu-user is transparent (uname /
-     * /proc/self/exe report aarch64) and binfmt_misc isn't readable from
-     * inside the container, so there is no reliable auto-probe — the env
-     * var is the deliberate signal.  Unset reproduces the old behaviour
-     * exactly: a no-op on native hosts. */
+     * the docker+qemu deployment.  Export it in the *top-level* startup
+     * script (a parent of every protected process): an `export` in a
+     * sub-script run as `sh sub.sh` only reaches that sub-script's own
+     * children and is gone when it returns, so sibling business processes
+     * never inherit it.  qemu-user is transparent (uname / /proc/self/exe
+     * report aarch64) and binfmt_misc isn't readable from inside the
+     * container, so there is no reliable auto-probe — the env var is the
+     * deliberate signal.  Unset reproduces the old behaviour exactly: a
+     * no-op on native hosts. */
     int force_qemu = getenv(OBFSTR("__r_FX")) != NULL;
 
     if (!force_qemu && !needs_qemu_for_fd(main_fd)) {
