@@ -2563,7 +2563,27 @@ static void try_exec_known_qemu(char **qemu_argv, char **new_env) {
  * Any failure falls through to a direct fexecve as the last line of
  * defence. */
 static void exec_target(int main_fd, char *const *argv, char **new_env, const char *real_exe) {
-    if (!needs_qemu_for_fd(main_fd)) {
+    /* Under qemu-user the aarch64 stub runs an aarch64 target, so
+     * needs_qemu_for_fd() (a compile-time-arch compare) reports "native"
+     * and we would take the plain fexecve path below.  That path
+     * *succeeds* via binfmt_misc's auto-wrap (qemu /proc/self/fd/N), but
+     * binfmt drops the real argv[0] — the guest cmdline becomes
+     * "qemu-aarch64-static /dev/fd/N" with no program name, so name-based
+     * process lookup (ps -o cmd | grep <name>, pgrep -f) can't find the
+     * process, breaking restart / keepalive scripts (old instance not
+     * killed -> keeps its listening socket -> next start hits EADDRINUSE).
+     *
+     * __r_FX forces the explicit-QEMU dispatch below (which passes
+     * "-0 <binname>" so the guest keeps its real argv[0]).  It is opt-in:
+     * set __r_FX=1 in the deployment env (one global var, like __r_NP) for
+     * the docker+qemu deployment.  qemu-user is transparent (uname /
+     * /proc/self/exe report aarch64) and binfmt_misc isn't readable from
+     * inside the container, so there is no reliable auto-probe — the env
+     * var is the deliberate signal.  Unset reproduces the old behaviour
+     * exactly: a no-op on native hosts. */
+    int force_qemu = getenv(OBFSTR("__r_FX")) != NULL;
+
+    if (!force_qemu && !needs_qemu_for_fd(main_fd)) {
         fexecve(main_fd, (char *const *) argv, new_env);
         /* fexecve returned → it failed.  Under qemu-user (e.g. an aarch64
          * container emulated on an x86 host), execveat(AT_EMPTY_PATH) /
@@ -2579,8 +2599,15 @@ static void exec_target(int main_fd, char *const *argv, char **new_env, const ch
             return;
     }
 
-    const char *binname = strrchr(real_exe, '/');
-    binname = binname ? binname + 1 : real_exe;
+    /* Guest program name for `-0 <binname>`.  Prefer argv[0]: under
+     * qemu-user readlink(/proc/self/exe) (real_exe) can resolve to the
+     * qemu translator binary rather than the protected program, so it is
+     * unreliable here — the same reason the daemon's arch self-check
+     * abandoned /proc/self/exe (see g_my_machine).  binfmt's P flag passes
+     * the true program path as argv[0]; fall back to real_exe if empty. */
+    const char *name_src = (argv && argv[0] && argv[0][0]) ? argv[0] : real_exe;
+    const char *binname = strrchr(name_src, '/');
+    binname = binname ? binname + 1 : name_src;
 
     int orig_argc = 0;
     while (argv[orig_argc])
