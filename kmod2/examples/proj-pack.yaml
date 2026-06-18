@@ -1,0 +1,48 @@
+# proj-pack.yaml — reference antirev-fs-pack.py config for the process-manager
+# business stack whose layout is:
+#
+#   ~/proj/bin/<module>/<executable>        protected executables
+#   ~/proj/lib/link/<module>/lib<...>.so    protected business libraries
+#   ~/proj/lib/link/sw/libPreload.so        global LD_PRELOAD shim (MUST be plaintext)
+#   ~/proj/lib/link/3rd/lib*.so             third-party libraries (plaintext)
+#
+# A start script sets, for every business process:
+#   LD_PRELOAD       = <mount>/lib/link/sw/libPreload.so
+#   LD_LIBRARY_PATH  = every dir under <mount>/lib/link (recursive)
+# and launches a process manager that boost::process::child()-spawns the
+# executables by RELATIVE path (cwd = ~/proj), each with arg "<name>,1".
+#
+# Why libPreload.so + lib/link/3rd MUST stay plaintext
+# ----------------------------------------------------
+# LD_PRELOAD is inherited by EVERY descendant — including shells, `env`, and any
+# helper the stack execs that is NOT in the decrypt allow-list. The gate
+# authorizes an encrypted-file open by the CONSUMER process's identity
+# (current->mm->exe_file). An *encrypted* preload (or any encrypted lib in its
+# DT_NEEDED closure) would therefore demand whitelisting every process that ever
+# inherits it — impossible. Keep libPreload.so and its whole closure plaintext;
+# under a `passdata` mount any non-ANTREV01 file is served verbatim and is never
+# gated, so non-whitelisted descendants load it fine.
+#
+# Pack:   sudo antirev-fs-pack.py proj-pack.yaml
+# Mount:  see antirev-remount-proj.sh (overlay-rw writable views, gate enforced).
+#
+# IMPORTANT — allow-list by BASENAME only (see CLAUDE.md "overlay-rw + gate"):
+# under antirev-mount-rw the same program reports two different absolute paths to
+# the gate (the overlay path for data reads vs the antirevfs ".../dec/..." path
+# for its own exec-load), so a full-path entry can never match both. Put bare
+# basenames in /etc/authorized_apps.txt: the process manager, every executable,
+# and (qemu) qemu-aarch64-static.
+
+install_dir: ~/proj                 # plaintext tree to encrypt (edit to taste)
+output_dir:  ~/proj_protect         # ciphertext lower tree antirevfs mounts over
+key:         proj.key.hex           # hex keyfile, relative to THIS file; 0600, created if absent
+
+# Produce a COMPLETE mixed-content tree: ELFs encrypted; .py/.sh/.conf/.json and
+# blacklisted (third-party) ELFs mirrored verbatim. Mount with `passdata`.
+mirror_plaintext: true
+
+# Left UNencrypted (plaintext). A trailing '/' is a path-prefix subtree relative
+# to install_dir; anything else is a basename glob.
+blacklist:
+  - lib/link/3rd/       # all third-party libs coexist plaintext
+  - libPreload.so       # global preload — its only non-system dep is in lib/link/3rd
