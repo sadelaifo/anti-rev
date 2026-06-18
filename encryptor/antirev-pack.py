@@ -781,25 +781,30 @@ def main():
         # Key-split: derive the real key from the lrxd that deploys to
         # $HOME/SA/bin/sa/lrxd + the version file.  Runtime paths are
         # HARDCODED in the stub ($HOME/SA/bin/sa/lrxd, $HOME/SA/version);
-        # the pack-time version path is read from the config's `version:`
-        # field (its content must equal what lands at $HOME/SA/version).
-        # Single-arch only: the runtime hashes one fixed lrxd, so there
-        # must be exactly one unsuffixed lrxd to bind to.
-        lrxd_built = output_dir / 'lrxd'
-        if not lrxd_built.exists():
-            sys.exit("[error] keysplit: expected a single unsuffixed daemon at "
-                     f"{lrxd_built} to bind the key to; multi-arch key-split is "
-                     "not supported (runtime hashes one $HOME/SA/bin/sa/lrxd)")
+        # the pack-time paths come from the config's `lrxd:` and `version:`
+        # fields.  Whatever is hashed/read here MUST be byte-identical (lrxd)
+        # / equal in content (version) to what deploys to those runtime
+        # paths.  Single-arch only: the runtime hashes one fixed lrxd.
+        lrxd_cfg = cfg.get('lrxd')
+        if lrxd_cfg:
+            lrxd_path = Path(_expand(lrxd_cfg)).resolve()
+        else:
+            # default: the single-arch daemon this run just built
+            lrxd_path = output_dir / 'lrxd'
+        if not lrxd_path.exists():
+            sys.exit(f"[error] keysplit: lrxd to hash not found at {lrxd_path} "
+                     "(set 'lrxd:' in config, or ensure a single unsuffixed "
+                     "daemon was built; runtime hashes one $HOME/SA/bin/sa/lrxd)")
         version_cfg = cfg.get('version')
         if not version_cfg:
-            sys.exit("[error] keysplit: config must set 'version' — the path to "
+            sys.exit("[error] keysplit: config must set 'version' -- the path to "
                      "the version file hashed at pack time.  Its content must "
                      "match what deploys to the hardcoded runtime $HOME/SA/version.")
         version_path = Path(_expand(version_cfg)).resolve()
         if not version_path.exists():
             sys.exit(f"[error] keysplit: version file not found at {version_path}")
-        real_key = derive_real_key(key, lrxd_built, version_path)
-        print(f"[pack] key-split: real key derived from {lrxd_built.name} "
+        real_key = derive_real_key(key, lrxd_path, version_path)
+        print(f"[pack] key-split: real key derived from {lrxd_path} "
               f"+ {version_path}")
 
         print(f"[pack] Encrypting {len(lib_files)} lib(s) individually...")
