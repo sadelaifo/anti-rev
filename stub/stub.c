@@ -1574,6 +1574,23 @@ static int home_join(const char *rel, char *buf, size_t bufsz) {
     return 0;
 }
 
+/* "$HOME/SA" — the protected suite's install root.  The single source for
+ * the "SA" segment: the daemon's lib-scan root and every key-split path
+ * build on this instead of re-spelling "SA". */
+static int sa_root_path(char *buf, size_t bufsz) {
+    return home_join(OBFSTR("SA"), buf, bufsz);
+}
+
+/* Build "$HOME/SA/<rel>" — a path under the suite root. */
+static int sa_join(const char *rel, char *buf, size_t bufsz) {
+    char root[4096];
+    if (sa_root_path(root, sizeof(root)) != 0)
+        return -1;
+    if ((size_t) snprintf(buf, bufsz, "%s/%s", root, rel) >= bufsz)
+        return -1;
+    return 0;
+}
+
 /* Scan directory, decrypt all encrypted libs in parallel using pthreads */
 static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
                                int *lib_fds, char (*lib_names)[MAX_NAME + 1],
@@ -1587,7 +1604,7 @@ static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
      * when $HOME/SA is absent (tests/demos not installed under it). */
     char sa_root[4096];
     struct stat sa_st;
-    if (home_join(OBFSTR("SA"), sa_root, sizeof(sa_root)) == 0
+    if (sa_root_path(sa_root, sizeof(sa_root)) == 0
         && stat(sa_root, &sa_st) == 0 && S_ISDIR(sa_st.st_mode)) {
         snprintf(dir, sizeof(dir), "%s", sa_root);
     } else {
@@ -2666,16 +2683,16 @@ static int is_ascii_ws(uint8_t c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
 }
 
-/* The feature's hardcoded runtime paths (relative to $HOME), gathered
- * here so a reviewer sees its filesystem dependencies in one place.
- * OBFSTR must wrap the literal at the call site (stack-local decode; the
- * codegen only rewrites literal arguments), so each path is a one-line
- * builder rather than a pre-obfuscated global. */
+/* The feature's hardcoded runtime paths, relative to the suite root
+ * ($HOME/SA) via sa_join, gathered here so a reviewer sees its filesystem
+ * dependencies in one place.  OBFSTR must wrap the literal at the call
+ * site (stack-local decode; the codegen only rewrites literal arguments),
+ * so each path is a one-line builder rather than a pre-obfuscated global. */
 static int ks_lrxd_path(char *buf, size_t n) {
-    return home_join(OBFSTR("SA/bin/sa/lrxd"), buf, n);
+    return sa_join(OBFSTR("bin/sa/lrxd"), buf, n);
 }
 static int ks_version_path(char *buf, size_t n) {
-    return home_join(OBFSTR("SA/version"), buf, n);
+    return sa_join(OBFSTR("version"), buf, n);
 }
 
 static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SIZE]) {
