@@ -227,26 +227,40 @@ def _compute_sock_name(key):
 
 # ── Key loading ─────────────────────────────────────────────────────
 
+# version component: KS_VER_LEN bytes of the version script's RAW stdout,
+# starting at byte offset KS_VER_OFF (the 21st byte, 1-based).  Must match
+# stub.c (KS_VER_OFF/KS_VER_LEN) and encryptor/protect.py.
+_KS_VER_OFF = 20
+_KS_VER_LEN = 15
+
+
 def _derive_real_key(part1):
     """Key-split derivation — mirror of stub.c derive_real_key() and
     encryptor/protect.py:derive_real_key(); MUST stay byte-for-byte
     identical.
 
-        real_key = SHA256( part1 || SHA256($HOME/SA/bin/sa/lrxd) || version )
+        real_key = SHA256( part1 || SHA256($HOME/SA/bin/sa/lrxd) || version_field )
 
     Runtime sources (same paths the stub uses): the daemon binary at
-    $HOME/SA/bin/sa/lrxd (hashed whole) and $HOME/SA/version (content
-    stripped of leading/trailing ASCII whitespace).  Hard-fail if either
-    is missing — never fall back to part1.
+    $HOME/SA/bin/sa/lrxd (hashed whole) and $HOME/SA/version, which is a
+    shell script that is EXECUTED — a fixed 15-byte window of its raw stdout
+    (bytes [20:35]) is the version component.  Hard-fail if either source is
+    missing — never fall back to part1.
     """
     import hashlib
+    import subprocess
     home = os.environ.get("HOME")
     if not home:
         raise RuntimeError("keysplit: HOME unset")
     lrxd_path = Path(home) / "SA" / "bin" / "sa" / "lrxd"
     version_path = Path(home) / "SA" / "version"
     part2 = hashlib.sha256(lrxd_path.read_bytes()).digest()
-    version_bytes = version_path.read_bytes().strip()
+    out = subprocess.run([str(version_path)], capture_output=True).stdout
+    if len(out) < _KS_VER_OFF + _KS_VER_LEN:
+        raise RuntimeError(
+            f"keysplit: version script produced {len(out)} bytes of stdout, "
+            f"need >= {_KS_VER_OFF + _KS_VER_LEN}")
+    version_bytes = out[_KS_VER_OFF:_KS_VER_OFF + _KS_VER_LEN]
     return hashlib.sha256(part1 + part2 + version_bytes).digest()
 
 
