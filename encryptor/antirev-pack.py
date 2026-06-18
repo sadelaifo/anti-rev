@@ -505,17 +505,23 @@ def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
             f"{len(data):>10,} -> {out_size:>10,} bytes{soname_note}")
 
 
-def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
+def _protect_exe_worker(src: str, stub: str, dst: str, enc_key: bytes, part1: bytes,
                         daemon_libs: bool = False,
                         needed_libs: list[str] = None) -> str:
-    """Encrypt an executable and wrap it in the stub launcher."""
+    """Encrypt an executable and wrap it in the stub launcher.
+
+    Key-split: the bundle is encrypted with enc_key (the derived real key),
+    but the trailer embeds part1 (the 32-byte share).  At runtime the stub
+    reads part1 from the trailer and re-derives enc_key -- so these two MUST
+    each be the right value (passing the real key as the trailer would make
+    the stub derive from the real key and fail to decrypt)."""
     src_p  = Path(src)
     stub_p = Path(stub)
     dst_p  = Path(dst)
 
     # Main exe entry
     data = src_p.read_bytes()
-    iv, tag, ct = encrypt_data(data, key)
+    iv, tag, ct = encrypt_data(data, enc_key)
     name_b = src_p.name.encode()
 
     entry  = struct.pack("<H", len(name_b))
@@ -542,7 +548,7 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
 
     stub_data     = stub_p.read_bytes()
     bundle_offset = len(stub_data)
-    trailer       = struct.pack("<Q", bundle_offset) + key + MAGIC
+    trailer       = struct.pack("<Q", bundle_offset) + part1 + MAGIC
 
     dst_p.parent.mkdir(parents=True, exist_ok=True)
     dst_p.write_bytes(stub_data + bundle + trailer)
@@ -881,7 +887,8 @@ def main():
                     str(src),
                     str(stubs[arch]),
                     str(output_dir / rel),
-                    real_key_by_arch[arch],
+                    real_key_by_arch[arch],   # enc_key: encrypts the bundle
+                    key,                       # part1: embedded in the trailer
                     exe_daemon_libs,
                     exe_needed.get(rel, []),
                 ): rel
