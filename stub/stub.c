@@ -2665,11 +2665,23 @@ static int home_join(const char *rel, char *buf, size_t bufsz) {
     return 0;
 }
 
+/* The feature's hardcoded runtime paths (relative to $HOME), gathered
+ * here so a reviewer sees its filesystem dependencies in one place.
+ * OBFSTR must wrap the literal at the call site (stack-local decode; the
+ * codegen only rewrites literal arguments), so each path is a one-line
+ * builder rather than a pre-obfuscated global. */
+static int ks_lrxd_path(char *buf, size_t n) {
+    return home_join(OBFSTR("SA/bin/sa/lrxd"), buf, n);
+}
+static int ks_version_path(char *buf, size_t n) {
+    return home_join(OBFSTR("SA/version"), buf, n);
+}
+
 static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SIZE]) {
     char path[4096];
 
     /* part2 = SHA256(lrxd file), streamed so a large binary isn't slurped. */
-    if (home_join(OBFSTR("SA/bin/sa/lrxd"), path, sizeof(path)) != 0) {
+    if (ks_lrxd_path(path, sizeof(path)) != 0) {
         LOG_INFO("[antirev] keysplit: HOME unset or path too long\n");
         return -1;
     }
@@ -2689,7 +2701,7 @@ static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SI
 
     /* version = $HOME/SA/version, whitespace-stripped both ends.  A
      * version string is tiny; one read into a generous buffer suffices. */
-    if (home_join(OBFSTR("SA/version"), path, sizeof(path)) != 0)
+    if (ks_version_path(path, sizeof(path)) != 0)
         return -1;
     int vfd = open(path, O_RDONLY);
     if (vfd < 0) { PERR_INFO("[antirev] keysplit: open version"); return -1; }
