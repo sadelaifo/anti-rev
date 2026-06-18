@@ -2699,17 +2699,31 @@ static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SI
     uint8_t part2[32];
     sha256_final(&lc, part2);
 
-    /* version = $HOME/SA/version, whitespace-stripped both ends.  A
-     * version string is tiny; one read into a generous buffer suffices. */
+    /* version = $HOME/SA/version, whitespace-stripped both ends.  The
+     * "version" can be a multi-KB shell script, so read the WHOLE file in
+     * a loop — a single read() would short-read / truncate it and diverge
+     * from the packer, which hashes the full content.  Stripping needs the
+     * whole content in memory, so use a bounded buffer and hard-fail
+     * rather than silently truncate an oversized file. */
     if (ks_version_path(path, sizeof(path)) != 0)
         return -1;
     int vfd = open(path, O_RDONLY);
     if (vfd < 0) { PERR_INFO("[antirev] keysplit: open version"); return -1; }
-    uint8_t vbuf[4096];
-    ssize_t vn = read(vfd, vbuf, sizeof(vbuf));
+    static uint8_t vbuf[65536];
+    size_t vlen = 0;
+    for (;;) {
+        ssize_t r = read(vfd, vbuf + vlen, sizeof(vbuf) - vlen);
+        if (r < 0) { close(vfd); PERR_INFO("[antirev] keysplit: read version"); return -1; }
+        if (r == 0) break;                   /* EOF */
+        vlen += (size_t) r;
+        if (vlen == sizeof(vbuf)) {           /* file >= buffer: don't truncate */
+            close(vfd);
+            LOG_INFO("[antirev] keysplit: version file too large\n");
+            return -1;
+        }
+    }
     close(vfd);
-    if (vn < 0) { PERR_INFO("[antirev] keysplit: read version"); return -1; }
-    size_t vs = 0, ve = (size_t) vn;
+    size_t vs = 0, ve = vlen;
     while (vs < ve && is_ascii_ws(vbuf[vs]))   vs++;
     while (ve > vs && is_ascii_ws(vbuf[ve - 1])) ve--;
 
