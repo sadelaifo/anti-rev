@@ -647,6 +647,7 @@ def main():
 
     # ── Scan all files ────────────────────────────────────────────────
     exe_files          = []   # (rel_path, arch, abs_path)
+    lib_arch           = {}   # abs_path -> arch (for per-arch key derivation)
     lib_files          = []   # abs_path — libs to encrypt
     plain_libs         = []   # abs_path — libs to copy as plaintext
     unsupported_arch   = []   # (rel, arch, src) — ELF whose arch is not in stubs
@@ -691,6 +692,7 @@ def main():
         if kind == 'exe':
             exe_files.append((rel, arch, src))
         else:
+            lib_arch[src] = arch   # remember arch so we encrypt with its key
             # Determine if this lib should be encrypted or stay plaintext
             if lib_whitelist:
                 # Whitelist mode: only encrypt if it matches
@@ -750,20 +752,23 @@ def main():
     # Encrypt libs individually to output_dir as standalone encrypted files,
     # and create a lightweight daemon binary (stub + key, no bundled libs)
     # that reads encrypted libs from disk at runtime
-    # Real AES key for every artifact.  Under key-split it is *derived*
-    # from the freshly-built lrxd + the version file (below), so it stays
-    # None until the daemon exists.  The trailer in each binary embeds
-    # part1 (`key`), never the real key.
-    real_key = None
+    # Per-architecture real AES keys.  Under key-split each arch's
+    # artifacts are encrypted with a key derived from THAT arch's lrxd, so
+    # a multi-arch pack produces one key per arch.  A runtime machine is
+    # single-arch and just hashes its one $HOME/SA/bin/sa/lrxd.  Empty
+    # until the daemon(s) are built.  The trailer still embeds part1
+    # (`key`), never the real key.
+    real_key_by_arch = {}
 
     if libs_mode == 'encrypt' and lib_files:
-        # Build the lightweight daemon(s) FIRST — the real key is derived
-        # from SHA256(lrxd), so lrxd must exist before anything is
-        # encrypted.  Multi-arch deploys get suffixed names (lrxd-x86_64 /
-        # -aarch64); single-arch keeps the unsuffixed lrxd.  (Renamed from
-        # ".antirev-libd*" so `ls`/`ps` doesn't fingerprint it; no leading
-        # dot — a hidden executable is itself suspicious and dotfiles get
-        # skipped by rsync/glob copies; plain "lrxd" blends in.)
+        # Build the lightweight daemon(s) FIRST -- each arch's real key is
+        # derived from SHA256(its lrxd), so the lrxd must exist before that
+        # arch's artifacts are encrypted.  Multi-arch deploys get suffixed
+        # names (lrxd-x86_64 / -aarch64); single-arch keeps the unsuffixed
+        # lrxd.  (Renamed from ".antirev-libd*" so `ls`/`ps` doesn't
+        # fingerprint it; no leading dot -- a hidden executable is itself
+        # suspicious and dotfiles get skipped by rsync/glob copies.)
+        built_lrxd = {}   # arch -> path of the daemon this run built
         for arch, stub_path in stubs.items():
             stub_data = stub_path.read_bytes()
             suffix = f'-{arch}' if len(stubs) > 1 else ''
@@ -775,26 +780,18 @@ def main():
             daemon_path.parent.mkdir(parents=True, exist_ok=True)
             daemon_path.write_bytes(stub_data + bundle + trailer)
             os.chmod(str(daemon_path), 0o755)
+            built_lrxd[arch] = daemon_path
             print(f"[pack] Daemon binary: {daemon_path.name}  "
                   f"({daemon_path.stat().st_size:,} bytes, {arch})")
 
-        # Key-split: derive the real key from the lrxd that deploys to
-        # $HOME/SA/bin/sa/lrxd + the version file.  Runtime paths are
-        # HARDCODED in the stub ($HOME/SA/bin/sa/lrxd, $HOME/SA/version);
-        # the pack-time paths come from the config's `lrxd:` and `version:`
-        # fields.  Whatever is hashed/read here MUST be byte-identical (lrxd)
-        # / equal in content (version) to what deploys to those runtime
-        # paths.  Single-arch only: the runtime hashes one fixed lrxd.
-        lrxd_cfg = cfg.get('lrxd')
-        if lrxd_cfg:
-            lrxd_path = Path(_expand(lrxd_cfg)).resolve()
-        else:
-            # default: the single-arch daemon this run just built
-            lrxd_path = output_dir / 'lrxd'
-        if not lrxd_path.exists():
-            sys.exit(f"[error] keysplit: lrxd to hash not found at {lrxd_path} "
-                     "(set 'lrxd:' in config, or ensure a single unsuffixed "
-                     "daemon was built; runtime hashes one $HOME/SA/bin/sa/lrxd)")
+        # Key-split: derive a real key PER ARCH from that arch's lrxd + the
+        # version file.  Runtime paths are HARDCODED in the stub
+        # ($HOME/SA/bin/sa/lrxd, $HOME/SA/version); pack-time paths come
+        # from config.  `version:` (required) is arch-independent.  `lrxd:`
+        # is an arch->path map like `stubs:` -- each entry must be
+        # byte-identical to what deploys as that arch machine's
+        # $HOME/SA/bin/sa/lrxd; per arch it defaults to the daemon built
+        # just above.
         version_cfg = cfg.get('version')
         if not version_cfg:
             sys.exit("[error] keysplit: config must set 'version' -- the path to "
@@ -803,9 +800,23 @@ def main():
         version_path = Path(_expand(version_cfg)).resolve()
         if not version_path.exists():
             sys.exit(f"[error] keysplit: version file not found at {version_path}")
-        real_key = derive_real_key(key, lrxd_path, version_path)
-        print(f"[pack] key-split: real key derived from {lrxd_path} "
-              f"+ {version_path}")
+
+        lrxd_cfg = cfg.get('lrxd') or {}
+        if not isinstance(lrxd_cfg, dict):
+            sys.exit("[error] keysplit: 'lrxd' must be an arch->path map (like "
+                     "'stubs'), e.g.  lrxd: { aarch64: ./out/lrxd-aarch64 }")
+        for arch in stubs:
+            if arch in lrxd_cfg:
+                lrxd_path = (config_path.parent / _expand(lrxd_cfg[arch])).resolve()
+            else:
+                lrxd_path = built_lrxd[arch]
+            if not lrxd_path.exists():
+                sys.exit(f"[error] keysplit: lrxd for arch '{arch}' not found at "
+                         f"{lrxd_path} (set lrxd.{arch} in config, or ensure the "
+                         "daemon was built)")
+            real_key_by_arch[arch] = derive_real_key(key, lrxd_path, version_path)
+            print(f"[pack] key-split[{arch}]: real key from {lrxd_path} "
+                  f"+ {version_path}")
 
         print(f"[pack] Encrypting {len(lib_files)} lib(s) individually...")
         with ProcessPoolExecutor(max_workers=workers) as pool:
@@ -814,7 +825,7 @@ def main():
                     _encrypt_lib_worker,
                     str(src),
                     str(output_dir / src.relative_to(install_dir)),
-                    real_key,
+                    real_key_by_arch[lib_arch[src]],
                 ): src.name
                 for src in lib_files
             }
@@ -826,7 +837,7 @@ def main():
         print()
 
     if exe_files:
-        if real_key is None:
+        if not real_key_by_arch:
             sys.exit("[error] keysplit requires daemon mode (libs: encrypt with "
                      "libs present) so the lrxd the key binds to exists; "
                      "exe-only packing is unsupported under key-split")
@@ -870,7 +881,7 @@ def main():
                     str(src),
                     str(stubs[arch]),
                     str(output_dir / rel),
-                    real_key,
+                    real_key_by_arch[arch],
                     exe_daemon_libs,
                     exe_needed.get(rel, []),
                 ): rel
