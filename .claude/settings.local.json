@@ -199,7 +199,9 @@
       "Bash(patchelf --add-needed liby.so libx.so)",
       "Bash(patchelf --add-needed libz.so liby.so)",
       "Bash(patchelf --add-needed libw.so libz.so)",
-      "Bash(readelf -d libx.so)"
+      "Bash(readelf -d libx.so)",
+      "WebSearch",
+      "WebFetch(domain:pyarmor.readthedocs.io)"
     ]
   }
 }
