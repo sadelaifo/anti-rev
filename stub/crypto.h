@@ -61,3 +61,22 @@ void aes256gcm_ctr_decrypt(aes256gcm_ctx *ctx,
  * Avoids reading the ciphertext twice (halves I/O). */
 void aes256gcm_onepass(aes256gcm_ctx *ctx,
                        const uint8_t *ct, uint8_t *pt, size_t len);
+
+/* ------------------------------------------------------------------ */
+/*  SHA-256 (FIPS 180-4) — used by the key-split key derivation.      */
+/*  Portable software impl: inputs are tiny (32-byte share, version   */
+/*  string) or read once (the lrxd binary), so throughput is moot and */
+/*  a plain-C impl keeps the stub free of an external crypto lib.     */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    uint32_t h[8];
+    uint64_t total;         /* total bytes absorbed                      */
+    uint8_t  buf[64];       /* partial-block buffer                      */
+    size_t   buf_len;       /* valid bytes in buf[]                      */
+} sha256_ctx;
+
+void sha256_init(sha256_ctx *c);
+void sha256_update(sha256_ctx *c, const uint8_t *data, size_t len);
+void sha256_final(sha256_ctx *c, uint8_t out[32]);
+/* One-shot convenience wrapper. */
+void sha256(const uint8_t *data, size_t len, uint8_t out[32]);

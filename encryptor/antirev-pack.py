@@ -77,7 +77,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from protect import (load_or_create_key, encrypt_data, MAGIC,
-                     BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS)
+                     BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS, derive_real_key)
 
 # ELF magic and type constants
 ELF_MAGIC = b'\x7fELF'
@@ -505,17 +505,23 @@ def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
             f"{len(data):>10,} -> {out_size:>10,} bytes{soname_note}")
 
 
-def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
+def _protect_exe_worker(src: str, stub: str, dst: str, enc_key: bytes, part1: bytes,
                         daemon_libs: bool = False,
                         needed_libs: list[str] = None) -> str:
-    """Encrypt an executable and wrap it in the stub launcher."""
+    """Encrypt an executable and wrap it in the stub launcher.
+
+    Key-split: the bundle is encrypted with enc_key (the derived real key),
+    but the trailer embeds part1 (the 32-byte share).  At runtime the stub
+    reads part1 from the trailer and re-derives enc_key -- so these two MUST
+    each be the right value (passing the real key as the trailer would make
+    the stub derive from the real key and fail to decrypt)."""
     src_p  = Path(src)
     stub_p = Path(stub)
     dst_p  = Path(dst)
 
     # Main exe entry
     data = src_p.read_bytes()
-    iv, tag, ct = encrypt_data(data, key)
+    iv, tag, ct = encrypt_data(data, enc_key)
     name_b = src_p.name.encode()
 
     entry  = struct.pack("<H", len(name_b))
@@ -542,7 +548,7 @@ def _protect_exe_worker(src: str, stub: str, dst: str, key: bytes,
 
     stub_data     = stub_p.read_bytes()
     bundle_offset = len(stub_data)
-    trailer       = struct.pack("<Q", bundle_offset) + key + MAGIC
+    trailer       = struct.pack("<Q", bundle_offset) + part1 + MAGIC
 
     dst_p.parent.mkdir(parents=True, exist_ok=True)
     dst_p.write_bytes(stub_data + bundle + trailer)
@@ -647,6 +653,7 @@ def main():
 
     # ── Scan all files ────────────────────────────────────────────────
     exe_files          = []   # (rel_path, arch, abs_path)
+    lib_arch           = {}   # abs_path -> arch (for per-arch key derivation)
     lib_files          = []   # abs_path — libs to encrypt
     plain_libs         = []   # abs_path — libs to copy as plaintext
     unsupported_arch   = []   # (rel, arch, src) — ELF whose arch is not in stubs
@@ -691,6 +698,7 @@ def main():
         if kind == 'exe':
             exe_files.append((rel, arch, src))
         else:
+            lib_arch[src] = arch   # remember arch so we encrypt with its key
             # Determine if this lib should be encrypted or stay plaintext
             if lib_whitelist:
                 # Whitelist mode: only encrypt if it matches
@@ -750,31 +758,23 @@ def main():
     # Encrypt libs individually to output_dir as standalone encrypted files,
     # and create a lightweight daemon binary (stub + key, no bundled libs)
     # that reads encrypted libs from disk at runtime
-    if libs_mode == 'encrypt' and lib_files:
-        print(f"[pack] Encrypting {len(lib_files)} lib(s) individually...")
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    _encrypt_lib_worker,
-                    str(src),
-                    str(output_dir / src.relative_to(install_dir)),
-                    key,
-                ): src.name
-                for src in lib_files
-            }
-            for fut in as_completed(futures):
-                try:
-                    print(fut.result())
-                except Exception as e:
-                    sys.exit(f"[error] encrypt lib failed for {futures[fut]}: {e}")
+    # Per-architecture real AES keys.  Under key-split each arch's
+    # artifacts are encrypted with a key derived from THAT arch's lrxd, so
+    # a multi-arch pack produces one key per arch.  A runtime machine is
+    # single-arch and just hashes its one $HOME/SA/bin/sa/lrxd.  Empty
+    # until the daemon(s) are built.  The trailer still embeds part1
+    # (`key`), never the real key.
+    real_key_by_arch = {}
 
-        # Build lightweight daemon per architecture.  Multi-arch deploys
-        # get suffixed filenames (lrxd-x86_64 / -aarch64); single-arch
-        # builds keep the unsuffixed lrxd.  Renamed from ".antirev-libd*"
-        # so `ls /opt/biz/` / `ps aux` doesn't fingerprint the daemon as
-        # antirev's.  No leading dot: a hidden executable is itself
-        # suspicious, and dotfiles get skipped by glob/rsync copies;
-        # plain "lrxd" blends in.  No wrapper binary — wrapper mode retired.
+    if libs_mode == 'encrypt' and lib_files:
+        # Build the lightweight daemon(s) FIRST -- each arch's real key is
+        # derived from SHA256(its lrxd), so the lrxd must exist before that
+        # arch's artifacts are encrypted.  Multi-arch deploys get suffixed
+        # names (lrxd-x86_64 / -aarch64); single-arch keeps the unsuffixed
+        # lrxd.  (Renamed from ".antirev-libd*" so `ls`/`ps` doesn't
+        # fingerprint it; no leading dot -- a hidden executable is itself
+        # suspicious and dotfiles get skipped by rsync/glob copies.)
+        built_lrxd = {}   # arch -> path of the daemon this run built
         for arch, stub_path in stubs.items():
             stub_data = stub_path.read_bytes()
             suffix = f'-{arch}' if len(stubs) > 1 else ''
@@ -786,11 +786,67 @@ def main():
             daemon_path.parent.mkdir(parents=True, exist_ok=True)
             daemon_path.write_bytes(stub_data + bundle + trailer)
             os.chmod(str(daemon_path), 0o755)
+            built_lrxd[arch] = daemon_path
             print(f"[pack] Daemon binary: {daemon_path.name}  "
                   f"({daemon_path.stat().st_size:,} bytes, {arch})")
+
+        # Key-split: derive a real key PER ARCH from that arch's lrxd + the
+        # version file.  Runtime paths are HARDCODED in the stub
+        # ($HOME/SA/bin/sa/lrxd, $HOME/SA/version); pack-time paths come
+        # from config.  `version:` (required) is arch-independent.  `lrxd:`
+        # is an arch->path map like `stubs:` -- each entry must be
+        # byte-identical to what deploys as that arch machine's
+        # $HOME/SA/bin/sa/lrxd; per arch it defaults to the daemon built
+        # just above.
+        version_cfg = cfg.get('version')
+        if not version_cfg:
+            sys.exit("[error] keysplit: config must set 'version' -- the path to "
+                     "the version file hashed at pack time.  Its content must "
+                     "match what deploys to the hardcoded runtime $HOME/SA/version.")
+        version_path = Path(_expand(version_cfg)).resolve()
+        if not version_path.exists():
+            sys.exit(f"[error] keysplit: version file not found at {version_path}")
+
+        lrxd_cfg = cfg.get('lrxd') or {}
+        if not isinstance(lrxd_cfg, dict):
+            sys.exit("[error] keysplit: 'lrxd' must be an arch->path map (like "
+                     "'stubs'), e.g.  lrxd: { aarch64: ./out/lrxd-aarch64 }")
+        for arch in stubs:
+            if arch in lrxd_cfg:
+                lrxd_path = (config_path.parent / _expand(lrxd_cfg[arch])).resolve()
+            else:
+                lrxd_path = built_lrxd[arch]
+            if not lrxd_path.exists():
+                sys.exit(f"[error] keysplit: lrxd for arch '{arch}' not found at "
+                         f"{lrxd_path} (set lrxd.{arch} in config, or ensure the "
+                         "daemon was built)")
+            real_key_by_arch[arch] = derive_real_key(key, lrxd_path, version_path)
+            print(f"[pack] key-split[{arch}]: real key from {lrxd_path} "
+                  f"+ {version_path}")
+
+        print(f"[pack] Encrypting {len(lib_files)} lib(s) individually...")
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _encrypt_lib_worker,
+                    str(src),
+                    str(output_dir / src.relative_to(install_dir)),
+                    real_key_by_arch[lib_arch[src]],
+                ): src.name
+                for src in lib_files
+            }
+            for fut in as_completed(futures):
+                try:
+                    print(fut.result())
+                except Exception as e:
+                    sys.exit(f"[error] encrypt lib failed for {futures[fut]}: {e}")
         print()
 
     if exe_files:
+        if not real_key_by_arch:
+            sys.exit("[error] keysplit requires daemon mode (libs: encrypt with "
+                     "libs present) so the lrxd the key binds to exists; "
+                     "exe-only packing is unsupported under key-split")
         print(f"[pack] Protecting {len(exe_files)} executable(s)...")
         # Arch-vs-stubs mismatch is filtered out earlier in the scan
         # phase (see 'unsupported_arch'), so every entry here has a
@@ -831,7 +887,8 @@ def main():
                     str(src),
                     str(stubs[arch]),
                     str(output_dir / rel),
-                    key,
+                    real_key_by_arch[arch],   # enc_key: encrypts the bundle
+                    key,                       # part1: embedded in the trailer
                     exe_daemon_libs,
                     exe_needed.get(rel, []),
                 ): rel

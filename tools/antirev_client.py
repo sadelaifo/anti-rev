@@ -227,20 +227,48 @@ def _compute_sock_name(key):
 
 # ── Key loading ─────────────────────────────────────────────────────
 
+def _derive_real_key(part1):
+    """Key-split derivation — mirror of stub.c derive_real_key() and
+    encryptor/protect.py:derive_real_key(); MUST stay byte-for-byte
+    identical.
+
+        real_key = SHA256( part1 || SHA256($HOME/SA/bin/sa/lrxd) || version )
+
+    Runtime sources (same paths the stub uses): the daemon binary at
+    $HOME/SA/bin/sa/lrxd (hashed whole) and $HOME/SA/version (content
+    stripped of leading/trailing ASCII whitespace).  Hard-fail if either
+    is missing — never fall back to part1.
+    """
+    import hashlib
+    home = os.environ.get("HOME")
+    if not home:
+        raise RuntimeError("keysplit: HOME unset")
+    lrxd_path = Path(home) / "SA" / "bin" / "sa" / "lrxd"
+    version_path = Path(home) / "SA" / "version"
+    part2 = hashlib.sha256(lrxd_path.read_bytes()).digest()
+    version_bytes = version_path.read_bytes().strip()
+    return hashlib.sha256(part1 + part2 + version_bytes).digest()
+
+
 def _load_key(path):
-    """Load 32-byte key from hex file or daemon/stub trailer."""
+    """Load the real AES key.
+
+    The file/trailer carries only part1 (a 32-byte share); the real key is
+    derived from part1 + SHA256(lrxd) + the version string (see
+    _derive_real_key)."""
     data = path.read_bytes()
 
     # Check if it's a binary with ANTREV01 trailer (last 48 bytes)
     if len(data) > 48 and data[-8:] == b"ANTREV01":
-        return data[-40:-8]
+        part1 = data[-40:-8]
+    else:
+        # Otherwise treat as hex text
+        hex_str = data.decode().strip()
+        part1 = bytes.fromhex(hex_str)
+        if len(part1) != KEY_SIZE:
+            raise ValueError(f"part1 must be {KEY_SIZE} bytes ({KEY_SIZE * 2} hex chars)")
 
-    # Otherwise treat as hex text
-    hex_str = data.decode().strip()
-    key = bytes.fromhex(hex_str)
-    if len(key) != KEY_SIZE:
-        raise ValueError(f"key must be {KEY_SIZE} bytes ({KEY_SIZE * 2} hex chars)")
-    return key
+    return _derive_real_key(part1)
 
 
 # ── Daemon protocol v2 framing ──────────────────────────────────────
