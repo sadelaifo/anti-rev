@@ -1562,6 +1562,18 @@ static void collect_enc_paths(const char *dir, dec_job_t *jobs, int *njobs,
     closedir(dp);
 }
 
+/* Build "$HOME/<rel>" into buf.  Shared path helper: the daemon's lib-scan
+ * root and the key-split derivation paths both build on it.  Returns 0 on
+ * success, -1 if HOME is unset/empty or the result would truncate. */
+static int home_join(const char *rel, char *buf, size_t bufsz) {
+    const char *home = getenv("HOME");
+    if (!home || !*home)
+        return -1;
+    if ((size_t) snprintf(buf, bufsz, "%s/%s", home, rel) >= bufsz)
+        return -1;
+    return 0;
+}
+
 /* Scan directory, decrypt all encrypted libs in parallel using pthreads */
 static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
                                int *lib_fds, char (*lib_names)[MAX_NAME + 1],
@@ -1574,10 +1586,8 @@ static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
      * tree (e.g. $HOME/SA/lib).  Falls back to the lrxd's own directory
      * when $HOME/SA is absent (tests/demos not installed under it). */
     char sa_root[4096];
-    const char *home = getenv("HOME");
     struct stat sa_st;
-    if (home && home[0]
-        && (size_t) snprintf(sa_root, sizeof(sa_root), "%s/SA", home) < sizeof(sa_root)
+    if (home_join(OBFSTR("SA"), sa_root, sizeof(sa_root)) == 0
         && stat(sa_root, &sa_st) == 0 && S_ISDIR(sa_st.st_mode)) {
         snprintf(dir, sizeof(dir), "%s", sa_root);
     } else {
@@ -2654,15 +2664,6 @@ static void exec_target(int main_fd, char *const *argv, char **new_env, const ch
 /* ------------------------------------------------------------------ */
 static int is_ascii_ws(uint8_t c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
-}
-
-static int home_join(const char *rel, char *buf, size_t bufsz) {
-    const char *home = getenv("HOME");
-    if (!home || !*home)
-        return -1;
-    if ((size_t) snprintf(buf, bufsz, "%s/%s", home, rel) >= bufsz)
-        return -1;
-    return 0;
 }
 
 /* The feature's hardcoded runtime paths (relative to $HOME), gathered
