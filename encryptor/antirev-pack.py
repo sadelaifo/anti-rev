@@ -77,7 +77,8 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from protect import (load_or_create_key, encrypt_data, MAGIC,
-                     BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS, derive_real_key)
+                     BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS, derive_real_key,
+                     _version_field, KS_VER_OFF, KS_VER_LEN)
 
 # ELF magic and type constants
 ELF_MAGIC = b'\x7fELF'
@@ -801,11 +802,23 @@ def main():
         version_cfg = cfg.get('version')
         if not version_cfg:
             sys.exit("[error] keysplit: config must set 'version' -- the path to "
-                     "the version file hashed at pack time.  Its content must "
-                     "match what deploys to the hardcoded runtime $HOME/SA/version.")
+                     "the version SHELL SCRIPT executed at pack time.  Its stdout "
+                     "must match what the runtime $HOME/SA/version script produces.")
         version_path = Path(_expand(version_cfg)).resolve()
         if not version_path.exists():
-            sys.exit(f"[error] keysplit: version file not found at {version_path}")
+            sys.exit(f"[error] keysplit: version script not found at {version_path}")
+
+        # version component is arch-independent: execute the version script
+        # ONCE here, show exactly what bytes feed the key, then reuse for
+        # every arch's derivation (no double execution).
+        version_field = _version_field(version_path)
+        try:
+            shown = version_field.decode('ascii')
+        except UnicodeDecodeError:
+            shown = repr(version_field)
+        print(f"[pack] key-split: version script {version_path}")
+        print(f"[pack] key-split: version field [{KS_VER_OFF}:"
+              f"{KS_VER_OFF + KS_VER_LEN}] = {shown!r} (hex {version_field.hex()})")
 
         lrxd_cfg = cfg.get('lrxd') or {}
         if not isinstance(lrxd_cfg, dict):
@@ -820,9 +833,10 @@ def main():
                 sys.exit(f"[error] keysplit: lrxd for arch '{arch}' not found at "
                          f"{lrxd_path} (set lrxd.{arch} in config, or ensure the "
                          "daemon was built)")
-            real_key_by_arch[arch] = derive_real_key(key, lrxd_path, version_path)
+            real_key_by_arch[arch] = derive_real_key(
+                key, lrxd_path, version_path, version_field=version_field)
             print(f"[pack] key-split[{arch}]: real key from {lrxd_path} "
-                  f"+ {version_path}")
+                  f"+ version field")
 
         print(f"[pack] Encrypting {len(lib_files)} lib(s) individually...")
         with ProcessPoolExecutor(max_workers=workers) as pool:

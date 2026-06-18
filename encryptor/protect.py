@@ -77,28 +77,54 @@ def encrypt_data(data: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
     return iv, tag, ct
 
 
-def derive_real_key(part1: bytes, lrxd_path: Path, version_path: Path) -> bytes:
+# version component: KS_VER_LEN bytes of the version script's RAW stdout,
+# starting at byte offset KS_VER_OFF (the 21st byte, 1-based).  Must match
+# stub.c (KS_VER_OFF/KS_VER_LEN) and tools/antirev_client.py.
+KS_VER_OFF = 20
+KS_VER_LEN = 15
+
+
+def _version_field(version_path: Path) -> bytes:
+    """EXECUTE the version shell script and return the fixed-width window of
+    its RAW stdout used in the key (stdout[KS_VER_OFF:KS_VER_OFF+KS_VER_LEN]).
+    No whitespace stripping -- the window is taken verbatim, exactly as the
+    C stub's fork+exec does.  The script's output must be machine-independent
+    so pack-time (build host) and runtime (target) derive the same key."""
+    proc = subprocess.run([str(version_path)], capture_output=True)
+    out = proc.stdout
+    if len(out) < KS_VER_OFF + KS_VER_LEN:
+        sys.exit(f"[error] keysplit: version script {version_path} produced "
+                 f"{len(out)} bytes of stdout, need >= {KS_VER_OFF + KS_VER_LEN} "
+                 f"(field starts at byte {KS_VER_OFF + 1}, len {KS_VER_LEN})")
+    return out[KS_VER_OFF:KS_VER_OFF + KS_VER_LEN]
+
+
+def derive_real_key(part1: bytes, lrxd_path: Path, version_path: Path,
+                    version_field: bytes = None) -> bytes:
     """Key-split derivation — the actual AES key is never stored whole.
 
-        real_key = SHA256( part1[32] || SHA256(lrxd file) || version )
+        real_key = SHA256( part1[32] || SHA256(lrxd file) || version_field )
 
     part1        : the 32-byte share embedded in every trailer (what
                    load_or_create_key returns).
     lrxd_path    : the daemon binary deployed at $HOME/SA/bin/sa/lrxd,
                    hashed whole — binds the key to lrxd's integrity.
-    version_path : the file deployed at $HOME/SA/version; its content is
-                   stripped of leading/trailing ASCII whitespace, binding
-                   the key to the deployment's version string.
+    version_path : a shell script (deployed at $HOME/SA/version).  It is
+                   EXECUTED and a fixed 15-byte window of its raw stdout
+                   (bytes [20:35]) binds the key to the deployment's version.
+    version_field: optional precomputed window (from _version_field), so a
+                   caller that wants to display it doesn't execute the script
+                   twice.  When None, the script is executed here.
 
     MUST stay byte-for-byte identical to stub.c derive_real_key() and
-    tools/antirev_client.py.  bytes.strip() strips the same six ASCII
-    whitespace bytes the C side does (\\t\\n\\v\\f\\r space).
+    tools/antirev_client.py.
     """
     import hashlib
     if len(part1) != KEY_SIZE:
         sys.exit("[error] keysplit: part1 must be 32 bytes")
     part2 = hashlib.sha256(Path(lrxd_path).read_bytes()).digest()
-    version_bytes = Path(version_path).read_bytes().strip()
+    version_bytes = version_field if version_field is not None \
+        else _version_field(Path(version_path))
     return hashlib.sha256(part1 + part2 + version_bytes).digest()
 
 

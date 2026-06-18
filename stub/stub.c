@@ -2679,9 +2679,6 @@ static void exec_target(int main_fd, char *const *argv, char **new_env, const ch
 /*  byte-for-byte identical to encryptor/protect.py:derive_real_key    */
 /*  and tools/antirev_client.py.                                       */
 /* ------------------------------------------------------------------ */
-static int is_ascii_ws(uint8_t c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
-}
 
 /* The feature's hardcoded runtime paths, relative to the suite root
  * ($HOME/SA) via sa_join, gathered here so a reviewer sees its filesystem
@@ -2712,6 +2709,14 @@ static void ks_fp(const uint8_t *b, size_t n, char *out /* >=9 */) {
     ks_hex(h, 4, out);
 }
 
+/* The version component of the key is a fixed-width window of the RAW stdout
+ * produced by EXECUTING $HOME/SA/version (a shell script): KS_VER_LEN bytes
+ * starting at byte offset KS_VER_OFF (the 21st byte, 1-based).  No whitespace
+ * stripping -- the window is taken verbatim.  Must match protect.py /
+ * antirev_client.py / keysplit_expect.py byte-for-byte. */
+#define KS_VER_OFF 20
+#define KS_VER_LEN 15
+
 static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SIZE]) {
     char path[4096];
 
@@ -2737,43 +2742,62 @@ static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SI
     { char hx[65]; ks_hex(part2, 32, hx);
       LOG_INFO("[antirev] keysplit[dbg]: hash(lrxd)=%s\n", hx); }
 
-    /* version = $HOME/SA/version, whitespace-stripped both ends.  The
-     * "version" can be a multi-KB shell script, so read the WHOLE file in
-     * a loop — a single read() would short-read / truncate it and diverge
-     * from the packer, which hashes the full content.  Stripping needs the
-     * whole content in memory, so use a bounded buffer and hard-fail
-     * rather than silently truncate an oversized file. */
+    /* version component = EXECUTE $HOME/SA/version (a shell script) and take
+     * a fixed KS_VER_LEN-byte window of its RAW stdout starting at offset
+     * KS_VER_OFF.  Use plain fork+exec, NOT popen: glibc's vfork-based popen
+     * corrupts this memfd-heavy parent on aarch64.  Capture stdout only; the
+     * script's output must be machine-independent so pack-time and runtime
+     * derive the same key. */
     if (ks_version_path(path, sizeof(path)) != 0)
         return -1;
-    int vfd = open(path, O_RDONLY);
-    if (vfd < 0) { PERR_INFO("[antirev] keysplit: open version"); return -1; }
     static uint8_t vbuf[65536];
     size_t vlen = 0;
-    for (;;) {
-        ssize_t r = read(vfd, vbuf + vlen, sizeof(vbuf) - vlen);
-        if (r < 0) { close(vfd); PERR_INFO("[antirev] keysplit: read version"); return -1; }
-        if (r == 0) break;                   /* EOF */
-        vlen += (size_t) r;
-        if (vlen == sizeof(vbuf)) {           /* file >= buffer: don't truncate */
-            close(vfd);
-            LOG_INFO("[antirev] keysplit: version file too large\n");
-            return -1;
+    {
+        int pfd[2];
+        if (pipe(pfd) != 0) { PERR_INFO("[antirev] keysplit: pipe"); return -1; }
+        pid_t vpid = fork();
+        if (vpid < 0) {
+            PERR_INFO("[antirev] keysplit: fork version");
+            close(pfd[0]); close(pfd[1]); return -1;
         }
+        if (vpid == 0) {
+            /* child: stdout -> pipe, then exec the version script directly */
+            dup2(pfd[1], STDOUT_FILENO);
+            close(pfd[0]); close(pfd[1]);
+            execl(path, path, (char *) NULL);
+            _exit(127);
+        }
+        close(pfd[1]);
+        for (;;) {
+            ssize_t r = read(pfd[0], vbuf + vlen, sizeof(vbuf) - vlen);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                PERR_INFO("[antirev] keysplit: read version stdout");
+                close(pfd[0]); waitpid(vpid, NULL, 0); return -1;
+            }
+            if (r == 0) break;                 /* EOF: script finished */
+            vlen += (size_t) r;
+            if (vlen == sizeof(vbuf)) break;   /* far more than we need */
+        }
+        close(pfd[0]);
+        waitpid(vpid, NULL, 0);
     }
-    close(vfd);
-    size_t vs = 0, ve = vlen;
-    while (vs < ve && is_ascii_ws(vbuf[vs]))   vs++;
-    while (ve > vs && is_ascii_ws(vbuf[ve - 1])) ve--;
-    { uint8_t vh[32]; sha256(vbuf + vs, ve - vs, vh); char hx[65]; ks_hex(vh, 32, hx);
-      LOG_INFO("[antirev] keysplit[dbg]: version_stripped_len=%zu hash=%s\n",
-               ve - vs, hx); }
+    if (vlen < KS_VER_OFF + KS_VER_LEN) {
+        LOG_INFO("[antirev] keysplit: version output too short (%zu bytes, "
+                 "need >= %d)\n", vlen, KS_VER_OFF + KS_VER_LEN);
+        return -1;
+    }
+    const uint8_t *vfield = vbuf + KS_VER_OFF;
+    { uint8_t vh[32]; sha256(vfield, KS_VER_LEN, vh); char hx[65]; ks_hex(vh, 32, hx);
+      LOG_INFO("[antirev] keysplit[dbg]: version stdout=%zu bytes, field[%d:%d] hash=%s\n",
+               vlen, KS_VER_OFF, KS_VER_OFF + KS_VER_LEN, hx); }
 
-    /* real_key = SHA256(part1 || part2 || version) */
+    /* real_key = SHA256(part1 || part2 || version_field) */
     sha256_ctx kc;
     sha256_init(&kc);
     sha256_update(&kc, part1, KEY_SIZE);
     sha256_update(&kc, part2, sizeof(part2));
-    sha256_update(&kc, vbuf + vs, ve - vs);
+    sha256_update(&kc, vfield, KS_VER_LEN);
     sha256_final(&kc, out_key);
     { char fp[9]; ks_fp(part1, KEY_SIZE, fp);
       LOG_INFO("[antirev] keysplit[dbg]: part1_fp=%s\n", fp);
