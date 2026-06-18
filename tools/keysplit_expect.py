@@ -20,11 +20,16 @@ ANTREV01 trailer of a packed binary via --trailer (last 48 bytes:
 [offset:8][part1:32][magic:8]).
 
 Output field -> stub log line:
-  part1                  -> keysplit[dbg]: part1=
   hash(lrxd)             -> keysplit[dbg]: hash(lrxd)=
   version_stripped_len   -> keysplit[dbg]: version_stripped_len=
   version_stripped_hash  -> keysplit[dbg]: ... hash=
-  real_key               -> keysplit[dbg]: real_key=
+  part1_fp               -> keysplit[dbg]: part1_fp=
+  real_key_fp            -> keysplit[dbg]: real_key_fp=
+
+The stub never logs raw key material; it logs a one-way fingerprint
+(first 4 bytes of SHA256(value)) for part1 and real_key.  This tool prints
+both the full local values (you have the key here) AND the matching fp so a
+field log can be compared without the key ever leaving the box.
 """
 import argparse
 import hashlib
@@ -63,11 +68,16 @@ def main() -> None:
     part2 = hashlib.sha256(lrxd_bytes).digest()
     real_key = hashlib.sha256(part1 + part2 + version_bytes).digest()
 
-    print(f"part1                 : {part1.hex()}")
+    def fp(b: bytes) -> str:               # mirror stub.c ks_fp: SHA256(value)[:4]
+        return hashlib.sha256(b).hexdigest()[:8]
+
     print(f"hash(lrxd)            : {part2.hex()}   ({args.lrxd}, {len(lrxd_bytes)} bytes)")
     print(f"version_stripped_len  : {len(version_bytes)}   ({args.version})")
     print(f"version_stripped_hash : {hashlib.sha256(version_bytes).hexdigest()}")
+    print(f"part1                 : {part1.hex()}")
+    print(f"part1_fp              : {fp(part1)}   (matches stub keysplit[dbg]: part1_fp=)")
     print(f"real_key              : {real_key.hex()}")
+    print(f"real_key_fp           : {fp(real_key)}   (matches stub keysplit[dbg]: real_key_fp=)")
 
 
 if __name__ == "__main__":

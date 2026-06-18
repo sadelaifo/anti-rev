@@ -2695,11 +2695,21 @@ static int ks_version_path(char *buf, size_t n) {
     return sa_join(OBFSTR("version"), buf, n);
 }
 
-/* DIAGNOSTIC ONLY (remove before merge): hex-encode for keysplit logs. */
+/* DIAGNOSTIC: hex-encode for keysplit logs (non-secret derivation inputs). */
 static void ks_hex(const uint8_t *b, size_t n, char *out) {
     static const char H[] = "0123456789abcdef";
     for (size_t i = 0; i < n; i++) { out[i*2] = H[b[i] >> 4]; out[i*2+1] = H[b[i] & 0xf]; }
     out[n*2] = '\0';
+}
+
+/* DIAGNOSTIC: one-way fingerprint of secret key material for keysplit logs.
+ * Prints the first 4 bytes of SHA256(value) so runtime vs pack-side can be
+ * compared for a match WITHOUT ever emitting the key itself.  keysplit_expect.py
+ * computes the same fp (sha256(value)[:4]). */
+static void ks_fp(const uint8_t *b, size_t n, char *out /* >=9 */) {
+    uint8_t h[32];
+    sha256(b, n, h);
+    ks_hex(h, 4, out);
 }
 
 static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SIZE]) {
@@ -2765,10 +2775,10 @@ static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SI
     sha256_update(&kc, part2, sizeof(part2));
     sha256_update(&kc, vbuf + vs, ve - vs);
     sha256_final(&kc, out_key);
-    { char hx[65]; ks_hex(part1, KEY_SIZE, hx);
-      LOG_INFO("[antirev] keysplit[dbg]: part1=%s\n", hx);
-      ks_hex(out_key, KEY_SIZE, hx);
-      LOG_INFO("[antirev] keysplit[dbg]: real_key=%s\n", hx); }
+    { char fp[9]; ks_fp(part1, KEY_SIZE, fp);
+      LOG_INFO("[antirev] keysplit[dbg]: part1_fp=%s\n", fp);
+      ks_fp(out_key, KEY_SIZE, fp);
+      LOG_INFO("[antirev] keysplit[dbg]: real_key_fp=%s\n", fp); }
     return 0;
 }
 
