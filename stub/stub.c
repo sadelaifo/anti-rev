@@ -2695,6 +2695,13 @@ static int ks_version_path(char *buf, size_t n) {
     return sa_join(OBFSTR("version"), buf, n);
 }
 
+/* DIAGNOSTIC ONLY (remove before merge): hex-encode for keysplit logs. */
+static void ks_hex(const uint8_t *b, size_t n, char *out) {
+    static const char H[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) { out[i*2] = H[b[i] >> 4]; out[i*2+1] = H[b[i] & 0xf]; }
+    out[n*2] = '\0';
+}
+
 static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SIZE]) {
     char path[4096];
 
@@ -2703,6 +2710,7 @@ static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SI
         LOG_INFO("[antirev] keysplit: HOME unset or path too long\n");
         return -1;
     }
+    LOG_INFO("[antirev] keysplit[dbg]: lrxd=%s\n", path);
     int fd = open(path, O_RDONLY);
     if (fd < 0) { PERR_INFO("[antirev] keysplit: open lrxd"); return -1; }
     sha256_ctx lc;
@@ -2716,6 +2724,8 @@ static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SI
     if (read_err) { PERR_INFO("[antirev] keysplit: read lrxd"); return -1; }
     uint8_t part2[32];
     sha256_final(&lc, part2);
+    { char hx[65]; ks_hex(part2, 32, hx);
+      LOG_INFO("[antirev] keysplit[dbg]: hash(lrxd)=%s\n", hx); }
 
     /* version = $HOME/SA/version, whitespace-stripped both ends.  The
      * "version" can be a multi-KB shell script, so read the WHOLE file in
@@ -2744,6 +2754,9 @@ static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SI
     size_t vs = 0, ve = vlen;
     while (vs < ve && is_ascii_ws(vbuf[vs]))   vs++;
     while (ve > vs && is_ascii_ws(vbuf[ve - 1])) ve--;
+    { uint8_t vh[32]; sha256(vbuf + vs, ve - vs, vh); char hx[65]; ks_hex(vh, 32, hx);
+      LOG_INFO("[antirev] keysplit[dbg]: version_stripped_len=%zu hash=%s\n",
+               ve - vs, hx); }
 
     /* real_key = SHA256(part1 || part2 || version) */
     sha256_ctx kc;
@@ -2752,6 +2765,10 @@ static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SI
     sha256_update(&kc, part2, sizeof(part2));
     sha256_update(&kc, vbuf + vs, ve - vs);
     sha256_final(&kc, out_key);
+    { char hx[65]; ks_hex(part1, KEY_SIZE, hx);
+      LOG_INFO("[antirev] keysplit[dbg]: part1=%s\n", hx);
+      ks_hex(out_key, KEY_SIZE, hx);
+      LOG_INFO("[antirev] keysplit[dbg]: real_key=%s\n", hx); }
     return 0;
 }
 
