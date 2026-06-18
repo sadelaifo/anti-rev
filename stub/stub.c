@@ -2773,7 +2773,7 @@ int main(int argc, char *argv[], char *envp[])
      *    missing source — never fall back to a usable key. */
     uint8_t key[KEY_SIZE];
     if (derive_real_key(trailer + 8, key) != 0) {
-        LOG_INFO("[antirev] key derivation failed — aborting\n");
+        LOG_INFO("[antirev] key derivation failed -- aborting\n");
         return 1;
     }
 
