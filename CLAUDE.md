@@ -32,6 +32,10 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make
 ```
 
+The top-level `CMakeLists.txt` is `add_subdirectory()`-safe: it references only `CMAKE_CURRENT_SOURCE_DIR` / `CMAKE_CURRENT_BINARY_DIR` (never the project-global `CMAKE_SOURCE_DIR` / `CMAKE_BINARY_DIR`), so it can be embedded in a larger project (`add_subdirectory(anti-rev)`) and build correctly. In that case its artifacts and test scratch dirs land under `<top-build>/anti-rev/`, and the test runner must be pointed there (e.g. `-DBUILD_DIR=<top-build>/anti-rev`).
+
+`CMakeLists.txt` itself only defines the shipping artifacts (`antirev_shim` + `stub`); every test binary and end-to-end test target lives in `cmake/tests.cmake`, pulled in via `include()` (NOT `add_subdirectory`, so it stays in the top-level directory scope and shares `CMAKE_CURRENT_*`, `X86_GCC`/`AARCH64_GCC`, and the obfstr/blob helpers). Test artifacts are built through helper functions — `arev_lib` / `arev_bin` / `arev_plain_bin` (build a `.so`/exe + its phony target), `daemon_test` (encrypt-lib → daemon → protected client), and `arev_protect_run` (protect a single exe and run it) — so a new test is usually one or two helper calls rather than a hand-written `add_custom_command`/`add_custom_target` pair.
+
 ## Testing
 
 Always run the full test suite after adding features or making changes:
