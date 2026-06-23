@@ -377,6 +377,7 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 #define OP_BYE          0x03u
 #define OP_LIST         0x04u  /* request: all lib names (no fds) */
 #define OP_GET_CLOSURE  0x05u  /* request: lib + transitive encrypted deps */
+#define OP_GET_PATCH    0x06u  /* request: lazy-decrypt a .patch file by basename */
 
 #define OP_BATCH    0x81u
 #define OP_END      0x82u
@@ -395,6 +396,18 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 static int compute_closure(const char *start,
                            const char (*lib_names)[MAX_NAME + 1], int nlibs,
                            int *out_idx, int max_out);
+
+/* Forward decl — defined alongside decrypt_enc_file (needs it + the
+ * trailer-key reload + the recursive name search). */
+static int handle_get_patch(int client, const char *scan_dir,
+                            const uint8_t *payload, uint32_t plen);
+
+/* Plaintext name of the key-free discovery file the daemon drops in its
+ * scan dir so a keyless client (antirev_patch.so) can find the abstract
+ * socket without re-deriving it from the AES key.  Sits next to the
+ * daemon binary, which is already visible on disk, so it leaks nothing
+ * new.  '.'-prefixed → skipped by collect_enc_paths. */
+#define DISCOVERY_FILE ".antirev-libd.sock"
 
 #define ST_OK        0u
 #define ST_NOT_FOUND 1u
@@ -746,7 +759,8 @@ static int parse_init_filter(const uint8_t *payload, uint32_t plen,
 /* Process a single inbound request from a connected client.
  * Returns 0 to keep the connection alive, -1 to close it. */
 static int daemon_handle_request(int client, const int *lib_fds,
-                                 const char (*lib_names)[MAX_NAME + 1], int nlibs)
+                                 const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                                 const char *scan_dir)
 {
     uint32_t op, plen;
     uint8_t  payload[MAX_PAYLOAD];
@@ -774,6 +788,9 @@ static int daemon_handle_request(int client, const int *lib_fds,
         return handle_get_closure(client, lib_fds, lib_names, nlibs,
                                   payload, plen);
     }
+    if (op == OP_GET_PATCH) {
+        return handle_get_patch(client, scan_dir, payload, plen);
+    }
     if (op == OP_BYE) {
         return -1;
     }
@@ -791,7 +808,8 @@ static int daemon_handle_request(int client, const int *lib_fds,
 #define DAEMON_MAX_CLIENTS 256
 
 static void daemon_serve(int listen_fd, int shutdown_efd, const int *lib_fds,
-                         const char (*lib_names)[MAX_NAME + 1], int nlibs)
+                         const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                         const char *scan_dir)
 {
     uid_t my_uid = getuid();
 
@@ -864,7 +882,7 @@ static void daemon_serve(int listen_fd, int shutdown_efd, const int *lib_fds,
             }
 
             if (evs[i].events & EPOLLIN) {
-                if (daemon_handle_request(fd, lib_fds, lib_names, nlibs) < 0) {
+                if (daemon_handle_request(fd, lib_fds, lib_names, nlibs, scan_dir) < 0) {
                     epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
                     close(fd);
                     for (int k = 0; k < DAEMON_MAX_CLIENTS; k++) {
@@ -889,12 +907,14 @@ struct daemon_serve_args {
     const int *lib_fds;
     const char (*lib_names)[MAX_NAME + 1];
     int nlibs;
+    const char *scan_dir;
 };
 
 static void *daemon_serve_thread(void *arg)
 {
     struct daemon_serve_args *a = (struct daemon_serve_args *)arg;
-    daemon_serve(a->listen_fd, a->shutdown_efd, a->lib_fds, a->lib_names, a->nlibs);
+    daemon_serve(a->listen_fd, a->shutdown_efd, a->lib_fds, a->lib_names, a->nlibs,
+                 a->scan_dir);
     /* If daemon_serve returned (setup error like epoll_create1
      * failure, or normal shutdown after the eventfd fired), make
      * sure the main thread's sigwait() also wakes — otherwise on
@@ -1403,6 +1423,120 @@ static int decrypt_enc_file(const char *path, const uint8_t *key,
 
     close(fd);
     return mfd;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Lazy .patch decrypt (OP_GET_PATCH)                                  */
+/*                                                                      */
+/*  Patch files are NOT scanned at startup (collect_enc_paths only      */
+/*  queues .so/.elf).  They are decrypted on demand: antirev_patch.so   */
+/*  intercepts the injector's open() of a .patch path and sends         */
+/*  OP_GET_PATCH(basename); the daemon resolves the basename under its   */
+/*  scan dir, re-reads the AES key from its own trailer for this one     */
+/*  decrypt (the startup key was wiped after bind), and replies with a   */
+/*  fresh memfd.  Fresh-per-request → each client gets an independent    */
+/*  file offset; re-read-then-wipe keeps key residency minimal.         */
+/* ------------------------------------------------------------------ */
+
+/* Re-read the AES-256 key from this binary's own 48-byte trailer.
+ * Layout (see main / _build_protected): [u64 bundle_off][key:32][MAGIC:8].
+ * Returns 0 on success; caller must explicit_bzero() the key after use. */
+static int reload_key_from_trailer(uint8_t key[KEY_SIZE]) {
+    int self = open("/proc/self/exe", O_RDONLY);
+    if (self < 0) return -1;
+    off_t fsize = lseek(self, 0, SEEK_END);
+    if (fsize < 48) { close(self); return -1; }
+    uint8_t trailer[48];
+    ssize_t got = pread(self, trailer, 48, fsize - 48);
+    close(self);
+    if (got != 48 || memcmp(trailer + 40, MAGIC, MAGIC_LEN) != 0)
+        return -1;
+    memcpy(key, trailer + 8, KEY_SIZE);
+    return 0;
+}
+
+/* Recursively search `dir` for a regular file whose basename equals
+ * `base`.  Writes the full path to out and returns 1 on first match, 0
+ * otherwise.  Skips dotfiles and symlinks (mirrors collect_enc_paths). */
+static int find_under_dir(const char *dir, const char *base,
+                          char *out, size_t out_sz) {
+    DIR *dp = opendir(dir);
+    if (!dp) return 0;
+    struct dirent *de;
+    int found = 0;
+    while (!found && (de = readdir(dp)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+        struct stat st;
+        if (lstat(path, &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) continue;
+        if (S_ISDIR(st.st_mode)) {
+            found = find_under_dir(path, base, out, out_sz);
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        if (strcmp(de->d_name, base) == 0) {
+            snprintf(out, out_sz, "%s", path);
+            found = 1;
+        }
+    }
+    closedir(dp);
+    return found;
+}
+
+/* Handle OP_GET_PATCH: lazily decrypt the patch named in the payload
+ * (basename only, resolved under scan_dir) and reply OP_LIB + status +
+ * one fd, reusing the OP_GET_LIB reply shape. */
+static int handle_get_patch(int client, const char *scan_dir,
+                            const uint8_t *payload, uint32_t plen) {
+    uint8_t resp[4];
+    if (plen < 2) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    uint16_t nlen;
+    memcpy(&nlen, payload, 2);
+    if ((uint32_t)nlen + 2u > plen || nlen > MAX_NAME) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    char name[MAX_NAME + 1];
+    memcpy(name, payload + 2, nlen);
+    name[nlen] = '\0';
+
+    /* Names are basenames resolved under scan_dir — reject any path
+     * separator so a client can't coax the daemon into decrypting an
+     * arbitrary absolute path (traversal). */
+    if (name[0] == '\0' || strchr(name, '/')) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+
+    char path[4096];
+    if (!scan_dir || !find_under_dir(scan_dir, name, path, sizeof(path))) {
+        put_u32le(resp, ST_NOT_FOUND);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+
+    uint8_t key[KEY_SIZE];
+    if (reload_key_from_trailer(key) != 0) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    uint8_t *chunk = malloc(CHUNK_SIZE);
+    int mfd = chunk ? decrypt_enc_file(path, key, chunk) : -1;
+    explicit_bzero(key, sizeof(key));
+    if (chunk) { explicit_bzero(chunk, CHUNK_SIZE); free(chunk); }
+
+    if (mfd < 0) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    put_u32le(resp, ST_OK);
+    int rc = send_msg(client, OP_LIB, resp, 4, &mfd, 1);
+    close(mfd); /* client received its own copy via SCM_RIGHTS */
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2372,6 +2506,48 @@ static int daemon_open_listen_socket(const uint8_t *key) {
     return sd;
 }
 
+/* Copy the abstract socket name (the bytes after the leading NUL) into
+ * `out` so it can be published in the discovery file.  Same derivation
+ * as make_sock_addr; the name is not secret. */
+static void derive_sock_name(char *out, size_t out_sz, const uint8_t *key) {
+    struct sockaddr_un addr;
+    make_sock_addr(&addr, key);
+    snprintf(out, out_sz, "%s", addr.sun_path + 1);
+}
+
+/* Publish / remove the key-free discovery file in the daemon's scan dir.
+ * Keyless clients (antirev_patch.so) read the abstract socket name from
+ * it instead of re-deriving it from the AES key. */
+static void write_discovery_file(const char *scan_dir, const char *sock_name) {
+    char p[4096];
+    snprintf(p, sizeof(p), "%s/%s", scan_dir, DISCOVERY_FILE);
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return;
+    char line[160];
+    int n = snprintf(line, sizeof(line), "%s\n", sock_name);
+    if (n > 0) { ssize_t w = write(fd, line, (size_t)n); (void)w; }
+    close(fd);
+}
+
+static void unlink_discovery_file(const char *scan_dir) {
+    char p[4096];
+    snprintf(p, sizeof(p), "%s/%s", scan_dir, DISCOVERY_FILE);
+    unlink(p);
+}
+
+/* Directory portion of an exe path, into `out` ("." if none). */
+static void exe_dir(const char *real_exe, char *out, size_t out_sz) {
+    const char *slash = strrchr(real_exe, '/');
+    if (slash) {
+        size_t dlen = (size_t)(slash - real_exe);
+        if (dlen >= out_sz) dlen = out_sz - 1;
+        memcpy(out, real_exe, dlen);
+        out[dlen] = '\0';
+    } else {
+        snprintf(out, out_sz, ".");
+    }
+}
+
 /* Time `scan_encrypted_libs` and print the decrypt duration. */
 static int decrypt_own_libs(const char *real_exe, const uint8_t *key, int *lib_fds, char (*lib_names)[MAX_NAME + 1],
                             int *nlibs) {
@@ -2431,15 +2607,29 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
 
     build_and_log_deps_graph(lib_fds, lib_names, *nlibs);
 
+    /* The scan dir is where lazy .patch decrypts (OP_GET_PATCH) resolve
+     * basenames, and where the discovery file is published. */
+    char scan_dir[4096];
+    exe_dir(real_exe, scan_dir, sizeof(scan_dir));
+
     int listen_sd = daemon_open_listen_socket(key);
+    /* Capture the (non-secret) abstract socket name for the discovery
+     * file before wiping the key. */
+    char sock_name[160] = {0};
+    if (listen_sd >= 0)
+        derive_sock_name(sock_name, sizeof(sock_name), key);
     explicit_bzero(key, KEY_SIZE);
     if (listen_sd < 0)
         return 1;
+    /* Publish discovery before the daemonising fork so the file exists
+     * by the time the launching parent returns. */
+    write_discovery_file(scan_dir, sock_name);
     LOG_INFO("[antirev] lib daemon ready (%d libs)\n", *nlibs);
 
     pid_t pid = fork();
     if (pid < 0) {
         PERR_INFO("fork");
+        unlink_discovery_file(scan_dir);
         return 1;
     }
     if (pid > 0)
@@ -2480,6 +2670,7 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
         .lib_fds      = lib_fds,
         .lib_names    = lib_names,
         .nlibs        = *nlibs,
+        .scan_dir     = scan_dir,
     };
 
     pthread_t worker;
@@ -2511,6 +2702,7 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
     /* Shutdown sweep: catches any dirs whose owner exe crashed
      * during this daemon's session before its atexit could fire. */
     sweep_dead_symlink_dirs();
+    unlink_discovery_file(scan_dir);
 
     _exit(0);
 }

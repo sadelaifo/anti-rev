@@ -27,6 +27,7 @@ set(TESTS
     test_fork_diff_lib    # parent and child use different libs independently
     test_script_multi_bin # script invokes A and B with shared + unique libs
     test_lib_daemon       # centralized lib daemon serves libs to client exes
+    test_patch_shim       # antirev_patch.so open()-redirect: lazy .patch decrypt via daemon
     test_python_client_daemon  # antirev_client.py speaks daemon v2 protocol
     test_python_reload    # antirev_client ctypes reload re-runs ctor
     test_fd_reduction     # exe_shim ctor closes DT_NEEDED memfds

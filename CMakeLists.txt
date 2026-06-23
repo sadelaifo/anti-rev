@@ -178,6 +178,36 @@ make_blob_header("${ANTIREV_SHIM_BLOB_H}" "$<TARGET_FILE:antirev_shim>"
 add_custom_target(antirev_shim_blob_h DEPENDS "${ANTIREV_SHIM_BLOB_H}")
 
 # ═══════════════════════════════════════════════════════════════════════
+#  antirev_patch.so — keyless open()/openat() redirect for hot-patch tools
+# ═══════════════════════════════════════════════════════════════════════
+# Separate, self-contained DSO LD_PRELOAD'd into an *unprotected* live-patch
+# injector.  Intercepts open()/openat() of encrypted ".patch" files and
+# returns the decrypted memfd fetched from the daemon (OP_GET_PATCH), so the
+# injector stays antirev-blind.  No key, no crypto, independent of the
+# antirev_shim interceptors.  Not bundled into the stub — shipped as a plain
+# .so the operator's launcher preloads.
+add_library(antirev_patch SHARED stub/patch_shim.c)
+set_target_properties(antirev_patch PROPERTIES
+    OUTPUT_NAME "antirev_patch${ARCH_SUFFIX}"
+    PREFIX ""
+    POSITION_INDEPENDENT_CODE ON
+    C_VISIBILITY_PRESET hidden
+    NO_SONAME ON
+)
+target_compile_options(antirev_patch PRIVATE -O2 ${ANTIREV_HARDEN_COMPILE_OPTS})
+target_link_options(antirev_patch PRIVATE
+    ${ANTIREV_HARDEN_LINK_OPTS}
+    ${ANTIREV_HARDEN_DSO_LINK_OPTS}
+)
+target_link_libraries(antirev_patch PRIVATE dl)
+add_custom_command(TARGET antirev_patch POST_BUILD
+    COMMAND ${CMAKE_STRIP} --strip-all --strip-unneeded
+            --remove-section=.comment
+            $<TARGET_FILE:antirev_patch>
+    COMMENT "Stripping $<TARGET_FILE_NAME:antirev_patch>"
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  stub executable
 # ═══════════════════════════════════════════════════════════════════════
 obfstr_codegen_sources(STUB_SOURCES_OBF
@@ -1540,6 +1570,27 @@ add_custom_target(test_lib_daemon
     DEPENDS stub mylib liblinkedmath dlopen_main linked_main
     WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
     COMMENT "lib daemon mode test (dlopen + DT_NEEDED via daemon)"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+#  test_patch_shim — antirev_patch.so open()-redirect for hot-patch tools
+# ═══════════════════════════════════════════════════════════════════════
+
+compile_test_bin("${CMAKE_BINARY_DIR}/open_patch"
+    gcc "${CMAKE_SOURCE_DIR}/tests/patch_shim/open_patch.c")
+add_custom_target(open_patch DEPENDS "${CMAKE_BINARY_DIR}/open_patch")
+
+add_custom_target(test_patch_shim
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_patch_shim ==="
+    COMMAND bash "${CMAKE_SOURCE_DIR}/tests/patch_shim/run_test.sh"
+            "${CMAKE_BINARY_DIR}/stub"
+            "$<TARGET_FILE:antirev_patch>"
+            "${CMAKE_BINARY_DIR}/open_patch"
+            "${CMAKE_BINARY_DIR}/mylib.so"
+    DEPENDS stub antirev_patch open_patch mylib
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "antirev_patch.so keyless open()-redirect via daemon (OP_GET_PATCH)"
     USES_TERMINAL
 )
 

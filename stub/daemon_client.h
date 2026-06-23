@@ -57,6 +57,7 @@
 /* Daemon opcodes used by the shims. */
 #define DC_OP_GET_LIB     0x02u
 #define DC_OP_GET_CLOSURE 0x05u
+#define DC_OP_GET_PATCH   0x06u  /* lazy-decrypt a .patch by basename (antirev_patch.so) */
 #define DC_OP_BATCH       0x81u
 #define DC_OP_END         0x82u
 #define DC_OP_LIB         0x83u
