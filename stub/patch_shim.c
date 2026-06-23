@@ -1,5 +1,7 @@
 /*
- * antirev_patch.so — keyless open()/openat() redirect for hot-patch tools.
+ * lrxd_<arch>.so — keyless open()/openat() redirect for hot-patch tools.
+ * (Deployed artifact name; the CMake target is `antirev_patch`. Named to
+ *  blend in next to the lrxd daemon binary.)
  *
  * Loaded via LD_PRELOAD into an *unprotected* host tool (a live-patch
  * injector).  When that tool open()s an encrypted ".patch" file from

@@ -403,7 +403,7 @@ static int handle_get_patch(int client, const char *scan_dir,
                             const uint8_t *payload, uint32_t plen);
 
 /* Plaintext name of the key-free discovery file the daemon drops in its
- * scan dir so a keyless client (antirev_patch.so) can find the abstract
+ * scan dir so a keyless client (lrxd_<arch>.so) can find the abstract
  * socket without re-deriving it from the AES key.  Sits next to the
  * daemon binary, which is already visible on disk, so it leaks nothing
  * new.  '.'-prefixed → skipped by collect_enc_paths. */
@@ -1429,7 +1429,7 @@ static int decrypt_enc_file(const char *path, const uint8_t *key,
 /*  Lazy .patch decrypt (OP_GET_PATCH)                                  */
 /*                                                                      */
 /*  Patch files are NOT scanned at startup (collect_enc_paths only      */
-/*  queues .so/.elf).  They are decrypted on demand: antirev_patch.so   */
+/*  queues .so/.elf).  They are decrypted on demand: lrxd_<arch>.so   */
 /*  intercepts the injector's open() of a .patch path and sends         */
 /*  OP_GET_PATCH(basename); the daemon resolves the basename under its   */
 /*  scan dir, re-reads the AES key from its own trailer for this one     */
@@ -2516,7 +2516,7 @@ static void derive_sock_name(char *out, size_t out_sz, const uint8_t *key) {
 }
 
 /* Publish / remove the key-free discovery file in the daemon's scan dir.
- * Keyless clients (antirev_patch.so) read the abstract socket name from
+ * Keyless clients (lrxd_<arch>.so) read the abstract socket name from
  * it instead of re-deriving it from the AES key. */
 static void write_discovery_file(const char *scan_dir, const char *sock_name) {
     char p[4096];

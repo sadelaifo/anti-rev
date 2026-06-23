@@ -2,7 +2,7 @@
  * open_patch — stand-in for a hot-patch injector.
  *
  * Opens a ".patch" file, fstat()s the opened fd, and reads it.  With
- * antirev_patch.so preloaded the open() is redirected to the daemon's
+ * lrxd_<arch>.so preloaded the open() is redirected to the daemon's
  * decrypted memfd, so this sees plaintext (and the fstat size is the
  * plaintext size).  Without the shim it sees the on-disk ciphertext.
  *

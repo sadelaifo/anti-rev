@@ -1,12 +1,12 @@
 #!/bin/bash
-# test_patch_shim — antirev_patch.so open()-redirect end-to-end
+# test_patch_shim — lrxd_<arch>.so open()-redirect end-to-end
 #
-# Usage: run_test.sh <stub> <antirev_patch.so> <open_patch_bin> <mylib.so>
+# Usage: run_test.sh <stub> <lrxd_<arch>.so> <open_patch_bin> <mylib.so>
 #
 # 1. Encrypt a dummy lib (so the daemon has >=1 lib and starts) + a
 #    standalone ".patch" file, all with the same key, into the daemon dir.
 # 2. Build + start the lightweight daemon (publishes the discovery file).
-# 3. Run an UNPROTECTED injector stand-in with antirev_patch.so preloaded;
+# 3. Run an UNPROTECTED injector stand-in with lrxd_<arch>.so preloaded;
 #    verify it reads the decrypted patch (not ciphertext).
 # 4. Negative control: without the shim it must see ciphertext.
 set -e
@@ -63,7 +63,7 @@ if [ ! -e "$TD/.antirev-libd.sock" ]; then
 fi
 echo "discovery file: $(cat "$TD/.antirev-libd.sock")"
 
-echo "--- injector WITH antirev_patch.so (expect decrypted) ---"
+echo "--- injector WITH lrxd_<arch>.so (expect decrypted) ---"
 LD_PRELOAD="$PATCH_SHIM" "$OPEN_PATCH" "$TD/foo.patch" "$PLAINTEXT"
 
 echo "--- negative control: NO shim (expect ciphertext) ---"
@@ -73,4 +73,4 @@ if "$OPEN_PATCH" "$TD/foo.patch" "$PLAINTEXT"; then
 fi
 echo "OK: without shim the injector sees ciphertext"
 
-echo "PASS: antirev_patch.so served decrypted patch via daemon"
+echo "PASS: lrxd_<arch>.so served decrypted patch via daemon"
