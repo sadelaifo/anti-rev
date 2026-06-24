@@ -40,6 +40,12 @@ Config format:
       - bin/start.sh                   # copy a specific file
       - *.conf                         # copy by pattern
 
+    patch_shim:                        # optional: hot-patch shim (lrxd_<arch>.so),
+      x86_64:  ../build/lrxd_x86_64.so #   built by cmake (not generated here).  pack
+      aarch64: ../build/lrxd_aarch64.so#   copies each into output_dir for the business
+    patch_shim_dest: bin/sa            #   launcher to LD_PRELOAD.  dest dir under
+                                       #   output_dir (optional, default: output_dir root)
+
 Path fields (install_dir, output_dir, key, stub, stubs.*) expand ~ and
 $VAR / ${VAR} from the environment, e.g. install_dir: $HOME/myapp.
 
@@ -958,6 +964,31 @@ def main():
                 dst.unlink()
             os.symlink(target, dst)
         print(f"[pack] Recreated {len(symlinks)} symlink(s)")
+        print()
+
+    # ── Copy the patch shim (lrxd_<arch>.so) into the output tree ─────
+    # The hot-patch shim is built by cmake (NOT generated here), so the
+    # operator points `patch_shim:` (arch->path, like `stubs:`) at the
+    # build artifacts; pack copies each into output_dir/<patch_shim_dest>
+    # (default: output_dir root).  The business launcher LD_PRELOADs it
+    # from there.
+    patch_shim_cfg = cfg.get('patch_shim') or {}
+    if patch_shim_cfg:
+        if not isinstance(patch_shim_cfg, dict):
+            sys.exit("[error] 'patch_shim' must be an arch->path map (like "
+                     "'stubs'), e.g.  patch_shim: { x86_64: ../build/lrxd_x86_64.so }")
+        dest_dir = (output_dir / _expand(cfg.get('patch_shim_dest', '.'))).resolve()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for arch, src in patch_shim_cfg.items():
+            src_p = (config_path.parent / _expand(src)).resolve()
+            if not src_p.exists():
+                print(f"[pack] WARNING: patch_shim for {arch} not found at "
+                      f"{src_p} — skipping", file=sys.stderr)
+                continue
+            dst_p = dest_dir / src_p.name
+            shutil.copy2(src_p, dst_p)
+            os.chmod(str(dst_p), 0o755)
+            print(f"[pack] Patch shim: {dst_p}  ({arch})")
         print()
 
     elapsed = time.monotonic() - t_start
