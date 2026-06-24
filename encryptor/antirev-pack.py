@@ -25,6 +25,9 @@ Config format:
 
     libs: encrypt                      # optional: encrypt|skip (default: encrypt)
 
+    lrxd: lrxd                          # optional: daemon binary base name (default: lrxd)
+    version: "1.1.0"                    # optional: package version (recorded in manifest)
+
     encrypt_libs:                      # optional whitelist: only encrypt these libs
       - libsecret.so                   #   all other libs/.elf are copied as plaintext
       - lib/crypto/                    #   supports same patterns as blacklist
@@ -40,8 +43,13 @@ Config format:
       - bin/start.sh                   # copy a specific file
       - *.conf                         # copy by pattern
 
-Path fields (install_dir, output_dir, key, stub, stubs.*) expand ~ and
+Path fields (install_dir, output_dir, key, stub, stubs.*, lrxd) expand ~ and
 $VAR / ${VAR} from the environment, e.g. install_dir: $HOME/myapp.
+
+CLI overrides: --install-dir, --output-dir, --key, --stub, --lrxd, --version
+each take priority over the same field in config.yaml (CLI > config > default).
+A CLI-supplied --key/--stub path is resolved relative to the current working
+directory; the config equivalents stay relative to the config file.
 
 What it does:
   - Recursively scans install_dir for all ELF files (executables and libraries)
@@ -58,6 +66,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 import os
 import re
 import shutil
@@ -78,6 +87,18 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent))
 from protect import (load_or_create_key, encrypt_data, MAGIC,
                      BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS)
+
+def _resolve_field(cli_val, cfg, key, default=None):
+    """Merge a single config field with CLI override precedence.
+
+    User CLI input wins over config.yaml, which wins over the default.
+    ``cli_val`` is the argparse value (``None`` when the flag was not
+    given); ``cfg`` is the parsed YAML dict.
+    """
+    if cli_val is not None:
+        return cli_val
+    return cfg.get(key, default)
+
 
 # ELF magic and type constants
 ELF_MAGIC = b'\x7fELF'
@@ -568,6 +589,17 @@ def main():
     ap.add_argument("config", help="YAML config file")
     ap.add_argument("-j", "--jobs", type=int, default=0,
                     help="Number of parallel workers (default: CPU count)")
+    # CLI overrides — each takes priority over the same field in config.yaml.
+    ap.add_argument("--install-dir", help="override config install_dir")
+    ap.add_argument("--output-dir", help="override config output_dir")
+    ap.add_argument("--key", help="override config key (hex keyfile path)")
+    ap.add_argument("--stub",
+                    help="override config stub/stubs (single stub ELF for all arches)")
+    ap.add_argument("--lrxd",
+                    help="daemon binary base name (overrides config 'lrxd', default: lrxd)")
+    ap.add_argument("--version", dest="pkg_version",
+                    help="package version string (overrides config 'version'); "
+                         "recorded in the pack manifest and summary")
     args = ap.parse_args()
 
     t_start = time.monotonic()
@@ -577,27 +609,58 @@ def main():
         sys.exit(f"[error] config not found: {config_path}")
 
     with open(config_path) as f:
-        cfg = yaml.safe_load(f)
-
-    # ── Validate required fields ──────────────────────────────────────
-    for field in ('install_dir', 'output_dir'):
-        if field not in cfg:
-            sys.exit(f"[error] missing required field '{field}' in config")
-    if 'stub' not in cfg and 'stubs' not in cfg:
-        sys.exit("[error] config must have 'stub' or 'stubs' field")
+        cfg = yaml.safe_load(f) or {}   # empty YAML -> {} so CLI-only runs work
 
     def _expand(p: str) -> str:
         return os.path.expanduser(os.path.expandvars(p))
 
-    install_dir = Path(_expand(cfg['install_dir'])).resolve()
-    output_dir  = Path(_expand(cfg['output_dir'])).resolve()
-    key_path    = (config_path.parent / _expand(cfg.get('key', 'antirev.key'))).resolve()
-    blacklist   = compile_blacklist(cfg.get('blacklist', []))
-    workers     = args.jobs if args.jobs > 0 else (os.cpu_count() or 4)
+    # ── Merge fields: CLI input > config.yaml > default ───────────────
+    install_raw = _resolve_field(args.install_dir, cfg, 'install_dir')
+    output_raw  = _resolve_field(args.output_dir,  cfg, 'output_dir')
+    stub_cli    = args.stub  # CLI --stub overrides config stub/stubs entirely
 
-    # Build arch -> stub mapping (supports single 'stub' or multi-arch 'stubs')
+    # ── Validate required fields (after the CLI/config merge) ─────────
+    if install_raw is None:
+        sys.exit("[error] missing required field 'install_dir' "
+                 "(set it in config or pass --install-dir)")
+    if output_raw is None:
+        sys.exit("[error] missing required field 'output_dir' "
+                 "(set it in config or pass --output-dir)")
+    if stub_cli is None and 'stub' not in cfg and 'stubs' not in cfg:
+        sys.exit("[error] config must have 'stub' or 'stubs' field "
+                 "(or pass --stub)")
+
+    install_dir = Path(_expand(install_raw)).resolve()
+    output_dir  = Path(_expand(output_raw)).resolve()
+
+    # key path: CWD-relative when supplied on the CLI, config-relative
+    # when read from config.yaml (preserves existing config semantics).
+    if args.key is not None:
+        key_path = (Path.cwd() / _expand(args.key)).resolve()
+    else:
+        key_path = (config_path.parent
+                    / _expand(cfg.get('key', 'antirev.key'))).resolve()
+
+    blacklist = compile_blacklist(cfg.get('blacklist', []))
+    workers   = args.jobs if args.jobs > 0 else (os.cpu_count() or 4)
+
+    # Daemon binary base name + package version (CLI > config > default).
+    lrxd_name = _expand(_resolve_field(args.lrxd, cfg, 'lrxd', 'lrxd')) or 'lrxd'
+    pkg_version = str(_resolve_field(args.pkg_version, cfg, 'version', '') or '').strip()
+
+    # Build arch -> stub mapping.  CLI --stub (CWD-relative) overrides the
+    # config stub/stubs entirely; otherwise use config 'stubs' or 'stub'
+    # (config-relative).
     stubs: dict[str, Path] = {}
-    if 'stubs' in cfg:
+    if stub_cli is not None:
+        single = (Path.cwd() / _expand(stub_cli)).resolve()
+        elf_info = classify_elf(single)
+        if elf_info:
+            stubs[elf_info[1]] = single
+        else:
+            stubs['x86_64'] = single
+            stubs['aarch64'] = single
+    elif 'stubs' in cfg:
         for arch, p in cfg['stubs'].items():
             stubs[arch] = (config_path.parent / _expand(p)).resolve()
     elif 'stub' in cfg:
@@ -779,7 +842,7 @@ def main():
             stub_data = stub_path.read_bytes()
             suffix = f'-{arch}' if len(stubs) > 1 else ''
 
-            daemon_path = output_dir / f'lrxd{suffix}'
+            daemon_path = output_dir / f'{lrxd_name}{suffix}'
             bundle = struct.pack("<IB", 0, 0)  # 0 files, no flags
             bundle_offset = len(stub_data)
             trailer = struct.pack("<Q", bundle_offset) + key + MAGIC
@@ -881,10 +944,31 @@ def main():
         print(f"[pack] Recreated {len(symlinks)} symlink(s)")
         print()
 
+    # ── Pack manifest (written NEXT TO the config, never inside the
+    #    shipped output tree — a file named *manifest* under output_dir
+    #    would fingerprint the deployment).  Records the version + the
+    #    key parameters used for this pack.
+    manifest = {
+        'version': pkg_version,
+        'lrxd': lrxd_name,
+        'install_dir': str(install_dir),
+        'output_dir': str(output_dir),
+        'arches': sorted(stubs.keys()),
+        'libs_mode': libs_mode,
+    }
+    manifest_path = config_path.parent / 'antirev-pack-manifest.json'
+    with open(manifest_path, 'w') as mf:
+        json.dump(manifest, mf, indent=2)
+        mf.write('\n')
+
     elapsed = time.monotonic() - t_start
     print(f"[pack] Done in {elapsed:.1f}s")
-    print(f"[pack]   Output -> {output_dir}")
-    print(f"[pack]   Key    -> {key_path}  (keep secret)")
+    if pkg_version:
+        print(f"[pack]   Version  -> {pkg_version}")
+    print(f"[pack]   Output   -> {output_dir}")
+    print(f"[pack]   Daemon   -> {lrxd_name}")
+    print(f"[pack]   Manifest -> {manifest_path}")
+    print(f"[pack]   Key      -> {key_path}  (keep secret)")
 
 
 if __name__ == '__main__':
