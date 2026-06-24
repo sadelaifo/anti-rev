@@ -84,7 +84,7 @@ def test_end_to_end_overrides():
 
         out_cli = td / "out_CLI"
         r = subprocess.run(
-            [sys.executable, str(PACK), str(cfg),
+            [sys.executable, str(PACK), "--config", str(cfg),
              "--output-dir", str(out_cli),
              "--lrxd", "lrxd_cli",
              "--version", "9.9-cli"],

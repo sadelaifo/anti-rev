@@ -3,7 +3,7 @@
 antirev-pack — config-driven batch protector
 
 Usage:
-    antirev-pack.py <config.yaml>
+    antirev-pack.py --config <config.yaml>
 
 Config format:
 
@@ -586,7 +586,8 @@ def _copy_worker(items: list[tuple[str, str]]) -> int:
 
 def main():
     ap = argparse.ArgumentParser(description="antirev config-driven batch protector")
-    ap.add_argument("config", help="YAML config file")
+    ap.add_argument("--config", required=True, metavar="FILE",
+                    help="YAML config file")
     ap.add_argument("-j", "--jobs", type=int, default=0,
                     help="Number of parallel workers (default: CPU count)")
     # CLI overrides — each takes priority over the same field in config.yaml.
