@@ -398,9 +398,14 @@ static int compute_closure(const char *start,
                            int *out_idx, int max_out);
 
 /* Forward decl — defined alongside decrypt_enc_file (needs it + the
- * trailer-key reload + the recursive name search). */
+ * trailer part1 reload + the recursive name search). */
 static int handle_get_patch(int client, const char *scan_dir,
                             const uint8_t *payload, uint32_t plen);
+
+/* Forward decl — key-split derivation, defined far below near main().
+ * handle_get_patch re-derives the real key for each lazy .patch decrypt
+ * so patches enjoy the same keysplit binding as the encrypted libs. */
+static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SIZE]);
 
 /* Plaintext name of the key-free discovery file the daemon drops in its
  * scan dir so a keyless client (lrxd_<arch>.so) can find the abstract
@@ -1438,10 +1443,12 @@ static int decrypt_enc_file(const char *path, const uint8_t *key,
 /*  file offset; re-read-then-wipe keeps key residency minimal.         */
 /* ------------------------------------------------------------------ */
 
-/* Re-read the AES-256 key from this binary's own 48-byte trailer.
- * Layout (see main / _build_protected): [u64 bundle_off][key:32][MAGIC:8].
- * Returns 0 on success; caller must explicit_bzero() the key after use. */
-static int reload_key_from_trailer(uint8_t key[KEY_SIZE]) {
+/* Re-read part1 (the 32-byte key SHARE) from this binary's own 48-byte
+ * trailer.  Layout (see main / antirev-pack.py): [u64 bundle_off]
+ * [part1:32][MAGIC:8].  part1 is NOT the AES key on its own — the caller
+ * must run derive_real_key() to combine it with SHA256(lrxd) + version.
+ * Returns 0 on success; caller must explicit_bzero() the buffer after use. */
+static int reload_part1_from_trailer(uint8_t part1[KEY_SIZE]) {
     int self = open("/proc/self/exe", O_RDONLY);
     if (self < 0) return -1;
     off_t fsize = lseek(self, 0, SEEK_END);
@@ -1451,7 +1458,7 @@ static int reload_key_from_trailer(uint8_t key[KEY_SIZE]) {
     close(self);
     if (got != 48 || memcmp(trailer + 40, MAGIC, MAGIC_LEN) != 0)
         return -1;
-    memcpy(key, trailer + 8, KEY_SIZE);
+    memcpy(part1, trailer + 8, KEY_SIZE);
     return 0;
 }
 
@@ -1519,11 +1526,24 @@ static int handle_get_patch(int client, const char *scan_dir,
         return send_msg(client, OP_LIB, resp, 4, NULL, 0);
     }
 
-    uint8_t key[KEY_SIZE];
-    if (reload_key_from_trailer(key) != 0) {
+    /* part1 alone is NOT the AES key.  Run the SAME key-split derivation
+     * the daemon used at startup (derive_real_key: part1 + SHA256(lrxd) +
+     * version) so a .patch gets IDENTICAL keysplit protection to the
+     * encrypted libs — it can't be decrypted with the trailer part1 alone
+     * (part1 is plaintext in every protected binary).  Re-derive per
+     * request (re-hash lrxd + re-run the version script); patches are rare
+     * so the cost is negligible, and it keeps key residency minimal. */
+    uint8_t part1[KEY_SIZE], key[KEY_SIZE];
+    if (reload_part1_from_trailer(part1) != 0) {
         put_u32le(resp, ST_ERROR);
         return send_msg(client, OP_LIB, resp, 4, NULL, 0);
     }
+    if (derive_real_key(part1, key) != 0) {
+        explicit_bzero(part1, sizeof(part1));
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    explicit_bzero(part1, sizeof(part1));
     uint8_t *chunk = malloc(CHUNK_SIZE);
     int mfd = chunk ? decrypt_enc_file(path, key, chunk) : -1;
     explicit_bzero(key, sizeof(key));
