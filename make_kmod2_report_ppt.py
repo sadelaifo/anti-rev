@@ -8,8 +8,8 @@ kept to what is needed to reason about those.
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
-from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.enum.shapes import MSO_SHAPE, MSO_CONNECTOR
 
 # ── Palette ─────────────────────────────────────────────────────────
 BG_DARK = RGBColor(0x1B, 0x1B, 0x2F)
@@ -157,6 +157,120 @@ def two_col_slide(prs, title, left_title, left_bullets, right_title, right_bulle
     return slide
 
 
+def _set_cell(cell, text, size=11, color=LIGHT, bold=False, align=PP_ALIGN.LEFT):
+    cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+    cell.margin_left = Inches(0.07)
+    cell.margin_right = Inches(0.07)
+    cell.margin_top = Inches(0.02)
+    cell.margin_bottom = Inches(0.02)
+    tf = cell.text_frame
+    tf.word_wrap = True
+    tf.clear()
+    p = tf.paragraphs[0]
+    p.alignment = align
+    p.text = text
+    for run in p.runs:
+        run.font.size = Pt(size)
+        run.font.color.rgb = color
+        run.font.bold = bold
+
+
+def table_slide(prs, title, headers, rows, col_widths=None, font=11,
+                header_fill=ACCENT):
+    """Comparison table slide. headers = [aspect, colB, colC]; rows = list of
+    [aspect, valB, valC]. First column is rendered as an orange label."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    set_slide_bg(slide, BG_DARK)
+    shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(10), Inches(0.9))
+    shape.fill.solid(); shape.fill.fore_color.rgb = BG_CARD; shape.line.fill.background()
+    tb = add_textbox(slide, Inches(0.6), Inches(0.12), Inches(8.9), Inches(0.7))
+    set_text(tb.text_frame, title, size=24, color=ACCENT, bold=True)
+
+    nrows = len(rows) + 1
+    ncols = len(headers)
+    gtable = slide.shapes.add_table(nrows, ncols, Inches(0.3), Inches(1.05),
+                                    Inches(9.4), Inches(0.4) * nrows)
+    table = gtable.table
+    table.first_row = False
+    table.horz_banding = False
+    if col_widths:
+        for i, w in enumerate(col_widths):
+            table.columns[i].width = w
+
+    for j, h in enumerate(headers):
+        cell = table.cell(0, j)
+        cell.fill.solid(); cell.fill.fore_color.rgb = header_fill
+        _set_cell(cell, h, size=font + 1, color=BG_DARK, bold=True,
+                  align=(PP_ALIGN.LEFT if j == 0 else PP_ALIGN.LEFT))
+    for r, row in enumerate(rows, start=1):
+        rowfill = BG_CARD if r % 2 else RGBColor(0x1F, 0x1F, 0x33)
+        for j, val in enumerate(row):
+            cell = table.cell(r, j)
+            cell.fill.solid(); cell.fill.fore_color.rgb = rowfill
+            _set_cell(cell, val, size=font,
+                      color=(ORANGE if j == 0 else LIGHT), bold=(j == 0))
+    return slide
+
+
+# ── Diagram helpers ─────────────────────────────────────────────────
+def diagram_title(prs, title, subtitle=""):
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    set_slide_bg(slide, BG_DARK)
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(10), Inches(0.9))
+    bar.fill.solid(); bar.fill.fore_color.rgb = BG_CARD; bar.line.fill.background()
+    tb = add_textbox(slide, Inches(0.6), Inches(0.12), Inches(8.9), Inches(0.7))
+    set_text(tb.text_frame, title, size=22, color=ACCENT, bold=True)
+    if subtitle:
+        tb = add_textbox(slide, Inches(0.5), Inches(6.95), Inches(9.1), Inches(0.5))
+        set_text(tb.text_frame, subtitle, size=11, color=GRAY)
+    return slide
+
+
+def dbox(slide, x, y, w, h, title, body="", fill=BG_CARD, border=ACCENT,
+         tcolor=None, tsize=13, bsize=10.5, shape=MSO_SHAPE.ROUNDED_RECTANGLE):
+    shp = slide.shapes.add_shape(shape, Inches(x), Inches(y), Inches(w), Inches(h))
+    shp.fill.solid(); shp.fill.fore_color.rgb = fill
+    if border:
+        shp.line.color.rgb = border; shp.line.width = Pt(1.5)
+    else:
+        shp.line.fill.background()
+    tf = shp.text_frame; tf.word_wrap = True
+    tf.margin_left = Inches(0.06); tf.margin_right = Inches(0.06)
+    tf.margin_top = Inches(0.03); tf.margin_bottom = Inches(0.03)
+    try:
+        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    except Exception:
+        pass
+    p = tf.paragraphs[0]; p.alignment = PP_ALIGN.CENTER
+    p.text = title; p.font.size = Pt(tsize); p.font.bold = True
+    p.font.color.rgb = tcolor or border
+    if body:
+        for line in body.split("\n"):
+            q = tf.add_paragraph(); q.alignment = PP_ALIGN.CENTER
+            q.text = line; q.font.size = Pt(bsize); q.font.color.rgb = LIGHT
+    return shp
+
+
+def darrow(slide, x, y, w, h, color=ACCENT2, shape=MSO_SHAPE.DOWN_ARROW):
+    a = slide.shapes.add_shape(shape, Inches(x), Inches(y), Inches(w), Inches(h))
+    a.fill.solid(); a.fill.fore_color.rgb = color; a.line.fill.background()
+    return a
+
+
+def dlabel(slide, x, y, w, text, color=GRAY, size=10, bold=False):
+    tb = add_textbox(slide, Inches(x), Inches(y), Inches(w), Inches(0.3))
+    set_text(tb.text_frame, text, size=size, color=color, bold=bold,
+             alignment=PP_ALIGN.CENTER)
+    return tb
+
+
+def dconnect(slide, x1, y1, x2, y2, color=ACCENT2, width=1.5):
+    c = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT,
+                                   Inches(x1), Inches(y1), Inches(x2), Inches(y2))
+    c.line.color.rgb = color; c.line.width = Pt(width)
+    return c
+
+
 # ═══════════════════════════════════════════════════════════════════════
 prs = Presentation()
 prs.slide_width = Inches(10)
@@ -184,7 +298,7 @@ content_slide(prs, "Executive Summary (TL;DR)", [
     "kmod2: AES key is embedded in EVERY encrypted file. A raw copy of the disk tree is decryptable — protection then rests on the mount + access gate + namespace isolation.",
     "",
     "##Status",
-    "Current design = shipping production path. kmod2 = working proof-of-concept / candidate, validated on the real x86-64 and SLES targets, not yet the release path.",
+    "Current design = shipping production path. kmod2 = advanced candidate: the full production deployment shape (process-manager stack + access gate + writable views) is now reproduced in automated end-to-end tests on both x86-64 and the ARM64-under-qemu RTOS path — validated on the real x86-64 and SLES targets, but not yet the release path.",
 ], body_size=14)
 
 # ════════════════ SECTION 1: DESIGN ════════════════
@@ -222,42 +336,20 @@ content_slide(prs, "kmod2 design — antirevfs kernel filesystem", [
 ], body_size=13)
 
 # Side by side
-two_col_slide(prs, "Design comparison at a glance",
-    "Current  (memfd + daemon)",
+COLW = (Inches(1.85), Inches(3.75), Inches(3.8))
+table_slide(prs, "Design comparison at a glance",
+    ["Aspect", "memfd + daemon  (current)", "kmod2  (antirevfs)"],
     [
-        "Userspace only — no kernel changes",
-        "Each binary re-wrapped as a stub launcher",
-        "Decrypt daemon process runs alongside app",
-        "LD_PRELOAD shims injected into every process",
-        "Plaintext lives in RAM-only memfds",
-        "/proc shows memfd:<random> instead of real path",
-        "",
-        "Must work around: symbol order, dlopen,",
-        "  protobuf dedup, implicit inter-lib deps",
-        "",
-        "KEY: only inside launcher + daemon binaries",
-        "LIBS ON DISK: keyless ciphertext (safe to copy)",
-        "",
-        "Status: SHIPPING / production",
-    ],
-    "kmod2  (antirevfs)",
-    [
-        "Requires a signed kernel module on the box",
-        "Binaries untouched — mounted, not wrapped",
-        "No daemon — kernel page cache shares plaintext",
-        "No LD_PRELOAD — native loading, real paths",
-        "Plaintext lives in kernel page cache (RAM)",
-        "/proc shows real paths — no memfd artifact",
-        "",
-        "Dependency problems largely DISAPPEAR",
-        "  (native ld.so resolution)",
-        "",
-        "KEY: embedded in every file",
-        "DISK TREE: decryptable if copied (needs gate +",
-        "  namespace isolation to stay protected)",
-        "",
-        "Status: working PoC / candidate",
-    ], body_size=12)
+        ["Layer", "Userspace only — no kernel changes", "Signed kernel module on the box"],
+        ["Binaries", "Each re-wrapped as a stub launcher", "Untouched — mounted, not wrapped"],
+        ["Decrypt path", "Daemon decrypts into RAM memfds", "Kernel FS decrypts on read (page cache)"],
+        ["Injection", "LD_PRELOAD shims in every process", "None — native loading, real paths"],
+        ["/proc view", "memfd:<random> (deleted)", "Real paths — no memfd artifact"],
+        ["Dependencies", "Must work around symbol order, dlopen, protobuf dedup", "Native ld.so — problems disappear"],
+        ["Key location", "Inside launcher + daemon binaries only", "Embedded in every file"],
+        ["Disk if copied", "Keyless ciphertext — safe", "Decryptable — needs gate + ns isolation"],
+        ["Status", "Shipping / production", "Candidate; prod shape e2e-tested"],
+    ], col_widths=COLW, font=11)
 
 # Key position — security-focused slide for the PM
 content_slide(prs, "Where is the AES key? (the security headline)", [
@@ -275,6 +367,117 @@ content_slide(prs, "Where is the AES key? (the security headline)", [
     "##Recommended backstop for both: factory TPM-seal the key per unit",
     "Sealed key never leaves the box and won't unseal on different hardware — exfiltrated ciphertext becomes doubly useless.",
 ], body_size=13)
+
+# ════════════════ kmod2 DIAGRAMS ════════════════
+slide = prs.slides.add_slide(prs.slide_layouts[6]); set_slide_bg(slide, BG_DARK)
+ln = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(1.2), Inches(3.55), Inches(2), Pt(4))
+ln.fill.solid(); ln.fill.fore_color.rgb = ACCENT; ln.line.fill.background()
+tb = add_textbox(slide, Inches(1.2), Inches(2.4), Inches(7.8), Inches(1.2))
+set_text(tb.text_frame, "kmod2 in diagrams", size=40, color=WHITE, bold=True)
+tb = add_textbox(slide, Inches(1.2), Inches(3.8), Inches(8.2), Inches(1.0))
+set_text(tb.text_frame, "Layered architecture · Decrypt read path · Decrypt gate · On-disk container",
+         size=18, color=GRAY)
+
+# Fig 1 · layered architecture
+slide = diagram_title(prs, "Fig 1 · kmod2 layered architecture (decrypting kernel FS)",
+    "Read: passes through antirevfs and is decrypted on the fly; Write: lands in the overlay upper, never touches the lower ciphertext")
+dbox(slide, 0.45, 1.15, 5.4, 0.9, "1. App · glibc · ld.so · Python",
+     "Sees: real paths + plaintext (identical to unencrypted)", border=GREEN, tcolor=GREEN)
+darrow(slide, 3.0, 2.08, 0.3, 0.3); dlabel(slide, 3.4, 2.08, 1.9, "read down: decrypt", ACCENT2)
+dbox(slide, 0.45, 2.45, 5.4, 1.45, "2. antirevfs mount (real install path)",
+     "read_folio decrypts on read\nkernel page cache shared across processes · real /proc paths\nno memfd · no daemon · no LD_PRELOAD",
+     border=ACCENT, tcolor=ACCENT)
+darrow(slide, 3.0, 3.95, 0.3, 0.3); dlabel(slide, 3.4, 3.95, 2.0, "write down: overlay", ORANGE)
+dbox(slide, 0.45, 4.3, 5.4, 0.8, "3. overlay writable upper",
+     "Runtime writes (lock / log / pid) land here, never touch ciphertext", border=ORANGE, tcolor=ORANGE)
+darrow(slide, 3.0, 5.15, 0.3, 0.3)
+dbox(slide, 0.45, 5.5, 5.4, 1.2, "4. lower .enc/ ciphertext tree (on disk)",
+     "ANTREV01 container: magic+iv+tag+ct+key+magic\n(key embedded per file)", border=RED, tcolor=RED)
+dbox(slide, 6.1, 1.15, 3.5, 1.7, "Decrypt gate (gate.c)",
+     "Authorized process -> plaintext (shared cache)\ncp / backup / file manager -> key-stripped cipher or EACCES\nexec-load by program's own path; data read by caller identity",
+     border=ORANGE, tcolor=ORANGE, tsize=12, bsize=10)
+dbox(slide, 6.1, 3.0, 3.5, 1.35, "Why it's simpler",
+     "Native symbol resolution, no LD_PRELOAD\nno daemon, no memfd fingerprint\ndep-order / protobuf problems vanish",
+     border=GREEN, tcolor=GREEN, tsize=12, bsize=10)
+dbox(slide, 6.1, 4.5, 3.5, 2.0, "Threat-model tradeoff",
+     "Key embedded per file -> raw .enc/ copy is decryptable\nProtection: gate strips key + namespace isolation\nFactory TPM-seal the key as backstop",
+     border=RED, tcolor=RED, tsize=12, bsize=10)
+
+# Fig 2 · decrypt read path
+slide = diagram_title(prs, "Fig 2 · Decrypt read path: read_folio decrypts on read",
+    "First fault decrypts the whole file once (GCM) and verifies the tag, then serves pages from the cache; per-page random decrypt is impossible")
+_steps = [
+    ("1. read / fault", "app reads a file\nunder the mount\n-> page fault", ACCENT),
+    ("2. read_folio", "kernel enters\ndecrypt on read", ACCENT2),
+    ("3. get key", "read embedded key\nfrom file trailer\n(zeroed after use)", ORANGE),
+    ("4. GCM decrypt", "whole file once\ndecrypt + verify tag", GREEN),
+    ("5. page cache", "into per-inode buffer\n-> kernel page cache", ACCENT2),
+    ("6. serve plaintext", "serve pages\nshared cross-process", GREEN),
+]
+_bx, _bw, _gap, _by, _bh = 0.35, 1.42, 0.16, 2.5, 1.95
+for _i, (_t, _b, _c) in enumerate(_steps):
+    _x = _bx + _i * (_bw + _gap)
+    dbox(slide, _x, _by, _bw, _bh, _t, _b, border=_c, tcolor=_c, tsize=12, bsize=10)
+    if _i < len(_steps) - 1:
+        darrow(slide, _x + _bw + 0.01, _by + _bh / 2 - 0.11, _gap - 0.02, 0.22,
+               color=GRAY, shape=MSO_SHAPE.RIGHT_ARROW)
+dbox(slide, 0.35, 4.75, 9.27, 1.55, "Unauthorized reader (gate denies)",
+     "Skips decrypt -> returns the cipher minus the 40B key trailer (cat sees ANTREV01 magic; objdump can't parse it).\n"
+     "GCM authenticates the whole message, so per-page random decrypt is impossible: first fault decrypts the whole file, tag verified once.",
+     border=RED, tcolor=RED, tsize=13, bsize=11)
+
+# Fig 3 · decrypt gate decision
+slide = diagram_title(prs, "Fig 3 · Decrypt gate: per-process authorization (encrypted files only)",
+    "exec-load is authorized by the PROGRAM'S OWN path; everything else (lib load / cp / source) by the caller's current->mm->exe_file")
+dbox(slide, 3.1, 1.05, 3.8, 0.55, "open an encrypted file (ANTREV01) under the mount", border=ACCENT, tsize=12)
+darrow(slide, 4.85, 1.62, 0.3, 0.26)
+dbox(slide, 4.0, 1.92, 2.0, 0.92, "exec-load ?", border=ACCENT2, tcolor=WHITE,
+     tsize=13, shape=MSO_SHAPE.DIAMOND)
+dconnect(slide, 4.0, 2.38, 2.05, 3.1); dlabel(slide, 2.3, 2.42, 1.6, "yes · exec", ACCENT2, 10, True)
+dbox(slide, 1.0, 3.1, 2.1, 0.95, "program itself\nwhitelisted ?", border=ACCENT2, tcolor=WHITE,
+     tsize=12, shape=MSO_SHAPE.DIAMOND)
+dconnect(slide, 1.55, 4.05, 1.15, 4.45); dlabel(slide, 0.2, 4.1, 1.0, "yes", GREEN, 10, True)
+dbox(slide, 0.35, 4.45, 1.6, 0.6, "OK: exec", border=GREEN, tcolor=GREEN, tsize=12)
+dconnect(slide, 2.55, 4.05, 3.0, 4.45); dlabel(slide, 3.0, 4.1, 1.0, "no", RED, 10, True)
+dbox(slide, 2.15, 4.45, 1.75, 0.6, "EACCES (126)", border=RED, tcolor=RED, tsize=12)
+dconnect(slide, 6.0, 2.38, 7.2, 3.1); dlabel(slide, 6.05, 2.42, 2.0, "no · data read", ACCENT2, 10, True)
+dbox(slide, 6.0, 3.1, 2.4, 0.95, "caller process\nwhitelisted ?", border=ACCENT2, tcolor=WHITE,
+     tsize=12, shape=MSO_SHAPE.DIAMOND)
+dconnect(slide, 6.6, 4.05, 5.7, 4.45); dlabel(slide, 4.95, 4.1, 1.0, "yes", GREEN, 10, True)
+dbox(slide, 4.6, 4.45, 2.05, 0.78, "decrypt -> plaintext\n(shared page cache)", border=GREEN, tcolor=GREEN,
+     tsize=12, bsize=10)
+dconnect(slide, 7.9, 4.05, 8.5, 4.45); dlabel(slide, 8.5, 4.1, 1.0, "no", RED, 10, True)
+dbox(slide, 7.6, 4.45, 2.0, 0.9, "gate_passthrough\n_cipher ?", border=ACCENT2, tcolor=WHITE,
+     tsize=11, shape=MSO_SHAPE.DIAMOND)
+dconnect(slide, 8.2, 5.35, 7.75, 5.7); dlabel(slide, 6.75, 5.42, 1.0, "yes", ORANGE, 10, True)
+dbox(slide, 6.9, 5.7, 1.7, 0.55, "key-stripped cipher", border=ORANGE, tcolor=ORANGE, tsize=10)
+dconnect(slide, 9.0, 5.35, 9.2, 5.7); dlabel(slide, 8.7, 5.42, 0.8, "no", RED, 10, True)
+dbox(slide, 8.65, 5.7, 1.1, 0.55, "EACCES", border=RED, tcolor=RED, tsize=11)
+
+# Fig 4 · on-disk container format
+slide = diagram_title(prs, "Fig 4 · On-disk container: embedded-key trailer (no mount key)",
+    "Authorized reader: kernel reads the trailer key and decrypts on the fly (stack copy zeroed after use); unauthorized reader: the 40B trailer is stripped")
+_segs = [("ANTREV01\n8B", 1.1, ACCENT), ("IV\n12B", 1.0, ACCENT2),
+         ("TAG\n16B", 1.2, ORANGE), ("ciphertext ct\n(plaintext, GCM)", 3.0, GREEN),
+         ("KEY\n32B", 1.5, RED), ("ANTREV01\n8B", 1.1, ACCENT)]
+_sx, _sy, _sh = 0.55, 2.7, 1.05
+_xs = []; _cx = _sx
+for (_t, _w, _c) in _segs:
+    _xs.append((_cx, _w, _c, _t)); _cx += _w
+for (_x, _w, _c, _t) in _xs:
+    dbox(slide, _x, _sy, _w, _sh, _t, border=_c, tcolor=_c, tsize=11)
+dlabel(slide, _xs[0][0], 2.28, (_xs[2][0] + _xs[2][1]) - _xs[0][0],
+       "HDR = 36B (magic+iv+tag)", ACCENT2, 11, True)
+dlabel(slide, _xs[3][0], 2.28, _xs[3][1], "plaintext_len = file - 76B", GREEN, 11, True)
+dlabel(slide, _xs[4][0], 2.28, (_xs[5][0] + _xs[5][1]) - _xs[4][0],
+       "TRAILER = 40B (key+magic)", RED, 11, True)
+dlabel(slide, _xs[4][0], _sy + _sh + 0.05, (_xs[5][0] + _xs[5][1]) - _xs[4][0],
+       "unauthorized reader -> drop this 40B -> keyless container", RED, 10.5, True)
+dbox(slide, 0.55, 4.55, 9.05, 1.75, "Key points",
+     "Key travels with the file: a raw .enc/ copy is decryptable -> requires namespace isolation + factory TPM-seal as backstop.\n"
+     "Authorized reader: reads the trailer key and decrypts on the fly.\n"
+     "Unauthorized reader: the 40B trailer is stripped; cp / vim / objdump only get a useless keyless container (objdump: format not recognized).",
+     border=ACCENT, tcolor=ACCENT, tsize=13, bsize=11)
 
 # ════════════════ SECTION 2: CI BUILD OUTPUT ════════════════
 section_slide(prs, 2, "After the CI build",
@@ -295,92 +498,32 @@ content_slide(prs, "Release pipeline — two stages (both designs)", [
     "Stage A is ordinary CI (build once, sign, archive). Stage B is the controlled, key-bearing step that should run in a protected release environment. The key is the only secret; everything else is reproducible from source.",
 ], body_size=14)
 
-two_col_slide(prs, "After CI: what the package looks like",
-    "Current  (memfd + daemon)",
+table_slide(prs, "After CI: what the package looks like",
+    ["Aspect", "memfd + daemon  (current)", "kmod2  (antirevfs)"],
     [
-        "NEW files added to the tree:",
-        "  • lrxd-x86_64 / lrxd-aarch64  (decrypt daemon)",
-        "  • antirev_shim_<arch>.so  (one per arch)",
-        "  • launch/start scripts that set LD_PRELOAD",
-        "",
-        "MODIFIED (replaced in place):",
-        "  • every protected .exe → stub launcher +",
-        "    embedded ciphertext + key trailer",
-        "  • every encrypted .so → keyless ciphertext",
-        "  • Python that loads encrypted .so → uses",
-        "    antirev_client",
-        "",
-        "KEPT SEPARATE / SECRET:",
-        "  • the 64-hex-char key file (0600), or the",
-        "    TPM-sealed key on the unit",
-        "",
-        "3rd-party libs (libprotobuf, Boost…): untouched",
-    ],
-    "kmod2  (antirevfs)",
-    [
-        "NEW files added:",
-        "  • antirevfs.ko  (signed kernel module)",
-        "  • mount tools: antirev-mount,",
-        "    antirev-mount-rw, antirev-remount-proj.sh",
-        "  • .enc/ ciphertext lower tree (mirrors bin/lib)",
-        "  • antirev-fs-manifest.json  (what was encrypted)",
-        "  • /etc/authorized_apps.txt  (gate allow-list)",
-        "  • boot wrapper / systemd unit to mount it",
-        "",
-        "MODIFIED:",
-        "  • business binaries are NOT modified —",
-        "    the original install path becomes a MOUNT",
-        "    POINT over the .enc/ tree",
-        "",
-        "KEY: embedded inside each .enc/ file",
-        "  (no separate key file to ship)",
-        "",
-        "3rd-party / preloaded libs: left plaintext in tree",
-    ], body_size=12)
+        ["New binaries", "lrxd-<arch> daemon, antirev_shim_<arch>.so, LD_PRELOAD launch scripts", "antirevfs.ko (signed), mount tools, boot/systemd mount unit"],
+        ["New data files", "—", ".enc/ ciphertext tree, manifest.json, proj-pack.yaml, /etc/authorized_apps.txt"],
+        ["Modified", "Every exe → stub+ciphertext+key; every .so → keyless ciphertext", "None — install path becomes a MOUNT POINT over .enc/"],
+        ["Python loaders", "Use antirev_client to load encrypted .so", "Unchanged — load natively through the mount"],
+        ["Key artifact", "Separate 64-hex key file (0600) / TPM-sealed", "Embedded per file — no separate key to ship"],
+        ["3rd-party libs", "Untouched (coexist plaintext)", "Left plaintext in the tree (blacklisted)"],
+    ], col_widths=COLW, font=11)
 
 # ════════════════ SECTION 3: RUNTIME ════════════════
 section_slide(prs, 3, "At runtime",
               "What the install directory and the running processes look like")
 
-two_col_slide(prs, "Runtime footprint on the box",
-    "Current  (memfd + daemon)",
+table_slide(prs, "Runtime footprint on the box",
+    ["Aspect", "memfd + daemon  (current)", "kmod2  (antirevfs)"],
     [
-        "ON DISK (install dir):",
-        "  • stub-wrapped exes + keyless encrypted .so",
-        "  • lrxd daemon binary",
-        "  → looks like normal files; contents ciphertext",
-        "",
-        "RUNNING PROCESSES:",
-        "  • one extra long-lived process: lrxd daemon",
-        "  • each app process carries LD_PRELOAD shims",
-        "",
-        "PROCESS / FS ARTIFACTS (observable):",
-        "  • /proc/<pid>/exe → memfd:<random> (deleted)",
-        "  • /proc/<pid>/maps → memfd entries, no real",
-        "    library paths",
-        "  • abstract Unix socket (daemon)",
-        "  • /tmp/antirev_<pid>_XXXX symlink dirs",
-        "  • each lib held open as a memory fd",
-    ],
-    "kmod2  (antirevfs)",
-    [
-        "ON DISK:",
-        "  • .enc/ ciphertext lower tree (hidden)",
-        "  • install path = a MOUNT POINT showing",
-        "    decrypted files at real paths",
-        "",
-        "RUNNING PROCESSES:",
-        "  • NO extra daemon process",
-        "  • apps run unmodified, no injected libs",
-        "",
-        "KERNEL / FS ARTIFACTS:",
-        "  • lsmod shows 'antirevfs' module loaded",
-        "  • mount list shows antirevfs (+ overlay for",
-        "    writable bin/lib)",
-        "  • /proc/<pid>/maps → REAL paths (no memfd)",
-        "  • page cache shared across processes for free",
-        "  • kernel gate enforces who may decrypt",
-    ], body_size=12)
+        ["On disk", "Stub-wrapped exes + keyless ciphertext libs + lrxd daemon", ".enc/ lower tree (hidden) + mount point showing real paths"],
+        ["Extra process", "One long-lived lrxd daemon", "None"],
+        ["Injected libs", "LD_PRELOAD shims in every process", "None — apps run unmodified"],
+        ["/proc/<pid>/exe", "memfd:<random> (deleted)", "Real path"],
+        ["/proc maps", "memfd entries, no library paths", "Real library paths"],
+        ["Other artifacts", "Abstract Unix socket, /tmp/antirev_* symlink dirs, open memfds", "lsmod antirevfs, mount entries, shared page cache, kernel gate"],
+        ["Writable bin/lib", "Normal files", "Overlay upper stacked over read-only antirevfs"],
+    ], col_widths=COLW, font=11)
 
 content_slide(prs, "Runtime: the writable-view detail (kmod2)", [
     "##The mount is read-only by design",
@@ -393,50 +536,73 @@ content_slide(prs, "Runtime: the writable-view detail (kmod2)", [
     "A normal-looking bin/ and lib/ that the app reads and writes as usual — while the real bytes on disk stay encrypted, and only authorized processes can pull plaintext through the mount.",
 ], body_size=14)
 
+# ── Developer self-verification scenario ────────────────────────────
+table_slide(prs, "Developer self-test: impact of building a new binary",
+    ["Aspect", "memfd + daemon  (current)", "kmod2  (antirevfs)"],
+    [
+        ["To test a new binary", "Pack first (encrypt + wrap stub) → start daemon → run", "Encrypt into .enc/ → mount → run (or develop plaintext, encrypt once to verify)"],
+        ["Same as compiled?", "Re-wrapped — not byte-identical; process model changes", "Byte-identical once decrypted — fully transparent"],
+        ["Debugging (gdb/core)", "Hard — /proc shows memfd, readlink spoofed, symbols hidden, core points at memfd", "Easy — real paths, native symbols, gdb/core dumps work"],
+        ["Protection-only bugs", "A class appears only when protected (symbol order, protobuf dedup, implicit deps / NO_PRELOAD)", "Essentially none — native loading, plaintext == encrypted behavior"],
+        ["Privileges", "Userspace — no root needed", "Root (insmod + mount); dev can set gate_enforce=0"],
+        ["Iteration loop", "Edit → re-pack → restart daemon → run", "Edit → re-encrypt that file → remount → run"],
+        ["Adding a dependency", "Update needed-libs metadata / re-pack the exe", "None — native DT_NEEDED resolution"],
+        ["Gate impact on dev", "No gate concept", "If gate on, allow-list shell/interpreter/gdb by basename"],
+        ["Self-test in CI", "Pure userspace — runs on a plain runner", "Needs privileged container / kernel module — heavier CI"],
+        ["Encryption visible to dev?", "High — wrapping / daemon / memfd artifacts all show", "Low — real paths; looks like an ordinary directory"],
+    ], col_widths=(Inches(1.95), Inches(3.7), Inches(3.75)), font=10)
+
+content_slide(prs, "Developer self-test: verifying without revealing encryption", [
+    "##The need: a dev edits their own exe/.so, drops it on the FS to verify — and other developers must NOT notice the package is encrypted",
+    "",
+    "##Shared baseline (both designs): devs develop & self-test on the plaintext tree",
+    "Encryption happens only at the CI pack step (Stage B). Developers build, run and debug on the unencrypted source/build tree — identical to an unprotected system, so encryption is invisible. This is the default and answers most self-test needs.",
+    "",
+    "##When the change must run INSIDE the protected package, the two diverge sharply:",
+    "kmod2: real paths, transparent — drop the self-built binary into the writable overlay (lands as plaintext) and it coexists with the decrypted libs at real paths. The dev sees an ordinary directory: no memfd, no daemon, no LD_PRELOAD — encryption is imperceptible.",
+    "  Caveat: with the gate on, a non-whitelisted self-built binary reading encrypted libs gets EACCES (looks like a plain permission error — which can itself raise suspicion) → use gate_enforce=0 on dev boxes, or whitelist its basename temporarily.",
+    "memfd + daemon: to use the encrypted libs the self-built binary must launch via the protected start script (LD_PRELOAD + daemon socket); and the stub wrapping, lrxd daemon and memfd artifacts are all exposed → hard to hide encryption from the dev. In practice devs verify on the plaintext tree; the protected form is verified by CI / a dedicated team.",
+    "",
+    "##Bottom line",
+    "'Keep encryption imperceptible to developers' is met natively by kmod2 at the FS layer (transparent, real paths); memfd + daemon, whose machinery is externally visible, can essentially only achieve it by 'devs only ever touch the plaintext tree'.",
+], body_size=13)
+
+content_slide(prs, "How each keeps encryption imperceptible: two recipes", [
+    "##kmod2 recipe (protected state is itself transparent — just configure it)",
+    "Mount the package as antirevfs + overlay-rw + passdata at the real install path; gate_enforce=0 on dev boxes.",
+    "Self-replace: cp the self-built binary into the mount → lands in the overlay upper (plaintext, served verbatim, ungated); a same-named file shadows the decrypted lower lib, so the dev's version takes effect immediately.",
+    "Self-verify: launch normally — real paths, no memfd / no daemon / no LD_PRELOAD, behavior == plaintext.",
+    "",
+    "##memfd + daemon recipe (machinery is visible — keep the dev on the plaintext plane)",
+    "Main path: devs replace + verify only on the unencrypted build tree — no encryption in their world, so imperceptible; encryption happens only at CI Stage B, the protected form verified by CI / a dedicated team.",
+    "Cost: misses 'works plaintext, breaks encrypted' bugs (symbol order / protobuf / implicit deps / NO_PRELOAD) — CI must catch them.",
+    "If it must run protected: a wrapper script hides the LD_PRELOAD / daemon-socket env → hides the commands, but /proc memfd and ps lrxd stay visible; and a plaintext same-name replacement is shadowed by the daemon's symlink dir.",
+], body_size=13)
+
+table_slide(prs, "Imperceptible encryption: the two designs",
+    ["Aspect", "memfd + daemon  (current)", "kmod2  (antirevfs)"],
+    [
+        ["Where it hides", "Can't hide runtime — keep the dev on the plaintext tree", "In the kernel read path — protected state is itself transparent"],
+        ["Self-replace", "cp on plaintext tree; a same-name encrypted lib is shadowed by the daemon", "cp into mount → overlay upper plaintext; same name auto-shadows, instant"],
+        ["Self-verify scope", "Functional only; protection-only bugs need CI / a team", "Verify directly on real paths; behavior == plaintext"],
+        ["Required step", "Wrapper script to hide env (still can't hide memfd / daemon)", "gate_enforce=0 on dev boxes (or basename whitelist)"],
+        ["Residual exposure", "/proc memfd, ps lrxd, LD_PRELOAD all show", "Only lsmod / mount reveal the module; normal workflow imperceptible"],
+    ], col_widths=COLW, font=11)
+
 # ════════════════ SECTION 4: PARTIAL UPGRADE ════════════════
 section_slide(prs, 4, "Partial upgrade",
               "Replacing / adding only some libraries in the field")
 
-two_col_slide(prs, "Partial upgrade — what changes & what the technician does",
-    "Current  (memfd + daemon)",
+table_slide(prs, "Partial upgrade — replacing / adding some libraries",
+    ["Step", "memfd + daemon  (current)", "kmod2  (antirevfs)"],
     [
-        "MUST reuse the SAME deployment key.",
-        "All libs + exes + daemon share ONE key, and the",
-        "daemon's socket identity is derived from it.",
-        "",
-        "Technician steps:",
-        "  1. Re-encrypt the changed/new .so with the",
-        "     existing key (antirev-pack / encrypt-lib)",
-        "  2. Drop the new ciphertext libs into the tree",
-        "  3. If a NEW dependency edge was added, re-pack",
-        "     the affected exe (needed-libs list changes)",
-        "  4. Restart the lrxd daemon so it re-scans &",
-        "     re-decrypts the new libs",
-        "",
-        "Key preservation:",
-        "  • Keep the original key file (or unseal from",
-        "    TPM). A wrong/new key breaks the whole set.",
-    ],
-    "kmod2  (antirevfs)",
-    [
-        "Each file carries its OWN key, so a new lib does",
-        "NOT have to match a global key — but in practice",
-        "use the same project keyfile for consistency.",
-        "",
-        "Technician steps:",
-        "  1. Re-encrypt the changed/new ELF into .enc/",
-        "     (antirev-fs-pack, embedded-key form)",
-        "  2. Swap the file(s) in the .enc/ lower tree",
-        "  3. REMOUNT that tree — antirevfs caches the",
-        "     encrypted-vs-plaintext decision per file at",
-        "     first lookup; without a remount the stale",
-        "     classification persists and reads fail",
-        "",
-        "Key preservation:",
-        "  • Keep proj.key.hex to add matching files;",
-        "    the existing files already embed their keys",
-        "  • No daemon to restart",
-    ], body_size=12)
+        ["Key requirement", "MUST reuse the one deployment key (all files + daemon share it)", "Files self-describe their key; reuse project key for consistency"],
+        ["Re-encrypt", "Changed/new .so with the existing key", "Changed/new ELF into .enc/ (embedded-key form)"],
+        ["Place files", "Drop ciphertext libs into the tree", "Swap the file(s) in the .enc/ lower tree"],
+        ["New dep edge", "Re-pack the affected exe (needed-libs list changes)", "Not needed — native resolution"],
+        ["Activate", "Restart the lrxd daemon (re-scan & re-decrypt)", "REMOUNT the tree (classification cached per file)"],
+        ["Gotcha", "Daemon must be restarted", "Needs a quiet stack — mapped libs pin the module"],
+    ], col_widths=COLW, font=11)
 
 content_slide(prs, "Partial upgrade — key takeaways for release planning", [
     "##The key is the one artifact that MUST survive every upgrade",
@@ -455,41 +621,17 @@ content_slide(prs, "Partial upgrade — key takeaways for release planning", [
 section_slide(prs, 5, "Full upgrade",
               "Replacing the entire protected software set")
 
-two_col_slide(prs, "Full upgrade — technician process",
-    "Current  (memfd + daemon)",
+table_slide(prs, "Full upgrade — replacing the entire protected set",
+    ["Step", "memfd + daemon  (current)", "kmod2  (antirevfs)"],
     [
-        "1. Stop the business stack and the lrxd daemon",
-        "2. Decide on key:",
-        "   • keep existing key → drop-in replacement",
-        "   • rotate key → everything re-packed together",
-        "     (exes + libs + daemon) so they stay",
-        "     consistent; re-seal the new key in TPM",
-        "3. Deploy the new packed tree (exes, libs,",
-        "   daemon, shims, scripts) in one shot",
-        "4. Start daemon, then the stack",
-        "",
-        "No kernel dependency — pure userspace swap.",
-        "",
-        "Rollback: keep the previous packed tree +",
-        "its key; swap back and restart.",
-    ],
-    "kmod2  (antirevfs)",
-    [
-        "1. Stop the business stack (mapped .so pin the",
-        "   module; the stack must be quiet to unmount)",
-        "2. Tear down the mounts (antirev-mount-rw --down)",
-        "3. Replace the .enc/ lower tree with the new",
-        "   packed tree (+ new manifest)",
-        "4. If the kernel changed: DKMS rebuilds /",
-        "   re-signs antirevfs.ko for the new kernel",
-        "5. Re-mount (antirev-remount-proj.sh automates",
-        "   umount→rmmod→insmod→mount), start the stack",
-        "",
-        "Extra dependency: the signed kernel module must",
-        "match the running kernel (Secure Boot signing).",
-        "",
-        "Rollback: keep the previous .enc/ tree; remount.",
-    ], body_size=12)
+        ["Stop", "Business stack + lrxd daemon", "Business stack (mapped .so pin the module)"],
+        ["Tear down", "—", "Bring mounts down (antirev-mount-rw --down)"],
+        ["Key choice", "Keep (drop-in) or rotate (re-pack all together, re-seal TPM)", "Keep or rotate; each file carries its own key"],
+        ["Deploy", "Swap packed tree (exes, libs, daemon, shims, scripts)", "Replace .enc/ lower tree + manifest"],
+        ["Kernel dep.", "None — pure userspace swap", ".ko must match kernel; DKMS rebuild + Secure Boot signing"],
+        ["Activate", "Start daemon, then the stack", "Remount (antirev-remount-proj.sh), start the stack"],
+        ["Rollback", "Keep previous packed tree + key; swap back", "Keep previous .enc/ tree; remount"],
+    ], col_widths=COLW, font=11)
 
 content_slide(prs, "Full upgrade — what release management must own", [
     "##Current design — fully self-contained, no host coupling",
@@ -518,40 +660,23 @@ content_slide(prs, "Threat model (agreed) — keep it in view", [
     "Sophisticated root-on-live-box attacks are genuinely out of scope: the person at the box can't do them, and the person who can isn't at the box.",
 ], body_size=15)
 
-two_col_slide(prs, "Security scorecard against that threat model",
-    "Current  (memfd + daemon)",
+table_slide(prs, "Security scorecard against the threat model",
+    ["Aspect", "memfd + daemon  (current)", "kmod2  (antirevfs)"],
     [
-        "Operator copies lib folder → keyless ciphertext.",
-        "  Strong: key is NOT in the lib files.",
-        "Operator copies an exe → ciphertext + key inside,",
-        "  but bound to the launcher; not a clean binary.",
-        "Plaintext only in RAM memfds; visible memfd",
-        "  artifacts hint 'something is protected'.",
-        "",
-        "Residual: key concentrated in the exe/daemon —",
-        "  hardening = obfuscation + TPM seal.",
-        "Maturity: production-proven at full scale.",
-    ],
-    "kmod2  (antirevfs)",
-    [
-        "Operator copies via the mount → unauthorized",
-        "  reader gets key-stripped ciphertext (useless).",
-        "Operator copies the .enc/ tree directly →",
-        "  DECRYPTABLE (key embedded). MUST be hidden in",
-        "  an isolated mount namespace + access gate.",
-        "No memfd artifact; real paths look ordinary.",
-        "",
-        "Residual: embedded key is the weak point —",
-        "  hardening = wrap/seal the per-file key (TODO).",
-        "Maturity: PoC, validated on real targets.",
-    ], body_size=12)
+        ["Copy lib folder", "Keyless ciphertext — key is NOT in the libs (strong)", "Via mount: key-stripped ciphertext (useless)"],
+        ["Copy raw disk tree", "Keyless ciphertext — safe", ".enc/ is DECRYPTABLE — must hide in mount namespace"],
+        ["Plaintext exposure", "RAM memfds; memfd artifact hints 'protected'", "Kernel page cache; real paths, no artifact"],
+        ["Residual risk", "Key concentrated in exe + daemon binaries", "Embedded per-file key is the weak point"],
+        ["Hardening path", "Obfuscation + TPM seal", "Wrap / TPM-seal the per-file key (TODO)"],
+        ["Maturity", "Production-proven at full scale", "Candidate; prod stack shape now e2e-tested"],
+    ], col_widths=COLW, font=11)
 
 content_slide(prs, "Recommendation & next steps", [
     "##Keep the current memfd+daemon design as the shipping path",
     "It is production-proven, fully userspace (no customer-kernel coupling), and its at-rest posture is strong: the bulk of the deployment (550 libs) is keyless ciphertext.",
     "",
     "##Continue kmod2 as the strategic candidate",
-    "It is dramatically simpler to integrate (no shims, no dependency-ordering workarounds, binaries untouched) and leaves no memfd fingerprint. Its main gap is the embedded key + the kernel-module lifecycle.",
+    "It is dramatically simpler to integrate (no shims, no dependency-ordering workarounds, binaries untouched) and leaves no memfd fingerprint. The real production deployment shape — process-manager stack, access gate, writable views — is now reproduced in automated end-to-end tests (x86-64 and ARM64-under-qemu). Its main gaps are the embedded key + the kernel-module lifecycle.",
     "",
     "##To make kmod2 release-ready, close these:",
     "  1. Harden the embedded key — obfuscate / TPM-seal the per-file trailer so a copied .enc/ tree is also undecryptable",
