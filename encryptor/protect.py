@@ -400,10 +400,11 @@ def cmd_encrypt_patch(args):
     only redirects open() of *.patch paths, so any other name would
     encrypt fine but never be intercepted by the injector."""
     for p_str in args.patches:
-        if not Path(p_str).name.endswith(".patch"):
-            print(f"[antirev] WARNING: {Path(p_str).name} does not end in "
-                  f"'.patch' — the hot-patch shim only redirects open() of "
-                  f"*.patch files, so the injector will NOT pick this up.",
+        nm = Path(p_str).name
+        if not nm.endswith(".pat"):
+            print(f"[antirev] WARNING: {nm} does not end in '.pat' — the "
+                  f"hot-patch shim only redirects open()/fopen() of *.pat "
+                  f"files, so the injector will NOT pick this up.",
                   file=sys.stderr)
 
     lrxd_path    = Path(args.lrxd)

@@ -377,7 +377,7 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 #define OP_BYE          0x03u
 #define OP_LIST         0x04u  /* request: all lib names (no fds) */
 #define OP_GET_CLOSURE  0x05u  /* request: lib + transitive encrypted deps */
-#define OP_GET_PATCH    0x06u  /* request: lazy-decrypt a .patch file by basename */
+#define OP_GET_PATCH    0x06u  /* request: lazy-decrypt a .pat file by basename */
 
 #define OP_BATCH    0x81u
 #define OP_END      0x82u
@@ -403,7 +403,7 @@ static int handle_get_patch(int client, const char *scan_dir,
                             const uint8_t *payload, uint32_t plen);
 
 /* Forward decl — key-split derivation, defined far below near main().
- * handle_get_patch re-derives the real key for each lazy .patch decrypt
+ * handle_get_patch re-derives the real key for each lazy .pat decrypt
  * so patches enjoy the same keysplit binding as the encrypted libs. */
 static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SIZE]);
 
@@ -1431,11 +1431,11 @@ static int decrypt_enc_file(const char *path, const uint8_t *key,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Lazy .patch decrypt (OP_GET_PATCH)                                  */
+/*  Lazy .pat decrypt (OP_GET_PATCH)                                  */
 /*                                                                      */
 /*  Patch files are NOT scanned at startup (collect_enc_paths only      */
 /*  queues .so/.elf).  They are decrypted on demand: lrxd_<arch>.so   */
-/*  intercepts the injector's open() of a .patch path and sends         */
+/*  intercepts the injector's open() of a .pat path and sends         */
 /*  OP_GET_PATCH(basename); the daemon resolves the basename under its   */
 /*  scan dir, re-reads the AES key from its own trailer for this one     */
 /*  decrypt (the startup key was wiped after bind), and replies with a   */
@@ -1528,7 +1528,7 @@ static int handle_get_patch(int client, const char *scan_dir,
 
     /* part1 alone is NOT the AES key.  Run the SAME key-split derivation
      * the daemon used at startup (derive_real_key: part1 + SHA256(lrxd) +
-     * version) so a .patch gets IDENTICAL keysplit protection to the
+     * version) so a .pat gets IDENTICAL keysplit protection to the
      * encrypted libs — it can't be decrypted with the trailer part1 alone
      * (part1 is plaintext in every protected binary).  Re-derive per
      * request (re-hash lrxd + re-run the version script); patches are rare
@@ -2627,7 +2627,7 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
 
     build_and_log_deps_graph(lib_fds, lib_names, *nlibs);
 
-    /* The scan dir is where lazy .patch decrypts (OP_GET_PATCH) resolve
+    /* The scan dir is where lazy .pat decrypts (OP_GET_PATCH) resolve
      * basenames, and where the discovery file is published. */
     char scan_dir[4096];
     exe_dir(real_exe, scan_dir, sizeof(scan_dir));

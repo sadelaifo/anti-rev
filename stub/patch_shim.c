@@ -4,7 +4,7 @@
  *  blend in next to the lrxd daemon binary.)
  *
  * Loaded via LD_PRELOAD into an *unprotected* host tool (a live-patch
- * injector).  When that tool open()s an encrypted ".patch" file from
+ * injector).  When that tool open()s an encrypted ".pat" file from
  * disk, this shim transparently hands it the *decrypted* bytes instead,
  * fetched as a memfd from the antirev lib daemon.  The injector calls
  * plain open() and stays completely antirev-blind; all antirev knowledge
@@ -21,12 +21,12 @@
  *     fd (ANTIREV_LIBD_SOCK).  A fresh injector process inherits nothing,
  *     so we connect from scratch: the daemon publishes its (non-secret)
  *     abstract socket name to a discovery file in its scan dir, and we
- *     find it by walking up from the .patch path's directory.
+ *     find it by walking up from the .pat path's directory.
  *
  * Env:
  *   ANTIREV_PATCH_LOG=<path>  line-buffered log of every decision.
  *
- * Limitations (v1): stat()-by-path on a .patch path still returns the
+ * Limitations (v1): stat()-by-path on a .pat path still returns the
  * on-disk ciphertext size; loaders that fstat() the opened fd see the
  * correct plaintext size (memfd) and work.  Relative openat() paths
  * without a directory component are not redirected.
@@ -54,7 +54,6 @@
 
 /* Key-free discovery file the daemon drops in its scan dir. */
 #define DISCOVERY_FILE ".antirev-libd.sock"
-#define PATCH_SUFFIX   ".patch"
 
 static FILE *g_log = NULL;
 #define LOG(...) do { if (g_log) fprintf(g_log, __VA_ARGS__); } while (0)
@@ -63,6 +62,9 @@ static int (*g_real_open)(const char *, int, ...)      = NULL;
 static int (*g_real_open64)(const char *, int, ...)    = NULL;
 static int (*g_real_openat)(int, const char *, int, ...)   = NULL;
 static int (*g_real_openat64)(int, const char *, int, ...) = NULL;
+static FILE *(*g_real_fopen)(const char *, const char *)   = NULL;
+static FILE *(*g_real_fopen64)(const char *, const char *) = NULL;
+static FILE *(*g_real_fdopen)(int, const char *)           = NULL;
 static int g_inited = 0;
 
 static void init_reals(void) {
@@ -72,9 +74,14 @@ static void init_reals(void) {
     g_real_open64   = dlsym(RTLD_NEXT, "open64");
     g_real_openat   = dlsym(RTLD_NEXT, "openat");
     g_real_openat64 = dlsym(RTLD_NEXT, "openat64");
+    g_real_fopen    = dlsym(RTLD_NEXT, "fopen");
+    g_real_fopen64  = dlsym(RTLD_NEXT, "fopen64");
+    g_real_fdopen   = dlsym(RTLD_NEXT, "fdopen");
     const char *lp = getenv("ANTIREV_PATCH_LOG");
-    if (lp) {
-        g_log = fopen(lp, "w");
+    if (lp && g_real_fopen) {
+        /* Use the REAL fopen, not our interposer, to avoid re-entering
+         * this DSO's own fopen() while init is still running. */
+        g_log = g_real_fopen(lp, "w");
         if (g_log) setvbuf(g_log, NULL, _IOLBF, 0);
     }
 }
@@ -108,14 +115,17 @@ static int read_all(int fd, void *buf, size_t len) {
     return 0;
 }
 
-/* True iff `path`'s basename ends in ".patch". */
+/* True iff `path`'s basename ends in ".pat" — the business patch
+ * artifact (an .o-style file). */
+static int has_suffix(const char *base, const char *suf) {
+    size_t bl = strlen(base), sl = strlen(suf);
+    return bl > sl && strcmp(base + bl - sl, suf) == 0;
+}
 static int is_patch_path(const char *path) {
     if (!path) return 0;
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
-    size_t len = strlen(base);
-    size_t slen = sizeof(PATCH_SUFFIX) - 1;
-    return len > slen && strcmp(base + len - slen, PATCH_SUFFIX) == 0;
+    return has_suffix(base, ".pat");
 }
 
 /* Read-only open via the real libc open (never re-enters our interposer). */
@@ -124,7 +134,7 @@ static int real_open_ro(const char *path) {
     return g_real_open(path, O_RDONLY);
 }
 
-/* Walk up from the .patch path's directory looking for the discovery
+/* Walk up from the .pat path's directory looking for the discovery
  * file; on success copy the abstract socket name into `out`. */
 static int find_discovery(const char *patch_path, char *out, size_t out_sz) {
     char d[4096];
@@ -272,7 +282,7 @@ static int fetch_patch(const char *path, int flags) {
     return fd;
 }
 
-/* Only redirect read-only opens of a .patch path; everything else, and
+/* Only redirect read-only opens of a .pat path; everything else, and
  * any fetch miss, falls through to the real call. */
 static int should_redirect(const char *path, int flags) {
     return is_patch_path(path) && !(flags & (O_WRONLY | O_RDWR | O_CREAT));
@@ -338,4 +348,41 @@ int openat64(int dirfd, const char *path, int flags, ...) {
     }
     if (!g_real_openat64) { errno = ENOSYS; return -1; }
     return g_real_openat64(dirfd, path, flags, mode);
+}
+
+/* stdio entry points.  glibc's fopen/fopen64 open the underlying file via
+ * a PRIVATE internal open that does NOT go through the PLT, so our
+ * open()/open64() interposers never see it — a business loader that opens
+ * the .pat with fopen64() would bypass the redirect entirely unless we
+ * hook the stdio functions directly.  Only read-only modes are redirected
+ * ("r"/"rb", no "+"/"w"/"a"); on a hit we fetch the decrypted memfd and
+ * wrap it with the REAL fdopen so the caller gets a FILE* over plaintext. */
+static int should_redirect_stream(const char *path, const char *mode) {
+    return is_patch_path(path) && mode && mode[0] == 'r' && !strchr(mode, '+');
+}
+
+static FILE *patch_fopen_common(const char *path, const char *mode,
+                                FILE *(*real)(const char *, const char *)) {
+    if (real && g_real_fdopen && should_redirect_stream(path, mode)) {
+        int fd = fetch_patch(path, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            FILE *f = g_real_fdopen(fd, mode);
+            if (f) { LOG("fopen %s: OK (memfd via fdopen)\n", path); return f; }
+            close(fd);
+        }
+    }
+    if (!real) { errno = ENOSYS; return NULL; }
+    return real(path, mode);
+}
+
+__attribute__((visibility("default")))
+FILE *fopen(const char *path, const char *mode) {
+    init_reals();
+    return patch_fopen_common(path, mode, g_real_fopen);
+}
+
+__attribute__((visibility("default")))
+FILE *fopen64(const char *path, const char *mode) {
+    init_reals();
+    return patch_fopen_common(path, mode, g_real_fopen64);
 }
