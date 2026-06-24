@@ -134,8 +134,45 @@ static int real_open_ro(const char *path) {
     return g_real_open(path, O_RDONLY);
 }
 
-/* Walk up from the .pat path's directory looking for the discovery
- * file; on success copy the abstract socket name into `out`. */
+/* Read the single-line abstract socket name from the discovery file at
+ * `disc_path`.  Returns 1 and copies the name into `out` on success. */
+static int read_discovery_file(const char *disc_path, char *out, size_t out_sz) {
+    int fd = real_open_ro(disc_path);
+    if (fd < 0) return 0;
+    char buf[200];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = '\0';
+    if (!buf[0]) return 0;
+    snprintf(out, out_sz, "%s", buf);
+    return 1;
+}
+
+/* The keysplit deployment hardcodes the daemon at $HOME/SA/bin/sa/lrxd
+ * (see stub.c derive_real_key / ks_lrxd_path), so it always drops its
+ * discovery file at $HOME/SA/bin/sa/.antirev-libd.sock.  Try that fixed,
+ * deployment-defined location first — it works no matter where the .pat
+ * lives, so no symlink or extra env var is needed (this IS the deploy
+ * convention).  Falls back to walking up from the .pat dir below. */
+static int find_discovery_fixed(char *out, size_t out_sz) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return 0;
+    char disc[4096];
+    snprintf(disc, sizeof(disc), "%s/SA/bin/sa/%s", home, DISCOVERY_FILE);
+    if (read_discovery_file(disc, out, out_sz)) {
+        LOG("discovery (fixed): %s\n", disc);
+        return 1;
+    }
+    return 0;
+}
+
+/* Walk up from the .pat path's directory looking for the discovery file;
+ * on success copy the abstract socket name into `out`.  Fallback for the
+ * standalone-injector layout where the .pat sits inside the daemon's
+ * scan tree. */
 static int find_discovery(const char *patch_path, char *out, size_t out_sz) {
     char d[4096];
     snprintf(d, sizeof(d), "%s", patch_path);
@@ -147,21 +184,8 @@ static int find_discovery(const char *patch_path, char *out, size_t out_sz) {
     for (int i = 0; i < 16; i++) {
         char p[4096];
         snprintf(p, sizeof(p), "%s/%s", d, DISCOVERY_FILE);
-        int fd = real_open_ro(p);
-        if (fd >= 0) {
-            char buf[200];
-            ssize_t n = read(fd, buf, sizeof(buf) - 1);
-            close(fd);
-            if (n > 0) {
-                buf[n] = '\0';
-                char *nl = strchr(buf, '\n');
-                if (nl) *nl = '\0';
-                if (buf[0]) {
-                    snprintf(out, out_sz, "%s", buf);
-                    return 1;
-                }
-            }
-        }
+        if (read_discovery_file(p, out, out_sz))
+            return 1;
         if (d[0] == '/' && d[1] == '\0') break;   /* reached root */
         char *s = strrchr(d, '/');
         if (!s) break;
@@ -261,7 +285,10 @@ static int recv_lib_fd(int sd) {
 /* Full fetch: discover daemon → connect → request → receive memfd. */
 static int fetch_patch(const char *path, int flags) {
     char sock_name[200];
-    if (!find_discovery(path, sock_name, sizeof(sock_name))) {
+    /* Prefer the fixed keysplit deployment location ($HOME/SA/bin/sa);
+     * fall back to walking up from the .pat directory (standalone layout). */
+    if (!find_discovery_fixed(sock_name, sizeof(sock_name)) &&
+        !find_discovery(path, sock_name, sizeof(sock_name))) {
         LOG("fetch %s: no discovery file\n", path);
         return -1;
     }
