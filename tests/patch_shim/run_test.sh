@@ -34,12 +34,14 @@ python3 "$PROTECT" encrypt-lib \
     --libs "$MYLIB" \
     --output-dir "$TD"
 
-# Encrypt the patch (same key) into the daemon dir. encrypt-lib is a raw
-# file encrypt that preserves the basename; ".patch" is NOT scanned at
-# startup, so it is only ever decrypted lazily via OP_GET_PATCH.
-python3 "$PROTECT" encrypt-lib \
+# Encrypt the patch (same key) into the daemon dir using the dedicated
+# encrypt-patch command (same ANTREV01 container as encrypt-lib; this
+# also exercises encrypt-patch). The basename is preserved; ".patch" is
+# NOT scanned at startup, so it is only ever decrypted lazily via
+# OP_GET_PATCH.
+python3 "$PROTECT" encrypt-patch \
     --key "$TD/test.key" \
-    --libs "$SRC/foo.patch" \
+    --patches "$SRC/foo.patch" \
     --output-dir "$TD"
 
 # Lightweight daemon over the same dir/key.

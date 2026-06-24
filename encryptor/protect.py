@@ -28,6 +28,16 @@ Subcommands:
       protect.py encrypt-lib --key <keyfile> --libs lib1.so [lib2.so ...] \\
                              [--output-dir <dir>]
 
+  encrypt-patch
+      Encrypt hot-patch ".patch" file(s) for the live-patch shim
+      (lrxd_<arch>.so).  Same ANTREV01 container and key handling as
+      encrypt-lib (raw part1 from the key file, NOT a keysplit-derived
+      key); basename is preserved so the daemon resolves it under its
+      scan dir via OP_GET_PATCH.
+
+      protect.py encrypt-patch --key <keyfile> --patches a.patch [b.patch ...] \\
+                               [--output-dir <dir>]
+
 Key file: 32 bytes as 64 hex chars.  Created with a fresh random key if absent.
 """
 from __future__ import annotations
@@ -329,30 +339,59 @@ def cmd_protect_daemon(args):
     print(f"\n[antirev] To run:\n    {out_path}   # starts daemon, exits immediately")
 
 
-# ── Subcommand: encrypt-lib ──────────────────────────────────────────
+# ── Shared whole-file encryptor (encrypt-lib / encrypt-patch) ────────
 
-def cmd_encrypt_lib(args):
-    key_path = Path(args.key)
-    key      = load_or_create_key(key_path)
-    out_dir  = Path(args.output_dir) if args.output_dir else None
+def _encrypt_files(paths, key_path, out_dir, kind="lib"):
+    """Encrypt one or more whole files into the ANTREV01 container
+    (MAGIC + iv + tag + ct), preserving each basename.
 
+    Shared by encrypt-lib and encrypt-patch — IDENTICAL on-disk format
+    and key handling.  The key used is the RAW part1 returned by
+    load_or_create_key (the keyfile value), NOT a keysplit-derived key:
+    that is exactly what the daemon's decrypt paths expect — both the
+    startup .so scan and the lazy .patch decrypt (handle_get_patch →
+    reload_key_from_trailer) read part1 straight out of the trailer."""
+    key     = load_or_create_key(Path(key_path))
+    out_dir = Path(out_dir) if out_dir else None
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    for lib_str in args.libs:
-        lib = Path(lib_str)
-        if not lib.exists():
-            sys.exit(f"[error] library not found: {lib}")
+    for p_str in paths:
+        f = Path(p_str)
+        if not f.exists():
+            sys.exit(f"[error] {kind} not found: {f}")
 
-        data         = lib.read_bytes()
-        iv, tag, ct  = encrypt_data(data, key)
+        data        = f.read_bytes()
+        iv, tag, ct = encrypt_data(data, key)
+        enc_data    = MAGIC + iv + tag + ct
 
-        enc_data = MAGIC + iv + tag + ct
-
-        dest = (out_dir / lib.name) if out_dir else lib
+        dest = (out_dir / f.name) if out_dir else f
         dest.write_bytes(enc_data)
-        print(f"[antirev] Encrypted lib: {lib.name}  "
+        print(f"[antirev] Encrypted {kind}: {f.name}  "
               f"({len(data):,} → {len(enc_data):,} bytes)  → {dest}")
+
+
+# ── Subcommand: encrypt-lib ──────────────────────────────────────────
+
+def cmd_encrypt_lib(args):
+    _encrypt_files(args.libs, args.key, args.output_dir, kind="lib")
+
+
+# ── Subcommand: encrypt-patch ────────────────────────────────────────
+
+def cmd_encrypt_patch(args):
+    """Encrypt hot-patch .patch file(s) for the live-patch shim
+    (lrxd_<arch>.so).  Same container/key as encrypt-lib; the only extra
+    is a basename check — the shim's is_patch_path() only redirects
+    open() of paths ending in ".patch", so a non-".patch" name would
+    encrypt fine but never be intercepted by the injector."""
+    for p_str in args.patches:
+        if not Path(p_str).name.endswith(".patch"):
+            print(f"[antirev] WARNING: {Path(p_str).name} does not end in "
+                  f"'.patch' — the hot-patch shim only redirects open() of "
+                  f"*.patch files, so the injector will NOT pick this up.",
+                  file=sys.stderr)
+    _encrypt_files(args.patches, args.key, args.output_dir, kind="patch")
 
 
 # ── Entry point ──────────────────────────────────────────────────────
@@ -387,6 +426,15 @@ def main():
     el.add_argument("--libs",       required=True, nargs="+", metavar="LIB")
     el.add_argument("--output-dir", default=None,        help="Write encrypted libs here (default: in-place)")
 
+    # encrypt-patch
+    ep = sub.add_parser("encrypt-patch",
+                        help="Encrypt hot-patch .patch file(s) for the live-patch "
+                             "shim (same ANTREV01 container/key as encrypt-lib)")
+    ep.add_argument("--key",        required=True,       help="Key file (hex); created if absent")
+    ep.add_argument("--patches",    required=True, nargs="+", metavar="PATCH",
+                    help="One or more hot-patch files (basename should end in .patch)")
+    ep.add_argument("--output-dir", default=None,        help="Write encrypted patches here (default: in-place)")
+
     args = p.parse_args()
 
     if args.cmd == "protect-exe":
@@ -395,6 +443,8 @@ def main():
         cmd_protect_daemon(args)
     elif args.cmd == "encrypt-lib":
         cmd_encrypt_lib(args)
+    elif args.cmd == "encrypt-patch":
+        cmd_encrypt_patch(args)
 
 
 if __name__ == "__main__":
