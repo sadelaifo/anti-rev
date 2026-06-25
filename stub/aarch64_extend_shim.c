@@ -115,9 +115,12 @@ static int cache_find(const char *base)
     return -1;
 }
 
-/* Ask the daemon for `base` and return the received fd, or -1 on failure.
- * Caller must hold g_lock. */
-static int fetch_one(const char *base)
+/* Ask the daemon for `base` via `opcode` (OP_GET_LIB for encrypted .elf
+ * libs, OP_GET_PATCH for hot-patch .pat) and return the received fd, or
+ * -1 on failure.  Only touches the daemon socket (serialized by the
+ * daemon-client IO lock), not the .elf cache, so the .pat path can call
+ * it without holding g_lock. */
+static int fetch_one_op(uint32_t opcode, const char *base)
 {
     if (daemon_client_sock() < 0) return -1;
     uint16_t nlen = (uint16_t)strlen(base);
@@ -137,7 +140,7 @@ static int fetch_one(const char *base)
      * dlopen_shim::fetch_closure on the same socket can't steal our
      * reply. */
     daemon_client_io_lock();
-    send_ok = (daemon_client_send(DC_OP_GET_LIB, req, (uint32_t)(2 + nlen)) == 0);
+    send_ok = (daemon_client_send(opcode, req, (uint32_t)(2 + nlen)) == 0);
     recv_ok = send_ok && (daemon_client_recv(&op, payload, &plen, sizeof(payload),
                                               fds, &nfds, 1) == 0);
     daemon_client_io_unlock();
@@ -162,6 +165,35 @@ static int fetch_one(const char *base)
         return -1;
     }
     return fds[0];
+}
+
+/* Encrypted .elf libs use OP_GET_LIB. */
+static int fetch_one(const char *base)
+{
+    return fetch_one_op(DC_OP_GET_LIB, base);
+}
+
+/* True iff `path`'s basename ends in ".pat" (the hot-patch artifact). */
+static int is_patch_path(const char *path)
+{
+    if (!path) return 0;
+    const char *b = strrchr(path, '/');
+    b = b ? b + 1 : path;
+    size_t len = strlen(b);
+    return len > 4 && strcmp(b + len - 4, ".pat") == 0;
+}
+
+/* Fetch a FRESH decrypted memfd for a .pat basename via OP_GET_PATCH.
+ * Returns the fd (caller owns it), or -1.  No caching — each open gets its
+ * own memfd (independent file offset), matching lrxd.so.  Lets a protected
+ * aarch64 process apply hot patches WITHOUT a separate lrxd.so: this shim
+ * already hooks open/openat (+ fopen below) and already holds the daemon
+ * connection. */
+static int fetch_patch_fd(const char *path)
+{
+    const char *b = strrchr(path, '/');
+    b = b ? b + 1 : path;
+    return fetch_one_op(DC_OP_GET_PATCH, b);
 }
 
 /* Resolve pgName basename to a stable "/proc/self/fd/N" path string
@@ -506,6 +538,19 @@ int openat(int dirfd, const char *pathname, int flags, ...)
         LOG("openat redirect %s -> %s\n", pathname, redirect);
         return raw_openat(AT_FDCWD, redirect, flags, mode);
     }
+    /* Hot-patch: read-only open of a .pat → fetch the decrypted memfd from
+     * the daemon (OP_GET_PATCH) and return it directly, so a protected
+     * process can apply patches WITHOUT a separate lrxd.so. */
+    if (is_owner_process() && is_patch_path(pathname)
+        && !(flags & (O_WRONLY | O_RDWR | O_CREAT))
+        && (dirfd == AT_FDCWD || pathname[0] == '/')) {
+        int pfd = fetch_patch_fd(pathname);
+        if (pfd >= 0) {
+            LOG("openat .pat %s -> memfd fd=%d\n", pathname, pfd);
+            return pfd;
+        }
+        LOG("openat .pat %s: daemon miss, passthrough\n", pathname);
+    }
     /* Non-.elf: chain to the NEXT openat via RTLD_NEXT instead of a raw
      * syscall, so a later LD_PRELOAD hook (e.g. lrxd's .pat redirect) is
      * NOT bypassed — this makes the LD_PRELOAD order between this shim and
@@ -538,6 +583,48 @@ int open(const char *pathname, int flags, ...)
     return has_mode
         ? openat(AT_FDCWD, pathname, flags, mode)
         : openat(AT_FDCWD, pathname, flags);
+}
+
+/* stdio fopen/fopen64 — glibc opens the underlying file via a PRIVATE
+ * internal open that bypasses the PLT, so our open/openat hooks never see
+ * a fopen64(".pat") (e.g. std::ifstream's backing fopen). Hook the stdio
+ * entry points too, so a protected process reading a .pat via
+ * ifstream/fopen still gets the decrypted memfd — no separate lrxd.so
+ * needed. Read-only modes only; on a hit, wrap the memfd with the real
+ * fdopen. */
+static FILE *(*g_real_fopen)(const char *, const char *)   = NULL;
+static FILE *(*g_real_fopen64)(const char *, const char *) = NULL;
+static FILE *(*g_real_fdopen)(int, const char *)           = NULL;
+
+static FILE *patch_fopen_common(const char *path, const char *mode,
+                                FILE *(*real)(const char *, const char *))
+{
+    if (is_owner_process() && is_patch_path(path)
+        && mode && mode[0] == 'r' && !strchr(mode, '+')) {
+        if (!g_real_fdopen) g_real_fdopen = dlsym(RTLD_NEXT, "fdopen");
+        int pfd = fetch_patch_fd(path);
+        if (pfd >= 0 && g_real_fdopen) {
+            FILE *f = g_real_fdopen(pfd, mode);
+            if (f) { LOG("fopen .pat %s -> memfd fd=%d\n", path, pfd); return f; }
+            close(pfd);
+        }
+    }
+    if (!real) { errno = ENOSYS; return NULL; }
+    return real(path, mode);
+}
+
+__attribute__((visibility("default")))
+FILE *fopen(const char *path, const char *mode)
+{
+    if (!g_real_fopen) g_real_fopen = dlsym(RTLD_NEXT, "fopen");
+    return patch_fopen_common(path, mode, g_real_fopen);
+}
+
+__attribute__((visibility("default")))
+FILE *fopen64(const char *path, const char *mode)
+{
+    if (!g_real_fopen64) g_real_fopen64 = dlsym(RTLD_NEXT, "fopen64");
+    return patch_fopen_common(path, mode, g_real_fopen64);
 }
 
 __attribute__((visibility("default")))
