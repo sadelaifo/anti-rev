@@ -506,7 +506,19 @@ int openat(int dirfd, const char *pathname, int flags, ...)
         LOG("openat redirect %s -> %s\n", pathname, redirect);
         return raw_openat(AT_FDCWD, redirect, flags, mode);
     }
-    return raw_openat(dirfd, pathname, flags, mode);
+    /* Non-.elf: chain to the NEXT openat via RTLD_NEXT instead of a raw
+     * syscall, so a later LD_PRELOAD hook (e.g. lrxd's .pat redirect) is
+     * NOT bypassed — this makes the LD_PRELOAD order between this shim and
+     * lrxd irrelevant for .pat handling.  Unlike the stat family, "openat"
+     * IS a real exported libc symbol, so dlsym never returns NULL here;
+     * the ENOSYS-process-wide bug that forced raw syscalls was specific to
+     * newfstatat/stat/lstat (not exported on glibc>=2.33), and open/openat
+     * were only swept in by association.  Fall back to the raw syscall in
+     * the impossible case dlsym fails, preserving the old behaviour. */
+    static int (*real_openat)(int, const char *, int, ...) = NULL;
+    if (!real_openat) real_openat = dlsym(RTLD_NEXT, "openat");
+    if (real_openat) return real_openat(dirfd, pathname, flags, mode);
+    return raw_openat(dirfd, pathname, flags, mode);  /* fallback */
 }
 
 /* Some glibc builds call open() -> openat(AT_FDCWD, ...) internally,
