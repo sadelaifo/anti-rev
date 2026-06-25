@@ -41,10 +41,12 @@ Config format:
       - *.conf                         # copy by pattern
 
     patch_shim:                        # optional: hot-patch shim (lrxd_<arch>.so),
-      x86_64:  ../build/lrxd_x86_64.so #   built by cmake (not generated here).  pack
-      aarch64: ../build/lrxd_aarch64.so#   copies each into output_dir for the business
-    patch_shim_dest: bin/sa            #   launcher to LD_PRELOAD.  dest dir under
-                                       #   output_dir (optional, default: output_dir root)
+      src:  ../build/lrxd_x86_64.so    #   built by cmake. single-arch: src + dest.
+      dest: bin/sa/lrxd_x86_64.so      #   dest is relative to output_dir (incl. filename).
+    # multi-arch form — one {src, dest} per arch:
+    #   patch_shim:
+    #     x86_64:  { src: ../build/lrxd_x86_64.so,  dest: bin/sa/lrxd_x86_64.so }
+    #     aarch64: { src: ../build/lrxd_aarch64.so, dest: bin/sa/lrxd_aarch64.so }
 
 Path fields (install_dir, output_dir, key, stub, stubs.*) expand ~ and
 $VAR / ${VAR} from the environment, e.g. install_dir: $HOME/myapp.
@@ -967,28 +969,35 @@ def main():
         print()
 
     # ── Copy the patch shim (lrxd_<arch>.so) into the output tree ─────
-    # The hot-patch shim is built by cmake (NOT generated here), so the
-    # operator points `patch_shim:` (arch->path, like `stubs:`) at the
-    # build artifacts; pack copies each into output_dir/<patch_shim_dest>
-    # (default: output_dir root).  The business launcher LD_PRELOADs it
-    # from there.
+    # The hot-patch shim is built by cmake (NOT generated here).  Each
+    # entry pairs `src` (build artifact, relative to this config) with
+    # `dest` (path relative to output_dir, INCLUDING the filename).  Two
+    # forms:
+    #   single-arch:  patch_shim: { src: …, dest: … }
+    #   multi-arch:   patch_shim: { x86_64: {src,dest}, aarch64: {src,dest} }
+    # The business launcher LD_PRELOADs it from the deployed dest.
     patch_shim_cfg = cfg.get('patch_shim') or {}
     if patch_shim_cfg:
         if not isinstance(patch_shim_cfg, dict):
-            sys.exit("[error] 'patch_shim' must be an arch->path map (like "
-                     "'stubs'), e.g.  patch_shim: { x86_64: ../build/lrxd_x86_64.so }")
-        dest_dir = (output_dir / _expand(cfg.get('patch_shim_dest', '.'))).resolve()
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        for arch, src in patch_shim_cfg.items():
-            src_p = (config_path.parent / _expand(src)).resolve()
+            sys.exit("[error] 'patch_shim' must be a map: {src, dest} for a single "
+                     "arch, or arch->{src, dest} for multi-arch")
+        # 'src' at the top level → single-arch; otherwise arch->{src,dest}.
+        entries = ([('', patch_shim_cfg)] if 'src' in patch_shim_cfg
+                   else list(patch_shim_cfg.items()))
+        for arch, entry in entries:
+            tag = f" ({arch})" if arch else ""
+            if not isinstance(entry, dict) or 'src' not in entry or 'dest' not in entry:
+                sys.exit(f"[error] patch_shim{tag or ' entry'} must have 'src' and 'dest'")
+            src_p = (config_path.parent / _expand(entry['src'])).resolve()
+            dst_p = (output_dir / _expand(entry['dest'])).resolve()
             if not src_p.exists():
-                print(f"[pack] WARNING: patch_shim for {arch} not found at "
-                      f"{src_p} — skipping", file=sys.stderr)
+                print(f"[pack] WARNING: patch_shim src not found at {src_p}{tag}"
+                      f" — skipping", file=sys.stderr)
                 continue
-            dst_p = dest_dir / src_p.name
+            dst_p.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src_p, dst_p)
             os.chmod(str(dst_p), 0o755)
-            print(f"[pack] Patch shim: {dst_p}  ({arch})")
+            print(f"[pack] Patch shim: {src_p} -> {dst_p}{tag}")
         print()
 
     elapsed = time.monotonic() - t_start
