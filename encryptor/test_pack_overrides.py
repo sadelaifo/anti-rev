@@ -87,7 +87,8 @@ def test_end_to_end_overrides():
             [sys.executable, str(PACK), "--config", str(cfg),
              "--output-dir", str(out_cli),
              "--lrxd", "lrxd_cli",
-             "--version", "9.9-cli"],
+             "--version", "9.9-cli",
+             "--patchelf", "/opt/bin/patchelf_cli"],
             capture_output=True, text=True,
         )
         assert r.returncode == 0, "packer failed:\n" + r.stdout + r.stderr
@@ -104,11 +105,12 @@ def test_end_to_end_overrides():
         assert not (out_cli / "antirev-pack-manifest.json").exists(), \
             "manifest must not be inside output_dir (fingerprint)"
         data = json.loads(man.read_text())
-        # CLI version/lrxd won over the config values
+        # CLI version/lrxd/patchelf won over the config values
         assert data["version"] == "9.9-cli", data
         assert data["lrxd"] == "lrxd_cli", data
-        print("ok: end-to-end CLI overrides config (output_dir/version/lrxd); "
-              "manifest outside output tree")
+        assert data["patchelf"] == "/opt/bin/patchelf_cli", data
+        print("ok: end-to-end CLI overrides config (output_dir/version/lrxd/"
+              "patchelf); manifest outside output tree")
 
 
 if __name__ == "__main__":

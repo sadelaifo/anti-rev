@@ -27,6 +27,7 @@ Config format:
 
     lrxd: lrxd                          # optional: daemon binary base name (default: lrxd)
     version: "1.1.0"                    # optional: package version (recorded in manifest)
+    patchelf: /usr/bin/patchelf         # optional: path to patchelf (default: found on PATH)
 
     encrypt_libs:                      # optional whitelist: only encrypt these libs
       - libsecret.so                   #   all other libs/.elf are copied as plaintext
@@ -43,11 +44,12 @@ Config format:
       - bin/start.sh                   # copy a specific file
       - *.conf                         # copy by pattern
 
-Path fields (install_dir, output_dir, key, stub, stubs.*, lrxd) expand ~ and
-$VAR / ${VAR} from the environment, e.g. install_dir: $HOME/myapp.
+Path fields (install_dir, output_dir, key, stub, stubs.*, lrxd, patchelf)
+expand ~ and $VAR / ${VAR} from the environment, e.g. install_dir: $HOME/myapp.
 
-CLI overrides: --install-dir, --output-dir, --key, --stub, --lrxd, --version
-each take priority over the same field in config.yaml (CLI > config > default).
+CLI overrides: --install-dir, --output-dir, --key, --stub, --lrxd, --version,
+--patchelf each take priority over the same field in config.yaml
+(CLI > config > default).
 A CLI-supplied --key/--stub path is resolved relative to the current working
 directory; the config equivalents stay relative to the config file.
 
@@ -468,8 +470,12 @@ def get_transitive_needed(path: Path, encrypted_names: set[str],
 
 # ── Worker functions (run in child processes) ─────────────────────────
 
-def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
+def _encrypt_lib_worker(src: str, dst: str, key: bytes,
+                        patchelf: str = "patchelf") -> str:
     """Encrypt a single .so file (or .elf PG binary). Returns status string.
+
+    ``patchelf`` is the path to (or name of) the patchelf binary used to
+    inject a DT_SONAME into libs that lack one.
 
     If a .so has no DT_SONAME, patch a copy with patchelf first so that
     glibc can match the LD_PRELOAD'd memfd to DT_NEEDED entries at
@@ -503,12 +509,14 @@ def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
         shutil.copy2(src_p, patched)
         try:
             subprocess.run(
-                ["patchelf", "--set-soname", src_p.name, str(patched)],
+                [patchelf, "--set-soname", src_p.name, str(patched)],
                 check=True, capture_output=True, text=True)
             soname_note = " [patched SONAME]"
         except FileNotFoundError:
-            sys.exit("[error] patchelf not found — required for libs without "
-                     "DT_SONAME. Install it: https://github.com/NixOS/patchelf")
+            sys.exit(f"[error] patchelf not found at '{patchelf}' — required for "
+                     "libs without DT_SONAME. Install it "
+                     "(https://github.com/NixOS/patchelf) or set --patchelf / "
+                     "the 'patchelf' config field to its path.")
         except subprocess.CalledProcessError as e:
             sys.exit(f"[error] patchelf failed on {src_p.name}: {e.stderr}")
 
@@ -598,6 +606,9 @@ def main():
                     help="override config stub/stubs (single stub ELF for all arches)")
     ap.add_argument("--lrxd",
                     help="daemon binary base name (overrides config 'lrxd', default: lrxd)")
+    ap.add_argument("--patchelf",
+                    help="path to the patchelf binary used to inject DT_SONAME "
+                         "(overrides config 'patchelf', default: patchelf)")
     ap.add_argument("--version", dest="pkg_version",
                     help="package version string (overrides config 'version'); "
                          "recorded in the pack manifest and summary")
@@ -648,6 +659,10 @@ def main():
     # Daemon binary base name + package version (CLI > config > default).
     lrxd_name = _expand(_resolve_field(args.lrxd, cfg, 'lrxd', 'lrxd')) or 'lrxd'
     pkg_version = str(_resolve_field(args.pkg_version, cfg, 'version', '') or '').strip()
+    # patchelf binary path (CLI > config > default). Left as a command name
+    # when unset so it is resolved on PATH; env vars / ~ expanded otherwise.
+    patchelf_path = _expand(_resolve_field(args.patchelf, cfg, 'patchelf',
+                                           'patchelf')) or 'patchelf'
 
     # Build arch -> stub mapping.  CLI --stub (CWD-relative) overrides the
     # config stub/stubs entirely; otherwise use config 'stubs' or 'stub'
@@ -823,6 +838,7 @@ def main():
                     str(src),
                     str(output_dir / src.relative_to(install_dir)),
                     key,
+                    patchelf_path,
                 ): src.name
                 for src in lib_files
             }
@@ -952,6 +968,7 @@ def main():
     manifest = {
         'version': pkg_version,
         'lrxd': lrxd_name,
+        'patchelf': patchelf_path,
         'install_dir': str(install_dir),
         'output_dir': str(output_dir),
         'arches': sorted(stubs.keys()),
