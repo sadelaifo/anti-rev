@@ -2627,10 +2627,24 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
 
     build_and_log_deps_graph(lib_fds, lib_names, *nlibs);
 
-    /* The scan dir is where lazy .pat decrypts (OP_GET_PATCH) resolve
-     * basenames, and where the discovery file is published. */
+    /* The discovery file is published next to the daemon binary (exe_dir),
+     * matching where the shim's fixed-path lookup expects it
+     * ($HOME/SA/bin/sa/.antirev-libd.sock). */
     char scan_dir[4096];
     exe_dir(real_exe, scan_dir, sizeof(scan_dir));
+
+    /* But lazy .pat lookup (OP_GET_PATCH) must span the WHOLE install tree
+     * — same root as the lib scan ($HOME/SA) — so a .pat anywhere under it
+     * (e.g. $HOME/SA/lib) is found even though the daemon lives in a subdir
+     * like $HOME/SA/bin/sa.  Fall back to exe_dir when $HOME/SA is absent
+     * (tests/demos not installed under it), matching scan_encrypted_libs. */
+    char patch_root[4096];
+    {
+        struct stat sa_st;
+        if (sa_root_path(patch_root, sizeof(patch_root)) != 0
+            || stat(patch_root, &sa_st) != 0 || !S_ISDIR(sa_st.st_mode))
+            exe_dir(real_exe, patch_root, sizeof(patch_root));
+    }
 
     int listen_sd = daemon_open_listen_socket(key);
     /* Capture the (non-secret) abstract socket name for the discovery
@@ -2690,7 +2704,7 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
         .lib_fds      = lib_fds,
         .lib_names    = lib_names,
         .nlibs        = *nlibs,
-        .scan_dir     = scan_dir,
+        .scan_dir     = patch_root,   /* .pat lookup spans $HOME/SA, not just exe_dir */
     };
 
     pthread_t worker;
