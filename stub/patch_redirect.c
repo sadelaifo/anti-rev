@@ -37,6 +37,7 @@
 #include <unistd.h>
 #include <fcntl.h>       /* O_RDONLY / O_WRONLY / O_CREAT / AT_FDCWD (x86) */
 #include <stdarg.h>      /* va_list for the variadic open* (x86)          */
+#include <sys/syscall.h> /* SYS_openat — raw-syscall fallback (x86)       */
 
 static FILE *(*g_real_fopen)(const char *, const char *)   = NULL;
 static FILE *(*g_real_fopen64)(const char *, const char *) = NULL;
@@ -167,8 +168,13 @@ int open(const char *path, int flags, ...)
     if (OPEN_NEEDS_MODE(flags)) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
     int fd = open_pat_fd(path, flags);
     if (fd >= 0) return fd;
-    if (!g_real_open) { errno = ENOSYS; return -1; }
-    return g_real_open(path, flags, mode);
+    if (g_real_open) return g_real_open(path, flags, mode);
+    /* Fallback to a raw syscall, exactly like aarch64_extend_shim's open:
+     * NEVER turn the business's own open() into ENOSYS just because our
+     * dlsym hasn't resolved g_real_open yet.  The missing fallback (vs the
+     * field-tested aarch64 path) is what made an unresolved pointer fatal
+     * on x86 while aarch64 shrugged it off. */
+    return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
 }
 
 __attribute__((visibility("default")))
@@ -179,8 +185,8 @@ int open64(const char *path, int flags, ...)
     if (OPEN_NEEDS_MODE(flags)) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
     int fd = open_pat_fd(path, flags);
     if (fd >= 0) return fd;
-    if (!g_real_open64) { errno = ENOSYS; return -1; }
-    return g_real_open64(path, flags, mode);
+    if (g_real_open64) return g_real_open64(path, flags, mode);
+    return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
 }
 
 __attribute__((visibility("default")))
@@ -193,8 +199,8 @@ int openat(int dirfd, const char *path, int flags, ...)
         int fd = open_pat_fd(path, flags);
         if (fd >= 0) return fd;
     }
-    if (!g_real_openat) { errno = ENOSYS; return -1; }
-    return g_real_openat(dirfd, path, flags, mode);
+    if (g_real_openat) return g_real_openat(dirfd, path, flags, mode);
+    return (int)syscall(SYS_openat, dirfd, path, flags, mode);
 }
 
 __attribute__((visibility("default")))
@@ -207,8 +213,8 @@ int openat64(int dirfd, const char *path, int flags, ...)
         int fd = open_pat_fd(path, flags);
         if (fd >= 0) return fd;
     }
-    if (!g_real_openat64) { errno = ENOSYS; return -1; }
-    return g_real_openat64(dirfd, path, flags, mode);
+    if (g_real_openat64) return g_real_openat64(dirfd, path, flags, mode);
+    return (int)syscall(SYS_openat, dirfd, path, flags, mode);
 }
 
 #endif /* !__aarch64__ */
