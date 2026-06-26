@@ -407,15 +407,9 @@ static int handle_get_patch(int client, const char *scan_dir,
  * so patches enjoy the same keysplit binding as the encrypted libs. */
 static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SIZE]);
 
-/* Plaintext name of the key-free discovery file the daemon drops in its
- * scan dir.  On THIS branch the shim reuses the inherited __r_LS daemon
- * socket, so this file is NOT read here — it is published only for the
- * standalone lrxd.so injector on branch xcc_hotpatch (which has no daemon
- * connection and can't re-derive the key-hashed socket name).  Named
- * ".lrxd.sock" (not the old ".antirev-libd.sock") so it doesn't leak the
- * project name — it sits next to the `lrxd` daemon binary and blends in.
- * '.'-prefixed → skipped by collect_enc_paths. */
-#define DISCOVERY_FILE ".lrxd.sock"
+/* (No discovery file on this branch — .pat rides antirev_shim over the
+ * inherited __r_LS daemon connection. The standalone lrxd.so injector on
+ * branch xcc_hotpatch publishes/reads one.) */
 
 #define ST_OK        0u
 #define ST_NOT_FOUND 1u
@@ -2529,34 +2523,11 @@ static int daemon_open_listen_socket(const uint8_t *key) {
     return sd;
 }
 
-/* Copy the abstract socket name (the bytes after the leading NUL) into
- * `out` so it can be published in the discovery file.  Same derivation
- * as make_sock_addr; the name is not secret. */
-static void derive_sock_name(char *out, size_t out_sz, const uint8_t *key) {
-    struct sockaddr_un addr;
-    make_sock_addr(&addr, key);
-    snprintf(out, out_sz, "%s", addr.sun_path + 1);
-}
-
-/* Publish / remove the key-free discovery file in the daemon's scan dir.
- * Keyless clients (lrxd_<arch>.so) read the abstract socket name from
- * it instead of re-deriving it from the AES key. */
-static void write_discovery_file(const char *scan_dir, const char *sock_name) {
-    char p[4096];
-    snprintf(p, sizeof(p), "%s/%s", scan_dir, DISCOVERY_FILE);
-    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) return;
-    char line[160];
-    int n = snprintf(line, sizeof(line), "%s\n", sock_name);
-    if (n > 0) { ssize_t w = write(fd, line, (size_t)n); (void)w; }
-    close(fd);
-}
-
-static void unlink_discovery_file(const char *scan_dir) {
-    char p[4096];
-    snprintf(p, sizeof(p), "%s/%s", scan_dir, DISCOVERY_FILE);
-    unlink(p);
-}
+/* (Discovery-file publishing removed on this branch — `.pat` rides
+ * antirev_shim, which reuses the inherited __r_LS daemon connection, so
+ * nothing ever reads a discovery file.  make_sock_addr stays: it's how the
+ * daemon binds its own listen socket.  The standalone lrxd.so injector on
+ * branch xcc_hotpatch still publishes/reads the discovery file.) */
 
 /* Directory portion of an exe path, into `out` ("." if none). */
 static void exe_dir(const char *real_exe, char *out, size_t out_sz) {
@@ -2630,13 +2601,7 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
 
     build_and_log_deps_graph(lib_fds, lib_names, *nlibs);
 
-    /* The discovery file is published next to the daemon binary (exe_dir),
-     * e.g. $HOME/SA/bin/sa/.lrxd.sock — only consumed by the standalone
-     * lrxd.so on branch xcc_hotpatch; unused here (shim reuses __r_LS). */
-    char scan_dir[4096];
-    exe_dir(real_exe, scan_dir, sizeof(scan_dir));
-
-    /* But lazy .pat lookup (OP_GET_PATCH) must span the WHOLE install tree
+    /* Lazy .pat lookup (OP_GET_PATCH) must span the WHOLE install tree
      * — same root as the lib scan ($HOME/SA) — so a .pat anywhere under it
      * (e.g. $HOME/SA/lib) is found even though the daemon lives in a subdir
      * like $HOME/SA/bin/sa.  Fall back to exe_dir when $HOME/SA is absent
@@ -2650,23 +2615,14 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
     }
 
     int listen_sd = daemon_open_listen_socket(key);
-    /* Capture the (non-secret) abstract socket name for the discovery
-     * file before wiping the key. */
-    char sock_name[160] = {0};
-    if (listen_sd >= 0)
-        derive_sock_name(sock_name, sizeof(sock_name), key);
     explicit_bzero(key, KEY_SIZE);
     if (listen_sd < 0)
         return 1;
-    /* Publish discovery before the daemonising fork so the file exists
-     * by the time the launching parent returns. */
-    write_discovery_file(scan_dir, sock_name);
     LOG_INFO("[antirev] lib daemon ready (%d libs)\n", *nlibs);
 
     pid_t pid = fork();
     if (pid < 0) {
         PERR_INFO("fork");
-        unlink_discovery_file(scan_dir);
         return 1;
     }
     if (pid > 0)
@@ -2739,7 +2695,6 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
     /* Shutdown sweep: catches any dirs whose owner exe crashed
      * during this daemon's session before its atexit could fire. */
     sweep_dead_symlink_dirs();
-    unlink_discovery_file(scan_dir);
 
     _exit(0);
 }
