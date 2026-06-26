@@ -56,10 +56,19 @@ static int   g_inited = 0;
 static void ensure_inited(void)
 {
     if (g_inited) return;
-    g_inited = 1;
     /* idempotent — other shims' constructors also call it; ensures the
      * daemon socket / __r_EL are read even if we run first. */
     daemon_client_init();
+    /* Resolve every real symbol BEFORE publishing g_inited.  The previous
+     * code set g_inited=1 up-front, so a second thread racing into the
+     * very first fopen could `if (g_inited) return` while g_real_fopen was
+     * still NULL — then redirect_common hits `if (!real)` and returns
+     * ENOSYS/NULL.  On a multi-threaded business startup that NULLs out an
+     * early fopen (e.g. opening/rotating the log file → fprintf on NULL →
+     * logging silently dies while the main loop keeps running).  x86 hit
+     * this timing window; aarch64 didn't.  Now a racing thread either sees
+     * g_inited==0 and re-does the harmless idempotent dlsyms, or sees a
+     * fully-populated g_real_* — never a half-initialised NULL. */
     g_real_fopen   = dlsym(RTLD_NEXT, "fopen");
     g_real_fopen64 = dlsym(RTLD_NEXT, "fopen64");
     g_real_fdopen  = dlsym(RTLD_NEXT, "fdopen");
@@ -75,7 +84,16 @@ static void ensure_inited(void)
         g_log = g_real_fopen(lp, "w");
         if (g_log) setvbuf(g_log, NULL, _IOLBF, 0);
     }
+    g_inited = 1;   /* publish LAST, after every g_real_* is stored */
 }
+
+/* Initialise at load time — single-threaded, before main() and before any
+ * business thread is spawned — so the first fopen/open from ANY thread
+ * already sees non-NULL g_real_*.  Belt-and-suspenders with the g_inited
+ * ordering above: together they make the lazy path race-free. */
+__attribute__((constructor))
+static void patch_redirect_ctor(void) { ensure_inited(); }
+
 #define LOG(...) do { if (g_log) fprintf(g_log, __VA_ARGS__); } while (0)
 
 static FILE *redirect_common(const char *path, const char *mode,
