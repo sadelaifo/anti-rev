@@ -408,11 +408,14 @@ static int handle_get_patch(int client, const char *scan_dir,
 static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SIZE]);
 
 /* Plaintext name of the key-free discovery file the daemon drops in its
- * scan dir so a keyless client (lrxd_<arch>.so) can find the abstract
- * socket without re-deriving it from the AES key.  Sits next to the
- * daemon binary, which is already visible on disk, so it leaks nothing
- * new.  '.'-prefixed → skipped by collect_enc_paths. */
-#define DISCOVERY_FILE ".antirev-libd.sock"
+ * scan dir.  On THIS branch the shim reuses the inherited __r_LS daemon
+ * socket, so this file is NOT read here — it is published only for the
+ * standalone lrxd.so injector on branch xcc_hotpatch (which has no daemon
+ * connection and can't re-derive the key-hashed socket name).  Named
+ * ".lrxd.sock" (not the old ".antirev-libd.sock") so it doesn't leak the
+ * project name — it sits next to the `lrxd` daemon binary and blends in.
+ * '.'-prefixed → skipped by collect_enc_paths. */
+#define DISCOVERY_FILE ".lrxd.sock"
 
 #define ST_OK        0u
 #define ST_NOT_FOUND 1u
@@ -2628,8 +2631,8 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
     build_and_log_deps_graph(lib_fds, lib_names, *nlibs);
 
     /* The discovery file is published next to the daemon binary (exe_dir),
-     * matching where the shim's fixed-path lookup expects it
-     * ($HOME/SA/bin/sa/.antirev-libd.sock). */
+     * e.g. $HOME/SA/bin/sa/.lrxd.sock — only consumed by the standalone
+     * lrxd.so on branch xcc_hotpatch; unused here (shim reuses __r_LS). */
     char scan_dir[4096];
     exe_dir(real_exe, scan_dir, sizeof(scan_dir));
 
