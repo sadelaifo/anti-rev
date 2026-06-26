@@ -33,6 +33,7 @@ typedef int _aarch64_extend_shim_empty;
 
 #define _GNU_SOURCE
 #include "daemon_client.h"
+#include "patch_fetch.h" /* shared .pat suffix check + OP_GET_PATCH fetch */
 #include "obfstr.h"     /* compile-time string-literal obfuscation */
 
 #include <dlfcn.h>
@@ -167,33 +168,13 @@ static int fetch_one_op(uint32_t opcode, const char *base)
     return fds[0];
 }
 
-/* Encrypted .elf libs use OP_GET_LIB. */
+/* Encrypted .elf libs use OP_GET_LIB.  (The `.pat` suffix check + the
+ * OP_GET_PATCH fetch now live in patch_fetch.c — `patch_is_pat_path` /
+ * `patch_fetch_fd` — shared with patch_redirect.c's fopen hook so the
+ * two .pat entry points stay in lockstep.) */
 static int fetch_one(const char *base)
 {
     return fetch_one_op(DC_OP_GET_LIB, base);
-}
-
-/* True iff `path`'s basename ends in ".pat" (the hot-patch artifact). */
-static int is_patch_path(const char *path)
-{
-    if (!path) return 0;
-    const char *b = strrchr(path, '/');
-    b = b ? b + 1 : path;
-    size_t len = strlen(b);
-    return len > 4 && strcmp(b + len - 4, ".pat") == 0;
-}
-
-/* Fetch a FRESH decrypted memfd for a .pat basename via OP_GET_PATCH.
- * Returns the fd (caller owns it), or -1.  No caching — each open gets its
- * own memfd (independent file offset), matching lrxd.so.  Lets a protected
- * aarch64 process apply hot patches WITHOUT a separate lrxd.so: this shim
- * already hooks open/openat (+ fopen below) and already holds the daemon
- * connection. */
-static int fetch_patch_fd(const char *path)
-{
-    const char *b = strrchr(path, '/');
-    b = b ? b + 1 : path;
-    return fetch_one_op(DC_OP_GET_PATCH, b);
 }
 
 /* Resolve pgName basename to a stable "/proc/self/fd/N" path string
@@ -540,11 +521,12 @@ int openat(int dirfd, const char *pathname, int flags, ...)
     }
     /* Hot-patch: read-only open of a .pat → fetch the decrypted memfd from
      * the daemon (OP_GET_PATCH) and return it directly, so a protected
-     * process can apply patches WITHOUT a separate lrxd.so. */
-    if (is_owner_process() && is_patch_path(pathname)
+     * process can apply patches WITHOUT a separate lrxd.so.  fopen/fopen64
+     * of a .pat is handled by patch_redirect.c (shared, all arches). */
+    if (is_owner_process() && patch_is_pat_path(pathname)
         && !(flags & (O_WRONLY | O_RDWR | O_CREAT))
         && (dirfd == AT_FDCWD || pathname[0] == '/')) {
-        int pfd = fetch_patch_fd(pathname);
+        int pfd = patch_fetch_fd(pathname);
         if (pfd >= 0) {
             LOG("openat .pat %s -> memfd fd=%d\n", pathname, pfd);
             return pfd;
@@ -585,47 +567,9 @@ int open(const char *pathname, int flags, ...)
         : openat(AT_FDCWD, pathname, flags);
 }
 
-/* stdio fopen/fopen64 — glibc opens the underlying file via a PRIVATE
- * internal open that bypasses the PLT, so our open/openat hooks never see
- * a fopen64(".pat") (e.g. std::ifstream's backing fopen). Hook the stdio
- * entry points too, so a protected process reading a .pat via
- * ifstream/fopen still gets the decrypted memfd — no separate lrxd.so
- * needed. Read-only modes only; on a hit, wrap the memfd with the real
- * fdopen. */
-static FILE *(*g_real_fopen)(const char *, const char *)   = NULL;
-static FILE *(*g_real_fopen64)(const char *, const char *) = NULL;
-static FILE *(*g_real_fdopen)(int, const char *)           = NULL;
-
-static FILE *patch_fopen_common(const char *path, const char *mode,
-                                FILE *(*real)(const char *, const char *))
-{
-    if (is_owner_process() && is_patch_path(path)
-        && mode && mode[0] == 'r' && !strchr(mode, '+')) {
-        if (!g_real_fdopen) g_real_fdopen = dlsym(RTLD_NEXT, "fdopen");
-        int pfd = fetch_patch_fd(path);
-        if (pfd >= 0 && g_real_fdopen) {
-            FILE *f = g_real_fdopen(pfd, mode);
-            if (f) { LOG("fopen .pat %s -> memfd fd=%d\n", path, pfd); return f; }
-            close(pfd);
-        }
-    }
-    if (!real) { errno = ENOSYS; return NULL; }
-    return real(path, mode);
-}
-
-__attribute__((visibility("default")))
-FILE *fopen(const char *path, const char *mode)
-{
-    if (!g_real_fopen) g_real_fopen = dlsym(RTLD_NEXT, "fopen");
-    return patch_fopen_common(path, mode, g_real_fopen);
-}
-
-__attribute__((visibility("default")))
-FILE *fopen64(const char *path, const char *mode)
-{
-    if (!g_real_fopen64) g_real_fopen64 = dlsym(RTLD_NEXT, "fopen64");
-    return patch_fopen_common(path, mode, g_real_fopen64);
-}
+/* NOTE: fopen/fopen64 .pat redirect lives in patch_redirect.c (shared,
+ * all arches) — glibc's fopen* bypass the PLT so the open/openat hooks
+ * above can't see them. Kept out of this aarch64-only TU on purpose. */
 
 __attribute__((visibility("default")))
 int newfstatat(int dirfd, const char *pathname, struct stat *buf, int flags)

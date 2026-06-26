@@ -40,14 +40,6 @@ Config format:
       - bin/start.sh                   # copy a specific file
       - *.conf                         # copy by pattern
 
-    patch_shim:                        # optional: hot-patch shim (lrxd_<arch>.so),
-      src:  ../build/lrxd_x86_64.so    #   built by cmake. single-arch: src + dest.
-      dest: bin/sa/lrxd_x86_64.so      #   dest is relative to output_dir (incl. filename).
-    # multi-arch form — one {src, dest} per arch:
-    #   patch_shim:
-    #     x86_64:  { src: ../build/lrxd_x86_64.so,  dest: bin/sa/lrxd_x86_64.so }
-    #     aarch64: { src: ../build/lrxd_aarch64.so, dest: bin/sa/lrxd_aarch64.so }
-
 Path fields (install_dir, output_dir, key, stub, stubs.*) expand ~ and
 $VAR / ${VAR} from the environment, e.g. install_dir: $HOME/myapp.
 
@@ -968,37 +960,11 @@ def main():
         print(f"[pack] Recreated {len(symlinks)} symlink(s)")
         print()
 
-    # ── Copy the patch shim (lrxd_<arch>.so) into the output tree ─────
-    # The hot-patch shim is built by cmake (NOT generated here).  Each
-    # entry pairs `src` (build artifact, relative to this config) with
-    # `dest` (path relative to output_dir, INCLUDING the filename).  Two
-    # forms:
-    #   single-arch:  patch_shim: { src: …, dest: … }
-    #   multi-arch:   patch_shim: { x86_64: {src,dest}, aarch64: {src,dest} }
-    # The business launcher LD_PRELOADs it from the deployed dest.
-    patch_shim_cfg = cfg.get('patch_shim') or {}
-    if patch_shim_cfg:
-        if not isinstance(patch_shim_cfg, dict):
-            sys.exit("[error] 'patch_shim' must be a map: {src, dest} for a single "
-                     "arch, or arch->{src, dest} for multi-arch")
-        # 'src' at the top level → single-arch; otherwise arch->{src,dest}.
-        entries = ([('', patch_shim_cfg)] if 'src' in patch_shim_cfg
-                   else list(patch_shim_cfg.items()))
-        for arch, entry in entries:
-            tag = f" ({arch})" if arch else ""
-            if not isinstance(entry, dict) or 'src' not in entry or 'dest' not in entry:
-                sys.exit(f"[error] patch_shim{tag or ' entry'} must have 'src' and 'dest'")
-            src_p = (config_path.parent / _expand(entry['src'])).resolve()
-            dst_p = (output_dir / _expand(entry['dest'])).resolve()
-            if not src_p.exists():
-                print(f"[pack] WARNING: patch_shim src not found at {src_p}{tag}"
-                      f" — skipping", file=sys.stderr)
-                continue
-            dst_p.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_p, dst_p)
-            os.chmod(str(dst_p), 0o755)
-            print(f"[pack] Patch shim: {src_p} -> {dst_p}{tag}")
-        print()
+    # NOTE: the standalone lrxd_<arch>.so patch shim was removed on this
+    # branch — hot patches ride antirev_shim itself (bundled in the stub),
+    # so there is no separate shim to copy. (The `patch_shim:` copy config
+    # and lrxd.so live on branch xcc_hotpatch for the standalone-injector
+    # case.)
 
     elapsed = time.monotonic() - t_start
     print(f"[pack] Done in {elapsed:.1f}s")

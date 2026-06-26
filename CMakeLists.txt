@@ -124,17 +124,26 @@ configure_file(
 #
 #   exe_shim.c             — readlink / realpath / getauxval identity hide
 #   dlopen_shim.c          — dlopen redirect to /proc/self/fd/N
-#   aarch64_extend_shim.c  — ANTI_LoadProcess hijack + popen/pclose
-#                             (aarch64 only — file is empty TU on x86)
+#   patch_fetch.c          — shared .pat suffix + OP_GET_PATCH fetch
+#   patch_redirect.c       — fopen / fopen64 .pat redirect (all arches;
+#                             the ONLY .pat hook on x86)
+#   aarch64_extend_shim.c  — ANTI_LoadProcess hijack + popen/pclose +
+#                             open/openat .pat redirect (aarch64 only —
+#                             empty TU on x86)
 #   daemon_client.c        — shared daemon-protocol client (socket fd,
 #                             __r_FM / __r_EL state,
 #                             send/recv helpers used by both shims)
 #
-# One .so = one memfd, one LD_PRELOAD entry, regardless of arch.
+# One .so = one memfd, one LD_PRELOAD entry, regardless of arch.  Hot
+# patches go through antirev_shim itself (reusing the daemon connection) —
+# no separate lrxd.so.  x86 hooks only fopen* (business reads .pat via
+# ifstream); aarch64 also hooks open/openat (rides the existing .elf path).
 set(ANTIREV_SHIM_SOURCES
     stub/exe_shim.c
     stub/dlopen_shim.c
     stub/daemon_client.c
+    stub/patch_fetch.c
+    stub/patch_redirect.c
 )
 if(TARGET_ARCH STREQUAL "aarch64")
     list(APPEND ANTIREV_SHIM_SOURCES stub/aarch64_extend_shim.c)
@@ -177,37 +186,10 @@ make_blob_header("${ANTIREV_SHIM_BLOB_H}" "$<TARGET_FILE:antirev_shim>"
                  "antirev_shim_blob" antirev_shim)
 add_custom_target(antirev_shim_blob_h DEPENDS "${ANTIREV_SHIM_BLOB_H}")
 
-# ═══════════════════════════════════════════════════════════════════════
-#  lrxd_<arch>.so — keyless open()/openat() redirect for hot-patch tools
-# ═══════════════════════════════════════════════════════════════════════
-# Separate, self-contained DSO LD_PRELOAD'd into an *unprotected* live-patch
-# injector.  Intercepts open()/openat() of encrypted ".patch" files and
-# returns the decrypted memfd fetched from the daemon (OP_GET_PATCH), so the
-# injector stays antirev-blind.  No key, no crypto, independent of the
-# antirev_shim interceptors.  Not bundled into the stub — shipped as a plain
-# .so the operator's launcher preloads (named lrxd_<arch>.so to blend in
-# next to the lrxd daemon binary).  CMake target name stays `antirev_patch`
-# (internal id only); the deployed artifact is lrxd${ARCH_SUFFIX}.so.
-add_library(antirev_patch SHARED stub/patch_shim.c)
-set_target_properties(antirev_patch PROPERTIES
-    OUTPUT_NAME "lrxd${ARCH_SUFFIX}"
-    PREFIX ""
-    POSITION_INDEPENDENT_CODE ON
-    C_VISIBILITY_PRESET hidden
-    NO_SONAME ON
-)
-target_compile_options(antirev_patch PRIVATE -O2 ${ANTIREV_HARDEN_COMPILE_OPTS})
-target_link_options(antirev_patch PRIVATE
-    ${ANTIREV_HARDEN_LINK_OPTS}
-    ${ANTIREV_HARDEN_DSO_LINK_OPTS}
-)
-target_link_libraries(antirev_patch PRIVATE dl)
-add_custom_command(TARGET antirev_patch POST_BUILD
-    COMMAND ${CMAKE_STRIP} --strip-all --strip-unneeded
-            --remove-section=.comment
-            $<TARGET_FILE:antirev_patch>
-    COMMENT "Stripping $<TARGET_FILE_NAME:antirev_patch>"
-)
+# NOTE: the standalone lrxd_<arch>.so (patch_shim.c) was removed on this
+# branch — hot patches now go through antirev_shim itself (patch_fetch.c +
+# patch_redirect.c, reusing the daemon connection). The lrxd.so variant is
+# kept on branch xcc_hotpatch for the standalone-injector case.
 
 # ═══════════════════════════════════════════════════════════════════════
 #  stub executable
@@ -1575,26 +1557,8 @@ add_custom_target(test_lib_daemon
     USES_TERMINAL
 )
 
-# ═══════════════════════════════════════════════════════════════════════
-#  test_patch_shim — lrxd_<arch>.so open()-redirect for hot-patch tools
-# ═══════════════════════════════════════════════════════════════════════
-
-compile_test_bin("${CMAKE_BINARY_DIR}/open_patch"
-    gcc "${CMAKE_SOURCE_DIR}/tests/patch_shim/open_patch.c")
-add_custom_target(open_patch DEPENDS "${CMAKE_BINARY_DIR}/open_patch")
-
-add_custom_target(test_patch_shim
-    COMMAND ${CMAKE_COMMAND} -E echo "=== test_patch_shim ==="
-    COMMAND bash "${CMAKE_SOURCE_DIR}/tests/patch_shim/run_test.sh"
-            "${CMAKE_BINARY_DIR}/stub"
-            "$<TARGET_FILE:antirev_patch>"
-            "${CMAKE_BINARY_DIR}/open_patch"
-            "${CMAKE_BINARY_DIR}/mylib.so"
-    DEPENDS stub antirev_patch open_patch mylib
-    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "lrxd_<arch>.so keyless open()-redirect via daemon (OP_GET_PATCH)"
-    USES_TERMINAL
-)
+# (test_patch_shim removed with lrxd.so — hot patches now ride antirev_shim;
+#  see branch xcc_hotpatch for the standalone lrxd.so test.)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  test_python_client_daemon — antirev_client.py speaks daemon protocol v2
