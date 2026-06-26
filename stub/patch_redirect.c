@@ -100,9 +100,12 @@ static FILE *redirect_common(const char *path, const char *mode,
                              FILE *(*real)(const char *, const char *))
 {
     /* Only the protected (owner) process redirects; read-only modes only
-     * ("r"/"rb", no "+"/"w"/"a"). Owner is decided by exe_shim's ctor. */
-    if (daemon_client_is_owner() && patch_is_pat_path(path)
-        && mode && mode[0] == 'r' && !strchr(mode, '+')) {
+     * ("r"/"rb", no "+"/"w"/"a"). Owner is decided by exe_shim's ctor.
+     * Order matters: test the cheap .pat-suffix + mode FIRST so the common
+     * non-.pat fopen short-circuits before the daemon_client_is_owner()
+     * getpid() syscall — this is a hot path on log-heavy business code. */
+    if (patch_is_pat_path(path) && mode && mode[0] == 'r'
+        && !strchr(mode, '+') && daemon_client_is_owner()) {
         int fd = patch_fetch_fd(path);
         if (fd >= 0 && g_real_fdopen) {
             FILE *f = g_real_fdopen(fd, mode);
@@ -144,8 +147,11 @@ FILE *fopen64(const char *path, const char *mode)
  * mean "not handled — fall through to the real call". */
 static int open_pat_fd(const char *path, int flags)
 {
-    if (daemon_client_is_owner() && patch_is_pat_path(path)
-        && !(flags & (O_WRONLY | O_RDWR | O_CREAT))) {
+    /* Cheap suffix + flag test first; getpid()-backed owner check last so
+     * the common non-.pat open short-circuits without a syscall. */
+    if (patch_is_pat_path(path)
+        && !(flags & (O_WRONLY | O_RDWR | O_CREAT))
+        && daemon_client_is_owner()) {
         int fd = patch_fetch_fd(path);
         if (fd >= 0) { LOG("open .pat %s -> memfd fd=%d\n", path, fd); return fd; }
         LOG("open .pat %s: daemon miss/err, passthrough\n", path);
