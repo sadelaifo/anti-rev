@@ -28,7 +28,6 @@
 /*  State                                                              */
 /* ------------------------------------------------------------------ */
 
-static int         g_initialized = 0;
 static int         g_sock        = -1;
 static const char *g_fd_map      = NULL;
 
@@ -62,11 +61,8 @@ static inline uint32_t u32le(const uint8_t *p)
 /*  Init                                                                */
 /* ------------------------------------------------------------------ */
 
-void daemon_client_init(void)
+static void daemon_client_init_impl(void)
 {
-    if (g_initialized) return;
-    g_initialized = 1;
-
     g_fd_map = getenv("__r_FM");
 
     const char *sock_str = getenv("__r_LS");
@@ -91,6 +87,19 @@ void daemon_client_init(void)
             free(buf);
         }
     }
+}
+
+/* pthread_once makes init race-free even if two shims' constructors (or a
+ * shim ctor and a racing first interceptor call) hit it concurrently.  The
+ * old `if (g_initialized) return; g_initialized = 1;` set the flag BEFORE
+ * populating g_sock/g_enc_names, so a racing caller could observe a half-
+ * initialised state (g_sock still -1) — same reentrancy bug class as the
+ * one fixed in patch_redirect's ensure_inited. */
+static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
+
+void daemon_client_init(void)
+{
+    pthread_once(&g_init_once, daemon_client_init_impl);
 }
 
 /* ------------------------------------------------------------------ */

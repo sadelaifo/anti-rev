@@ -131,6 +131,15 @@ FILE *fopen64(const char *path, const char *mode)
 
 #ifndef __aarch64__   /* x86: open/openat .pat redirect (aarch64 has its own) */
 
+/* open()/openat() consume the variadic mode arg for O_CREAT — and also for
+ * O_TMPFILE (= O_DIRECTORY | __O_TMPFILE), so test the full mask.  Without
+ * this an O_TMPFILE create would pass mode 0 → a 000-perm file. */
+#ifdef O_TMPFILE
+#  define OPEN_NEEDS_MODE(f) (((f) & O_CREAT) || (((f) & O_TMPFILE) == O_TMPFILE))
+#else
+#  define OPEN_NEEDS_MODE(f) ((f) & O_CREAT)
+#endif
+
 /* Fresh memfd fd for a read-only .pat open in the owner process, or -1 to
  * mean "not handled — fall through to the real call". */
 static int open_pat_fd(const char *path, int flags)
@@ -149,7 +158,7 @@ int open(const char *path, int flags, ...)
 {
     ensure_inited();
     mode_t mode = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
+    if (OPEN_NEEDS_MODE(flags)) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
     int fd = open_pat_fd(path, flags);
     if (fd >= 0) return fd;
     if (!g_real_open) { errno = ENOSYS; return -1; }
@@ -161,7 +170,7 @@ int open64(const char *path, int flags, ...)
 {
     ensure_inited();
     mode_t mode = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
+    if (OPEN_NEEDS_MODE(flags)) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
     int fd = open_pat_fd(path, flags);
     if (fd >= 0) return fd;
     if (!g_real_open64) { errno = ENOSYS; return -1; }
@@ -173,7 +182,7 @@ int openat(int dirfd, const char *path, int flags, ...)
 {
     ensure_inited();
     mode_t mode = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
+    if (OPEN_NEEDS_MODE(flags)) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
     if (dirfd == AT_FDCWD || (path && path[0] == '/')) {
         int fd = open_pat_fd(path, flags);
         if (fd >= 0) return fd;
@@ -187,7 +196,7 @@ int openat64(int dirfd, const char *path, int flags, ...)
 {
     ensure_inited();
     mode_t mode = 0;
-    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
+    if (OPEN_NEEDS_MODE(flags)) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
     if (dirfd == AT_FDCWD || (path && path[0] == '/')) {
         int fd = open_pat_fd(path, flags);
         if (fd >= 0) return fd;
