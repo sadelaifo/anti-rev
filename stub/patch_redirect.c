@@ -21,6 +21,9 @@
 #define _GNU_SOURCE
 #include "patch_fetch.h"
 #include "daemon_client.h"
+#include "obfstr.h"     /* MUST be included: obfstr_gen rewrites string
+                         * literals to _OBF(...) at codegen time, so every
+                         * TU it processes needs the _OBF macro. */
 
 #include <stdio.h>
 #include <stdlib.h>
