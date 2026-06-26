@@ -125,8 +125,9 @@ configure_file(
 #   exe_shim.c             — readlink / realpath / getauxval identity hide
 #   dlopen_shim.c          — dlopen redirect to /proc/self/fd/N
 #   patch_fetch.c          — shared .pat suffix + OP_GET_PATCH fetch
-#   patch_redirect.c       — fopen / fopen64 .pat redirect (all arches;
-#                             the ONLY .pat hook on x86)
+#   patch_redirect.c       — fopen/fopen64 .pat redirect (all arches) +
+#                             open/openat .pat redirect (x86 only, via
+#                             #ifndef __aarch64__)
 #   aarch64_extend_shim.c  — ANTI_LoadProcess hijack + popen/pclose +
 #                             open/openat .pat redirect (aarch64 only —
 #                             empty TU on x86)
@@ -136,8 +137,9 @@ configure_file(
 #
 # One .so = one memfd, one LD_PRELOAD entry, regardless of arch.  Hot
 # patches go through antirev_shim itself (reusing the daemon connection) —
-# no separate lrxd.so.  x86 hooks only fopen* (business reads .pat via
-# ifstream); aarch64 also hooks open/openat (rides the existing .elf path).
+# no separate lrxd.so.  The business opens .pat via BOTH fopen64 (ifstream)
+# and open(), so both are hooked: fopen* on all arches (patch_redirect),
+# open/openat on x86 (patch_redirect) and aarch64 (aarch64_extend_shim).
 set(ANTIREV_SHIM_SOURCES
     stub/exe_shim.c
     stub/dlopen_shim.c

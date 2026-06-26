@@ -1,12 +1,16 @@
 /*
  * patch_redirect — fopen/fopen64 hot-patch (.pat) redirect, ALL arches.
  *
- * glibc's fopen/fopen64 open the underlying file via a PRIVATE internal
- * open that bypasses the PLT, so the open/openat interposers (aarch64
- * only) never see an std::ifstream's fopen64(".pat"). Hooking the stdio
- * entry points here covers .pat uniformly on both arches — and is the
- * ONLY .pat hook on x86 (x86 has no open/openat hook and doesn't need
- * one; the business reads .pat via ifstream → fopen64).
+ * Hooks fopen/fopen64 on ALL arches, plus open/open64/openat/openat64 on
+ * x86 ONLY:
+ *   - fopen* are mandatory everywhere: glibc opens the underlying file via
+ *     a PRIVATE internal open that bypasses the PLT, so even an open/openat
+ *     interposer can't see an std::ifstream's fopen64(".pat").
+ *   - open/openat: the business ALSO opens .pat directly via open(); on
+ *     aarch64 that is already hooked in aarch64_extend_shim (where open
+ *     also does the .elf redirect), so here we add open/openat on x86 only
+ *     (#ifndef __aarch64__) to avoid a duplicate-symbol clash. x86 has no
+ *     .elf path, so .pat is the only reason to hook open there.
  *
  * On a read-only open of a .pat in the owner (protected) process, fetch
  * the decrypted memfd from the daemon (patch_fetch) and wrap it with the
@@ -31,10 +35,21 @@
 #include <errno.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <fcntl.h>       /* O_RDONLY / O_WRONLY / O_CREAT / AT_FDCWD (x86) */
+#include <stdarg.h>      /* va_list for the variadic open* (x86)          */
 
 static FILE *(*g_real_fopen)(const char *, const char *)   = NULL;
 static FILE *(*g_real_fopen64)(const char *, const char *) = NULL;
 static FILE *(*g_real_fdopen)(int, const char *)           = NULL;
+#ifndef __aarch64__
+/* x86 hooks open/openat too (.pat only). aarch64's open/openat live in
+ * aarch64_extend_shim (also doing the .elf redirect); defining them here
+ * on aarch64 would be a duplicate symbol. */
+static int (*g_real_open)(const char *, int, ...)          = NULL;
+static int (*g_real_open64)(const char *, int, ...)        = NULL;
+static int (*g_real_openat)(int, const char *, int, ...)   = NULL;
+static int (*g_real_openat64)(int, const char *, int, ...) = NULL;
+#endif
 static FILE *g_log    = NULL;
 static int   g_inited = 0;
 
@@ -48,6 +63,12 @@ static void ensure_inited(void)
     g_real_fopen   = dlsym(RTLD_NEXT, "fopen");
     g_real_fopen64 = dlsym(RTLD_NEXT, "fopen64");
     g_real_fdopen  = dlsym(RTLD_NEXT, "fdopen");
+#ifndef __aarch64__
+    g_real_open     = dlsym(RTLD_NEXT, "open");
+    g_real_open64   = dlsym(RTLD_NEXT, "open64");
+    g_real_openat   = dlsym(RTLD_NEXT, "openat");
+    g_real_openat64 = dlsym(RTLD_NEXT, "openat64");
+#endif
     const char *lp = getenv("ANTIREV_PATCH_LOG");
     if (lp && g_real_fopen) {
         /* the REAL fopen, not our interposer, to avoid re-entering us */
@@ -89,3 +110,72 @@ FILE *fopen64(const char *path, const char *mode)
     ensure_inited();
     return redirect_common(path, mode, g_real_fopen64);
 }
+
+#ifndef __aarch64__   /* x86: open/openat .pat redirect (aarch64 has its own) */
+
+/* Fresh memfd fd for a read-only .pat open in the owner process, or -1 to
+ * mean "not handled — fall through to the real call". */
+static int open_pat_fd(const char *path, int flags)
+{
+    if (daemon_client_is_owner() && patch_is_pat_path(path)
+        && !(flags & (O_WRONLY | O_RDWR | O_CREAT))) {
+        int fd = patch_fetch_fd(path);
+        if (fd >= 0) { LOG("open .pat %s -> memfd fd=%d\n", path, fd); return fd; }
+        LOG("open .pat %s: daemon miss/err, passthrough\n", path);
+    }
+    return -1;
+}
+
+__attribute__((visibility("default")))
+int open(const char *path, int flags, ...)
+{
+    ensure_inited();
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
+    int fd = open_pat_fd(path, flags);
+    if (fd >= 0) return fd;
+    if (!g_real_open) { errno = ENOSYS; return -1; }
+    return g_real_open(path, flags, mode);
+}
+
+__attribute__((visibility("default")))
+int open64(const char *path, int flags, ...)
+{
+    ensure_inited();
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
+    int fd = open_pat_fd(path, flags);
+    if (fd >= 0) return fd;
+    if (!g_real_open64) { errno = ENOSYS; return -1; }
+    return g_real_open64(path, flags, mode);
+}
+
+__attribute__((visibility("default")))
+int openat(int dirfd, const char *path, int flags, ...)
+{
+    ensure_inited();
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
+    if (dirfd == AT_FDCWD || (path && path[0] == '/')) {
+        int fd = open_pat_fd(path, flags);
+        if (fd >= 0) return fd;
+    }
+    if (!g_real_openat) { errno = ENOSYS; return -1; }
+    return g_real_openat(dirfd, path, flags, mode);
+}
+
+__attribute__((visibility("default")))
+int openat64(int dirfd, const char *path, int flags, ...)
+{
+    ensure_inited();
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
+    if (dirfd == AT_FDCWD || (path && path[0] == '/')) {
+        int fd = open_pat_fd(path, flags);
+        if (fd >= 0) return fd;
+    }
+    if (!g_real_openat64) { errno = ENOSYS; return -1; }
+    return g_real_openat64(dirfd, path, flags, mode);
+}
+
+#endif /* !__aarch64__ */
