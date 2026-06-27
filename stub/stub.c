@@ -1492,6 +1492,47 @@ static int find_under_dir(const char *dir, const char *base,
     return found;
 }
 
+/* basename -> resolved-path cache for OP_GET_PATCH.  cdb4f54 widened the
+ * .pat search root from exe_dir to the whole $HOME/SA tree (so a .pat in
+ * $HOME/SA/lib is found), but find_under_dir RECURSES the entire tree —
+ * on a real install (550+ libs) a business that re-opens its .pat
+ * (ifstream tellg/seekg/read, or polling) made the daemon re-walk
+ * thousands of files PER open, wedging x86.  Cache the resolved path so a
+ * repeat lookup is O(1).  The .pat is overwritten in place on update, so
+ * the path is stable; we still stat() it and re-walk if it has gone. */
+#define PATCH_CACHE_MAX 64
+static struct { char name[MAX_NAME + 1]; char path[4096]; }
+    g_patch_cache[PATCH_CACHE_MAX];
+static int             g_patch_cache_n   = 0;
+static pthread_mutex_t g_patch_cache_lck = PTHREAD_MUTEX_INITIALIZER;
+
+static int find_under_dir_cached(const char *dir, const char *base,
+                                 char *out, size_t out_sz) {
+    pthread_mutex_lock(&g_patch_cache_lck);
+    for (int i = 0; i < g_patch_cache_n; i++) {
+        if (strcmp(g_patch_cache[i].name, base) != 0) continue;
+        struct stat st;
+        if (stat(g_patch_cache[i].path, &st) == 0 && S_ISREG(st.st_mode)) {
+            snprintf(out, out_sz, "%s", g_patch_cache[i].path);
+            pthread_mutex_unlock(&g_patch_cache_lck);
+            return 1;
+        }
+        /* stale (file moved/removed) — drop entry, fall through to re-walk */
+        g_patch_cache[i] = g_patch_cache[--g_patch_cache_n];
+        break;
+    }
+    pthread_mutex_unlock(&g_patch_cache_lck);
+
+    if (!find_under_dir(dir, base, out, out_sz)) return 0;
+
+    pthread_mutex_lock(&g_patch_cache_lck);
+    int slot = (g_patch_cache_n < PATCH_CACHE_MAX) ? g_patch_cache_n++ : 0;
+    snprintf(g_patch_cache[slot].name, sizeof(g_patch_cache[slot].name), "%s", base);
+    snprintf(g_patch_cache[slot].path, sizeof(g_patch_cache[slot].path), "%s", out);
+    pthread_mutex_unlock(&g_patch_cache_lck);
+    return 1;
+}
+
 /* Handle OP_GET_PATCH: lazily decrypt the patch named in the payload
  * (basename only, resolved under scan_dir) and reply OP_LIB + status +
  * one fd, reusing the OP_GET_LIB reply shape. */
@@ -1521,7 +1562,7 @@ static int handle_get_patch(int client, const char *scan_dir,
     }
 
     char path[4096];
-    if (!scan_dir || !find_under_dir(scan_dir, name, path, sizeof(path))) {
+    if (!scan_dir || !find_under_dir_cached(scan_dir, name, path, sizeof(path))) {
         put_u32le(resp, ST_NOT_FOUND);
         return send_msg(client, OP_LIB, resp, 4, NULL, 0);
     }
