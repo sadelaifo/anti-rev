@@ -407,6 +407,11 @@ static int handle_get_patch(int client, const char *scan_dir,
  * so patches enjoy the same keysplit binding as the encrypted libs. */
 static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SIZE]);
 
+/* Forward decl — "$HOME/SA/<rel>" path builder, defined below near the lib
+ * scan.  Needed early because handle_get_patch resolves its .pat dirs
+ * through it (and through patch_search_dir, which wraps it). */
+static int sa_join(const char *rel, char *buf, size_t bufsz);
+
 /* Plaintext name of the key-free discovery file the daemon drops in its
  * scan dir so a keyless client (lrxd_<arch>.so) can find the abstract
  * socket without re-deriving it from the AES key.  Sits next to the
@@ -1533,6 +1538,19 @@ static int find_under_dir_cached(const char *dir, const char *base,
     return 1;
 }
 
+/* The dirs under $HOME/SA where hot-patch .pat files are deployed — the
+ * SINGLE place these path segments live (don't re-spell them inline).
+ * OP_GET_PATCH searches exactly these, NOT the whole tree.  Writes the
+ * i-th dir into buf; returns -1 once i is past the last (loop sentinel).
+ * Add a deployment dir here and every lookup picks it up. */
+static int patch_search_dir(int i, char *buf, size_t n) {
+    switch (i) {
+        case 0: return sa_join(OBFSTR("bin/sa"),      buf, n);
+        case 1: return sa_join(OBFSTR("lib/link/sa"), buf, n);
+        default: return -1;
+    }
+}
+
 /* Handle OP_GET_PATCH: lazily decrypt the patch named in the payload
  * (basename only, resolved under scan_dir) and reply OP_LIB + status +
  * one fd, reusing the OP_GET_LIB reply shape. */
@@ -1561,18 +1579,15 @@ static int handle_get_patch(int client, const char *scan_dir,
         return send_msg(client, OP_LIB, resp, 4, NULL, 0);
     }
 
-    char path[4096];
-    /* .pat lives in one of two FIXED suite dirs — search just those (via
-     * sa_join, reusing the single "SA" path constant), NOT the whole
-     * $HOME/SA tree.  cdb4f54 widened the search to the whole tree and
-     * find_under_dir RECURSES it; on a real install (550+ libs) that walk
-     * per OP_GET_PATCH wedged x86.  scan_dir (exe_dir) stays as the
-     * tests/demos fallback for trees not installed under $HOME/SA. */
-    char dir[4096];
+    /* .pat lives in one of the FIXED suite dirs from patch_search_dir (the
+     * single source for those path segments) — search just those, NOT the
+     * whole $HOME/SA tree.  cdb4f54 widened it to the whole tree and
+     * find_under_dir RECURSES; on a real install (550+ libs) that walk per
+     * OP_GET_PATCH wedged x86.  scan_dir (exe_dir) is the tests/demos
+     * fallback for trees not installed under $HOME/SA. */
+    char path[4096], dir[4096];
     int found = 0;
-    if (sa_join(OBFSTR("bin/sa"), dir, sizeof(dir)) == 0)
-        found = find_under_dir_cached(dir, name, path, sizeof(path));
-    if (!found && sa_join(OBFSTR("lib/link/sa"), dir, sizeof(dir)) == 0)
+    for (int i = 0; !found && patch_search_dir(i, dir, sizeof(dir)) == 0; i++)
         found = find_under_dir_cached(dir, name, path, sizeof(path));
     if (!found && scan_dir)
         found = find_under_dir_cached(scan_dir, name, path, sizeof(path));
