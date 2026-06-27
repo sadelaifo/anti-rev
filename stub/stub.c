@@ -1562,7 +1562,21 @@ static int handle_get_patch(int client, const char *scan_dir,
     }
 
     char path[4096];
-    if (!scan_dir || !find_under_dir_cached(scan_dir, name, path, sizeof(path))) {
+    /* .pat lives in one of two FIXED suite dirs — search just those (via
+     * sa_join, reusing the single "SA" path constant), NOT the whole
+     * $HOME/SA tree.  cdb4f54 widened the search to the whole tree and
+     * find_under_dir RECURSES it; on a real install (550+ libs) that walk
+     * per OP_GET_PATCH wedged x86.  scan_dir (exe_dir) stays as the
+     * tests/demos fallback for trees not installed under $HOME/SA. */
+    char dir[4096];
+    int found = 0;
+    if (sa_join(OBFSTR("bin/sa"), dir, sizeof(dir)) == 0)
+        found = find_under_dir_cached(dir, name, path, sizeof(path));
+    if (!found && sa_join(OBFSTR("lib/link/sa"), dir, sizeof(dir)) == 0)
+        found = find_under_dir_cached(dir, name, path, sizeof(path));
+    if (!found && scan_dir)
+        found = find_under_dir_cached(scan_dir, name, path, sizeof(path));
+    if (!found) {
         put_u32le(resp, ST_NOT_FOUND);
         return send_msg(client, OP_LIB, resp, 4, NULL, 0);
     }
@@ -2674,18 +2688,11 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
     char scan_dir[4096];
     exe_dir(real_exe, scan_dir, sizeof(scan_dir));
 
-    /* But lazy .pat lookup (OP_GET_PATCH) must span the WHOLE install tree
-     * — same root as the lib scan ($HOME/SA) — so a .pat anywhere under it
-     * (e.g. $HOME/SA/lib) is found even though the daemon lives in a subdir
-     * like $HOME/SA/bin/sa.  Fall back to exe_dir when $HOME/SA is absent
-     * (tests/demos not installed under it), matching scan_encrypted_libs. */
-    char patch_root[4096];
-    {
-        struct stat sa_st;
-        if (sa_root_path(patch_root, sizeof(patch_root)) != 0
-            || stat(patch_root, &sa_st) != 0 || !S_ISDIR(sa_st.st_mode))
-            exe_dir(real_exe, patch_root, sizeof(patch_root));
-    }
+    /* Lazy .pat lookup (OP_GET_PATCH) is resolved in handle_get_patch, which
+     * searches only the two fixed suite dirs ($HOME/SA/bin/sa and
+     * $HOME/SA/lib/link/sa) — NOT the whole tree (recursing 550+ libs per
+     * lookup wedged x86).  scan_dir (exe_dir) is passed only as the
+     * tests/demos fallback for trees not installed under $HOME/SA. */
 
     int listen_sd = daemon_open_listen_socket(key);
     /* Capture the (non-secret) abstract socket name for the discovery
@@ -2745,7 +2752,7 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
         .lib_fds      = lib_fds,
         .lib_names    = lib_names,
         .nlibs        = *nlibs,
-        .scan_dir     = patch_root,   /* .pat lookup spans $HOME/SA, not just exe_dir */
+        .scan_dir     = scan_dir,     /* tests/demos fallback; real lookup uses the two fixed suite dirs */
     };
 
     pthread_t worker;
