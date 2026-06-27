@@ -69,7 +69,16 @@ static int g_inited = 0;
 
 static void init_reals(void) {
     if (g_inited) return;
-    g_inited = 1;
+    /* Resolve every real symbol BEFORE publishing g_inited.  The old code
+     * set g_inited=1 up-front, so on a multi-threaded business startup a
+     * second thread racing into the very first fopen could `if (g_inited)
+     * return` while g_real_fopen was still NULL — then patch_fopen_common
+     * hits `if (!real)` and returns ENOSYS/NULL.  When that NULLs out the
+     * business's log-file fopen, logging silently dies.  Before 7b904fb
+     * added the fopen hook the business's fopen never entered this DSO, so
+     * the race was invisible; the hook exposed it.  Now a racing thread
+     * either re-does the idempotent dlsyms or sees fully-populated
+     * pointers — never a half-initialised NULL. */
     g_real_open     = dlsym(RTLD_NEXT, "open");
     g_real_open64   = dlsym(RTLD_NEXT, "open64");
     g_real_openat   = dlsym(RTLD_NEXT, "openat");
@@ -84,7 +93,15 @@ static void init_reals(void) {
         g_log = g_real_fopen(lp, "w");
         if (g_log) setvbuf(g_log, NULL, _IOLBF, 0);
     }
+    g_inited = 1;   /* publish LAST, after every g_real_* is stored */
 }
+
+/* Initialise at load time — single-threaded, before main() and before any
+ * business thread is spawned — so the first fopen/open from ANY thread
+ * already sees non-NULL g_real_*.  Belt-and-suspenders with the g_inited
+ * ordering above: together they make the lazy path race-free. */
+__attribute__((constructor))
+static void patch_shim_ctor(void) { init_reals(); }
 
 /* ---- little-endian wire helpers ---- */
 static void put_u32le(uint8_t *p, uint32_t v) {
