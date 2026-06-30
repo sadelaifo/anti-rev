@@ -775,7 +775,16 @@ def main():
         # lrxd.  (Renamed from ".antirev-libd*" so `ls`/`ps` doesn't
         # fingerprint it; no leading dot -- a hidden executable is itself
         # suspicious and dotfiles get skipped by rsync/glob copies.)
-        built_lrxd = {}   # arch -> path of the daemon this run built
+        # `lrxd:` (optional) is an arch->path map naming WHERE TO PLACE each
+        # arch's built daemon.  Default (unset) keeps it at
+        # output_dir/lrxd[-arch].  Parsed up front so the build loop can move
+        # each daemon to its destination as it goes.
+        lrxd_cfg = cfg.get('lrxd') or {}
+        if not isinstance(lrxd_cfg, dict):
+            sys.exit("[error] keysplit: 'lrxd' must be an arch->path map (like "
+                     "'stubs'), e.g.  lrxd: { aarch64: ./out/lrxd-aarch64 }")
+
+        built_lrxd = {}   # arch -> final path of the daemon this run built
         for arch, stub_path in stubs.items():
             stub_data = stub_path.read_bytes()
             suffix = f'-{arch}' if len(stubs) > 1 else ''
@@ -787,18 +796,28 @@ def main():
             daemon_path.parent.mkdir(parents=True, exist_ok=True)
             daemon_path.write_bytes(stub_data + bundle + trailer)
             os.chmod(str(daemon_path), 0o755)
+
+            # If `lrxd:` names a destination for this arch, MOVE the freshly
+            # built daemon there.  Moving doesn't change the bytes, so the
+            # keysplit SHA256(lrxd) is identical wherever it lands — we then
+            # derive from (and the runtime reads) that same file.
+            if arch in lrxd_cfg:
+                dest = (config_path.parent / _expand(lrxd_cfg[arch])).resolve()
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(daemon_path), str(dest))
+                daemon_path = dest
+
             built_lrxd[arch] = daemon_path
-            print(f"[pack] Daemon binary: {daemon_path.name}  "
+            print(f"[pack] Daemon binary: {daemon_path}  "
                   f"({daemon_path.stat().st_size:,} bytes, {arch})")
 
         # Key-split: derive a real key PER ARCH from that arch's lrxd + the
         # version file.  Runtime paths are HARDCODED in the stub
-        # ($HOME/SA/bin/sa/lrxd, $HOME/SA/version); pack-time paths come
-        # from config.  `version:` (required) is arch-independent.  `lrxd:`
-        # is an arch->path map like `stubs:` -- each entry must be
-        # byte-identical to what deploys as that arch machine's
-        # $HOME/SA/bin/sa/lrxd; per arch it defaults to the daemon built
-        # just above.
+        # ($HOME/SA/bin/sa/lrxd, $HOME/SA/version); the pack-time version
+        # path comes from config.  `version:` (required) is arch-independent.
+        # The lrxd used for derivation is the one built (and moved to `lrxd:`
+        # if set) just above — same bytes wherever it now lives, so its
+        # SHA256 matches the runtime $HOME/SA/bin/sa/lrxd by construction.
         version_cfg = cfg.get('version')
         if not version_cfg:
             sys.exit("[error] keysplit: config must set 'version' -- the path to "
@@ -820,19 +839,8 @@ def main():
         print(f"[pack] key-split: version field [{KS_VER_OFF}:"
               f"{KS_VER_OFF + KS_VER_LEN}] = {shown!r} (hex {version_field.hex()})")
 
-        lrxd_cfg = cfg.get('lrxd') or {}
-        if not isinstance(lrxd_cfg, dict):
-            sys.exit("[error] keysplit: 'lrxd' must be an arch->path map (like "
-                     "'stubs'), e.g.  lrxd: { aarch64: ./out/lrxd-aarch64 }")
         for arch in stubs:
-            if arch in lrxd_cfg:
-                lrxd_path = (config_path.parent / _expand(lrxd_cfg[arch])).resolve()
-            else:
-                lrxd_path = built_lrxd[arch]
-            if not lrxd_path.exists():
-                sys.exit(f"[error] keysplit: lrxd for arch '{arch}' not found at "
-                         f"{lrxd_path} (set lrxd.{arch} in config, or ensure the "
-                         "daemon was built)")
+            lrxd_path = built_lrxd[arch]   # built above, moved to `lrxd:` if set
             real_key_by_arch[arch] = derive_real_key(
                 key, lrxd_path, version_path, version_field=version_field)
             print(f"[pack] key-split[{arch}]: real key from {lrxd_path} "
@@ -951,6 +959,12 @@ def main():
             os.symlink(target, dst)
         print(f"[pack] Recreated {len(symlinks)} symlink(s)")
         print()
+
+    # NOTE: the standalone lrxd_<arch>.so patch shim was removed on this
+    # branch — hot patches ride antirev_shim itself (bundled in the stub),
+    # so there is no separate shim to copy. (The `patch_shim:` copy config
+    # and lrxd.so live on branch xcc_hotpatch for the standalone-injector
+    # case.)
 
     elapsed = time.monotonic() - t_start
     print(f"[pack] Done in {elapsed:.1f}s")

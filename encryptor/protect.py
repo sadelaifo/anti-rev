@@ -28,6 +28,20 @@ Subcommands:
       protect.py encrypt-lib --key <keyfile> --libs lib1.so [lib2.so ...] \\
                              [--output-dir <dir>]
 
+  encrypt-patch
+      Encrypt hot-patch ".patch" file(s) for the live-patch shim
+      (lrxd_<arch>.so).  Same ANTREV01 container as encrypt-lib, but the
+      key is the KEYSPLIT-derived real key (part1 + SHA256(lrxd) +
+      version), matching what the daemon re-derives in handle_get_patch —
+      so --lrxd / --version must be byte-identical to the target's
+      $HOME/SA/bin/sa/lrxd and $HOME/SA/version.  keysplit is per-arch;
+      pass the lrxd for the arch the patch targets.  Basename is preserved
+      so the daemon resolves it under its scan dir via OP_GET_PATCH.
+
+      protect.py encrypt-patch --key <keyfile> --lrxd <lrxd-bin> \\
+                               --version <version-script> \\
+                               --patches a.patch [b.patch ...] [--output-dir <dir>]
+
 Key file: 32 bytes as 64 hex chars.  Created with a fresh random key if absent.
 """
 from __future__ import annotations
@@ -329,30 +343,81 @@ def cmd_protect_daemon(args):
     print(f"\n[antirev] To run:\n    {out_path}   # starts daemon, exits immediately")
 
 
-# ── Subcommand: encrypt-lib ──────────────────────────────────────────
+# ── Shared whole-file encryptor (encrypt-lib / encrypt-patch) ────────
 
-def cmd_encrypt_lib(args):
-    key_path = Path(args.key)
-    key      = load_or_create_key(key_path)
-    out_dir  = Path(args.output_dir) if args.output_dir else None
+def _encrypt_files(paths, key, out_dir, kind="lib"):
+    """Encrypt one or more whole files into the ANTREV01 container
+    (MAGIC + iv + tag + ct), preserving each basename.
 
+    Shared by encrypt-lib and encrypt-patch — IDENTICAL on-disk format.
+    The 32-byte `key` is supplied by the caller (it decides whether that
+    is the bare part1 or a keysplit-derived real key), so this helper
+    stays agnostic about key derivation."""
+    out_dir = Path(out_dir) if out_dir else None
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    for lib_str in args.libs:
-        lib = Path(lib_str)
-        if not lib.exists():
-            sys.exit(f"[error] library not found: {lib}")
+    for p_str in paths:
+        f = Path(p_str)
+        if not f.exists():
+            sys.exit(f"[error] {kind} not found: {f}")
 
-        data         = lib.read_bytes()
-        iv, tag, ct  = encrypt_data(data, key)
+        data        = f.read_bytes()
+        iv, tag, ct = encrypt_data(data, key)
+        enc_data    = MAGIC + iv + tag + ct
 
-        enc_data = MAGIC + iv + tag + ct
-
-        dest = (out_dir / lib.name) if out_dir else lib
+        dest = (out_dir / f.name) if out_dir else f
         dest.write_bytes(enc_data)
-        print(f"[antirev] Encrypted lib: {lib.name}  "
+        print(f"[antirev] Encrypted {kind}: {f.name}  "
               f"({len(data):,} → {len(enc_data):,} bytes)  → {dest}")
+
+
+# ── Subcommand: encrypt-lib ──────────────────────────────────────────
+
+def cmd_encrypt_lib(args):
+    # encrypt-lib uses the bare part1 (keyfile value) — this command is the
+    # non-keysplit / standalone path (keysplit production goes through
+    # antirev-pack.py, which derives the real key per arch).
+    key = load_or_create_key(Path(args.key))
+    _encrypt_files(args.libs, key, args.output_dir, kind="lib")
+
+
+# ── Subcommand: encrypt-patch ────────────────────────────────────────
+
+def cmd_encrypt_patch(args):
+    """Encrypt hot-patch .patch file(s) for the live-patch shim
+    (lrxd_<arch>.so), using the SAME keysplit-derived real key as the
+    encrypted libs — NOT the bare part1.
+
+    The daemon decrypts a .patch via handle_get_patch ->
+    derive_real_key(part1 + SHA256(lrxd) + version), so the key here must
+    be derived identically.  --lrxd / --version must therefore be
+    byte-identical to what the target deploys at $HOME/SA/bin/sa/lrxd and
+    $HOME/SA/version.  keysplit is per-arch (part2 = SHA256 of THAT arch's
+    lrxd), so pass the lrxd for the arch this patch targets.
+
+    Also warns on a non-".patch" basename: the shim's is_patch_path()
+    only redirects open() of *.patch paths, so any other name would
+    encrypt fine but never be intercepted by the injector."""
+    for p_str in args.patches:
+        nm = Path(p_str).name
+        if not nm.endswith(".pat"):
+            print(f"[antirev] WARNING: {nm} does not end in '.pat' — the "
+                  f"hot-patch shim only redirects open()/fopen() of *.pat "
+                  f"files, so the injector will NOT pick this up.",
+                  file=sys.stderr)
+
+    lrxd_path    = Path(args.lrxd)
+    version_path = Path(args.version)
+    if not lrxd_path.exists():
+        sys.exit(f"[error] --lrxd not found: {lrxd_path}")
+    if not version_path.exists():
+        sys.exit(f"[error] --version script not found: {version_path}")
+
+    part1    = load_or_create_key(Path(args.key))
+    real_key = derive_real_key(part1, lrxd_path, version_path)
+    print(f"[antirev] key-split: real key from {lrxd_path} + version field")
+    _encrypt_files(args.patches, real_key, args.output_dir, kind="patch")
 
 
 # ── Entry point ──────────────────────────────────────────────────────
@@ -387,6 +452,21 @@ def main():
     el.add_argument("--libs",       required=True, nargs="+", metavar="LIB")
     el.add_argument("--output-dir", default=None,        help="Write encrypted libs here (default: in-place)")
 
+    # encrypt-patch
+    ep = sub.add_parser("encrypt-patch",
+                        help="Encrypt hot-patch .patch file(s) for the live-patch "
+                             "shim (same ANTREV01 container/key as encrypt-lib)")
+    ep.add_argument("--key",        required=True,       help="Key file (part1 share, hex); created if absent")
+    ep.add_argument("--patches",    required=True, nargs="+", metavar="PATCH",
+                    help="One or more hot-patch files (basename should end in .patch)")
+    ep.add_argument("--lrxd",       required=True,
+                    help="Target arch's lrxd daemon binary (keysplit part2 = "
+                         "SHA256 of this file; must match deployed $HOME/SA/bin/sa/lrxd)")
+    ep.add_argument("--version",    required=True,
+                    help="version SHELL SCRIPT (keysplit version component; must "
+                         "match deployed $HOME/SA/version)")
+    ep.add_argument("--output-dir", default=None,        help="Write encrypted patches here (default: in-place)")
+
     args = p.parse_args()
 
     if args.cmd == "protect-exe":
@@ -395,6 +475,8 @@ def main():
         cmd_protect_daemon(args)
     elif args.cmd == "encrypt-lib":
         cmd_encrypt_lib(args)
+    elif args.cmd == "encrypt-patch":
+        cmd_encrypt_patch(args)
 
 
 if __name__ == "__main__":
