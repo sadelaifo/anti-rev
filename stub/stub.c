@@ -377,6 +377,7 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 #define OP_BYE          0x03u
 #define OP_LIST         0x04u  /* request: all lib names (no fds) */
 #define OP_GET_CLOSURE  0x05u  /* request: lib + transitive encrypted deps */
+#define OP_GET_PATCH    0x06u  /* request: lazy-decrypt a .pat file by basename */
 
 #define OP_BATCH    0x81u
 #define OP_END      0x82u
@@ -395,6 +396,20 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 static int compute_closure(const char *start,
                            const char (*lib_names)[MAX_NAME + 1], int nlibs,
                            int *out_idx, int max_out);
+
+/* Forward decl — defined alongside decrypt_enc_file (needs it + the
+ * trailer part1 reload + the recursive name search). */
+static int handle_get_patch(int client, const char *scan_dir,
+                            const uint8_t *payload, uint32_t plen);
+
+/* Forward decl — key-split derivation, defined far below near main().
+ * handle_get_patch re-derives the real key for each lazy .pat decrypt
+ * so patches enjoy the same keysplit binding as the encrypted libs. */
+static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SIZE]);
+
+/* (No discovery file on this branch — .pat rides antirev_shim over the
+ * inherited __r_LS daemon connection. The standalone lrxd.so injector on
+ * branch xcc_hotpatch publishes/reads one.) */
 
 #define ST_OK        0u
 #define ST_NOT_FOUND 1u
@@ -746,7 +761,8 @@ static int parse_init_filter(const uint8_t *payload, uint32_t plen,
 /* Process a single inbound request from a connected client.
  * Returns 0 to keep the connection alive, -1 to close it. */
 static int daemon_handle_request(int client, const int *lib_fds,
-                                 const char (*lib_names)[MAX_NAME + 1], int nlibs)
+                                 const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                                 const char *scan_dir)
 {
     uint32_t op, plen;
     uint8_t  payload[MAX_PAYLOAD];
@@ -774,6 +790,9 @@ static int daemon_handle_request(int client, const int *lib_fds,
         return handle_get_closure(client, lib_fds, lib_names, nlibs,
                                   payload, plen);
     }
+    if (op == OP_GET_PATCH) {
+        return handle_get_patch(client, scan_dir, payload, plen);
+    }
     if (op == OP_BYE) {
         return -1;
     }
@@ -791,7 +810,8 @@ static int daemon_handle_request(int client, const int *lib_fds,
 #define DAEMON_MAX_CLIENTS 256
 
 static void daemon_serve(int listen_fd, int shutdown_efd, const int *lib_fds,
-                         const char (*lib_names)[MAX_NAME + 1], int nlibs)
+                         const char (*lib_names)[MAX_NAME + 1], int nlibs,
+                         const char *scan_dir)
 {
     uid_t my_uid = getuid();
 
@@ -864,7 +884,7 @@ static void daemon_serve(int listen_fd, int shutdown_efd, const int *lib_fds,
             }
 
             if (evs[i].events & EPOLLIN) {
-                if (daemon_handle_request(fd, lib_fds, lib_names, nlibs) < 0) {
+                if (daemon_handle_request(fd, lib_fds, lib_names, nlibs, scan_dir) < 0) {
                     epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
                     close(fd);
                     for (int k = 0; k < DAEMON_MAX_CLIENTS; k++) {
@@ -889,12 +909,14 @@ struct daemon_serve_args {
     const int *lib_fds;
     const char (*lib_names)[MAX_NAME + 1];
     int nlibs;
+    const char *scan_dir;
 };
 
 static void *daemon_serve_thread(void *arg)
 {
     struct daemon_serve_args *a = (struct daemon_serve_args *)arg;
-    daemon_serve(a->listen_fd, a->shutdown_efd, a->lib_fds, a->lib_names, a->nlibs);
+    daemon_serve(a->listen_fd, a->shutdown_efd, a->lib_fds, a->lib_names, a->nlibs,
+                 a->scan_dir);
     /* If daemon_serve returned (setup error like epoll_create1
      * failure, or normal shutdown after the eventfd fired), make
      * sure the main thread's sigwait() also wakes — otherwise on
@@ -1403,6 +1425,135 @@ static int decrypt_enc_file(const char *path, const uint8_t *key,
 
     close(fd);
     return mfd;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Lazy .pat decrypt (OP_GET_PATCH)                                  */
+/*                                                                      */
+/*  Patch files are NOT scanned at startup (collect_enc_paths only      */
+/*  queues .so/.elf).  They are decrypted on demand: lrxd_<arch>.so   */
+/*  intercepts the injector's open() of a .pat path and sends         */
+/*  OP_GET_PATCH(basename); the daemon resolves the basename under its   */
+/*  scan dir, re-reads the AES key from its own trailer for this one     */
+/*  decrypt (the startup key was wiped after bind), and replies with a   */
+/*  fresh memfd.  Fresh-per-request → each client gets an independent    */
+/*  file offset; re-read-then-wipe keeps key residency minimal.         */
+/* ------------------------------------------------------------------ */
+
+/* Re-read part1 (the 32-byte key SHARE) from this binary's own 48-byte
+ * trailer.  Layout (see main / antirev-pack.py): [u64 bundle_off]
+ * [part1:32][MAGIC:8].  part1 is NOT the AES key on its own — the caller
+ * must run derive_real_key() to combine it with SHA256(lrxd) + version.
+ * Returns 0 on success; caller must explicit_bzero() the buffer after use. */
+static int reload_part1_from_trailer(uint8_t part1[KEY_SIZE]) {
+    int self = open("/proc/self/exe", O_RDONLY);
+    if (self < 0) return -1;
+    off_t fsize = lseek(self, 0, SEEK_END);
+    if (fsize < 48) { close(self); return -1; }
+    uint8_t trailer[48];
+    ssize_t got = pread(self, trailer, 48, fsize - 48);
+    close(self);
+    if (got != 48 || memcmp(trailer + 40, MAGIC, MAGIC_LEN) != 0)
+        return -1;
+    memcpy(part1, trailer + 8, KEY_SIZE);
+    return 0;
+}
+
+/* Recursively search `dir` for a regular file whose basename equals
+ * `base`.  Writes the full path to out and returns 1 on first match, 0
+ * otherwise.  Skips dotfiles and symlinks (mirrors collect_enc_paths). */
+static int find_under_dir(const char *dir, const char *base,
+                          char *out, size_t out_sz) {
+    DIR *dp = opendir(dir);
+    if (!dp) return 0;
+    struct dirent *de;
+    int found = 0;
+    while (!found && (de = readdir(dp)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+        struct stat st;
+        if (lstat(path, &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) continue;
+        if (S_ISDIR(st.st_mode)) {
+            found = find_under_dir(path, base, out, out_sz);
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        if (strcmp(de->d_name, base) == 0) {
+            snprintf(out, out_sz, "%s", path);
+            found = 1;
+        }
+    }
+    closedir(dp);
+    return found;
+}
+
+/* Handle OP_GET_PATCH: lazily decrypt the patch named in the payload
+ * (basename only, resolved under scan_dir) and reply OP_LIB + status +
+ * one fd, reusing the OP_GET_LIB reply shape. */
+static int handle_get_patch(int client, const char *scan_dir,
+                            const uint8_t *payload, uint32_t plen) {
+    uint8_t resp[4];
+    if (plen < 2) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    uint16_t nlen;
+    memcpy(&nlen, payload, 2);
+    if ((uint32_t)nlen + 2u > plen || nlen > MAX_NAME) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    char name[MAX_NAME + 1];
+    memcpy(name, payload + 2, nlen);
+    name[nlen] = '\0';
+
+    /* Names are basenames resolved under scan_dir — reject any path
+     * separator so a client can't coax the daemon into decrypting an
+     * arbitrary absolute path (traversal). */
+    if (name[0] == '\0' || strchr(name, '/')) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+
+    char path[4096];
+    if (!scan_dir || !find_under_dir(scan_dir, name, path, sizeof(path))) {
+        put_u32le(resp, ST_NOT_FOUND);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+
+    /* part1 alone is NOT the AES key.  Run the SAME key-split derivation
+     * the daemon used at startup (derive_real_key: part1 + SHA256(lrxd) +
+     * version) so a .pat gets IDENTICAL keysplit protection to the
+     * encrypted libs — it can't be decrypted with the trailer part1 alone
+     * (part1 is plaintext in every protected binary).  Re-derive per
+     * request (re-hash lrxd + re-run the version script); patches are rare
+     * so the cost is negligible, and it keeps key residency minimal. */
+    uint8_t part1[KEY_SIZE], key[KEY_SIZE];
+    if (reload_part1_from_trailer(part1) != 0) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    if (derive_real_key(part1, key) != 0) {
+        explicit_bzero(part1, sizeof(part1));
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    explicit_bzero(part1, sizeof(part1));
+    uint8_t *chunk = malloc(CHUNK_SIZE);
+    int mfd = chunk ? decrypt_enc_file(path, key, chunk) : -1;
+    explicit_bzero(key, sizeof(key));
+    if (chunk) { explicit_bzero(chunk, CHUNK_SIZE); free(chunk); }
+
+    if (mfd < 0) {
+        put_u32le(resp, ST_ERROR);
+        return send_msg(client, OP_LIB, resp, 4, NULL, 0);
+    }
+    put_u32le(resp, ST_OK);
+    int rc = send_msg(client, OP_LIB, resp, 4, &mfd, 1);
+    close(mfd); /* client received its own copy via SCM_RIGHTS */
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2372,6 +2523,25 @@ static int daemon_open_listen_socket(const uint8_t *key) {
     return sd;
 }
 
+/* (Discovery-file publishing removed on this branch — `.pat` rides
+ * antirev_shim, which reuses the inherited __r_LS daemon connection, so
+ * nothing ever reads a discovery file.  make_sock_addr stays: it's how the
+ * daemon binds its own listen socket.  The standalone lrxd.so injector on
+ * branch xcc_hotpatch still publishes/reads the discovery file.) */
+
+/* Directory portion of an exe path, into `out` ("." if none). */
+static void exe_dir(const char *real_exe, char *out, size_t out_sz) {
+    const char *slash = strrchr(real_exe, '/');
+    if (slash) {
+        size_t dlen = (size_t)(slash - real_exe);
+        if (dlen >= out_sz) dlen = out_sz - 1;
+        memcpy(out, real_exe, dlen);
+        out[dlen] = '\0';
+    } else {
+        snprintf(out, out_sz, ".");
+    }
+}
+
 /* Time `scan_encrypted_libs` and print the decrypt duration. */
 static int decrypt_own_libs(const char *real_exe, const uint8_t *key, int *lib_fds, char (*lib_names)[MAX_NAME + 1],
                             int *nlibs) {
@@ -2431,6 +2601,19 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
 
     build_and_log_deps_graph(lib_fds, lib_names, *nlibs);
 
+    /* Lazy .pat lookup (OP_GET_PATCH) must span the WHOLE install tree
+     * — same root as the lib scan ($HOME/SA) — so a .pat anywhere under it
+     * (e.g. $HOME/SA/lib) is found even though the daemon lives in a subdir
+     * like $HOME/SA/bin/sa.  Fall back to exe_dir when $HOME/SA is absent
+     * (tests/demos not installed under it), matching scan_encrypted_libs. */
+    char patch_root[4096];
+    {
+        struct stat sa_st;
+        if (sa_root_path(patch_root, sizeof(patch_root)) != 0
+            || stat(patch_root, &sa_st) != 0 || !S_ISDIR(sa_st.st_mode))
+            exe_dir(real_exe, patch_root, sizeof(patch_root));
+    }
+
     int listen_sd = daemon_open_listen_socket(key);
     explicit_bzero(key, KEY_SIZE);
     if (listen_sd < 0)
@@ -2480,6 +2663,7 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
         .lib_fds      = lib_fds,
         .lib_names    = lib_names,
         .nlibs        = *nlibs,
+        .scan_dir     = patch_root,   /* .pat lookup spans $HOME/SA, not just exe_dir */
     };
 
     pthread_t worker;

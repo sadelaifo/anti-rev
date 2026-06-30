@@ -33,6 +33,7 @@ typedef int _aarch64_extend_shim_empty;
 
 #define _GNU_SOURCE
 #include "daemon_client.h"
+#include "patch_fetch.h" /* shared .pat suffix check + OP_GET_PATCH fetch */
 #include "obfstr.h"     /* compile-time string-literal obfuscation */
 
 #include <dlfcn.h>
@@ -115,9 +116,12 @@ static int cache_find(const char *base)
     return -1;
 }
 
-/* Ask the daemon for `base` and return the received fd, or -1 on failure.
- * Caller must hold g_lock. */
-static int fetch_one(const char *base)
+/* Ask the daemon for `base` via `opcode` (OP_GET_LIB for encrypted .elf
+ * libs, OP_GET_PATCH for hot-patch .pat) and return the received fd, or
+ * -1 on failure.  Only touches the daemon socket (serialized by the
+ * daemon-client IO lock), not the .elf cache, so the .pat path can call
+ * it without holding g_lock. */
+static int fetch_one_op(uint32_t opcode, const char *base)
 {
     if (daemon_client_sock() < 0) return -1;
     uint16_t nlen = (uint16_t)strlen(base);
@@ -137,7 +141,7 @@ static int fetch_one(const char *base)
      * dlopen_shim::fetch_closure on the same socket can't steal our
      * reply. */
     daemon_client_io_lock();
-    send_ok = (daemon_client_send(DC_OP_GET_LIB, req, (uint32_t)(2 + nlen)) == 0);
+    send_ok = (daemon_client_send(opcode, req, (uint32_t)(2 + nlen)) == 0);
     recv_ok = send_ok && (daemon_client_recv(&op, payload, &plen, sizeof(payload),
                                               fds, &nfds, 1) == 0);
     daemon_client_io_unlock();
@@ -162,6 +166,15 @@ static int fetch_one(const char *base)
         return -1;
     }
     return fds[0];
+}
+
+/* Encrypted .elf libs use OP_GET_LIB.  (The `.pat` suffix check + the
+ * OP_GET_PATCH fetch now live in patch_fetch.c — `patch_is_pat_path` /
+ * `patch_fetch_fd` — shared with patch_redirect.c's fopen hook so the
+ * two .pat entry points stay in lockstep.) */
+static int fetch_one(const char *base)
+{
+    return fetch_one_op(DC_OP_GET_LIB, base);
 }
 
 /* Resolve pgName basename to a stable "/proc/self/fd/N" path string
@@ -506,7 +519,33 @@ int openat(int dirfd, const char *pathname, int flags, ...)
         LOG("openat redirect %s -> %s\n", pathname, redirect);
         return raw_openat(AT_FDCWD, redirect, flags, mode);
     }
-    return raw_openat(dirfd, pathname, flags, mode);
+    /* Hot-patch: read-only open of a .pat → fetch the decrypted memfd from
+     * the daemon (OP_GET_PATCH) and return it directly, so a protected
+     * process can apply patches WITHOUT a separate lrxd.so.  fopen/fopen64
+     * of a .pat is handled by patch_redirect.c (shared, all arches). */
+    if (is_owner_process() && patch_is_pat_path(pathname)
+        && !(flags & (O_WRONLY | O_RDWR | O_CREAT))
+        && (dirfd == AT_FDCWD || pathname[0] == '/')) {
+        int pfd = patch_fetch_fd(pathname);
+        if (pfd >= 0) {
+            LOG("openat .pat %s -> memfd fd=%d\n", pathname, pfd);
+            return pfd;
+        }
+        LOG("openat .pat %s: daemon miss, passthrough\n", pathname);
+    }
+    /* Non-.elf: chain to the NEXT openat via RTLD_NEXT instead of a raw
+     * syscall, so a later LD_PRELOAD hook (e.g. lrxd's .pat redirect) is
+     * NOT bypassed — this makes the LD_PRELOAD order between this shim and
+     * lrxd irrelevant for .pat handling.  Unlike the stat family, "openat"
+     * IS a real exported libc symbol, so dlsym never returns NULL here;
+     * the ENOSYS-process-wide bug that forced raw syscalls was specific to
+     * newfstatat/stat/lstat (not exported on glibc>=2.33), and open/openat
+     * were only swept in by association.  Fall back to the raw syscall in
+     * the impossible case dlsym fails, preserving the old behaviour. */
+    static int (*real_openat)(int, const char *, int, ...) = NULL;
+    if (!real_openat) real_openat = dlsym(RTLD_NEXT, "openat");
+    if (real_openat) return real_openat(dirfd, pathname, flags, mode);
+    return raw_openat(dirfd, pathname, flags, mode);  /* fallback */
 }
 
 /* Some glibc builds call open() -> openat(AT_FDCWD, ...) internally,
@@ -527,6 +566,10 @@ int open(const char *pathname, int flags, ...)
         ? openat(AT_FDCWD, pathname, flags, mode)
         : openat(AT_FDCWD, pathname, flags);
 }
+
+/* NOTE: fopen/fopen64 .pat redirect lives in patch_redirect.c (shared,
+ * all arches) — glibc's fopen* bypass the PLT so the open/openat hooks
+ * above can't see them. Kept out of this aarch64-only TU on purpose. */
 
 __attribute__((visibility("default")))
 int newfstatat(int dirfd, const char *pathname, struct stat *buf, int flags)
