@@ -612,8 +612,9 @@ def main():
                          "arches (CWD-relative)")
     ap.add_argument("--lrxd",
                     help="override config 'lrxd' destination for a SINGLE-arch "
-                         "pack: place the built daemon at this path (CWD-relative). "
-                         "For multi-arch, use the config 'lrxd:' arch->path map.")
+                         "pack (CWD-relative): a DIRECTORY (daemon placed inside "
+                         "as lrxd) or a full FILE path. For multi-arch, use the "
+                         "config 'lrxd:' arch->path map.")
     ap.add_argument("--version", dest="pkg_version",
                     help="override config 'version' (the keysplit version value)")
     args = ap.parse_args()
@@ -890,13 +891,21 @@ def main():
             daemon_path.write_bytes(stub_data + bundle + trailer)
             os.chmod(str(daemon_path), 0o755)
 
-            # If `lrxd:` names a destination for this arch, MOVE the freshly
-            # built daemon there.  Moving doesn't change the bytes, so the
-            # keysplit SHA256(lrxd) is identical wherever it lands — we then
-            # derive from (and the runtime reads) that same file.
+            # If `lrxd:` / --lrxd names a destination for this arch, MOVE the
+            # freshly built daemon there.  Moving doesn't change the bytes, so
+            # the keysplit SHA256(lrxd) is identical wherever it lands — we then
+            # derive from (and the runtime reads) that same file.  The
+            # destination may be a DIRECTORY (the daemon is placed inside it as
+            # lrxd[-arch]) or a full FILE path.  Any stale daemon from a previous
+            # pack is overwritten so re-runs are idempotent (plain shutil.move
+            # onto an existing dir raised "Destination path already exists").
             if arch in lrxd_cfg:
                 dest = (config_path.parent / _expand(lrxd_cfg[arch])).resolve()
+                if dest.is_dir():
+                    dest = dest / f'lrxd{suffix}'
                 dest.parent.mkdir(parents=True, exist_ok=True)
+                if dest.exists() or dest.is_symlink():
+                    dest.unlink()
                 shutil.move(str(daemon_path), str(dest))
                 daemon_path = dest
 
