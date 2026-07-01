@@ -5,12 +5,14 @@ antirev-pack — config-driven batch protector
 Usage:
     antirev-pack.py <config.yaml>
     antirev-pack.py --config <config.yaml> [--install-dir DIR] [--output-dir DIR]
-                    [--key FILE] [--stub ELF] [--version VALUE]
+                    [--key FILE] [--stub ELF] [--lrxd PATH] [--version VALUE]
 
 The config file may be given positionally or via --config (both work).  Any of
---install-dir / --output-dir / --key / --stub / --version overrides the same
-field in the config for that run (CLI > config.yaml).  Override flags accept
-both --foo-bar and --foo_bar spellings.
+--install-dir / --output-dir / --key / --stub / --lrxd / --version overrides the
+same field in the config for that run (CLI > config.yaml).  Override flags accept
+both --foo-bar and --foo_bar spellings.  --lrxd is single-arch only (it sets the
+built daemon's destination path); multi-arch packs must use the config 'lrxd:'
+arch->path map.
 
 Config format:
 
@@ -608,6 +610,11 @@ def main():
     ap.add_argument("--stub",
                     help="override config stub/stubs: single stub ELF for all "
                          "arches (CWD-relative)")
+    ap.add_argument("--lrxd",
+                    help="override config 'lrxd' destination for a SINGLE-arch "
+                         "pack (CWD-relative): a DIRECTORY (daemon placed inside "
+                         "as lrxd) or a full FILE path. For multi-arch, use the "
+                         "config 'lrxd:' arch->path map.")
     ap.add_argument("--version", dest="pkg_version",
                     help="override config 'version' (the keysplit version value)")
     args = ap.parse_args()
@@ -857,6 +864,20 @@ def main():
             sys.exit("[error] keysplit: 'lrxd' must be an arch->path map (like "
                      "'stubs'), e.g.  lrxd: { aarch64: ./out/lrxd-aarch64 }")
 
+        # CLI --lrxd overrides the destination for the single-arch case (CLI >
+        # config).  It maps to one path, so it is ambiguous when packing more
+        # than one arch — require the config 'lrxd:' map there.  Resolve to an
+        # absolute path so the config-relative join below is a no-op (CLI paths
+        # are CWD-relative, matching --stub/--key).
+        if args.lrxd is not None:
+            if len(stubs) != 1:
+                sys.exit("[error] --lrxd <path> is single-arch only; this pack "
+                         f"has {len(stubs)} arches ({', '.join(sorted(stubs))}). "
+                         "Use the config 'lrxd:' arch->path map instead.")
+            only_arch = next(iter(stubs))
+            lrxd_cfg = dict(lrxd_cfg)   # copy so we don't mutate cfg
+            lrxd_cfg[only_arch] = str((Path.cwd() / _expand(args.lrxd)).resolve())
+
         built_lrxd = {}   # arch -> final path of the daemon this run built
         for arch, stub_path in stubs.items():
             stub_data = stub_path.read_bytes()
@@ -870,13 +891,21 @@ def main():
             daemon_path.write_bytes(stub_data + bundle + trailer)
             os.chmod(str(daemon_path), 0o755)
 
-            # If `lrxd:` names a destination for this arch, MOVE the freshly
-            # built daemon there.  Moving doesn't change the bytes, so the
-            # keysplit SHA256(lrxd) is identical wherever it lands — we then
-            # derive from (and the runtime reads) that same file.
+            # If `lrxd:` / --lrxd names a destination for this arch, MOVE the
+            # freshly built daemon there.  Moving doesn't change the bytes, so
+            # the keysplit SHA256(lrxd) is identical wherever it lands — we then
+            # derive from (and the runtime reads) that same file.  The
+            # destination may be a DIRECTORY (the daemon is placed inside it as
+            # lrxd[-arch]) or a full FILE path.  Any stale daemon from a previous
+            # pack is overwritten so re-runs are idempotent (plain shutil.move
+            # onto an existing dir raised "Destination path already exists").
             if arch in lrxd_cfg:
                 dest = (config_path.parent / _expand(lrxd_cfg[arch])).resolve()
+                if dest.is_dir():
+                    dest = dest / f'lrxd{suffix}'
                 dest.parent.mkdir(parents=True, exist_ok=True)
+                if dest.exists() or dest.is_symlink():
+                    dest.unlink()
                 shutil.move(str(daemon_path), str(dest))
                 daemon_path = dest
 
