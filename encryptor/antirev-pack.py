@@ -4,6 +4,13 @@ antirev-pack — config-driven batch protector
 
 Usage:
     antirev-pack.py <config.yaml>
+    antirev-pack.py --config <config.yaml> [--install-dir DIR] [--output-dir DIR]
+                    [--key FILE] [--stub ELF] [--version VALUE]
+
+The config file may be given positionally or via --config (both work).  Any of
+--install-dir / --output-dir / --key / --stub / --version overrides the same
+field in the config for that run (CLI > config.yaml).  Override flags accept
+both --foo-bar and --foo_bar spellings.
 
 Config format:
 
@@ -579,39 +586,98 @@ def _copy_worker(items: list[tuple[str, str]]) -> int:
 
 def main():
     ap = argparse.ArgumentParser(description="antirev config-driven batch protector")
-    ap.add_argument("config", help="YAML config file")
+    # The config file may be given either positionally (antirev-pack.py foo.yaml)
+    # or via --config FILE — both forms work.  The positional form is kept for
+    # backward compatibility with existing callers/scripts; --config is the
+    # explicit-flag form some tooling prefers.
+    ap.add_argument("config_pos", nargs="?", metavar="CONFIG",
+                    help="YAML config file (positional; or use --config FILE)")
+    ap.add_argument("--config", dest="config_opt", metavar="FILE",
+                    help="YAML config file (same as the positional CONFIG)")
     ap.add_argument("-j", "--jobs", type=int, default=0,
                     help="Number of parallel workers (default: CPU count)")
+    # CLI overrides — each takes priority over the same field in config.yaml,
+    # so one config can be reused while varying paths/values per invocation.
+    # Both --foo-bar and --foo_bar spellings are accepted.
+    ap.add_argument("--install-dir", "--install_dir", dest="install_dir",
+                    help="override config install_dir (CWD-relative)")
+    ap.add_argument("--output-dir", "--output_dir", dest="output_dir",
+                    help="override config output_dir (CWD-relative)")
+    ap.add_argument("--key",
+                    help="override config key: hex keyfile path (CWD-relative)")
+    ap.add_argument("--stub",
+                    help="override config stub/stubs: single stub ELF for all "
+                         "arches (CWD-relative)")
+    ap.add_argument("--version", dest="pkg_version",
+                    help="override config 'version' (the keysplit version value)")
     args = ap.parse_args()
+
+    if args.config_opt and args.config_pos and args.config_opt != args.config_pos:
+        ap.error("config given both positionally and via --config; provide only one")
+    config_arg = args.config_opt or args.config_pos
+    if not config_arg:
+        ap.error("a config file is required (positional CONFIG or --config FILE)")
 
     t_start = time.monotonic()
 
-    config_path = Path(args.config)
+    config_path = Path(config_arg)
     if not config_path.exists():
         sys.exit(f"[error] config not found: {config_path}")
 
     with open(config_path) as f:
-        cfg = yaml.safe_load(f)
-
-    # ── Validate required fields ──────────────────────────────────────
-    for field in ('install_dir', 'output_dir'):
-        if field not in cfg:
-            sys.exit(f"[error] missing required field '{field}' in config")
-    if 'stub' not in cfg and 'stubs' not in cfg:
-        sys.exit("[error] config must have 'stub' or 'stubs' field")
+        cfg = yaml.safe_load(f) or {}   # empty YAML -> {} so CLI-only overrides work
 
     def _expand(p: str) -> str:
         return os.path.expanduser(os.path.expandvars(p))
 
-    install_dir = Path(_expand(cfg['install_dir'])).resolve()
-    output_dir  = Path(_expand(cfg['output_dir'])).resolve()
-    key_path    = (config_path.parent / _expand(cfg.get('key', 'antirev.key'))).resolve()
+    def _resolve(cli_val, key, default=None):
+        """CLI override > config.yaml value > default."""
+        if cli_val is not None:
+            return cli_val
+        v = cfg.get(key)
+        return v if v is not None else default
+
+    # ── Merge CLI overrides with config, then validate ────────────────
+    install_raw = _resolve(args.install_dir, 'install_dir')
+    output_raw  = _resolve(args.output_dir,  'output_dir')
+    if install_raw is None:
+        sys.exit("[error] missing required field 'install_dir' "
+                 "(set it in config or pass --install-dir)")
+    if output_raw is None:
+        sys.exit("[error] missing required field 'output_dir' "
+                 "(set it in config or pass --output-dir)")
+    if args.stub is None and 'stub' not in cfg and 'stubs' not in cfg:
+        sys.exit("[error] config must have 'stub' or 'stubs' field "
+                 "(or pass --stub)")
+
+    # install_dir/output_dir are CWD-relative (via .resolve()) for both config
+    # and CLI, so expandvars+resolve is enough.
+    install_dir = Path(_expand(install_raw)).resolve()
+    output_dir  = Path(_expand(output_raw)).resolve()
+
+    # key/stub paths: CWD-relative when supplied on the CLI (you typed them from
+    # your shell), config-relative when read from config.yaml (preserves the
+    # existing config semantics).
+    if args.key is not None:
+        key_path = (Path.cwd() / _expand(args.key)).resolve()
+    else:
+        key_path = (config_path.parent / _expand(cfg.get('key', 'antirev.key'))).resolve()
+
     blacklist   = compile_blacklist(cfg.get('blacklist', []))
     workers     = args.jobs if args.jobs > 0 else (os.cpu_count() or 4)
 
-    # Build arch -> stub mapping (supports single 'stub' or multi-arch 'stubs')
+    # Build arch -> stub mapping.  CLI --stub (CWD-relative) overrides config
+    # stub/stubs entirely; otherwise use config 'stubs' or 'stub' (config-rel).
     stubs: dict[str, Path] = {}
-    if 'stubs' in cfg:
+    if args.stub is not None:
+        single = (Path.cwd() / _expand(args.stub)).resolve()
+        elf_info = classify_elf(single)
+        if elf_info:
+            stubs[elf_info[1]] = single
+        else:
+            stubs['x86_64'] = single
+            stubs['aarch64'] = single
+    elif 'stubs' in cfg:
         for arch, p in cfg['stubs'].items():
             stubs[arch] = (config_path.parent / _expand(p)).resolve()
     elif 'stub' in cfg:
@@ -828,7 +894,7 @@ def main():
         # derivation is the one built (and moved to `lrxd:` if set) just above —
         # same bytes wherever it now lives, so its SHA256 matches the runtime
         # $HOME/SA/bin/sa/lrxd by construction.
-        version_cfg = cfg.get('version')
+        version_cfg = _resolve(args.pkg_version, 'version')
         if version_cfg is None or str(version_cfg).strip() == "":
             sys.exit("[error] keysplit: config must set 'version' -- the deployment "
                      "version STRING (e.g. 'V100R001C00').  It must equal what the "
