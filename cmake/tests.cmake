@@ -86,6 +86,48 @@ else()
     )
 endif()
 
+# ── keysplit version-field parser test ────────────────────────────────
+# Unit-tests ksv_parse (stub/keysplit_version.h) — the runtime extraction of
+# the keysplit "version" key-component from the version script's stdout — plus
+# the Python mirror (protect.parse_version_field).  Arch-agnostic, no daemon,
+# no root: just compiles + runs a tiny C harness and a Python checker.
+if(X86_GCC OR AARCH64_GCC)
+    set(_KSV_TEST_CC "${X86_GCC}")
+    if(NOT _KSV_TEST_CC)
+        set(_KSV_TEST_CC "${AARCH64_GCC}")
+    endif()
+
+    add_custom_command(
+        OUTPUT  "${CMAKE_CURRENT_BINARY_DIR}/test_keysplit_version_bin"
+        COMMAND "${_KSV_TEST_CC}" -O2 -Wall -Wextra
+                -I "${CMAKE_CURRENT_SOURCE_DIR}/stub"
+                -o "${CMAKE_CURRENT_BINARY_DIR}/test_keysplit_version_bin"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/keysplit_version/test_parse.c"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/keysplit_version/test_parse.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/stub/keysplit_version.h"
+        COMMENT "Building test_keysplit_version_bin"
+    )
+    add_custom_target(test_keysplit_version_bin ALL
+                      DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/test_keysplit_version_bin")
+
+    add_custom_target(test_keysplit_version
+        COMMAND ${CMAKE_COMMAND} -E echo "=== keysplit version-field parser test ==="
+        COMMAND "${CMAKE_CURRENT_BINARY_DIR}/test_keysplit_version_bin"
+        COMMAND ${CMAKE_COMMAND} -E echo "--- python mirror ---"
+        COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/tests/keysplit_version/test_parse.py"
+        DEPENDS test_keysplit_version_bin
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+        COMMENT "Running keysplit version-field parser test (C + Python)"
+        USES_TERMINAL
+    )
+else()
+    add_custom_target(test_keysplit_version
+        COMMAND ${CMAKE_COMMAND} -E echo
+                "[test_keysplit_version] no native compiler — running Python mirror only"
+        COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/tests/keysplit_version/test_parse.py"
+    )
+endif()
+
 # ═══════════════════════════════════════════════════════════════════════
 #  End-to-end tests
 # ═══════════════════════════════════════════════════════════════════════

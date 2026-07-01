@@ -10,6 +10,7 @@ Config format:
     install_dir: /opt/myapp            # source directory with original binaries
     output_dir:  /opt/myapp-prot       # destination for protected output
     key: ./production.key              # created if absent
+    version: "V100R001C00"             # keysplit version VALUE (see below)
     stub: ./build/stub                 # single stub (when all binaries are same arch)
     # or multi-arch:
     # stubs:
@@ -42,6 +43,13 @@ Config format:
 
 Path fields (install_dir, output_dir, key, stub, stubs.*) expand ~ and
 $VAR / ${VAR} from the environment, e.g. install_dir: $HOME/myapp.
+
+`version:` (required) is the keysplit version component — the literal
+deployment version string, taken verbatim (whitespace-stripped, no other
+processing).  It MUST equal what the target's $HOME/SA/version script parses
+to at runtime: the text after "Version: " on its line, truncated before any
+"SPC", then stripped.  (e.g. a script printing "Version: V100R001C00SPC010"
+means version: "V100R001C00".)
 
 What it does:
   - Recursively scans install_dir for all ELF files (executables and libraries)
@@ -77,8 +85,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from protect import (load_or_create_key, encrypt_data, MAGIC,
-                     BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS, derive_real_key,
-                     _version_field, KS_VER_OFF, KS_VER_LEN)
+                     BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS, derive_real_key)
 
 # ELF magic and type constants
 ELF_MAGIC = b'\x7fELF'
@@ -812,37 +819,29 @@ def main():
                   f"({daemon_path.stat().st_size:,} bytes, {arch})")
 
         # Key-split: derive a real key PER ARCH from that arch's lrxd + the
-        # version file.  Runtime paths are HARDCODED in the stub
-        # ($HOME/SA/bin/sa/lrxd, $HOME/SA/version); the pack-time version
-        # path comes from config.  `version:` (required) is arch-independent.
-        # The lrxd used for derivation is the one built (and moved to `lrxd:`
-        # if set) just above — same bytes wherever it now lives, so its
-        # SHA256 matches the runtime $HOME/SA/bin/sa/lrxd by construction.
+        # version VALUE.  Runtime paths are HARDCODED in the stub
+        # ($HOME/SA/bin/sa/lrxd, $HOME/SA/version); `version:` in config is now
+        # the deployment version STRING itself (arch-independent), not a path.
+        # It must equal what the runtime $HOME/SA/version script parses to
+        # (text after "Version: ", truncated before any "SPC", stripped — see
+        # protect.parse_version_field / stub.c ksv_parse).  The lrxd used for
+        # derivation is the one built (and moved to `lrxd:` if set) just above —
+        # same bytes wherever it now lives, so its SHA256 matches the runtime
+        # $HOME/SA/bin/sa/lrxd by construction.
         version_cfg = cfg.get('version')
-        if not version_cfg:
-            sys.exit("[error] keysplit: config must set 'version' -- the path to "
-                     "the version SHELL SCRIPT executed at pack time.  Its stdout "
-                     "must match what the runtime $HOME/SA/version script produces.")
-        version_path = Path(_expand(version_cfg)).resolve()
-        if not version_path.exists():
-            sys.exit(f"[error] keysplit: version script not found at {version_path}")
-
-        # version component is arch-independent: execute the version script
-        # ONCE here, show exactly what bytes feed the key, then reuse for
-        # every arch's derivation (no double execution).
-        version_field = _version_field(version_path)
-        try:
-            shown = version_field.decode('ascii')
-        except UnicodeDecodeError:
-            shown = repr(version_field)
-        print(f"[pack] key-split: version script {version_path}")
-        print(f"[pack] key-split: version field [{KS_VER_OFF}:"
-              f"{KS_VER_OFF + KS_VER_LEN}] = {shown!r} (hex {version_field.hex()})")
+        if version_cfg is None or str(version_cfg).strip() == "":
+            sys.exit("[error] keysplit: config must set 'version' -- the deployment "
+                     "version STRING (e.g. 'V100R001C00').  It must equal what the "
+                     "runtime $HOME/SA/version script parses to: the text after "
+                     "'Version: ', truncated before any 'SPC', whitespace-stripped.")
+        version_field = str(version_cfg).strip().encode()
+        print(f"[pack] key-split: version = "
+              f"{version_field.decode('ascii', 'replace')!r} "
+              f"(hex {version_field.hex()})")
 
         for arch in stubs:
             lrxd_path = built_lrxd[arch]   # built above, moved to `lrxd:` if set
-            real_key_by_arch[arch] = derive_real_key(
-                key, lrxd_path, version_path, version_field=version_field)
+            real_key_by_arch[arch] = derive_real_key(key, lrxd_path, version_field)
             print(f"[pack] key-split[{arch}]: real key from {lrxd_path} "
                   f"+ version field")
 

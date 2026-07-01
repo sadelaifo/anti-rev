@@ -227,11 +227,37 @@ def _compute_sock_name(key):
 
 # ── Key loading ─────────────────────────────────────────────────────
 
-# version component: KS_VER_LEN bytes of the version script's RAW stdout,
-# starting at byte offset KS_VER_OFF (the 21st byte, 1-based).  Must match
-# stub.c (KS_VER_OFF/KS_VER_LEN) and encryptor/protect.py.
-_KS_VER_OFF = 20
-_KS_VER_LEN = 15
+# version component: parsed from the version script's RAW stdout — the text
+# after b"Version: " on its line, truncated before any b"SPC", stripped.  MUST
+# stay byte-for-byte identical to stub.c (ksv_parse in keysplit_version.h),
+# encryptor/protect.py:parse_version_field, and tools/keysplit_expect.py.
+_VERSION_MARKER = b"Version: "
+_VERSION_SPC    = b"SPC"
+
+
+def _parse_version_field(stdout):
+    """Extract the version key-component from the version script's raw stdout.
+    Mirror of stub.c ksv_parse() / protect.parse_version_field(); MUST stay
+    byte-for-byte identical.  Rule:
+      1. find b"Version: " (first occurrence)
+      2. take to the end of that line ('\\n'/EOF)
+      3. if b"SPC" occurs, truncate before it
+      4. strip ASCII whitespace
+    """
+    i = stdout.find(_VERSION_MARKER)
+    if i < 0:
+        raise RuntimeError('keysplit: "Version: " marker not found in version '
+                           'script output')
+    start = i + len(_VERSION_MARKER)
+    nl    = stdout.find(b"\n", start)
+    line  = stdout[start:nl if nl >= 0 else len(stdout)]
+    spc   = line.find(_VERSION_SPC)
+    if spc >= 0:
+        line = line[:spc]
+    field = line.strip()
+    if not field:
+        raise RuntimeError("keysplit: version field is empty after parsing")
+    return field
 
 
 def _derive_real_key(part1):
@@ -243,9 +269,9 @@ def _derive_real_key(part1):
 
     Runtime sources (same paths the stub uses): the daemon binary at
     $HOME/SA/bin/sa/lrxd (hashed whole) and $HOME/SA/version, which is a
-    shell script that is EXECUTED — a fixed 15-byte window of its raw stdout
-    (bytes [20:35]) is the version component.  Hard-fail if either source is
-    missing — never fall back to part1.
+    shell script that is EXECUTED — its stdout is parsed by
+    _parse_version_field to get the version component.  Hard-fail if either
+    source is missing — never fall back to part1.
     """
     import hashlib
     import subprocess
@@ -256,11 +282,7 @@ def _derive_real_key(part1):
     version_path = Path(home) / "SA" / "version"
     part2 = hashlib.sha256(lrxd_path.read_bytes()).digest()
     out = subprocess.run([str(version_path)], capture_output=True).stdout
-    if len(out) < _KS_VER_OFF + _KS_VER_LEN:
-        raise RuntimeError(
-            f"keysplit: version script produced {len(out)} bytes of stdout, "
-            f"need >= {_KS_VER_OFF + _KS_VER_LEN}")
-    version_bytes = out[_KS_VER_OFF:_KS_VER_OFF + _KS_VER_LEN]
+    version_bytes = _parse_version_field(out)
     return hashlib.sha256(part1 + part2 + version_bytes).digest()
 
 
