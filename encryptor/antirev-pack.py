@@ -5,12 +5,14 @@ antirev-pack — config-driven batch protector
 Usage:
     antirev-pack.py <config.yaml>
     antirev-pack.py --config <config.yaml> [--install-dir DIR] [--output-dir DIR]
-                    [--key FILE] [--stub ELF] [--version VALUE]
+                    [--key FILE] [--stub ELF] [--lrxd PATH] [--version VALUE]
 
 The config file may be given positionally or via --config (both work).  Any of
---install-dir / --output-dir / --key / --stub / --version overrides the same
-field in the config for that run (CLI > config.yaml).  Override flags accept
-both --foo-bar and --foo_bar spellings.
+--install-dir / --output-dir / --key / --stub / --lrxd / --version overrides the
+same field in the config for that run (CLI > config.yaml).  Override flags accept
+both --foo-bar and --foo_bar spellings.  --lrxd is single-arch only (it sets the
+built daemon's destination path); multi-arch packs must use the config 'lrxd:'
+arch->path map.
 
 Config format:
 
@@ -608,6 +610,10 @@ def main():
     ap.add_argument("--stub",
                     help="override config stub/stubs: single stub ELF for all "
                          "arches (CWD-relative)")
+    ap.add_argument("--lrxd",
+                    help="override config 'lrxd' destination for a SINGLE-arch "
+                         "pack: place the built daemon at this path (CWD-relative). "
+                         "For multi-arch, use the config 'lrxd:' arch->path map.")
     ap.add_argument("--version", dest="pkg_version",
                     help="override config 'version' (the keysplit version value)")
     args = ap.parse_args()
@@ -856,6 +862,20 @@ def main():
         if not isinstance(lrxd_cfg, dict):
             sys.exit("[error] keysplit: 'lrxd' must be an arch->path map (like "
                      "'stubs'), e.g.  lrxd: { aarch64: ./out/lrxd-aarch64 }")
+
+        # CLI --lrxd overrides the destination for the single-arch case (CLI >
+        # config).  It maps to one path, so it is ambiguous when packing more
+        # than one arch — require the config 'lrxd:' map there.  Resolve to an
+        # absolute path so the config-relative join below is a no-op (CLI paths
+        # are CWD-relative, matching --stub/--key).
+        if args.lrxd is not None:
+            if len(stubs) != 1:
+                sys.exit("[error] --lrxd <path> is single-arch only; this pack "
+                         f"has {len(stubs)} arches ({', '.join(sorted(stubs))}). "
+                         "Use the config 'lrxd:' arch->path map instead.")
+            only_arch = next(iter(stubs))
+            lrxd_cfg = dict(lrxd_cfg)   # copy so we don't mutate cfg
+            lrxd_cfg[only_arch] = str((Path.cwd() / _expand(args.lrxd)).resolve())
 
         built_lrxd = {}   # arch -> final path of the daemon this run built
         for arch, stub_path in stubs.items():
