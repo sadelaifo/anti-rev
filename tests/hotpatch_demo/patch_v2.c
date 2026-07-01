@@ -10,8 +10,10 @@
  *   # rename/encrypt to the .pat your loader expects, e.g.:
  *   cp say_hello.o say_hello.pat
  *   python3 encryptor/protect.py encrypt-patch \
- *       --key <part1.key> --lrxd <lrxd-aarch64> --version <version.sh> \
+ *       --key <part1.key> --lrxd <lrxd-aarch64> --version <version-value> \
  *       --patches say_hello.pat --output-dir <daemon-scan-dir>
+ *   # --version is the deployment version VALUE (e.g. V100R001C00), matching
+ *   # what the target's $HOME/SA/version parses to.
  *
  * The signature MUST match the original say_hello() in demo.c exactly.
  */

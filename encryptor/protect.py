@@ -33,13 +33,14 @@ Subcommands:
       (lrxd_<arch>.so).  Same ANTREV01 container as encrypt-lib, but the
       key is the KEYSPLIT-derived real key (part1 + SHA256(lrxd) +
       version), matching what the daemon re-derives in handle_get_patch —
-      so --lrxd / --version must be byte-identical to the target's
-      $HOME/SA/bin/sa/lrxd and $HOME/SA/version.  keysplit is per-arch;
-      pass the lrxd for the arch the patch targets.  Basename is preserved
-      so the daemon resolves it under its scan dir via OP_GET_PATCH.
+      so --lrxd must be byte-identical to the target's $HOME/SA/bin/sa/lrxd
+      and --version must equal what the target's $HOME/SA/version parses to
+      (the value, not the script).  keysplit is per-arch; pass the lrxd for
+      the arch the patch targets.  Basename is preserved so the daemon
+      resolves it under its scan dir via OP_GET_PATCH.
 
       protect.py encrypt-patch --key <keyfile> --lrxd <lrxd-bin> \\
-                               --version <version-script> \\
+                               --version <version-value> \\
                                --patches a.patch [b.patch ...] [--output-dir <dir>]
 
 Key file: 32 bytes as 64 hex chars.  Created with a fresh random key if absent.
@@ -91,30 +92,43 @@ def encrypt_data(data: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
     return iv, tag, ct
 
 
-# version component: KS_VER_LEN bytes of the version script's RAW stdout,
-# starting at byte offset KS_VER_OFF (the 21st byte, 1-based).  Must match
-# stub.c (KS_VER_OFF/KS_VER_LEN) and tools/antirev_client.py.
-KS_VER_OFF = 20
-KS_VER_LEN = 15
+# version component: parsed from the version script's RAW stdout — the text
+# after b"Version: " on its line, truncated before any b"SPC", stripped.  MUST
+# stay byte-for-byte identical to stub.c (ksv_parse in keysplit_version.h),
+# tools/antirev_client.py, and tools/keysplit_expect.py.
+_VERSION_MARKER = b"Version: "
+_VERSION_SPC    = b"SPC"
 
 
-def _version_field(version_path: Path) -> bytes:
-    """EXECUTE the version shell script and return the fixed-width window of
-    its RAW stdout used in the key (stdout[KS_VER_OFF:KS_VER_OFF+KS_VER_LEN]).
-    No whitespace stripping -- the window is taken verbatim, exactly as the
-    C stub's fork+exec does.  The script's output must be machine-independent
-    so pack-time (build host) and runtime (target) derive the same key."""
-    proc = subprocess.run([str(version_path)], capture_output=True)
-    out = proc.stdout
-    if len(out) < KS_VER_OFF + KS_VER_LEN:
-        sys.exit(f"[error] keysplit: version script {version_path} produced "
-                 f"{len(out)} bytes of stdout, need >= {KS_VER_OFF + KS_VER_LEN} "
-                 f"(field starts at byte {KS_VER_OFF + 1}, len {KS_VER_LEN})")
-    return out[KS_VER_OFF:KS_VER_OFF + KS_VER_LEN]
+def parse_version_field(stdout: bytes) -> bytes:
+    """Extract the version key-component from the version script's raw stdout.
+
+    Rule (identical to stub.c ksv_parse / antirev_client._parse_version_field):
+      1. find the marker b"Version: " (first occurrence)
+      2. take the bytes from just after it to the end of THAT line ('\\n'/EOF)
+      3. if b"SPC" occurs in that range, drop it and everything after it
+      4. strip leading/trailing ASCII whitespace
+
+    Hard-fails if the marker is absent or the field is empty after parsing.
+    Used for tests and for CLI callers that still point at a live script; the
+    config-driven pack path supplies the value directly (already parsed)."""
+    i = stdout.find(_VERSION_MARKER)
+    if i < 0:
+        sys.exit('[error] keysplit: "Version: " marker not found in version '
+                 'script output')
+    start = i + len(_VERSION_MARKER)
+    nl    = stdout.find(b"\n", start)
+    line  = stdout[start:nl if nl >= 0 else len(stdout)]
+    spc   = line.find(_VERSION_SPC)
+    if spc >= 0:
+        line = line[:spc]
+    field = line.strip()
+    if not field:
+        sys.exit("[error] keysplit: version field is empty after parsing")
+    return field
 
 
-def derive_real_key(part1: bytes, lrxd_path: Path, version_path: Path,
-                    version_field: bytes = None) -> bytes:
+def derive_real_key(part1: bytes, lrxd_path: Path, version_field: bytes) -> bytes:
     """Key-split derivation — the actual AES key is never stored whole.
 
         real_key = SHA256( part1[32] || SHA256(lrxd file) || version_field )
@@ -123,12 +137,10 @@ def derive_real_key(part1: bytes, lrxd_path: Path, version_path: Path,
                    load_or_create_key returns).
     lrxd_path    : the daemon binary deployed at $HOME/SA/bin/sa/lrxd,
                    hashed whole — binds the key to lrxd's integrity.
-    version_path : a shell script (deployed at $HOME/SA/version).  It is
-                   EXECUTED and a fixed 15-byte window of its raw stdout
-                   (bytes [20:35]) binds the key to the deployment's version.
-    version_field: optional precomputed window (from _version_field), so a
-                   caller that wants to display it doesn't execute the script
-                   twice.  When None, the script is executed here.
+    version_field: the deployment version VALUE as raw bytes (already parsed /
+                   stripped).  The config-driven packer passes config.yaml
+                   `version:` verbatim; the runtime stub derives the same bytes
+                   by parsing $HOME/SA/version's stdout (see parse_version_field).
 
     MUST stay byte-for-byte identical to stub.c derive_real_key() and
     tools/antirev_client.py.
@@ -136,10 +148,10 @@ def derive_real_key(part1: bytes, lrxd_path: Path, version_path: Path,
     import hashlib
     if len(part1) != KEY_SIZE:
         sys.exit("[error] keysplit: part1 must be 32 bytes")
+    if not version_field:
+        sys.exit("[error] keysplit: version_field must be non-empty")
     part2 = hashlib.sha256(Path(lrxd_path).read_bytes()).digest()
-    version_bytes = version_field if version_field is not None \
-        else _version_field(Path(version_path))
-    return hashlib.sha256(part1 + part2 + version_bytes).digest()
+    return hashlib.sha256(part1 + part2 + bytes(version_field)).digest()
 
 
 # ── Bundle building ────────────────────────────────────────────────
@@ -391,10 +403,11 @@ def cmd_encrypt_patch(args):
 
     The daemon decrypts a .patch via handle_get_patch ->
     derive_real_key(part1 + SHA256(lrxd) + version), so the key here must
-    be derived identically.  --lrxd / --version must therefore be
-    byte-identical to what the target deploys at $HOME/SA/bin/sa/lrxd and
-    $HOME/SA/version.  keysplit is per-arch (part2 = SHA256 of THAT arch's
-    lrxd), so pass the lrxd for the arch this patch targets.
+    be derived identically.  --lrxd must be byte-identical to what the target
+    deploys at $HOME/SA/bin/sa/lrxd, and --version must equal what the target's
+    $HOME/SA/version script parses to (the value; NOT the script).  keysplit is
+    per-arch (part2 = SHA256 of THAT arch's lrxd), so pass the lrxd for the arch
+    this patch targets.
 
     Also warns on a non-".patch" basename: the shim's is_patch_path()
     only redirects open() of *.patch paths, so any other name would
@@ -407,16 +420,18 @@ def cmd_encrypt_patch(args):
                   f"files, so the injector will NOT pick this up.",
                   file=sys.stderr)
 
-    lrxd_path    = Path(args.lrxd)
-    version_path = Path(args.version)
+    lrxd_path = Path(args.lrxd)
     if not lrxd_path.exists():
         sys.exit(f"[error] --lrxd not found: {lrxd_path}")
-    if not version_path.exists():
-        sys.exit(f"[error] --version script not found: {version_path}")
+
+    version_field = args.version.strip().encode()
+    if not version_field:
+        sys.exit("[error] --version must be a non-empty version string")
 
     part1    = load_or_create_key(Path(args.key))
-    real_key = derive_real_key(part1, lrxd_path, version_path)
-    print(f"[antirev] key-split: real key from {lrxd_path} + version field")
+    real_key = derive_real_key(part1, lrxd_path, version_field)
+    print(f"[antirev] key-split: real key from {lrxd_path} + version "
+          f"{version_field.decode('ascii', 'replace')!r}")
     _encrypt_files(args.patches, real_key, args.output_dir, kind="patch")
 
 
@@ -463,8 +478,10 @@ def main():
                     help="Target arch's lrxd daemon binary (keysplit part2 = "
                          "SHA256 of this file; must match deployed $HOME/SA/bin/sa/lrxd)")
     ep.add_argument("--version",    required=True,
-                    help="version SHELL SCRIPT (keysplit version component; must "
-                         "match deployed $HOME/SA/version)")
+                    help="version VALUE (keysplit version component; the literal "
+                         "deployment version, e.g. 'V100R001C00'.  Must equal what "
+                         "the target's $HOME/SA/version script parses to: text after "
+                         "'Version: ', truncated before any 'SPC', stripped)")
     ep.add_argument("--output-dir", default=None,        help="Write encrypted patches here (default: in-place)")
 
     args = p.parse_args()

@@ -56,6 +56,7 @@
 #include <time.h>
 #include <signal.h>
 #include "crypto.h"
+#include "keysplit_version.h" /* ksv_parse: version-field extraction rule    */
 
 #ifndef __NR_memfd_create
 #  if defined(__x86_64__)
@@ -2855,8 +2856,10 @@ static void exec_target(int main_fd, char *const *argv, char **new_env, const ch
 /*    part1   : trailer[8..40] (same share in every protected binary)  */
 /*    lrxd    : $HOME/SA/bin/sa/lrxd, whole file (binds the key to     */
 /*              lrxd's integrity — patch lrxd and derivation breaks)   */
-/*    version : $HOME/SA/version, ASCII-whitespace-stripped both ends  */
-/*              (matches Python bytes.strip()); binds to deployment     */
+/*    version : parsed from $HOME/SA/version's stdout — the text after  */
+/*              "Version: " on its line, truncated before any "SPC",    */
+/*              ASCII-whitespace-stripped (see keysplit_version.h);      */
+/*              binds the key to the deployment version                  */
 /*                                                                     */
 /*  Hard-fail (return -1) if a source is missing/unreadable: the       */
 /*  caller aborts rather than fall back to any usable key.  Must stay  */
@@ -2893,13 +2896,12 @@ static void ks_fp(const uint8_t *b, size_t n, char *out /* >=9 */) {
     ks_hex(h, 4, out);
 }
 
-/* The version component of the key is a fixed-width window of the RAW stdout
- * produced by EXECUTING $HOME/SA/version (a shell script): KS_VER_LEN bytes
- * starting at byte offset KS_VER_OFF (the 21st byte, 1-based).  No whitespace
- * stripping -- the window is taken verbatim.  Must match protect.py /
- * antirev_client.py / keysplit_expect.py byte-for-byte. */
-#define KS_VER_OFF 20
-#define KS_VER_LEN 15
+/* The version component of the key is PARSED from the RAW stdout produced by
+ * EXECUTING $HOME/SA/version (a shell script): the text after "Version: " on
+ * its line, truncated before any "SPC", then ASCII-whitespace-stripped (see
+ * ksv_parse in keysplit_version.h).  The packer feeds the SAME value verbatim
+ * from config.yaml `version:` (protect.py / antirev-pack.py) — the two must
+ * agree byte-for-byte, and match tools/antirev_client.py / keysplit_expect.py. */
 
 static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SIZE]) {
     char path[4096];
@@ -2926,9 +2928,9 @@ static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SI
     { char hx[65]; ks_hex(part2, 32, hx);
       LOG_INFO("[antirev] keysplit[dbg]: hash(lrxd)=%s\n", hx); }
 
-    /* version component = EXECUTE $HOME/SA/version (a shell script) and take
-     * a fixed KS_VER_LEN-byte window of its RAW stdout starting at offset
-     * KS_VER_OFF.  Use plain fork+exec, NOT popen: glibc's vfork-based popen
+    /* version component = EXECUTE $HOME/SA/version (a shell script) and parse
+     * its RAW stdout (see ksv_parse below).  Use plain fork+exec, NOT popen:
+     * glibc's vfork-based popen
      * corrupts this memfd-heavy parent on aarch64.  Capture stdout only; the
      * script's output must be machine-independent so pack-time and runtime
      * derive the same key. */
@@ -2966,22 +2968,28 @@ static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SI
         close(pfd[0]);
         waitpid(vpid, NULL, 0);
     }
-    if (vlen < KS_VER_OFF + KS_VER_LEN) {
-        LOG_INFO("[antirev] keysplit: version output too short (%zu bytes, "
-                 "need >= %d)\n", vlen, KS_VER_OFF + KS_VER_LEN);
+    /* Parse the version field: text after "Version: ", cut before "SPC",
+     * whitespace-stripped.  Markers go through OBFSTR so they don't survive
+     * `strings`; the parse rule itself lives in keysplit_version.h. */
+    uint8_t vfield[256];
+    size_t  vfield_len = 0;
+    if (ksv_parse(vbuf, vlen, OBFSTR("Version: "), OBFSTR("SPC"),
+                  vfield, sizeof(vfield), &vfield_len) != 0) {
+        LOG_INFO("[antirev] keysplit: could not parse version field from "
+                 "$HOME/SA/version output (%zu bytes) -- need a \"Version: \" "
+                 "line with a non-empty value\n", vlen);
         return -1;
     }
-    const uint8_t *vfield = vbuf + KS_VER_OFF;
-    { uint8_t vh[32]; sha256(vfield, KS_VER_LEN, vh); char hx[65]; ks_hex(vh, 32, hx);
-      LOG_INFO("[antirev] keysplit[dbg]: version stdout=%zu bytes, field[%d:%d] hash=%s\n",
-               vlen, KS_VER_OFF, KS_VER_OFF + KS_VER_LEN, hx); }
+    { uint8_t vh[32]; sha256(vfield, vfield_len, vh); char hx[65]; ks_hex(vh, 32, hx);
+      LOG_INFO("[antirev] keysplit[dbg]: version stdout=%zu bytes, "
+               "field(len=%zu) hash=%s\n", vlen, vfield_len, hx); }
 
     /* real_key = SHA256(part1 || part2 || version_field) */
     sha256_ctx kc;
     sha256_init(&kc);
     sha256_update(&kc, part1, KEY_SIZE);
     sha256_update(&kc, part2, sizeof(part2));
-    sha256_update(&kc, vfield, KS_VER_LEN);
+    sha256_update(&kc, vfield, vfield_len);
     sha256_final(&kc, out_key);
     { char fp[9]; ks_fp(part1, KEY_SIZE, fp);
       LOG_INFO("[antirev] keysplit[dbg]: part1_fp=%s\n", fp);

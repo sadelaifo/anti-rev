@@ -22,8 +22,11 @@ cp say_hello.o say_hello.pat        # name it what your loader opens
 
 # 3. Encrypt the .pat into the daemon's scan tree (keysplit-derived key)
 python3 ../../encryptor/protect.py encrypt-patch \
-    --key <part1.key> --lrxd <deployed lrxd-aarch64> --version <version.sh> \
+    --key <part1.key> --lrxd <deployed lrxd-aarch64> --version <version-value> \
     --patches say_hello.pat --output-dir <daemon-scan-dir>
+#   --version is the deployment version VALUE (e.g. V100R001C00) — it must
+#   equal what the target's $HOME/SA/version script parses to (text after
+#   "Version: ", truncated before any "SPC", stripped).
 
 # 4. Run the target with the patch shim preloaded so its readFile of the
 #    .pat is transparently decrypted (LD_PRELOAD order: lrxd BEFORE

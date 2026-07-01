@@ -34,6 +34,7 @@ set(TESTS
     test_tamper           # bit-flipped ciphertext -> clean failure
     test_missing_syms     # missing_syms.py: missing DT_NEEDED + circular deps
     test_obfstr           # OBFSTR codegen + runtime decoder smoke test
+    test_keysplit_version # keysplit version-field parser (C ksv_parse + Py mirror)
 )
 
 # Tests disabled — need further work:
