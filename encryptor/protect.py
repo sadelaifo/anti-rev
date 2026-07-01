@@ -48,6 +48,8 @@ Key file: 32 bytes as 64 hex chars.  Created with a fresh random key if absent.
 from __future__ import annotations
 
 import argparse
+import ctypes as _ct
+import ctypes.util as _ctu
 import os
 import re
 import struct
@@ -55,14 +57,81 @@ import subprocess
 import sys
 from pathlib import Path
 
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-except ImportError:
-    sys.exit("Missing dependency: pip install cryptography")
-
 MAGIC    = b"ANTREV01"
 KEY_SIZE = 32   # AES-256
 IV_SIZE  = 12   # GCM nonce
+
+
+# ── AES-256-GCM via system libcrypto (no pip `cryptography` dependency) ──
+# Uses the OpenSSL EVP API through ctypes — the same system library the daemon
+# links and that tools/antirev_client.py already calls for AES.  The encrypted
+# container ([magic][iv][tag][ct]) is byte-for-byte what the C stub / kernel
+# module decrypt, so nothing downstream changes.
+_EVP_CTRL_GCM_SET_IVLEN = 0x9
+_EVP_CTRL_GCM_GET_TAG   = 0x10
+_TAG_SIZE               = 16
+
+_libcrypto = None
+
+
+def _load_libcrypto():
+    global _libcrypto
+    if _libcrypto is not None:
+        return _libcrypto
+    name = _ctu.find_library("crypto") or "libcrypto.so.3"
+    try:
+        lib = _ct.CDLL(name)
+    except OSError as e:
+        sys.exit(f"[error] cannot load system libcrypto ({name}): {e}. "
+                 f"Install OpenSSL (e.g. libssl / openssl-libs).")
+    vp, cp, ip = _ct.c_void_p, _ct.c_char_p, _ct.POINTER(_ct.c_int)
+    lib.EVP_CIPHER_CTX_new.restype  = vp
+    lib.EVP_CIPHER_CTX_new.argtypes = []
+    lib.EVP_CIPHER_CTX_free.argtypes = [vp]
+    lib.EVP_aes_256_gcm.restype = vp
+    lib.EVP_aes_256_gcm.argtypes = []
+    lib.EVP_EncryptInit_ex.restype  = _ct.c_int
+    lib.EVP_EncryptInit_ex.argtypes = [vp, vp, vp, cp, cp]
+    lib.EVP_EncryptUpdate.restype  = _ct.c_int
+    lib.EVP_EncryptUpdate.argtypes = [vp, cp, ip, cp, _ct.c_int]
+    lib.EVP_EncryptFinal_ex.restype  = _ct.c_int
+    lib.EVP_EncryptFinal_ex.argtypes = [vp, cp, ip]
+    lib.EVP_CIPHER_CTX_ctrl.restype  = _ct.c_int
+    lib.EVP_CIPHER_CTX_ctrl.argtypes = [vp, _ct.c_int, _ct.c_int, vp]
+    _libcrypto = lib
+    return lib
+
+
+def _aes256_gcm_encrypt(key: bytes, iv: bytes, data: bytes) -> tuple[bytes, bytes]:
+    """AES-256-GCM encrypt (no AAD).  Returns (ciphertext, 16-byte tag)."""
+    lib = _load_libcrypto()
+    ctx = lib.EVP_CIPHER_CTX_new()
+    if not ctx:
+        raise RuntimeError("EVP_CIPHER_CTX_new failed")
+    try:
+        if lib.EVP_EncryptInit_ex(ctx, lib.EVP_aes_256_gcm(), None, None, None) != 1:
+            raise RuntimeError("EVP_EncryptInit_ex(cipher) failed")
+        if lib.EVP_CIPHER_CTX_ctrl(ctx, _EVP_CTRL_GCM_SET_IVLEN, len(iv), None) != 1:
+            raise RuntimeError("set GCM IV length failed")
+        if lib.EVP_EncryptInit_ex(ctx, None, None, key, iv) != 1:
+            raise RuntimeError("EVP_EncryptInit_ex(key/iv) failed")
+        outbuf = _ct.create_string_buffer(len(data) + 16)
+        outlen = _ct.c_int(0)
+        if data:
+            if lib.EVP_EncryptUpdate(ctx, outbuf, _ct.byref(outlen), data, len(data)) != 1:
+                raise RuntimeError("EVP_EncryptUpdate failed")
+        ct_len = outlen.value
+        finbuf = _ct.create_string_buffer(16)
+        finlen = _ct.c_int(0)
+        if lib.EVP_EncryptFinal_ex(ctx, finbuf, _ct.byref(finlen)) != 1:
+            raise RuntimeError("EVP_EncryptFinal_ex failed")
+        ct = outbuf.raw[:ct_len] + finbuf.raw[:finlen.value]
+        tag = _ct.create_string_buffer(_TAG_SIZE)
+        if lib.EVP_CIPHER_CTX_ctrl(ctx, _EVP_CTRL_GCM_GET_TAG, _TAG_SIZE, tag) != 1:
+            raise RuntimeError("get GCM tag failed")
+        return ct, tag.raw[:_TAG_SIZE]
+    finally:
+        lib.EVP_CIPHER_CTX_free(ctx)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -85,10 +154,7 @@ def load_or_create_key(key_path: Path) -> bytes:
 def encrypt_data(data: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
     """Return (iv, tag, ciphertext)."""
     iv = os.urandom(IV_SIZE)
-    aesgcm = AESGCM(key)
-    ct_and_tag = aesgcm.encrypt(iv, data, None)
-    ct  = ct_and_tag[:-16]
-    tag = ct_and_tag[-16:]
+    ct, tag = _aes256_gcm_encrypt(key, iv, data)
     return iv, tag, ct
 
 

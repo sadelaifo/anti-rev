@@ -35,6 +35,7 @@ set(TESTS
     test_missing_syms     # missing_syms.py: missing DT_NEEDED + circular deps
     test_obfstr           # OBFSTR codegen + runtime decoder smoke test
     test_keysplit_version # keysplit version-field parser (C ksv_parse + Py mirror)
+    test_pythonlib        # dependency-free miniyaml + libcrypto GCM (no pip deps)
 )
 
 # Tests disabled — need further work:

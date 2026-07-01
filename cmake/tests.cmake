@@ -128,6 +128,20 @@ else()
     )
 endif()
 
+# ── dependency-free python-lib replacements (miniyaml + libcrypto GCM) ─
+# Verifies the two pip-dependency removals in the packer: miniyaml (replaces
+# PyYAML) and the ctypes->libcrypto AES-256-GCM (replaces the `cryptography`
+# package).  Pure Python; the GCM half checks NIST known-answer vectors against
+# system libcrypto (OpenSSL), present on the build host.
+add_custom_target(test_pythonlib
+    COMMAND ${CMAKE_COMMAND} -E echo "=== python-lib replacements (miniyaml + GCM KAT) ==="
+    COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/tests/pythonlib/test_miniyaml.py"
+    COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/tests/pythonlib/test_gcm.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    COMMENT "Running python-lib replacement tests (miniyaml + GCM)"
+    USES_TERMINAL
+)
+
 # ═══════════════════════════════════════════════════════════════════════
 #  End-to-end tests
 # ═══════════════════════════════════════════════════════════════════════
