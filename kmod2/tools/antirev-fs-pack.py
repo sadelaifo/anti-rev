@@ -57,14 +57,10 @@ _REPO = _HERE.parents[2]
 sys.path.insert(0, str(_REPO / "encryptor"))
 try:
     from protect import MAGIC, encrypt_data, load_or_create_key  # noqa: E402
+    import miniyaml  # noqa: E402 — dependency-free YAML-subset loader
 except ImportError as e:
-    sys.exit(f"[error] cannot import encryptor/protect.py ({e}); "
-             f"expected at {_REPO / 'encryptor' / 'protect.py'}")
-
-try:
-    import yaml
-except ImportError:
-    sys.exit("Missing dependency: pip install pyyaml")
+    sys.exit(f"[error] cannot import encryptor/protect.py or miniyaml ({e}); "
+             f"expected under {_REPO / 'encryptor'}")
 
 ELF_MAGIC = b"\x7fELF"
 
@@ -139,8 +135,7 @@ def main() -> int:
     cfg_path = Path(args.config)
     if not cfg_path.exists():
         sys.exit(f"[error] config not found: {cfg_path}")
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f) or {}
+    cfg = miniyaml.load_path(cfg_path) or {}
 
     for field in ("install_dir", "output_dir"):
         if field not in cfg:

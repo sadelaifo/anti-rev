@@ -87,12 +87,8 @@ from collections import deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-try:
-    import yaml
-except ImportError:
-    sys.exit("Missing dependency: pip install pyyaml")
-
 sys.path.insert(0, str(Path(__file__).parent))
+import miniyaml   # dependency-free YAML-subset loader (drops the PyYAML dep)
 from protect import (load_or_create_key, encrypt_data, MAGIC,
                      BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS, derive_real_key)
 
@@ -631,8 +627,7 @@ def main():
     if not config_path.exists():
         sys.exit(f"[error] config not found: {config_path}")
 
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f) or {}   # empty YAML -> {} so CLI-only overrides work
+    cfg = miniyaml.load_path(config_path) or {}   # empty config -> {} so CLI-only overrides work
 
     def _expand(p: str) -> str:
         return os.path.expanduser(os.path.expandvars(p))
