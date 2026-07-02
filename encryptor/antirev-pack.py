@@ -847,72 +847,78 @@ def main():
     # (`key`), never the real key.
     real_key_by_arch = {}
 
-    if libs_mode == 'encrypt' and lib_files:
-        # Build the lightweight daemon(s) FIRST -- each arch's real key is
-        # derived from SHA256(its lrxd), so the lrxd must exist before that
-        # arch's artifacts are encrypted.  Multi-arch deploys get suffixed
-        # names (lrxd-x86_64 / -aarch64); single-arch keeps the unsuffixed
-        # lrxd.  (Renamed from ".antirev-libd*" so `ls`/`ps` doesn't
-        # fingerprint it; no leading dot -- a hidden executable is itself
-        # suspicious and dotfiles get skipped by rsync/glob copies.)
-        # `lrxd:` (optional) is an arch->path map naming WHERE TO PLACE each
-        # arch's built daemon.  Default (unset) keeps it at
-        # output_dir/lrxd[-arch].  Parsed up front so the build loop can move
-        # each daemon to its destination as it goes.
-        lrxd_cfg = cfg.get('lrxd') or {}
-        if not isinstance(lrxd_cfg, dict):
-            sys.exit("[error] keysplit: 'lrxd' must be an arch->path map (like "
-                     "'stubs'), e.g.  lrxd: { aarch64: ./out/lrxd-aarch64 }")
+    # lrxd is a general keysplit/runtime component, NOT tied to whether this pack
+    # produced any protected artifact.  It is (1) the keysplit key anchor — every
+    # real key's part2 = SHA256(lrxd), and at runtime the stub re-derives the key
+    # by hashing the deployed $HOME/SA/bin/sa/lrxd — and (2) the .pat hot-patch /
+    # ANTI_LoadProcess .elf server.  So we ALWAYS build it (one per configured
+    # arch); whether to actually run it at deploy time is the operator's choice.
+    # Building the daemon needs only the stub + part1 `key` (the trailer embeds
+    # part1, never the real key), so emitting lrxd requires no `version:`.
+    #   `lrxd:` (optional) is an arch->path map naming WHERE TO PLACE each arch's
+    #   built daemon (default output_dir/lrxd[-arch]); --lrxd overrides it for
+    #   the single-arch case.  Names dropped the leading dot / ".antirev-libd*"
+    #   so `ls`/`ps` don't fingerprint it and rsync/glob copies don't skip it.
+    lrxd_cfg = cfg.get('lrxd') or {}
+    if not isinstance(lrxd_cfg, dict):
+        sys.exit("[error] keysplit: 'lrxd' must be an arch->path map (like "
+                 "'stubs'), e.g.  lrxd: { aarch64: ./out/lrxd-aarch64 }")
 
-        # CLI --lrxd overrides the destination for the single-arch case (CLI >
-        # config).  It maps to one path, so it is ambiguous when packing more
-        # than one arch — require the config 'lrxd:' map there.  Resolve to an
-        # absolute path so the config-relative join below is a no-op (CLI paths
-        # are CWD-relative, matching --stub/--key).
-        if args.lrxd is not None:
-            if len(stubs) != 1:
-                sys.exit("[error] --lrxd <path> is single-arch only; this pack "
-                         f"has {len(stubs)} arches ({', '.join(sorted(stubs))}). "
-                         "Use the config 'lrxd:' arch->path map instead.")
-            only_arch = next(iter(stubs))
-            lrxd_cfg = dict(lrxd_cfg)   # copy so we don't mutate cfg
-            lrxd_cfg[only_arch] = str((Path.cwd() / _expand(args.lrxd)).resolve())
+    # CLI --lrxd overrides the destination for the single-arch case (CLI >
+    # config).  It maps to one path, so it is ambiguous when packing more than
+    # one arch — require the config 'lrxd:' map there.  Resolve to an absolute
+    # path so the config-relative join below is a no-op (CLI paths are
+    # CWD-relative, matching --stub/--key).
+    if args.lrxd is not None:
+        if len(stubs) != 1:
+            sys.exit("[error] --lrxd <path> is single-arch only; this pack "
+                     f"has {len(stubs)} arches ({', '.join(sorted(stubs))}). "
+                     "Use the config 'lrxd:' arch->path map instead.")
+        only_arch = next(iter(stubs))
+        lrxd_cfg = dict(lrxd_cfg)   # copy so we don't mutate cfg
+        lrxd_cfg[only_arch] = str((Path.cwd() / _expand(args.lrxd)).resolve())
 
-        built_lrxd = {}   # arch -> final path of the daemon this run built
-        for arch, stub_path in stubs.items():
-            stub_data = stub_path.read_bytes()
-            suffix = f'-{arch}' if len(stubs) > 1 else ''
+    built_lrxd = {}   # arch -> final path of the daemon this run built
+    for arch, stub_path in stubs.items():
+        stub_data = stub_path.read_bytes()
+        suffix = f'-{arch}' if len(stubs) > 1 else ''
 
-            daemon_path = output_dir / f'lrxd{suffix}'
-            bundle = struct.pack("<IB", 0, 0)  # 0 files, no flags
-            bundle_offset = len(stub_data)
-            trailer = struct.pack("<Q", bundle_offset) + key + MAGIC
-            daemon_path.parent.mkdir(parents=True, exist_ok=True)
-            daemon_path.write_bytes(stub_data + bundle + trailer)
-            os.chmod(str(daemon_path), 0o755)
+        daemon_path = output_dir / f'lrxd{suffix}'
+        bundle = struct.pack("<IB", 0, 0)  # 0 files, no flags
+        bundle_offset = len(stub_data)
+        trailer = struct.pack("<Q", bundle_offset) + key + MAGIC
+        daemon_path.parent.mkdir(parents=True, exist_ok=True)
+        daemon_path.write_bytes(stub_data + bundle + trailer)
+        os.chmod(str(daemon_path), 0o755)
 
-            # If `lrxd:` / --lrxd names a destination for this arch, MOVE the
-            # freshly built daemon there.  Moving doesn't change the bytes, so
-            # the keysplit SHA256(lrxd) is identical wherever it lands — we then
-            # derive from (and the runtime reads) that same file.  The
-            # destination may be a DIRECTORY (the daemon is placed inside it as
-            # lrxd[-arch]) or a full FILE path.  Any stale daemon from a previous
-            # pack is overwritten so re-runs are idempotent (plain shutil.move
-            # onto an existing dir raised "Destination path already exists").
-            if arch in lrxd_cfg:
-                dest = (config_path.parent / _expand(lrxd_cfg[arch])).resolve()
-                if dest.is_dir():
-                    dest = dest / f'lrxd{suffix}'
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                if dest.exists() or dest.is_symlink():
-                    dest.unlink()
-                shutil.move(str(daemon_path), str(dest))
-                daemon_path = dest
+        # If `lrxd:` / --lrxd names a destination for this arch, MOVE the freshly
+        # built daemon there.  Moving doesn't change the bytes, so the keysplit
+        # SHA256(lrxd) is identical wherever it lands — we then derive from (and
+        # the runtime reads) that same file.  The destination may be a DIRECTORY
+        # (the daemon is placed inside it as lrxd[-arch]) or a full FILE path.
+        # Any stale daemon from a previous pack is overwritten so re-runs are
+        # idempotent (plain shutil.move onto an existing dir raised "Destination
+        # path already exists").
+        if arch in lrxd_cfg:
+            dest = (config_path.parent / _expand(lrxd_cfg[arch])).resolve()
+            if dest.is_dir():
+                dest = dest / f'lrxd{suffix}'
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists() or dest.is_symlink():
+                dest.unlink()
+            shutil.move(str(daemon_path), str(dest))
+            daemon_path = dest
 
-            built_lrxd[arch] = daemon_path
-            print(f"[pack] Daemon binary: {daemon_path}  "
-                  f"({daemon_path.stat().st_size:,} bytes, {arch})")
+        built_lrxd[arch] = daemon_path
+        print(f"[pack] Daemon binary: {daemon_path}  "
+              f"({daemon_path.stat().st_size:,} bytes, {arch})")
 
+    # Derive per-arch real keys + encrypt, ONLY when this pack actually protects
+    # something (an encrypted exe or, in encrypt mode, an encrypted lib).  This
+    # is the only step that needs `version:`, so a pack that emits just lrxd (or
+    # only plaintext copies) does not require it.
+    produced_protected = bool(exe_files) or (libs_mode == 'encrypt' and bool(lib_files))
+    if produced_protected:
         # Key-split: derive a real key PER ARCH from that arch's lrxd + the
         # version VALUE.  Runtime paths are HARDCODED in the stub
         # ($HOME/SA/bin/sa/lrxd, $HOME/SA/version); `version:` in config is now
@@ -940,29 +946,32 @@ def main():
             print(f"[pack] key-split[{arch}]: real key from {lrxd_path} "
                   f"+ version field")
 
-        print(f"[pack] Encrypting {len(lib_files)} lib(s) individually...")
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    _encrypt_lib_worker,
-                    str(src),
-                    str(output_dir / src.relative_to(install_dir)),
-                    real_key_by_arch[lib_arch[src]],
-                ): src.name
-                for src in lib_files
-            }
-            for fut in as_completed(futures):
-                try:
-                    print(fut.result())
-                except Exception as e:
-                    sys.exit(f"[error] encrypt lib failed for {futures[fut]}: {e}")
-        print()
+        if libs_mode == 'encrypt' and lib_files:
+            print(f"[pack] Encrypting {len(lib_files)} lib(s) individually...")
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(
+                        _encrypt_lib_worker,
+                        str(src),
+                        str(output_dir / src.relative_to(install_dir)),
+                        real_key_by_arch[lib_arch[src]],
+                    ): src.name
+                    for src in lib_files
+                }
+                for fut in as_completed(futures):
+                    try:
+                        print(fut.result())
+                    except Exception as e:
+                        sys.exit(f"[error] encrypt lib failed for {futures[fut]}: {e}")
+            print()
 
     if exe_files:
+        # Defensive: exe_files implies produced_protected above, so lrxd was
+        # built and keys derived.  If not, something is inconsistent (e.g. no
+        # usable stub for the exe's arch) — fail clearly rather than KeyError.
         if not real_key_by_arch:
-            sys.exit("[error] keysplit requires daemon mode (libs: encrypt with "
-                     "libs present) so the lrxd the key binds to exists; "
-                     "exe-only packing is unsupported under key-split")
+            sys.exit("[error] keysplit: no real key derived — the lrxd daemon "
+                     "the key binds to was not built (no usable stub/arch?)")
         print(f"[pack] Protecting {len(exe_files)} executable(s)...")
         # Arch-vs-stubs mismatch is filtered out earlier in the scan
         # phase (see 'unsupported_arch'), so every entry here has a
