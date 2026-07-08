@@ -1287,6 +1287,25 @@ add_custom_target(test_missing_syms
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_dlsym_intercept — dlsym_intercept.so + symdiff.py detect a dlsym
+#  ownership flip (produced by load-order change) and ignore a stable
+#  specific-handle lookup.  Covers the blind spot LD_DEBUG=bindings has:
+#  runtime dlsym() resolution is not a relocation, so only an interceptor
+#  can surface an ownership change under memfd+daemon loading.
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_target(test_dlsym_intercept
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_dlsym_intercept ==="
+    COMMAND ${CMAKE_COMMAND} -E env "CC=${X86_GCC}"
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/symcheck/test_symcheck.sh"
+            "${CMAKE_CURRENT_BINARY_DIR}/symcheck_work"
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    COMMENT "dlsym interceptor + symdiff: detect a dlsym ownership flip"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  run_tests — runs all tests and prints a summary
 # ═══════════════════════════════════════════════════════════════════════
 
