@@ -22,7 +22,7 @@
  *
  * ─── Two-stage architecture ───────────────────────────────────────────
  *
- *      source (stub/*.c)
+ *      source (stub/<name>.c)
  *          │   perror("memfd_create");
  *          │   fprintf(stderr, "[antirev] failed");
  *          │   dlsym(RTLD_NEXT, "ANTI_LoadProcess");
@@ -30,7 +30,7 @@
  *      [1] tools/obfstr_gen.py        ← compile-time, runs before gcc
  *          │   scan call sites, encrypt literal arguments
  *          ▼
- *      build/obf/*.c (rewritten source)
+ *      build/obf/<name>.c (rewritten source)
  *          │   perror(_OBF(0x3a, 0x2b, 0x2c, ...));
  *          │   fprintf(stderr, _OBF(0x0c, 0x2f, ...));
  *          │   dlsym(RTLD_NEXT, _OBF(0x16, 0x00, ...));
@@ -43,7 +43,7 @@
  *
  * ─── Stage 1: tools/obfstr_gen.py ─────────────────────────────────────
  *
- * CMake runs this Python pass before compiling each stub/*.c, writing
+ * CMake runs this Python pass before compiling each stub/<name>.c, writing
  * the rewritten source to build/obf/<basename>.  The scanner pattern-
  * matches calls to a fixed set of functions/macros:
  *

@@ -1888,7 +1888,7 @@ static void derive_daemon_path(const char *real_exe, char *out, size_t out_sz) {
      * to drop the antirev brand from `ls` / `ps aux` / customer start
      * scripts.  No leading dot on purpose: a hidden *executable* is
      * itself a red flag (normal binaries aren't dotfiles), and a leading
-     * dot makes the file get skipped by glob-based copies (`cp dir/*`,
+     * dot makes the file get skipped by glob-based copies (`cp dir/<f>`,
      * rsync); plain "lrxd" blends in with ordinary binaries.  Existing
      * deployments must rename the file alongside an antirev upgrade. */
 #if defined(__x86_64__) || defined(__i386__)
