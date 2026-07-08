@@ -227,11 +227,12 @@ def _compute_sock_name(key):
 
 # ── Key loading ─────────────────────────────────────────────────────
 
-# version component: parsed from the version script's RAW stdout — the text
-# after b"Version: " on its line, truncated before any b"SPC", stripped.  MUST
-# stay byte-for-byte identical to stub.c (ksv_parse in keysplit_version.h),
-# encryptor/protect.py:parse_version_field, and tools/keysplit_expect.py.
-_VERSION_MARKER = b"Version: "
+# version component: parsed from the version script's RAW stdout.  Two formats:
+# dotted (test) -> everything after the first b"."; else (formal) -> text after
+# b"Version: DY", before b"SPC", stripped.  MUST stay byte-for-byte identical to
+# stub.c (ksv_parse in keysplit_version.h), encryptor/protect.py:parse_version_field,
+# and tools/keysplit_expect.py.
+_VERSION_MARKER = b"Version: DY"
 _VERSION_SPC    = b"SPC"
 
 
@@ -239,22 +240,25 @@ def _parse_version_field(stdout):
     """Extract the version key-component from the version script's raw stdout.
     Mirror of stub.c ksv_parse() / protect.parse_version_field(); MUST stay
     byte-for-byte identical.  Rule:
-      1. find b"Version: " (first occurrence)
-      2. take to the end of that line ('\\n'/EOF)
-      3. if b"SPC" occurs, truncate before it
-      4. strip ASCII whitespace
+      IF stdout contains b".":  field = everything after the first b"."
+        (excluding the dot), to the end, stripped (marker/SPC ignored).
+      ELSE: find b"Version: DY"; take after it to end of line; truncate before
+        any b"SPC"; strip.
     """
-    i = stdout.find(_VERSION_MARKER)
-    if i < 0:
-        raise RuntimeError('keysplit: "Version: " marker not found in version '
-                           'script output')
-    start = i + len(_VERSION_MARKER)
-    nl    = stdout.find(b"\n", start)
-    line  = stdout[start:nl if nl >= 0 else len(stdout)]
-    spc   = line.find(_VERSION_SPC)
-    if spc >= 0:
-        line = line[:spc]
-    field = line.strip()
+    if b"." in stdout:
+        field = stdout[stdout.index(b".") + 1:].strip()
+    else:
+        i = stdout.find(_VERSION_MARKER)
+        if i < 0:
+            raise RuntimeError('keysplit: version output has no "." and no '
+                               '"Version: DY" marker')
+        start = i + len(_VERSION_MARKER)
+        nl    = stdout.find(b"\n", start)
+        line  = stdout[start:nl if nl >= 0 else len(stdout)]
+        spc   = line.find(_VERSION_SPC)
+        if spc >= 0:
+            line = line[:spc]
+        field = line.strip()
     if not field:
         raise RuntimeError("keysplit: version field is empty after parsing")
     return field

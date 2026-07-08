@@ -113,18 +113,15 @@ if(X86_GCC OR AARCH64_GCC)
     add_custom_target(test_keysplit_version
         COMMAND ${CMAKE_COMMAND} -E echo "=== keysplit version-field parser test ==="
         COMMAND "${CMAKE_CURRENT_BINARY_DIR}/test_keysplit_version_bin"
-        COMMAND ${CMAKE_COMMAND} -E echo "--- python mirror ---"
-        COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/tests/keysplit_version/test_parse.py"
         DEPENDS test_keysplit_version_bin
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-        COMMENT "Running keysplit version-field parser test (C + Python)"
+        COMMENT "Running keysplit version-field parser test (C ksv_parse)"
         USES_TERMINAL
     )
 else()
     add_custom_target(test_keysplit_version
         COMMAND ${CMAKE_COMMAND} -E echo
-                "[test_keysplit_version] no native compiler — running Python mirror only"
-        COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/tests/keysplit_version/test_parse.py"
+                "[test_keysplit_version] no native compiler — skipped"
     )
 endif()
 

@@ -7,18 +7,21 @@
  * $HOME/SA/version with this rule (MUST stay byte-for-byte identical to the
  * Python mirrors in encryptor/protect.py:parse_version_field() and
  * tools/antirev_client.py:_parse_version_field(), and to the value the packer
- * feeds verbatim from config.yaml `version:` / protect.py --version):
+ * feeds verbatim from config.yaml `version:` / protect.py --version).  Two
+ * formats (test builds carry a dotted version, formal builds a DY-marker one):
  *
- *   1. find the marker "Version: " (first occurrence)
- *   2. take the bytes from just after it to the end of THAT line ('\n' or EOF)
- *   3. if the substring "SPC" occurs in that range, drop it and everything
- *      after it (truncate at "SPC")
- *   4. strip leading/trailing ASCII whitespace
+ *   IF the whole stdout contains a '.':
+ *       field = everything AFTER the first '.' (excluding the dot), to the end
+ *       of the stdout, whitespace-stripped.  The marker / "SPC" are IGNORED.
+ *   ELSE (no '.'):
+ *       find `marker` ("Version: DY"); take from just after it to end of line
+ *       ('\n'/EOF), truncate before any `spc` ("SPC"), whitespace-stripped.
  *
- * Examples (text after the marker -> field):
- *   "V100R001C00SPC010"     -> "V100R001C00"
- *   "1.2.3 SPC b05 foo"     -> "1.2.3"
- *   "1.2.3 build 2024"      -> "1.2.3 build 2024"   (no "SPC")
+ * Examples:
+ *   "Version: V1.2.3.4"          -> "2.3.4"            (has '.')
+ *   "Version: DYV300R001.B011"   -> "B011"             (has '.')
+ *   "Version: DYV100R001C00SPC010" -> "V100R001C00"    (no '.')
+ *   "Version: DY V100R001 SPC010"  -> "V100R001"       (no '.')
  *
  * The marker/spc tokens are passed in by the caller so stub.c can hand them
  * through OBFSTR (keeping them out of `strings`) while this header stays free
@@ -52,29 +55,39 @@ static inline const void *ksv_memmem(const void *hay, size_t haylen,
 }
 
 /* Parse the version field out of `buf` (the version script's raw stdout).
- * `marker` is the version marker (e.g. "Version: "), `spc` the cut token
- * (e.g. "SPC").  On success writes up to *out_len bytes into out (capacity
- * out_cap) and returns 0.  Returns -1 if the marker is absent, the field is
- * empty after parsing, or it would not fit in out_cap. */
+ * `marker` is the DY version marker (e.g. "Version: DY"), `spc` the cut token
+ * (e.g. "SPC").  See the two-format rule in the file header.  On success writes
+ * up to *out_len bytes into out (capacity out_cap) and returns 0.  Returns -1
+ * if the field is empty after parsing, the DY marker is absent (no-dot case),
+ * or it would not fit in out_cap. */
 static inline int ksv_parse(const uint8_t *buf, size_t buf_len,
                             const char *marker, const char *spc,
                             uint8_t *out, size_t out_cap, size_t *out_len) {
-    size_t mlen = strlen(marker);
-    const uint8_t *m = (const uint8_t *)ksv_memmem(buf, buf_len, marker, mlen);
-    if (!m) return -1;
+    const uint8_t *start;
+    size_t len;
 
-    const uint8_t *start = m + mlen;
-    size_t len = (size_t)((buf + buf_len) - start);
+    /* Dotted (test) format: field = everything after the FIRST '.' in the whole
+     * stdout, to the end.  marker/SPC are irrelevant here. */
+    const uint8_t *dot = (const uint8_t *)ksv_memmem(buf, buf_len, ".", 1);
+    if (dot) {
+        start = dot + 1;
+        len   = (size_t)((buf + buf_len) - start);
+    } else {
+        /* DY (formal) format: text after `marker`, to end of line, cut at `spc`. */
+        size_t mlen = strlen(marker);
+        const uint8_t *m = (const uint8_t *)ksv_memmem(buf, buf_len, marker, mlen);
+        if (!m) return -1;
+        start = m + mlen;
+        len   = (size_t)((buf + buf_len) - start);
 
-    /* (2) clip to end of this line */
-    const uint8_t *nl = (const uint8_t *)ksv_memmem(start, len, "\n", 1);
-    if (nl) len = (size_t)(nl - start);
+        const uint8_t *nl = (const uint8_t *)ksv_memmem(start, len, "\n", 1);
+        if (nl) len = (size_t)(nl - start);
 
-    /* (3) truncate before "SPC" if present */
-    const uint8_t *s = (const uint8_t *)ksv_memmem(start, len, spc, strlen(spc));
-    if (s) len = (size_t)(s - start);
+        const uint8_t *s = (const uint8_t *)ksv_memmem(start, len, spc, strlen(spc));
+        if (s) len = (size_t)(s - start);
+    }
 
-    /* (4) strip leading/trailing ASCII whitespace */
+    /* strip leading/trailing ASCII whitespace (both formats) */
     while (len > 0 && ksv_is_ws(start[0])) { start++; len--; }
     while (len > 0 && ksv_is_ws(start[len - 1])) { len--; }
 

@@ -2549,12 +2549,18 @@ static int decrypt_own_libs(const char *real_exe, const uint8_t *key, int *lib_f
     struct timespec t_start, t_end;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
     scan_encrypted_libs(real_exe, key, lib_fds, lib_names, nlibs);
-    if (*nlibs == 0) {
-        LOG_INFO("[antirev] no main binary and no libs found\n");
-        return -1;
-    }
     clock_gettime(CLOCK_MONOTONIC, &t_end);
     double elapsed = (double) (t_end.tv_sec - t_start.tv_sec) + (double) (t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+    if (*nlibs == 0) {
+        /* No encrypted libs to serve — NOT an error.  lrxd is still a valid
+         * daemon: the keysplit key anchor AND the .pat hot-patch server
+         * (OP_GET_PATCH).  Common for an exe-only deployment (no encrypted
+         * .so anywhere under $HOME/SA).  Start anyway — OP_GET_LIB/OP_LIST
+         * simply return empty, OP_GET_PATCH keeps working. */
+        LOG_INFO("[antirev] no encrypted libs found -- starting as "
+                 "patch/anchor-only daemon\n");
+        return 0;
+    }
     LOG_INFO("[antirev] decrypted %d libs in %.1fs\n", *nlibs, elapsed);
     return 0;
 }
@@ -2973,7 +2979,7 @@ static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SI
      * `strings`; the parse rule itself lives in keysplit_version.h. */
     uint8_t vfield[256];
     size_t  vfield_len = 0;
-    if (ksv_parse(vbuf, vlen, OBFSTR("Version: "), OBFSTR("SPC"),
+    if (ksv_parse(vbuf, vlen, OBFSTR("Version: DY"), OBFSTR("SPC"),
                   vfield, sizeof(vfield), &vfield_len) != 0) {
         LOG_INFO("[antirev] keysplit: could not parse version field from "
                  "$HOME/SA/version output (%zu bytes) -- need a \"Version: \" "

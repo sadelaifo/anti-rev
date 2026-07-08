@@ -38,10 +38,37 @@ field log can be compared without the key ever leaving the box.
 """
 import argparse
 import hashlib
+import subprocess
 import sys
 from pathlib import Path
 
 MAGIC = b"ANTREV01"
+
+# Version-field parser — MUST stay byte-for-byte identical to stub.c ksv_parse
+# and encryptor/protect.py:parse_version_field.  Two formats: dotted (test) ->
+# everything after the first b"."; else (formal) -> after b"Version: DY",
+# before b"SPC", stripped.
+_VERSION_MARKER = b"Version: DY"
+_VERSION_SPC    = b"SPC"
+
+
+def parse_version_field(stdout: bytes) -> bytes:
+    if b"." in stdout:
+        field = stdout[stdout.index(b".") + 1:].strip()
+    else:
+        i = stdout.find(_VERSION_MARKER)
+        if i < 0:
+            sys.exit('version output has no "." and no "Version: DY" marker')
+        start = i + len(_VERSION_MARKER)
+        nl    = stdout.find(b"\n", start)
+        line  = stdout[start:nl if nl >= 0 else len(stdout)]
+        spc   = line.find(_VERSION_SPC)
+        if spc >= 0:
+            line = line[:spc]
+        field = line.strip()
+    if not field:
+        sys.exit("version field is empty after parsing")
+    return field
 
 
 def load_part1(args) -> bytes:
@@ -60,9 +87,14 @@ def main() -> None:
     src.add_argument("--key", help="hex key file holding part1 (what the packer used)")
     src.add_argument("--trailer", help="packed binary whose ANTREV01 trailer holds part1")
     ap.add_argument("--lrxd", required=True, help="lrxd binary to hash")
-    ap.add_argument("--version", required=True,
-                    help="version VALUE (literal string, taken verbatim/stripped; "
-                         "must equal what $HOME/SA/version parses to)")
+    ver = ap.add_mutually_exclusive_group(required=True)
+    ver.add_argument("--version",
+                     help="version VALUE (literal string, taken verbatim/stripped; "
+                          "must equal what $HOME/SA/version parses to)")
+    ver.add_argument("--version-script",
+                     help="EXECUTE this version script and parse its stdout with the "
+                          "runtime rule (dotted -> after first '.'; else after "
+                          "'Version: DY' before 'SPC') — reproduces what the stub derives")
     args = ap.parse_args()
 
     part1 = load_part1(args)
@@ -70,9 +102,13 @@ def main() -> None:
         sys.exit(f"part1 must be 32 bytes, got {len(part1)}")
 
     lrxd_bytes = Path(args.lrxd).read_bytes()
-    version_bytes = args.version.strip().encode()
+    if args.version_script:
+        out = subprocess.run([str(args.version_script)], capture_output=True).stdout
+        version_bytes = parse_version_field(out)
+    else:
+        version_bytes = args.version.strip().encode()
     if not version_bytes:
-        sys.exit("--version must be a non-empty string")
+        sys.exit("version field is empty")
 
     part2 = hashlib.sha256(lrxd_bytes).digest()
     real_key = hashlib.sha256(part1 + part2 + version_bytes).digest()

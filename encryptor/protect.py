@@ -162,33 +162,38 @@ def encrypt_data(data: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
 # after b"Version: " on its line, truncated before any b"SPC", stripped.  MUST
 # stay byte-for-byte identical to stub.c (ksv_parse in keysplit_version.h),
 # tools/antirev_client.py, and tools/keysplit_expect.py.
-_VERSION_MARKER = b"Version: "
+_VERSION_MARKER = b"Version: DY"   # formal (no-dot) marker; value starts after "DY"
 _VERSION_SPC    = b"SPC"
 
 
 def parse_version_field(stdout: bytes) -> bytes:
     """Extract the version key-component from the version script's raw stdout.
 
-    Rule (identical to stub.c ksv_parse / antirev_client._parse_version_field):
-      1. find the marker b"Version: " (first occurrence)
-      2. take the bytes from just after it to the end of THAT line ('\\n'/EOF)
-      3. if b"SPC" occurs in that range, drop it and everything after it
-      4. strip leading/trailing ASCII whitespace
+    Two formats (identical to stub.c ksv_parse / antirev_client._parse_version_field):
+      IF the whole stdout contains b".":  (test builds, dotted version)
+          field = everything AFTER the first b"." (excluding the dot), to the end,
+          whitespace-stripped.  The marker / "SPC" are ignored.
+      ELSE (no b"."):  (formal builds, DY-marker version)
+          find b"Version: DY"; take from just after it to end of line ('\\n'/EOF),
+          truncate before any b"SPC", whitespace-strip.
 
-    Hard-fails if the marker is absent or the field is empty after parsing.
-    Used for tests and for CLI callers that still point at a live script; the
+    Hard-fails if the field is empty, or (no-dot case) the DY marker is absent.
+    Used for tests and for CLI callers that point at a live script; the
     config-driven pack path supplies the value directly (already parsed)."""
-    i = stdout.find(_VERSION_MARKER)
-    if i < 0:
-        sys.exit('[error] keysplit: "Version: " marker not found in version '
-                 'script output')
-    start = i + len(_VERSION_MARKER)
-    nl    = stdout.find(b"\n", start)
-    line  = stdout[start:nl if nl >= 0 else len(stdout)]
-    spc   = line.find(_VERSION_SPC)
-    if spc >= 0:
-        line = line[:spc]
-    field = line.strip()
+    if b"." in stdout:
+        field = stdout[stdout.index(b".") + 1:].strip()
+    else:
+        i = stdout.find(_VERSION_MARKER)
+        if i < 0:
+            sys.exit('[error] keysplit: version output has no "." and no '
+                     '"Version: DY" marker')
+        start = i + len(_VERSION_MARKER)
+        nl    = stdout.find(b"\n", start)
+        line  = stdout[start:nl if nl >= 0 else len(stdout)]
+        spc   = line.find(_VERSION_SPC)
+        if spc >= 0:
+            line = line[:spc]
+        field = line.strip()
     if not field:
         sys.exit("[error] keysplit: version field is empty after parsing")
     return field

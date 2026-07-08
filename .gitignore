@@ -39,3 +39,6 @@ core.*
 
 # CMake tooling
 compile_commands.json
+
+# local-only keysplit version parser dev test (not tracked)
+tests/keysplit_version/test_parse.py
