@@ -18,7 +18,7 @@ static int check(const char *in, const char *expect) {
     uint8_t out[256];
     size_t  n = 0;
     int r = ksv_parse((const uint8_t *)in, strlen(in),
-                      "Version: ", "SPC", out, sizeof(out), &n);
+                      "Version: DY", "SPC", out, sizeof(out), &n);
     if (expect == NULL)
         return r != 0;                 /* expected to fail */
     if (r != 0)
@@ -28,22 +28,29 @@ static int check(const char *in, const char *expect) {
 
 int main(void) {
     struct { const char *in; const char *out; } cases[] = {
-        /* Huawei-style contiguous SPC */
-        { "Version: V100R001C00SPC010\n",              "V100R001C00" },
-        /* marker mid-stream, space-separated SPC, trailing junk dropped */
-        { "prod\nVersion: 1.2.3 SPC b05 foo\nother\n", "1.2.3" },
-        /* no SPC -> whole line (stripped) */
-        { "Version: 1.2.3 build 2024\n",               "1.2.3 build 2024" },
-        /* extra whitespace around the value */
-        { "Version:    V1   \n",                       "V1" },
+        /* ── dotted (test) format: everything after the first '.' ── */
+        { "Version: V1.2.3.4\n",                       "2.3.4" },
+        { "Version: DYV300R001.B011\n",                "B011" },
+        /* dot anywhere in stdout wins; marker/SPC ignored */
+        { "anything.HELLO WORLD\n",                    "HELLO WORLD" },
+        /* after-dot then stripped (trailing newline removed) */
+        { "x.abc  \n",                                 "abc" },
+
+        /* ── DY (formal) format: after "Version: DY", before "SPC" ── */
+        { "Version: DYV100R001C00SPC010\n",            "V100R001C00" },
+        { "Version: DY V100R001 SPC010\n",             "V100R001" },
+        /* no SPC -> whole line after DY (stripped) */
+        { "Version: DYV100R001C00\n",                  "V100R001C00" },
         /* no trailing newline (marker line is EOF) */
-        { "Version: V100R001C00SPC010",                "V100R001C00" },
-        /* marker absent -> fail */
-        { "no version marker here\n",                  NULL },
-        /* value is entirely SPC... -> empty after cut -> fail */
-        { "Version: SPC123\n",                         NULL },
-        /* value only whitespace -> empty -> fail */
-        { "Version:    \n",                            NULL },
+        { "Version: DYV100R001C00SPC010",              "V100R001C00" },
+
+        /* ── failures ── */
+        /* no '.' and no DY marker -> fail */
+        { "no marker here\n",                          NULL },
+        /* dotted but empty after the dot -> fail */
+        { "abc.\n",                                    NULL },
+        /* DY value entirely SPC... -> empty after cut -> fail */
+        { "Version: DYSPC123\n",                       NULL },
     };
 
     int failed = 0;
