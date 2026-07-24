@@ -28,6 +28,7 @@ Usage:
   tools/pyarmor_compat_scan.py src --min-severity MEDIUM
   tools/pyarmor_compat_scan.py src --no-rft --no-bcc      # basic mode only
   tools/pyarmor_compat_scan.py src --exclude tests --exclude build
+  tools/pyarmor_compat_scan.py huge/tree -j 8             # 8 parallel workers
 
 Exit code is non-zero when a finding at or above --fail-on (default HIGH) is
 present, so it can gate CI.
@@ -204,22 +205,28 @@ class Scanner(ast.NodeVisitor):
 
     def visit_AsyncFunctionDef(self, node):
         self._check_decorators(node)
-        self.add(node.lineno, "LOW", "bcc",
-                 f"'async def {node.name}'  -  some PyArmor BCC/bytecode-to-C versions "
-                 f"don't support async; review if using BCC mode")
+        if not self.opts.no_bcc:
+            self.add(node.lineno, "LOW", "bcc",
+                     f"'async def {node.name}'  -  some PyArmor BCC/bytecode-to-C versions "
+                     f"don't support async; review if using BCC mode")
         self.generic_visit(node)
 
     def _check_bcc(self, node):
         # BCC (bytecode-to-C) mode has feature gaps; flag constructs to review.
+        # Skip the (expensive) subtree walk entirely when BCC checks are off.
+        if self.opts.no_bcc:
+            return
+        seen_yield = seen_nonlocal = False
         for n in ast.walk(node):
-            if isinstance(n, (ast.Yield, ast.YieldFrom)):
+            if not seen_yield and isinstance(n, (ast.Yield, ast.YieldFrom)):
                 self.add(n.lineno, "LOW", "bcc",
                          f"generator (yield) in '{node.name}'  -  verify under BCC mode")
-                break
-        for n in ast.walk(node):
-            if isinstance(n, ast.Nonlocal):
+                seen_yield = True
+            elif not seen_nonlocal and isinstance(n, ast.Nonlocal):
                 self.add(n.lineno, "LOW", "bcc",
                          f"nonlocal/closure in '{node.name}'  -  verify under BCC mode")
+                seen_nonlocal = True
+            if seen_yield and seen_nonlocal:
                 break
 
     # ---- calls ----------------------------------------------------------
@@ -352,6 +359,12 @@ def scan_file(path, opts):
     return uniq
 
 
+def _scan_worker(arg):
+    """Top-level (picklable) worker for the process pool: (path, opts) -> (path, findings)."""
+    path, opts = arg
+    return str(path), scan_file(path, opts)
+
+
 def iter_py_files(root, excludes):
     root = Path(root)
     if root.is_file():
@@ -386,15 +399,30 @@ def main(argv=None):
                     help="skip BCC/bytecode-to-C checks (use if not using BCC mode)")
     ap.add_argument("--exclude", action="append", default=[],
                     help="directory name/part to skip (repeatable)")
+    ap.add_argument("-j", "--jobs", type=int, default=0,
+                    help="parallel worker processes (0 = auto = CPU count; 1 = serial)")
     opts = ap.parse_args(argv)
 
     min_sev = SEVERITY_ORDER[opts.min_severity]
+    files = list(iter_py_files(opts.root, set(opts.exclude)))
+    files_scanned = len(files)
+
+    jobs = opts.jobs if opts.jobs > 0 else (os.cpu_count() or 1)
+    # Process-pool overhead isn't worth it for a handful of files.
+    if jobs > 1 and files_scanned > 16:
+        from concurrent.futures import ProcessPoolExecutor
+        chunk = max(1, files_scanned // (jobs * 4))
+        with ProcessPoolExecutor(max_workers=jobs) as ex:
+            scanned = ex.map(_scan_worker, ((p, opts) for p in files), chunksize=chunk)
+    else:
+        scanned = (_scan_worker((p, opts)) for p in files)
+
     results = {}   # path -> [findings]
-    for path in iter_py_files(opts.root, set(opts.exclude)):
-        findings = [f for f in scan_file(path, opts) if SEVERITY_ORDER[f[1]] >= min_sev]
+    for path, raw in scanned:
+        findings = [f for f in raw if SEVERITY_ORDER[f[1]] >= min_sev]
         if findings:
             findings.sort(key=lambda f: (-SEVERITY_ORDER[f[1]], f[0]))
-            results[str(path)] = findings
+            results[path] = findings
 
     # summary aggregates
     by_cat = {}
@@ -418,7 +446,7 @@ def main(argv=None):
                           for (l, s, c, m) in fs] for p, fs in results.items()},
             "summary": {"by_severity": by_sev, "by_category": by_cat,
                         "exclude_candidates": sorted(exclude_candidates),
-                        "files_scanned": sum(1 for _ in iter_py_files(opts.root, set(opts.exclude)))},
+                        "files_scanned": files_scanned},
         }
         print(json.dumps(out, indent=2))
         return exit_code
