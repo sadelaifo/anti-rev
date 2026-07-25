@@ -23,6 +23,12 @@ input from network/user/env (requests, input(), response.text, ...) or of
 undetermined origin is kept as a code-injection (RCE) risk. --no-trace-exec
 restores the old "flag everything" behaviour.
 
+exec/eval of a CONSTRUCTED code string (f-string/concat/.format that builds
+source from live variable names, e.g. exec(f'{foo}{field} = v')) is reported
+separately as 'dynamic-codegen': it runs fine under basic obfuscation but
+BREAKS under RFT rename, since the names in the string aren't renamed with the
+variables. These are always kept (never omitted) for review.
+
 Severity:
   HIGH    almost certainly breaks under obfuscation -> exclude the module
   MEDIUM  breaks in common configs (spawn, dynamic exec) -> review
@@ -303,14 +309,19 @@ class Scanner(ast.NodeVisitor):
                     self.add(node.lineno, "MEDIUM", "dynamic-exec",
                              f"{fn.id}()  -  dynamic code; interacts with PyArmor import hook / BCC")
                 else:
-                    src = self._classify_source(node.args[0] if node.args else None,
-                                                frozenset())
-                    if src == "local":
-                        pass   # input traces to a literal / config / local file -> omit
-                    elif src == "external":
+                    arg = node.args[0] if node.args else None
+                    src = self._classify_source(arg, frozenset())
+                    if src == "external":                    # RCE wins (highest concern)
                         self.add(node.lineno, "MEDIUM", "dynamic-exec",
                                  f"{fn.id}() on EXTERNAL input (network/user/env)  -  "
                                  f"code-injection (RCE) risk; use json.loads / ast.literal_eval")
+                    elif self._is_constructed_code(arg):
+                        self.add(node.lineno, "MEDIUM", "dynamic-codegen",
+                                 f"{fn.id}() on a CONSTRUCTED code string (f-string/concat/"
+                                 f".format built from live variable names)  -  runs fine under "
+                                 f"basic obfuscation but BREAKS under RFT rename; review")
+                    elif src == "local":
+                        pass   # input traces to a literal / config / local file -> omit
                     else:
                         self.add(node.lineno, "MEDIUM", "dynamic-exec",
                                  f"{fn.id}() input origin undetermined  -  verify it's trusted "
@@ -358,6 +369,19 @@ class Scanner(ast.NodeVisitor):
     def _refs_dunder_file(node):
         return any(isinstance(n, ast.Name) and n.id == "__file__"
                    for n in ast.walk(node))
+
+    @staticmethod
+    def _is_constructed_code(node):
+        """True if the exec/eval arg is a code string BUILT at runtime (f-string,
+        concat, %-format, .format()/.join()) rather than a plain literal/var."""
+        if isinstance(node, ast.JoinedStr):                 # f'{foo} = ...'
+            return any(isinstance(v, ast.FormattedValue) for v in node.values)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+            return True                                      # 'x' + name  /  '%s' % name
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("format", "join")):
+            return True                                      # '{}'.format(name) / ''.join(...)
+        return False
 
     # ---- eval/exec source provenance (best-effort, intra-file) ----------
     def _classify_source(self, node, seen):
