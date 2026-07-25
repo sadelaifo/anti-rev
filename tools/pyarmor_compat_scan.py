@@ -502,6 +502,10 @@ def main(argv=None):
         epilog=__doc__)
     ap.add_argument("root", help="file or directory to scan")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("-o", "--out", nargs="?", const="__AUTO__", default=None,
+                    metavar="FILE",
+                    help="also write the output to FILE (still prints to the terminal). "
+                         "Bare -o auto-names it output.json (--json) or output.txt.")
     ap.add_argument("--min-severity", default="INFO",
                     choices=list(SEVERITY_ORDER), help="hide findings below this level")
     ap.add_argument("--fail-on", default="HIGH",
@@ -557,6 +561,15 @@ def main(argv=None):
                 default=-1)
     exit_code = 1 if worst >= SEVERITY_ORDER[opts.fail_on] else 0
 
+    # resolve the optional output file (bare -o auto-names by mode)
+    if opts.out is None:
+        outfile = None
+    elif opts.out == "__AUTO__":
+        outfile = "output.json" if opts.json else "output.txt"
+    else:
+        outfile = opts.out
+
+    # build the whole output as one string, then print AND optionally save it
     if opts.json:
         out = {
             "files": {p: [{"line": l, "severity": s, "category": c, "message": m}
@@ -565,29 +578,35 @@ def main(argv=None):
                         "exclude_candidates": sorted(exclude_candidates),
                         "files_scanned": files_scanned},
         }
-        print(json.dumps(out, indent=2))
-        return exit_code
+        text = json.dumps(out, indent=2)
+    elif not results:
+        text = "No PyArmor-compatibility issues found."
+    else:
+        lines = []
+        for path in sorted(results):
+            lines.append(f"\n{path}")
+            for line, sev, cat, msg in results[path]:
+                lines.append(f"  {sev:6} [{cat}] line {line}: {msg}")
+        lines.append("\n" + "=" * 70)
+        lines.append("SUMMARY")
+        lines.append("  findings by severity: " +
+                     ", ".join(f"{k}={by_sev[k]}" for k in ["HIGH", "MEDIUM", "LOW", "INFO"]))
+        lines.append("  findings by category: " +
+                     ", ".join(f"{k}={v}" for k, v in sorted(by_cat.items())))
+        if exclude_candidates:
+            lines.append("\n  >> Modules to EXCLUDE from obfuscation (HIGH breakers):")
+            for p in sorted(exclude_candidates):
+                lines.append(f"       {p}")
+        lines.append("\n  Static pre-filter only  -  confirm with encryptor/pyarmor_verify.py.")
+        text = "\n".join(lines)
 
-    if not results:
-        print("No PyArmor-compatibility issues found.")
-        return exit_code
-
-    for path in sorted(results):
-        print(f"\n{path}")
-        for line, sev, cat, msg in results[path]:
-            print(f"  {sev:6} [{cat}] line {line}: {msg}")
-
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print(f"  findings by severity: " +
-          ", ".join(f"{k}={by_sev[k]}" for k in ["HIGH", "MEDIUM", "LOW", "INFO"]))
-    print(f"  findings by category: " +
-          ", ".join(f"{k}={v}" for k, v in sorted(by_cat.items())))
-    if exclude_candidates:
-        print("\n  >> Modules to EXCLUDE from obfuscation (HIGH breakers):")
-        for p in sorted(exclude_candidates):
-            print(f"       {p}")
-    print("\n  Static pre-filter only  -  confirm with encryptor/pyarmor_verify.py.")
+    print(text)
+    if outfile:
+        try:
+            Path(outfile).write_text(text + "\n", encoding="utf-8")
+            print(f"[written to {outfile}]", file=sys.stderr)
+        except OSError as e:
+            print(f"[could not write {outfile}: {e}]", file=sys.stderr)
     return exit_code
 
 
