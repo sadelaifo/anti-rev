@@ -16,6 +16,13 @@ It is a PRE-FILTER, not a proof of safety:
     pickled only under a runtime branch, spawn chosen via env var).
 Treat the output as a triage list; confirm behaviour with pyarmor_verify.py.
 
+eval/exec provenance: exec/eval/compile findings are traced back (best-effort,
+within one file) to where their input comes from. Input that traces to a
+literal or a local/config file is OMITTED (trusted, and PyArmor runs it fine);
+input from network/user/env (requests, input(), response.text, ...) or of
+undetermined origin is kept as a code-injection (RCE) risk. --no-trace-exec
+restores the old "flag everything" behaviour.
+
 Severity:
   HIGH    almost certainly breaks under obfuscation -> exclude the module
   MEDIUM  breaks in common configs (spawn, dynamic exec) -> review
@@ -92,6 +99,24 @@ FRAME_INTROSPECT_CALLABLES = {
 # --- #6 dynamic name resolution (RFT rename mode) ---
 RFT_NAME_CALLABLES = {"operator.attrgetter", "operator.methodcaller"}
 
+# --- eval/exec source provenance (trace where the executed string comes from) ---
+# EXTERNAL = untrusted / attacker-influenceable -> keep (code-injection risk).
+EXTERNAL_SOURCE_CALLS = {
+    "input", "requests.get", "requests.post", "requests.put", "requests.patch",
+    "requests.delete", "requests.head", "requests.request",
+    "urllib.request.urlopen", "httpx.get", "httpx.post", "httpx.request",
+    "os.getenv", "os.environ.get",
+    "subprocess.check_output", "subprocess.getoutput", "subprocess.run",
+}
+EXTERNAL_METHODS = {"recv", "recvfrom"}                  # socket reads
+EXTERNAL_ATTRS = {"text", "content", "body", "raw"}      # response.text/.content/...
+# LOCAL = literal or in-tree/config file -> omit (trusted, shipped alongside code).
+LOCAL_SOURCE_CALLS = {
+    "open", "pathlib.Path", "json.load", "json.loads",
+    "yaml.load", "yaml.safe_load", "toml.load",
+}
+LOCAL_METHODS = {"read", "read_text", "readlines", "getvalue"}
+
 # module imports that are, on their own, a signal
 IMPORT_SIGNALS = {
     # module -> (severity, category, note)
@@ -125,9 +150,11 @@ def dotted_name(node):
 
 
 class Scanner(ast.NodeVisitor):
-    def __init__(self, path, opts):
+    def __init__(self, path, opts, assignments=None):
         self.path = path
         self.opts = opts
+        self.assignments = assignments or {}   # var name -> [RHS AST nodes] (whole file)
+        self.trace_exec = not getattr(opts, "no_trace_exec", False)
         self.aliases = {}          # local name -> full dotted module/callable path
         self.findings = []         # (line, severity, category, message)
         self._imported_mods = set()
@@ -272,8 +299,22 @@ class Scanner(ast.NodeVisitor):
         fn = node.func
         if isinstance(fn, ast.Name):
             if fn.id in DYNAMIC_EXEC_NAMES:
-                self.add(node.lineno, "MEDIUM", "dynamic-exec",
-                         f"{fn.id}()  -  dynamic code; interacts with PyArmor import hook / BCC")
+                if not self.trace_exec:
+                    self.add(node.lineno, "MEDIUM", "dynamic-exec",
+                             f"{fn.id}()  -  dynamic code; interacts with PyArmor import hook / BCC")
+                else:
+                    src = self._classify_source(node.args[0] if node.args else None,
+                                                frozenset())
+                    if src == "local":
+                        pass   # input traces to a literal / config / local file -> omit
+                    elif src == "external":
+                        self.add(node.lineno, "MEDIUM", "dynamic-exec",
+                                 f"{fn.id}() on EXTERNAL input (network/user/env)  -  "
+                                 f"code-injection (RCE) risk; use json.loads / ast.literal_eval")
+                    else:
+                        self.add(node.lineno, "MEDIUM", "dynamic-exec",
+                                 f"{fn.id}() input origin undetermined  -  verify it's trusted "
+                                 f"(not network/user input); use ast.literal_eval if it's data")
             elif fn.id in RFT_ATTR_BUILTINS and len(node.args) >= 2:
                 name_arg = node.args[1]
                 is_literal = isinstance(name_arg, ast.Constant) and isinstance(name_arg.value, str)
@@ -318,6 +359,60 @@ class Scanner(ast.NodeVisitor):
         return any(isinstance(n, ast.Name) and n.id == "__file__"
                    for n in ast.walk(node))
 
+    # ---- eval/exec source provenance (best-effort, intra-file) ----------
+    def _classify_source(self, node, seen):
+        """Where does a value come from? 'local' (trusted) | 'external' | 'unknown'."""
+        if node is None:
+            return "unknown"
+        if isinstance(node, ast.Constant):
+            return "local"                       # a literal is in-source, trusted
+        if isinstance(node, ast.Name):
+            return self._classify_name(node.id, seen)
+        if isinstance(node, ast.Call):
+            return self._classify_call(node, seen)
+        if isinstance(node, ast.Attribute):
+            return "external" if node.attr in EXTERNAL_ATTRS else "unknown"
+        if isinstance(node, ast.JoinedStr):      # f-string
+            return self._combine(self._classify_source(v.value, seen)
+                                 for v in node.values
+                                 if isinstance(v, ast.FormattedValue))
+        if isinstance(node, ast.BinOp):          # concat / % formatting
+            return self._combine([self._classify_source(node.left, seen),
+                                  self._classify_source(node.right, seen)])
+        return "unknown"
+
+    @staticmethod
+    def _combine(classes):
+        classes = set(classes)
+        if "external" in classes:                # any tainted part taints the whole
+            return "external"
+        if classes and classes <= {"local"}:
+            return "local"
+        return "unknown"
+
+    def _classify_name(self, name, seen):
+        if name in seen:                         # guard assignment cycles (a=b; b=a)
+            return "unknown"
+        rhss = self.assignments.get(name)
+        if not rhss:                             # param / import / builtin / not seen
+            return "unknown"
+        seen = seen | {name}
+        return self._combine(self._classify_source(r, seen) for r in rhss)
+
+    def _classify_call(self, node, seen):
+        full = self.resolve(node)
+        if full in EXTERNAL_SOURCE_CALLS:
+            return "external"
+        if full in LOCAL_SOURCE_CALLS:
+            return "local"
+        if isinstance(node.func, ast.Attribute):
+            meth = node.func.attr
+            if meth in EXTERNAL_METHODS or meth == "json":   # sock.recv(), resp.json()
+                return "external"
+            if meth in LOCAL_METHODS:            # f.read()/.read_text(): trust = receiver's
+                return self._classify_source(node.func.value, seen)
+        return "unknown"
+
     # ---- class-name-keyed registries (RFT) ------------------------------
     def visit_Attribute(self, node):
         if node.attr in ("__name__", "__qualname__"):
@@ -346,7 +441,26 @@ def scan_file(path, opts):
     except SyntaxError as e:
         return [(e.lineno or 0, "HIGH", "syntax-error",
                  f"does not parse ({e.msg})  -  PyArmor can't obfuscate it either")]
-    sc = Scanner(path, opts)
+    # Pre-collect variable assignments (whole file) so eval/exec provenance can
+    # trace a name back to its source. Imprecise (ignores scope/order) but
+    # conservative: we only OMIT a finding when *every* assignment is local.
+    assignments = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    assignments.setdefault(t.id, []).append(n.value)
+        elif isinstance(n, ast.AnnAssign):
+            if isinstance(n.target, ast.Name) and n.value is not None:
+                assignments.setdefault(n.target.id, []).append(n.value)
+        elif isinstance(n, ast.NamedExpr):       # walrus  (x := ...)
+            if isinstance(n.target, ast.Name):
+                assignments.setdefault(n.target.id, []).append(n.value)
+        elif isinstance(n, (ast.With, ast.AsyncWith)):   # with open(...) as f
+            for item in n.items:
+                if isinstance(item.optional_vars, ast.Name):
+                    assignments.setdefault(item.optional_vars.id, []).append(item.context_expr)
+    sc = Scanner(path, opts, assignments)
     sc.visit(tree)
     # de-dup identical (line, category, message)
     seen = set()
@@ -397,6 +511,9 @@ def main(argv=None):
                     help="skip RFT/rename-mode checks (use if not using rename mode)")
     ap.add_argument("--no-bcc", action="store_true",
                     help="skip BCC/bytecode-to-C checks (use if not using BCC mode)")
+    ap.add_argument("--no-trace-exec", action="store_true",
+                    help="don't trace eval/exec input provenance; flag ALL exec/eval/compile "
+                         "(default: omit those whose input traces to a literal/config/local file)")
     ap.add_argument("--exclude", action="append", default=[],
                     help="directory name/part to skip (repeatable)")
     ap.add_argument("-j", "--jobs", type=int, default=0,
