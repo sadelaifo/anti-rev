@@ -29,9 +29,18 @@ separately as 'dynamic-codegen': it runs fine under basic obfuscation but
 BREAKS under RFT rename, since the names in the string aren't renamed with the
 variables. These are always kept (never omitted) for review.
 
+Scope (--checks, default 'pyarmor'):
+  By default this reports ONLY failures that OBFUSCATION INTRODUCES - code that
+  works in plaintext but breaks once obfuscated (numba, inspect.getsource, dill/
+  cloudpickle, open(__file__) self-read, loader resources, reload). Pre-existing
+  business-logic / security issues that fail the SAME with or without PyArmor -
+  spawn/pool picklability, eval-of-untrusted-input (RCE), sibling data-file
+  loads - are the developer's responsibility and are HIDDEN. Pass --checks all
+  to include them as an extra lint.
+
 Severity:
   HIGH    almost certainly breaks under obfuscation -> exclude the module
-  MEDIUM  breaks in common configs (spawn, dynamic exec) -> review
+  MEDIUM  breaks in common configs -> review
   LOW     only matters in specific modes (RFT rename / BCC) -> mode-dependent
   INFO    worth knowing, usually fine
 
@@ -56,6 +65,11 @@ import sys
 from pathlib import Path
 
 SEVERITY_ORDER = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
+
+# Categories that are NOT PyArmor-introduced: the code behaves the SAME with or
+# without obfuscation (pre-existing business logic / security). Shown only with
+# --checks all; hidden by the default --checks pyarmor.
+BUSINESS_CATEGORIES = {"dynamic-exec", "func-dispatch", "resource-sibling"}
 
 # --- dotted callables that are hard breakers, keyed to a category ---
 # JIT / bytecode-compiling decorators: PyArmor-transformed bytecode is
@@ -132,8 +146,8 @@ IMPORT_SIGNALS = {
     "memory_profiler": ("MEDIUM", "profiler", "memory_profiler traces; may be blocked"),
     "dill": ("HIGH", "func-serialization", "dill pickles functions/code  -  fails on obfuscated code objects"),
     "cloudpickle": ("HIGH", "func-serialization", "cloudpickle exists to serialize functions  -  fails on obfuscated code"),
-    "celery": ("HIGH", "func-serialization", "Celery ships task functions to workers  -  obfuscated code won't marshal"),
-    "joblib": ("MEDIUM", "func-serialization", "joblib.Parallel may pickle functions to worker processes"),
+    "celery": ("MEDIUM", "func-dispatch", "Celery dispatches tasks by NAME; the worker imports the (obfuscated) module  -  works either way, not PyArmor-introduced"),
+    "joblib": ("MEDIUM", "func-dispatch", "joblib may pickle a callable to a worker  -  a top-level func works, a lambda fails with or without PyArmor"),
     "Cython": ("INFO", "compiled", "Cython output is already compiled  -  can't/needn't be obfuscated"),
     "cython": ("INFO", "compiled", "Cython output is already compiled  -  can't/needn't be obfuscated"),
     "sqlalchemy": ("LOW", "rft", "ORM maps columns to attribute names  -  RFT rename can break mapping"),
@@ -161,15 +175,21 @@ class Scanner(ast.NodeVisitor):
         self.opts = opts
         self.assignments = assignments or {}   # var name -> [RHS AST nodes] (whole file)
         self.trace_exec = not getattr(opts, "no_trace_exec", False)
+        self.checks_all = getattr(opts, "checks", "pyarmor") == "all"
         self.aliases = {}          # local name -> full dotted module/callable path
         self.findings = []         # (line, severity, category, message)
         self._imported_mods = set()
 
     # ---- finding helper -------------------------------------------------
     def add(self, line, severity, category, message):
-        if category == "rft" and self.opts.no_rft:
+        # RFT-only breakage (incl. constructed-code exec) is only introduced when
+        # rename mode is on; BCC-only likewise. Suppressed when those are off.
+        if category in ("rft", "dynamic-codegen") and self.opts.no_rft:
             return
         if category == "bcc" and self.opts.no_bcc:
+            return
+        # Not-PyArmor-introduced (business/security): only with --checks all.
+        if category in BUSINESS_CATEGORIES and not self.checks_all:
             return
         self.findings.append((line, severity, category, message))
 
@@ -227,9 +247,9 @@ class Scanner(ast.NodeVisitor):
                          f"@{full.split('.')[-1]} on '{node.name}()'  -  JIT compiler "
                          f"reads real bytecode; EXCLUDE this function from obfuscation")
             elif full in ("celery.shared_task",) or (full and full.endswith(".task")):
-                self.add(dec.lineno, "HIGH", "func-serialization",
-                         f"task decorator on '{node.name}()'  -  worker must marshal the "
-                         f"function; obfuscated code won't pickle")
+                self.add(dec.lineno, "MEDIUM", "func-dispatch",
+                         f"task decorator on '{node.name}()'  -  Celery dispatches by name and "
+                         f"the worker imports the obfuscated module; works, not PyArmor-introduced")
 
     def visit_FunctionDef(self, node):
         self._check_decorators(node)
@@ -297,9 +317,9 @@ class Scanner(ast.NodeVisitor):
             self.add(node.lineno, "LOW", "rft",
                      f"{full}()  -  resolves attributes by name; RFT rename mode may break it")
         elif full in PATH_FROM_FILE_CALLABLES and self._refs_dunder_file(node):
-            self.add(node.lineno, "LOW", "resource-path",
-                     f"{full}(__file__ ...)  -  path derived from __file__; obfuscation "
-                     f"may move __file__, so sibling data files may not resolve")
+            self.add(node.lineno, "LOW", "resource-sibling",
+                     f"{full}(__file__ ...)  -  locates a file next to the module; resolves "
+                     f"the same obfuscated as plaintext if the data file ships alongside")
 
         # builtins (not import-resolved)
         fn = node.func
@@ -337,10 +357,14 @@ class Scanner(ast.NodeVisitor):
                 self.add(node.lineno, "LOW", "rft",
                          f"{fn.id}()  -  name-keyed access; RFT rename mode may break lookups")
             elif fn.id == "open" and self._refs_dunder_file(node):
-                self.add(node.lineno, "MEDIUM", "resource-path",
-                         "open() on a path derived from __file__  -  obfuscation may change "
-                         "__file__; verify data files still resolve (and it won't read plaintext "
-                         "source of itself)")
+                if self._targets_sibling_of_file(node):
+                    self.add(node.lineno, "LOW", "resource-sibling",
+                             "open() of a file next to the module (dirname(__file__)/..)  -  "
+                             "resolves the same obfuscated as plaintext if the data file ships")
+                else:
+                    self.add(node.lineno, "MEDIUM", "resource-path",
+                             "open(__file__)  -  reads the module's OWN source; after "
+                             "obfuscation that path holds the obfuscated bytes, not your code")
             elif fn.id == "type" and len(node.args) == 3:
                 self.add(node.lineno, "LOW", "rft",
                          "type(name, bases, dict)  -  dynamic class creation is name-based; "
@@ -353,22 +377,38 @@ class Scanner(ast.NodeVisitor):
 
     def _check_spawn(self, node, full):
         if full == "concurrent.futures.ProcessPoolExecutor":
-            self.add(node.lineno, "MEDIUM", "func-serialization",
-                     "ProcessPoolExecutor  -  pickles the submitted callable to a child; "
-                     "obfuscated functions won't marshal (esp. under 'spawn')")
+            self.add(node.lineno, "MEDIUM", "func-dispatch",
+                     "ProcessPoolExecutor pickles the target by NAME  -  a top-level func "
+                     "works (child re-imports the obfuscated module); a lambda/local fails "
+                     "with or without PyArmor")
             return
         # multiprocessing.set_start_method('spawn') / get_context('spawn')
         for a in list(node.args) + [k.value for k in node.keywords]:
             if isinstance(a, ast.Constant) and a.value == "spawn":
-                self.add(node.lineno, "MEDIUM", "func-serialization",
-                         "multiprocessing 'spawn' start method re-imports & pickles the "
-                         "target; obfuscated code can fail to load in the child")
+                self.add(node.lineno, "MEDIUM", "func-dispatch",
+                         "multiprocessing 'spawn' pickles the target by NAME  -  a top-level "
+                         "func works, a lambda/local fails with or without PyArmor")
                 return
 
     @staticmethod
     def _refs_dunder_file(node):
         return any(isinstance(n, ast.Name) and n.id == "__file__"
                    for n in ast.walk(node))
+
+    @staticmethod
+    def _targets_sibling_of_file(node):
+        """True if the path goes through dirname(__file__)/Path(__file__).parent,
+        i.e. it targets a SIBLING file rather than reading __file__ itself."""
+        for n in ast.walk(node):
+            if isinstance(n, ast.Attribute) and n.attr == "parent":
+                return True
+            if isinstance(n, ast.Call):
+                f = n.func
+                if isinstance(f, ast.Attribute) and f.attr in ("dirname", "split", "join"):
+                    return True
+                if isinstance(f, ast.Name) and f.id in ("dirname", "join"):
+                    return True
+        return False
 
     @staticmethod
     def _is_constructed_code(node):
@@ -542,6 +582,11 @@ def main(argv=None):
     ap.add_argument("--no-trace-exec", action="store_true",
                     help="don't trace eval/exec input provenance; flag ALL exec/eval/compile "
                          "(default: omit those whose input traces to a literal/config/local file)")
+    ap.add_argument("--checks", choices=["pyarmor", "all"], default="pyarmor",
+                    help="'pyarmor' (default): only report failures OBFUSCATION INTRODUCES "
+                         "(works plaintext, breaks obfuscated). 'all': also report pre-existing "
+                         "business-logic/security issues (spawn/pool picklability, eval-of-input "
+                         "RCE, sibling data-file loads) that fail the same with or without PyArmor.")
     ap.add_argument("--exclude", action="append", default=[],
                     help="directory name/part to skip (repeatable)")
     ap.add_argument("-j", "--jobs", type=int, default=0,
