@@ -642,10 +642,10 @@ def main(argv=None):
                     metavar="FILE",
                     help="also write the output to FILE (still prints to the terminal). "
                          "Bare -o auto-names it output.json (--json) or output.txt.")
-    ap.add_argument("--xlsx", nargs="?", const="__AUTO__", default=None,
-                    metavar="FILE",
+    ap.add_argument("--xlsx", "--excel", dest="xlsx", nargs="?",
+                    const="__AUTO__", default=None, metavar="FILE",
                     help="also write findings to an Excel .xlsx workbook (Findings + "
-                         "Summary sheets), independent of --json/-o. Bare --xlsx "
+                         "Summary sheets), independent of --json/-o. Bare --xlsx/--excel "
                          "auto-names it output.xlsx. Requires openpyxl "
                          "(pip install openpyxl).")
     ap.add_argument("--min-severity", default="INFO",
