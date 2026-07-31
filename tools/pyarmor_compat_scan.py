@@ -47,6 +47,7 @@ Severity:
 Usage:
   tools/pyarmor_compat_scan.py /path/to/pysuite
   tools/pyarmor_compat_scan.py . --json > report.json
+  tools/pyarmor_compat_scan.py src --xlsx report.xlsx    # Excel workbook
   tools/pyarmor_compat_scan.py src --min-severity MEDIUM
   tools/pyarmor_compat_scan.py src --no-rft --no-bcc      # basic mode only
   tools/pyarmor_compat_scan.py src --exclude tests --exclude build
@@ -543,6 +544,77 @@ def _scan_worker(arg):
     return str(path), scan_file(path, opts)
 
 
+def write_xlsx(path, results, by_sev, by_cat, exclude_candidates, files_scanned):
+    """Write findings + summary to an Excel .xlsx workbook. Requires openpyxl
+    (raises ImportError if it isn't installed, so callers can degrade gracefully)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    sev_fill = {
+        "HIGH":   PatternFill("solid", fgColor="FFC7CE"),   # light red
+        "MEDIUM": PatternFill("solid", fgColor="FFEB9C"),   # amber
+        "LOW":    PatternFill("solid", fgColor="FFF2CC"),   # pale yellow
+        "INFO":   PatternFill("solid", fgColor="E7E6E6"),   # gray
+    }
+    header_fill = PatternFill("solid", fgColor="4472C4")
+    header_font = Font(bold=True, color="FFFFFF")
+
+    wb = Workbook()
+
+    # ── Findings sheet: one row per finding, worst-first within each file ──
+    ws = wb.active
+    ws.title = "Findings"
+    headers = ["File", "Line", "Severity", "Category", "Message"]
+    ws.append(headers)
+    for col in range(1, len(headers) + 1):
+        c = ws.cell(row=1, column=col)
+        c.fill = header_fill
+        c.font = header_font
+    rows = [(p, line, sev, cat, msg)
+            for p in sorted(results)
+            for (line, sev, cat, msg) in results[p]]
+    rows.sort(key=lambda r: (r[0], -SEVERITY_ORDER[r[2]], r[1]))
+    for (p, line, sev, cat, msg) in rows:
+        ws.append([p, line, sev, cat, msg])
+        fill = sev_fill.get(sev)
+        if fill:
+            ws.cell(row=ws.max_row, column=3).fill = fill
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(ws.max_row, 1)}"
+    for i, w in enumerate((50, 6, 9, 22, 90), start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.cell(row=1, column=5).alignment = Alignment(horizontal="left")
+
+    # ── Summary sheet ─────────────────────────────────────────────────
+    sm = wb.create_sheet("Summary")
+
+    def _title(text):
+        sm.append([text])
+        sm.cell(row=sm.max_row, column=1).font = Font(bold=True)
+
+    sm.append(["Files scanned", files_scanned])
+    sm.append([])
+    _title("Findings by severity")
+    for k in ("HIGH", "MEDIUM", "LOW", "INFO"):
+        sm.append([k, by_sev.get(k, 0)])
+        fill = sev_fill.get(k)
+        if fill:
+            sm.cell(row=sm.max_row, column=1).fill = fill
+    sm.append([])
+    _title("Findings by category")
+    for k, v in sorted(by_cat.items()):
+        sm.append([k, v])
+    sm.append([])
+    _title("Modules to EXCLUDE from obfuscation (HIGH breakers)")
+    for p in (exclude_candidates or ["(none)"]):
+        sm.append([p])
+    sm.column_dimensions["A"].width = 55
+    sm.column_dimensions["B"].width = 12
+
+    wb.save(path)
+
+
 def iter_py_files(root, excludes):
     root = Path(root)
     if root.is_file():
@@ -570,6 +642,12 @@ def main(argv=None):
                     metavar="FILE",
                     help="also write the output to FILE (still prints to the terminal). "
                          "Bare -o auto-names it output.json (--json) or output.txt.")
+    ap.add_argument("--xlsx", nargs="?", const="__AUTO__", default=None,
+                    metavar="FILE",
+                    help="also write findings to an Excel .xlsx workbook (Findings + "
+                         "Summary sheets), independent of --json/-o. Bare --xlsx "
+                         "auto-names it output.xlsx. Requires openpyxl "
+                         "(pip install openpyxl).")
     ap.add_argument("--min-severity", default="INFO",
                     choices=list(SEVERITY_ORDER), help="hide findings below this level")
     ap.add_argument("--fail-on", default="HIGH",
@@ -629,6 +707,18 @@ def main(argv=None):
     worst = max((SEVERITY_ORDER[s] for f in results.values() for (_, s, _, _) in f),
                 default=-1)
     exit_code = 1 if worst >= SEVERITY_ORDER[opts.fail_on] else 0
+
+    # optional Excel workbook (independent of the text/JSON terminal output)
+    if opts.xlsx is not None:
+        xlsx_path = "output.xlsx" if opts.xlsx == "__AUTO__" else opts.xlsx
+        try:
+            write_xlsx(xlsx_path, results, by_sev, by_cat,
+                       sorted(exclude_candidates), files_scanned)
+            print(f"[written to {xlsx_path}]", file=sys.stderr)
+        except ImportError:
+            print("[--xlsx needs openpyxl: pip install openpyxl]", file=sys.stderr)
+        except OSError as e:
+            print(f"[could not write {xlsx_path}: {e}]", file=sys.stderr)
 
     # resolve the optional output file (bare -o auto-names by mode)
     if opts.out is None:
