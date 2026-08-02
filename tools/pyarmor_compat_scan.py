@@ -339,7 +339,7 @@ class Scanner(ast.NodeVisitor):
                      f"{full}()  -  reads source lines BY FILENAME; obfuscated code's "
                      f"co_filename is '<frozen modname>', so this finds no source (returns '')")
         elif full in TRACEBACK_INTROSPECT:
-            self.add(node.lineno, "LOW", "co-filename",
+            self.add(node.lineno, "MEDIUM", "co-filename",
                      f"{full}()  -  after obfuscation frame filenames are '<frozen "
                      f"modname>' and source lines are blank; programmatic frame/file "
                      f"inspection degrades (fine if you only print the traceback)")
