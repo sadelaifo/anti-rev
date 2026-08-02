@@ -16,14 +16,20 @@ so a log format using ``%(module)s`` / ``{module}`` (or ``filename``/
 
 Fix
 ---
-Install a ``LogRecordFactory`` that rewrites ``module`` from a reliable source
-in BOTH modes, so the SAME dotted name prints obfuscated or not:
+Install a ``LogRecordFactory`` that recovers the real dotted module name from a
+reliable source in BOTH modes, then stores its LAST component in ``module`` (the
+part after the last dot, matching stdlib's plaintext ``%(module)s``), so the same
+value prints obfuscated or not:
 
   * obfuscated: ``record.pathname`` is ``<frozen pkg.sub.mod>`` — strip the
     ``<frozen `` / ``>`` wrapper to get ``pkg.sub.mod`` verbatim (PyArmor embeds
     the real dotted fullname there).
   * plaintext:  ``record.pathname`` is a real path — derive the same dotted name
     the way importlib does (relative to the longest matching ``sys.path`` root).
+
+``module`` is set to the leaf (e.g. ``wtc`` for ``wtmat.src.mod`` -> ``mod``,
+i.e. ``pkg.sub.wtc`` -> ``wtc``); ``pathname`` keeps the full ``pkg/sub/mod.py``
+form for tooling.
 
 This deliberately keys off ``co_filename``/path, NOT the logger ``name``, so it
 works regardless of what you pass to ``getLogger()`` (a fixed script name, an
@@ -94,9 +100,10 @@ def _apply(record: logging.LogRecord, only_packages) -> None:
     dotted = defrost_module(record.pathname)
     if only_packages and dotted.split(".", 1)[0] not in only_packages:
         return                               # leave third-party/stdlib default alone
-    record.module = dotted
+    leaf = dotted.rsplit(".", 1)[-1]         # keep only the part after the last dot
+    record.module = leaf
     # keep filename/pathname internally consistent with the recovered name
-    record.filename = dotted.rsplit(".", 1)[-1] + ".py"
+    record.filename = leaf + ".py"
     if str(record.pathname).startswith(_FROZEN_PREFIX):
         record.pathname = dotted.replace(".", "/") + ".py"
 
