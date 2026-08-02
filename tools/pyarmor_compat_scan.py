@@ -29,6 +29,14 @@ separately as 'dynamic-codegen': it runs fine under basic obfuscation but
 BREAKS under RFT rename, since the names in the string aren't renamed with the
 variables. These are always kept (never omitted) for review.
 
+co_filename / <frozen> ('co-filename' category): PyArmor compiles obfuscated
+modules with a code-object co_filename of '<frozen modname>' instead of the real
+path (even under basic obfuscation). So reading a code object's .co_filename,
+inspect.getfile(), linecache.getline/getlines(), and traceback.extract_*/walk_*
+all see '<frozen ...>' and can't map back to a real path or fetch source. IMPORTANT:
+the __file__ attribute is UNAFFECTED - it stays the real on-disk path; only
+co_filename (tracebacks / inspect / linecache) changes.
+
 Scope (--checks, default 'pyarmor'):
   By default this reports ONLY failures that OBFUSCATION INTRODUCES - code that
   works in plaintext but breaks once obfuscated (numba, inspect.getsource, dill/
@@ -80,9 +88,21 @@ JIT_CALLABLES = {
     "numba.stencil", "numba.cfunc", "numba.cuda.jit", "numba.experimental.jitclass",
 }
 # Reading source / bytecode of live objects -> nothing there after obfuscation.
+# inspect.getfile returns a code object's co_filename ('<frozen ...>' when
+# obfuscated), so it belongs with the source-locating calls.
 SOURCE_CALLABLES = {
     "inspect.getsource", "inspect.getsourcelines", "inspect.getsourcefile",
-    "inspect.getcomments", "dis.dis", "dis.Bytecode", "dis.get_instructions",
+    "inspect.getfile", "inspect.getcomments",
+    "dis.dis", "dis.Bytecode", "dis.get_instructions",
+}
+# co_filename / <frozen>: PyArmor compiles obfuscated modules with co_filename
+# '<frozen modname>' (NOT the real path), so anything reading a code object's
+# co_filename, or reading source BY filename, sees '<frozen ...>' instead of a
+# real path. (Note: __file__ itself is UNAFFECTED - it stays the real path.)
+LINECACHE_CALLABLES = {"linecache.getline", "linecache.getlines"}
+TRACEBACK_INTROSPECT = {
+    "traceback.extract_stack", "traceback.extract_tb",
+    "traceback.walk_stack", "traceback.walk_tb",
 }
 # marshal round-trips code objects; blocked / meaningless once obfuscated.
 MARSHAL_CALLABLES = {"marshal.dumps", "marshal.loads"}
@@ -314,6 +334,15 @@ class Scanner(ast.NodeVisitor):
             self.add(node.lineno, "LOW", "source-introspection",
                      f"{full}()  -  frame/source introspection; line/source info is "
                      f"degraded after obfuscation")
+        elif full in LINECACHE_CALLABLES:
+            self.add(node.lineno, "MEDIUM", "co-filename",
+                     f"{full}()  -  reads source lines BY FILENAME; obfuscated code's "
+                     f"co_filename is '<frozen modname>', so this finds no source (returns '')")
+        elif full in TRACEBACK_INTROSPECT:
+            self.add(node.lineno, "LOW", "co-filename",
+                     f"{full}()  -  after obfuscation frame filenames are '<frozen "
+                     f"modname>' and source lines are blank; programmatic frame/file "
+                     f"inspection degrades (fine if you only print the traceback)")
         elif full in RFT_NAME_CALLABLES:
             self.add(node.lineno, "LOW", "rft",
                      f"{full}()  -  resolves attributes by name; RFT rename mode may break it")
@@ -484,6 +513,11 @@ class Scanner(ast.NodeVisitor):
             self.add(node.lineno, "LOW", "rft",
                      f"uses .{node.attr}  -  if used as a registry key / dispatch, RFT "
                      f"rename mode changes it")
+        elif node.attr == "co_filename":
+            self.add(node.lineno, "MEDIUM", "co-filename",
+                     "reads .co_filename  -  PyArmor sets obfuscated code objects' "
+                     "co_filename to '<frozen modname>' (NOT the real path); comparing it "
+                     "to __file__, using it as a path, or filtering frames by file breaks")
         self.generic_visit(node)
 
     def visit_ClassDef(self, node):
