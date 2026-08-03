@@ -37,6 +37,17 @@ all see '<frozen ...>' and can't map back to a real path or fetch source. IMPORT
 the __file__ attribute is UNAFFECTED - it stays the real on-disk path; only
 co_filename (tracebacks / inspect / linecache) changes.
 
+frames (sys._getframe / inspect.currentframe / stack / trace): the frame object
+still works, but obfuscation RENAMES local variables (f_locals['x'] becomes
+'_var_var_0'), sets co_filename to '<frozen ...>', and degrades line numbers - so
+code that reads locals/filename off a frame BY NAME breaks. Flagged LOW.
+
+pickle / cPickle: NOT broken by basic obfuscation - plain data, class instances,
+and top-level functions pickle identically (lambdas fail with or without PyArmor).
+Pickling a function/class stores its module.qualname, which only RFT rename mode
+changes, so pickle calls are flagged LOW under the 'rft' category (suppressed by
+--no-rft). marshal (which round-trips code objects) is a separate MEDIUM finding.
+
 Scope (--checks, default 'pyarmor'):
   By default this reports ONLY failures that OBFUSCATION INTRODUCES - code that
   works in plaintext but breaks once obfuscated (numba, inspect.getsource, dill/
@@ -135,10 +146,23 @@ PATH_FROM_FILE_CALLABLES = {
 }
 FRAME_INTROSPECT_CALLABLES = {
     "inspect.stack", "inspect.currentframe", "inspect.getframeinfo",
-    "inspect.trace",
+    "inspect.trace", "sys._getframe", "sys._current_frames",
 }
 # --- #6 dynamic name resolution (RFT rename mode) ---
 RFT_NAME_CALLABLES = {"operator.attrgetter", "operator.methodcaller"}
+# pickle / cPickle by-reference: pickling a FUNCTION or CLASS stores its
+# module.qualname and re-imports on load. This works under BASIC obfuscation
+# (verified: plain data, class instances, and top-level funcs all pickle
+# identically; lambdas fail with or without PyArmor). Only RFT rename mode
+# changes the qualname, so a pickle written by one build won't resolve in
+# another -> flagged as an RFT-mode concern, suppressed by --no-rft.
+PICKLE_CALLABLES = {
+    "pickle.dumps", "pickle.dump", "pickle.loads", "pickle.load",
+    "pickle.Pickler", "pickle.Unpickler",
+    "cPickle.dumps", "cPickle.dump", "cPickle.loads", "cPickle.load",
+    "cPickle.Pickler", "cPickle.Unpickler",
+    "_pickle.dumps", "_pickle.dump", "_pickle.loads", "_pickle.load",
+}
 
 # --- eval/exec source provenance (trace where the executed string comes from) ---
 # EXTERNAL = untrusted / attacker-influenceable -> keep (code-injection risk).
@@ -332,8 +356,9 @@ class Scanner(ast.NodeVisitor):
                      f"changes __loader__/__file__ and this can fail")
         elif full in FRAME_INTROSPECT_CALLABLES:
             self.add(node.lineno, "LOW", "source-introspection",
-                     f"{full}()  -  frame/source introspection; line/source info is "
-                     f"degraded after obfuscation")
+                     f"{full}()  -  frame introspection; after obfuscation the frame's "
+                     f"co_filename is '<frozen ...>', local variable NAMES are renamed "
+                     f"(f_locals['x'] won't be found), and line info is degraded")
         elif full in LINECACHE_CALLABLES:
             self.add(node.lineno, "MEDIUM", "co-filename",
                      f"{full}()  -  reads source lines BY FILENAME; obfuscated code's "
@@ -346,6 +371,11 @@ class Scanner(ast.NodeVisitor):
         elif full in RFT_NAME_CALLABLES:
             self.add(node.lineno, "LOW", "rft",
                      f"{full}()  -  resolves attributes by name; RFT rename mode may break it")
+        elif full in PICKLE_CALLABLES:
+            self.add(node.lineno, "LOW", "rft",
+                     f"{full}()  -  pickling a FUNCTION/CLASS stores its qualified name; "
+                     f"RFT rename mode changes that name so a pickle from another build "
+                     f"won't resolve (plain data is fine; works under basic obfuscation)")
         elif full in PATH_FROM_FILE_CALLABLES and self._refs_dunder_file(node):
             self.add(node.lineno, "LOW", "resource-sibling",
                      f"{full}(__file__ ...)  -  locates a file next to the module; resolves "
