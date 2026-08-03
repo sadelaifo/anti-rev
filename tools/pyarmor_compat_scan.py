@@ -39,8 +39,11 @@ co_filename (tracebacks / inspect / linecache) changes.
 
 frames (sys._getframe / inspect.currentframe / stack / trace): the frame object
 still works, but obfuscation RENAMES local variables (f_locals['x'] becomes
-'_var_var_0'), sets co_filename to '<frozen ...>', and degrades line numbers - so
-code that reads locals/filename off a frame BY NAME breaks. Flagged LOW.
+'_var_var_0') and sets co_filename to '<frozen ...>' - so code that reads
+locals/filename off a frame BY NAME breaks. The frame-access CALL is flagged LOW;
+the specific breaking reads .f_locals and .code_context are flagged MEDIUM. Safe
+reads (f_globals, co_name, f_lineno) are unaffected and not flagged. .filename is
+NOT flagged (too generic to attribute to a frame reliably).
 
 pickle / cPickle: NOT broken by basic obfuscation - plain data, class instances,
 and top-level functions pickle identically (lambdas fail with or without PyArmor).
@@ -548,6 +551,15 @@ class Scanner(ast.NodeVisitor):
                      "reads .co_filename  -  PyArmor sets obfuscated code objects' "
                      "co_filename to '<frozen modname>' (NOT the real path); comparing it "
                      "to __file__, using it as a path, or filtering frames by file breaks")
+        elif node.attr == "f_locals":
+            self.add(node.lineno, "MEDIUM", "source-introspection",
+                     "reads .f_locals  -  even basic obfuscation RENAMES local variables "
+                     "(e.g. 'x' -> '_var_var_0'), so frame.f_locals lookups BY NAME fail "
+                     "(f_globals / co_name / f_lineno are unaffected)")
+        elif node.attr == "code_context":
+            self.add(node.lineno, "MEDIUM", "source-introspection",
+                     "reads .code_context  -  a FrameInfo's source lines are None after "
+                     "obfuscation (no source at the '<frozen ...>' filename)")
         self.generic_visit(node)
 
     def visit_ClassDef(self, node):
