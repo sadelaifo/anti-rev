@@ -51,6 +51,18 @@ Pickling a function/class stores its module.qualname, which only RFT rename mode
 changes, so pickle calls are flagged LOW under the 'rft' category (suppressed by
 --no-rft). marshal (which round-trips code objects) is a separate MEDIUM finding.
 
+Library-aware "boundary" checks: a 3rd-party lib (itself unencrypted) breaks only
+when it introspects YOUR obfuscated objects. These flag the spots in YOUR code
+that hand obfuscated things to such libraries:
+  * mindspore  @jit / nn.Cell (graph mode parses your SOURCE/AST)        HIGH/MEDIUM
+  * logging/loguru format strings using module/filename/pathname/{file}  MEDIUM
+  * pandas     df.query/df.eval with an '@local' (reads renamed f_locals) MEDIUM
+  * ply/jsonpath-ng  t_*/p_* grammar rules kept in DOCSTRINGS            LOW
+  * PySide2    connectSlotsByName (slot match by method name; RFT)       LOW
+  * APScheduler  persistent *JobStore (pickles job funcs by name; RFT)   LOW
+--configs additionally side-scans .json/.yaml/.ini/.cfg/.conf/.toml for the log
+format tokens (logging config often lives in a file the AST pass can't see).
+
 Scope (--checks, default 'pyarmor'):
   By default this reports ONLY failures that OBFUSCATION INTRODUCES - code that
   works in plaintext but breaks once obfuscated (numba, inspect.getsource, dill/
@@ -166,6 +178,22 @@ PICKLE_CALLABLES = {
     "cPickle.Pickler", "cPickle.Unpickler",
     "_pickle.dumps", "_pickle.dump", "_pickle.loads", "_pickle.load",
 }
+
+# --- library-aware "boundary" detections (tuned to the deployed dependency set) ---
+# A 3rd-party lib (itself unencrypted) breaks only when it introspects YOUR
+# obfuscated objects. These flag the spots in YOUR code that hand obfuscated
+# things to such libraries.
+# mindspore graph mode / @jit PARSES your function source+AST to build the graph
+# -> source is gone after obfuscation (like numba, but source- not bytecode-based).
+MINDSPORE_JIT = {
+    "mindspore.jit", "mindspore.ms_function",
+    "mindspore.common.api.jit", "mindspore.common.jit",
+}
+# log-format field tokens derived from co_filename -> '<frozen modname>' obfuscated.
+RISKY_LOG_FIELDS = ("%(module)s", "%(filename)s", "%(pathname)s",
+                    "{module}", "{filename}", "{pathname}", "{file}")
+# config-file extensions to sniff for those tokens (logging config often lives here).
+CONFIG_EXTS = (".json", ".yaml", ".yml", ".ini", ".cfg", ".conf", ".toml")
 
 # --- eval/exec source provenance (trace where the executed string comes from) ---
 # EXTERNAL = untrusted / attacker-influenceable -> keep (code-injection risk).
@@ -294,6 +322,11 @@ class Scanner(ast.NodeVisitor):
                 self.add(dec.lineno, "HIGH", "numba-jit",
                          f"@{full.split('.')[-1]} on '{node.name}()'  -  JIT compiler "
                          f"reads real bytecode; EXCLUDE this function from obfuscation")
+            elif full in MINDSPORE_JIT:
+                self.add(dec.lineno, "HIGH", "mindspore",
+                         f"@{full.split('.')[-1]} on '{node.name}()'  -  MindSpore graph mode "
+                         f"PARSES the function SOURCE/AST to build the graph; source is gone "
+                         f"after obfuscation, EXCLUDE this function")
             elif full in ("celery.shared_task",) or (full and full.endswith(".task")):
                 self.add(dec.lineno, "MEDIUM", "func-dispatch",
                          f"task decorator on '{node.name}()'  -  Celery dispatches by name and "
@@ -302,7 +335,17 @@ class Scanner(ast.NodeVisitor):
     def visit_FunctionDef(self, node):
         self._check_decorators(node)
         self._check_bcc(node)
+        self._check_ply_rule(node)
         self.generic_visit(node)
+
+    def _check_ply_rule(self, node):
+        # ply (lex/yacc) puts the grammar in the function's DOCSTRING (def p_x(p): '''...''').
+        # If PyArmor is configured to strip docstrings, the grammar is lost.
+        if (node.name.startswith(("t_", "p_")) and node.name not in ("t_error", "p_error")
+                and ast.get_docstring(node)):
+            self.add(node.lineno, "LOW", "docstring",
+                     f"'{node.name}' looks like a ply lex/yacc rule with its grammar in the "
+                     f"DOCSTRING  -  breaks if obfuscation strips docstrings (jsonpath-ng/ply)")
 
     def visit_AsyncFunctionDef(self, node):
         self._check_decorators(node)
@@ -330,9 +373,56 @@ class Scanner(ast.NodeVisitor):
             if seen_yield and seen_nonlocal:
                 break
 
+    # ---- library-aware boundary checks (mindspore/loguru/logging/pandas/ply/Qt) ----
+    def _check_log_format(self, node, full):
+        def scan(s, where):
+            hits = [t for t in RISKY_LOG_FIELDS if t in s]
+            if hits:
+                self.add(node.lineno, "MEDIUM", "co-filename",
+                         f"log format {where} uses {', '.join(hits)}  -  these derive from "
+                         f"co_filename and print '<frozen modname>' after obfuscation; use "
+                         f"%(name)s / {{name}} or apply antirev_log_fix (record.module rewrite)")
+        for kw in node.keywords:
+            if (kw.arg in ("format", "fmt") and isinstance(kw.value, ast.Constant)
+                    and isinstance(kw.value.value, str)):
+                scan(kw.value.value, f"({kw.arg}=)")
+        if full == "logging.Formatter" and node.args:
+            a = node.args[0]
+            if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                scan(a.value, "(Formatter)")
+
+    def _check_thirdparty_calls(self, node, full):
+        # mindspore jit used as a call: ms.jit(fn)
+        if full in MINDSPORE_JIT:
+            self.add(node.lineno, "HIGH", "mindspore",
+                     f"{full}()  -  MindSpore graph mode parses function SOURCE/AST; "
+                     f"source is gone after obfuscation, exclude the target")
+        self._check_log_format(node, full)
+        fn = node.func
+        if isinstance(fn, ast.Attribute):
+            if fn.attr in ("query", "eval") and node.args:
+                a = node.args[0]
+                if isinstance(a, ast.Constant) and isinstance(a.value, str) and "@" in a.value:
+                    self.add(node.lineno, "MEDIUM", "source-introspection",
+                             ".query()/.eval() with an '@local'  -  pandas reads the CALLER's "
+                             "f_locals, whose names obfuscation renames, so '@name' isn't found "
+                             "(a value referenced from module globals is unaffected)")
+            elif fn.attr == "connectSlotsByName":
+                self.add(node.lineno, "LOW", "rft",
+                         ".connectSlotsByName()  -  Qt auto-connects slots by method NAME "
+                         "(on_<obj>_<signal>); RFT rename mode breaks the matching")
+        callee = dotted_name(fn)
+        if callee:
+            leaf = callee.split(".")[-1]
+            if leaf.endswith("JobStore") and leaf != "MemoryJobStore":
+                self.add(node.lineno, "LOW", "rft",
+                         f"{leaf}()  -  a persistent APScheduler jobstore pickles the job "
+                         f"function by module:qualname; RFT rename / cross-build breaks lookup")
+
     # ---- calls ----------------------------------------------------------
     def visit_Call(self, node):
         full = self.resolve(node)
+        self._check_thirdparty_calls(node, full)
         if full in JIT_CALLABLES:
             self.add(node.lineno, "HIGH", "numba-jit",
                      f"{full}() call  -  JIT reads real bytecode; exclude the target")
@@ -569,6 +659,15 @@ class Scanner(ast.NodeVisitor):
                          f"class '{node.name}' uses a metaclass  -  metaclass registries "
                          f"often key on class names; RFT rename mode may break them")
                 break
+        # MindSpore nn.Cell: graph-mode compiles construct() by parsing its source/AST.
+        for base in node.bases:
+            bn = dotted_name(base)
+            if bn and bn.split(".")[-1] == "Cell":
+                self.add(node.lineno, "MEDIUM", "mindspore",
+                         f"class '{node.name}(...Cell)'  -  if run in MindSpore GRAPH mode, "
+                         f"construct() is compiled by parsing its SOURCE/AST, which is gone "
+                         f"after obfuscation (fine in pure PyNative/eager mode)")
+                break
         self.generic_visit(node)
 
 
@@ -618,6 +717,42 @@ def _scan_worker(arg):
     """Top-level (picklable) worker for the process pool: (path, opts) -> (path, findings)."""
     path, opts = arg
     return str(path), scan_file(path, opts)
+
+
+def scan_config_file(path):
+    """Non-AST side-scan: flag log-format tokens (%(module)s / {module} / ...) in a
+    config file. Logging format often lives in JSON/YAML/INI, which the AST pass
+    can't see - and that is exactly where a '<frozen ...>' surprise hides."""
+    findings = []
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return findings
+    for i, line in enumerate(text.splitlines(), 1):
+        hits = [t for t in RISKY_LOG_FIELDS if t in line]
+        if hits:
+            findings.append((i, "MEDIUM", "co-filename",
+                             f"config log-format uses {', '.join(hits)}  -  derives from "
+                             f"co_filename -> '<frozen modname>' after obfuscation; use "
+                             f"%(name)s / {{name}} or rewrite record.module (antirev_log_fix)"))
+    return findings
+
+
+def iter_config_files(root, excludes):
+    root = Path(root)
+    if root.is_file():
+        if root.suffix.lower() in CONFIG_EXTS:
+            yield root
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in excludes and not d.startswith(".")
+                       and d != "__pycache__"]
+        for fn in filenames:
+            if os.path.splitext(fn)[1].lower() in CONFIG_EXTS:
+                p = Path(dirpath) / fn
+                if not any(ex in p.parts for ex in excludes):
+                    yield p
 
 
 def write_xlsx(path, results, by_sev, by_cat, exclude_candidates, files_scanned):
@@ -743,6 +878,10 @@ def main(argv=None):
                          "RCE, sibling data-file loads) that fail the same with or without PyArmor.")
     ap.add_argument("--exclude", action="append", default=[],
                     help="directory name/part to skip (repeatable)")
+    ap.add_argument("--configs", action="store_true",
+                    help="also side-scan config files (.json/.yaml/.ini/.cfg/.conf/.toml) "
+                         "for log-format tokens (%%(module)s / {module} / ...) that print "
+                         "'<frozen ...>' after obfuscation - the AST pass can't see these")
     ap.add_argument("-j", "--jobs", type=int, default=0,
                     help="parallel worker processes (0 = auto = CPU count; 1 = serial)")
     opts = ap.parse_args(argv)
@@ -768,6 +907,14 @@ def main(argv=None):
             findings.sort(key=lambda f: (-SEVERITY_ORDER[f[1]], f[0]))
             results[path] = findings
 
+    # optional config-file side-scan (log-format tokens in .json/.yaml/.ini/...)
+    if opts.configs:
+        for cfg in iter_config_files(opts.root, set(opts.exclude)):
+            raw = [f for f in scan_config_file(cfg) if SEVERITY_ORDER[f[1]] >= min_sev]
+            if raw:
+                raw.sort(key=lambda f: (-SEVERITY_ORDER[f[1]], f[0]))
+                results[str(cfg)] = raw
+
     # summary aggregates
     by_cat = {}
     by_sev = {k: 0 for k in SEVERITY_ORDER}
@@ -776,7 +923,7 @@ def main(argv=None):
         for line, sev, cat, msg in findings:
             by_cat[cat] = by_cat.get(cat, 0) + 1
             by_sev[sev] += 1
-            if sev == "HIGH" and cat in ("numba-jit", "func-serialization",
+            if sev == "HIGH" and cat in ("numba-jit", "mindspore", "func-serialization",
                                          "source-introspection", "trace-hooks"):
                 exclude_candidates.add(path)
 
