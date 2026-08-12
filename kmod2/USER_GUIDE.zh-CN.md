@@ -7,6 +7,9 @@ stub + shim + 守护进程（lrxd）+ `antirev_client.py`。
 > 原始方案（stub/shim/daemon）见仓库根目录 `docs/USER_GUIDE.zh-CN.md`，是当前正式发布的方案。
 > antirevfs 是可用的 PoC/v1，设计细节见 `kmod2/DESIGN.md`。两者**二选一**，不要混用。
 
+> **适用范围**：本指南只覆盖**实机模式下 host 机器**（x86-64 SUSE）上的软件保护——
+> antirevfs 在这台 Linux 主机上运行，保护主机上的可执行文件与库。
+
 ---
 
 ## 1. 它是什么，好在哪
@@ -20,7 +23,7 @@ stub + shim + 守护进程（lrxd）+ `antirev_client.py`。
 - **内核页缓存自带跨进程共享**：多个进程映射同一路径，共用同一份解密后的物理页。
 
 代价与边界：这仍是**静态**（data-at-rest）保护。挂载点是真实路径，会把明文交给任何被授权的
-读者；CPU 执行明文，root 总能读到——见第 12 节威胁模型。
+读者；CPU 执行明文，root 总能读到——见第 11 节威胁模型。
 
 ---
 
@@ -51,7 +54,7 @@ stub + shim + 守护进程（lrxd）+ `antirev_client.py`。
 - **未授权读者**通过挂载看到的是**去掉尾部（40 字节）的容器**——一个看起来合法、但缺密钥、
   无法解密的 `[magic][iv][tag][ct]`。
 - **重要权衡**：密钥现在就在 `.enc/` 文件里，所以**原始拷贝下层 `.enc/` 树是可解密的**。保护依赖
-  两点：① 挂载对未授权读者剥掉尾部；② `.enc/` 树保持**命名空间隔离**（见第 12 节）。
+  两点：① 挂载对未授权读者剥掉尾部；② `.enc/` 树保持**命名空间隔离**（见第 11 节）。
 
 ---
 
@@ -64,7 +67,7 @@ stub + shim + 守护进程（lrxd）+ `antirev_client.py`。
 | `inode.c` | lookup 代理到下层、inode 缓存（按下层 dentry，一个路径共享一份页缓存）、getattr 报明文大小、**符号链接支持** |
 | `file.c` | `read_folio` 解密、目录 `iterate_shared`、以及未授权读者的“剥尾部”透传 ops |
 | `crypto.c` | `gcm(aes)` 内核 crypto API；从尾部读每文件密钥 |
-| `gate.c` | 解密授权门（见第 9 节） |
+| `gate.c` | 解密授权门（见第 8 节） |
 | `compat.h` | 跨内核兼容垫片（6.8 → SLES 4.12） |
 
 **工具**（`kmod2/tools/`）
@@ -137,7 +140,7 @@ key:         proj.key.hex
 mirror_plaintext: true
 blacklist:
   - lib/link/3rd/                    # 第三方库子树，保持明文（结尾斜杠！）
-  - libPreload.so                    # 全局预加载库，必须明文（见第 11 节）
+  - libPreload.so                    # 全局预加载库，必须明文（见第 10 节）
 ```
 
 打包后核对清单：
@@ -212,7 +215,6 @@ sudo kmod2/tools/antirev-mount-inplace.sh down
 processManager
 executable_x
 python3                 # python 加载加密 .so 时，按解释器身份授权
-qemu-aarch64-static     # sim 模式，见第 10 节
 ```
 
 运行时切换（无需重载）：
@@ -236,23 +238,7 @@ sudo bash kmod2/tools/antirev-remount-proj.sh
 
 ---
 
-## 10. sim 模式：ARM64-on-x86（qemu-user）
-
-部署有 **ARM64 RTOS 从机**，在 **x86-64 host** 上用 **`qemu-user-static`**（binfmt_misc）跑，
-有时在 **Docker** 里。**qemu-user 路径已验证**（`test_antirevfs_qemu.sh` 10/10）；**Docker 命名空间
-集成仍未测试**。
-
-- **解密与架构无关**：x86 的 `.ko` 逐字节服务 AARCH64 ELF；qemu 通过 host 内核 `open`/`mmap`
-  ARM64 二进制 → 命中 antirevfs → 明文 ARM64 字节被模拟执行。
-- **门按模拟器身份授权**：qemu-user 下进程的 `exe_file` 是 **`qemu-aarch64-static`**，不是那个
-  ARM64 程序。所以 ARM64 库/数据读要**白名单 `qemu-aarch64-static`**；透明运行的加密 ARM64
-  **可执行**还需要它**自身 basename**（host 内核在 binfmt 重定向前以 `FMODE_EXEC` 打开它）。
-- **Docker 待办**：挂载须在容器挂载命名空间可见（bind/volume）→ 容器内暴露明文；`authz_path`
-  解析到**容器的** `/etc`（白名单要放容器里）；`d_path` 是容器相对的 → 用 **basename**。
-
----
-
-## 11. 部署陷阱（现场踩过的坑）
+## 10. 部署陷阱（现场踩过的坑）
 
 - **全局预加载库（及其整条 `DT_NEEDED` 闭包）必须明文。** `LD_PRELOAD` 被每个后代继承，门按
   **消费进程**身份授权加密文件——加密的预加载库要给每个继承它的进程都白名单，不现实。把
@@ -274,7 +260,7 @@ sudo bash kmod2/tools/antirev-remount-proj.sh
 
 ---
 
-## 12. 安全边界（威胁模型）
+## 11. 安全边界（威胁模型）
 
 - **保护静态数据，不保护运行中数据。** 挂载点是真实路径，会把明文交给被授权读者；从应用上下文
   `cp /proj/lib/foo.so /usb/` 会带走明文 ELF——**挂载视图**就是泄露面。
@@ -292,7 +278,7 @@ sudo bash kmod2/tools/antirev-remount-proj.sh
 
 ---
 
-## 13. 排错速查
+## 12. 排错速查
 
 ```bash
 # 挂载视图应是明文，下层应是密文：
@@ -309,7 +295,7 @@ dmesg | tail                                 # 门的拒绝决策等
 
 ---
 
-## 14. 测试（root）
+## 13. 测试（root）
 
 ```bash
 sudo bash kmod2/tests/test_antirevfs.sh              # 解密/密文在盘/dlopen/strict/passdata/符号链接…
@@ -318,14 +304,13 @@ sudo bash kmod2/tests/test_gate.sh                   # 授权门：授权读放�
 sudo bash kmod2/tests/test_gate_passthrough.sh       # 去尾部密文透传
 sudo bash kmod2/tests/test_gate_whitelist.sh         # 多程序白名单
 sudo bash kmod2/tests/test_gate_access_matrix.sh     # {执行/读/写}×{列名/未列名} 矩阵
-sudo bash kmod2/tests/test_antirevfs_qemu.sh         # sim 模式 ARM64-on-x86
 sudo bash kmod2/tests/test_fs_pack.sh                # 打包器（无需 root）
 sudo bash kmod2/tests/test_proj_setup.sh             # 业务栈复现（gate + overlay-rw + 相对路径 exec）
 ```
 
 ---
 
-## 15. 命令速查
+## 14. 命令速查
 
 ```bash
 # 编译 + 加载（关门起步）
