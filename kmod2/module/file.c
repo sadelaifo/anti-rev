@@ -335,21 +335,52 @@ static int antirevfs_file_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static int antirevfs_dir_iterate(struct file *file, struct dir_context *ctx)
+/*
+ * Directory reads must keep ONE lower directory file open for the whole
+ * lifetime of the antirevfs dir file.  A getdents(2) on a large directory spans
+ * multiple ->iterate_shared calls, and stateful lower filesystems (ext4 htree,
+ * overlayfs) hold their readdir cursor / dedup cache in the lower file's
+ * private_data across those calls.  Re-opening the lower dir per call (as an
+ * earlier version did) discarded that state every call, so the hash position
+ * never reached EOF and readdir looped forever on any directory too big to
+ * return in a single getdents buffer (e.g. a real bin/ or lib/ tree).  Open the
+ * lower dir once in ->open, reuse it here, release it in ->release.
+ */
+static int antirevfs_dir_open(struct inode *inode, struct file *file)
 {
-	struct antirevfs_inode_info *ii = ANTIREVFS_I(file_inode(file));
+	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
 	struct file *lower;
-	int ret;
 
 	lower = dentry_open(&ii->lower_path, O_RDONLY | O_DIRECTORY,
 			    current_cred());
 	if (IS_ERR(lower))
 		return PTR_ERR(lower);
+	file->private_data = lower;
+	return 0;
+}
+
+static int antirevfs_dir_release(struct inode *inode, struct file *file)
+{
+	struct file *lower = file->private_data;
+
+	if (lower) {
+		file->private_data = NULL;
+		fput(lower);
+	}
+	return 0;
+}
+
+static int antirevfs_dir_iterate(struct file *file, struct dir_context *ctx)
+{
+	struct file *lower = file->private_data;
+	int ret;
+
+	if (!lower)
+		return -EBADF;
 
 	lower->f_pos = ctx->pos;
 	ret = iterate_dir(lower, ctx);
 	ctx->pos = lower->f_pos;
-	fput(lower);
 	return ret;
 }
 
@@ -371,6 +402,8 @@ const struct file_operations antirevfs_file_fops = {
 };
 
 const struct file_operations antirevfs_dir_fops = {
+	.open		= antirevfs_dir_open,
+	.release	= antirevfs_dir_release,
 	.iterate_shared	= antirevfs_dir_iterate,
 	.read		= generic_read_dir,
 	.llseek		= generic_file_llseek,
