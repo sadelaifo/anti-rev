@@ -1,0 +1,29 @@
+# antirev-real.service — real-mode (native machine) mount at boot.
+#
+# No container: mount antirevfs in-place over the local bin/lib once at boot,
+# BEFORE the business app starts.  oneshot (runs, mounts, exits; the mounts
+# persist).  Use this on the real appliance / real ARM64 slave hardware.
+#
+# Install (adjust the ExecStart path):
+#   install -m0755 antirev-mount-inplace.sh /opt/antirev/
+#   install -m0644 antirev-real.service     /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable antirev-real.service          # runs at next boot before the app
+#
+# If you know the business unit name, uncomment Before= so ordering is enforced.
+
+[Unit]
+Description=antirev real-mode in-place mount (decrypt bin/lib on this host)
+DefaultDependencies=yes
+# Before=your-business-app.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=AREV_MODE=real
+# Environment=AREV_KO=/opt/antirev/antirevfs.ko
+ExecStart=/opt/antirev/antirev-mount-inplace.sh --mode real up
+ExecStop=/opt/antirev/antirev-mount-inplace.sh --mode real down
+
+[Install]
+WantedBy=multi-user.target
