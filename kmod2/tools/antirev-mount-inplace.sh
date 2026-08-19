@@ -144,6 +144,19 @@ GATE_PASSTHROUGH=1                           # 1 = unauth read -> trailer-stripp
 AUTHZ_PATH=/etc/authorized_apps.txt          # resolved in the TARGET's mount ns (container's /etc in sim)
 ANTIREVFS_OPTS="ro,passdata"                 # antirevfs mount options
 
+# Overlay-lower staging (sim / Docker).  FIELD FACT: on SLES 12 SP5 (4.12.14)
+# antirevfs cannot positioned-read an *overlayfs* lower — the offset-0 magic read
+# sneaks through (plaintext files work) but the offset-(size-8) trailer read and
+# the decrypt reads return -EIO, so every ENCRYPTED file fails with EIO through a
+# mount whose lower is the Docker image layer (overlay2).  Workaround: copy the
+# CIPHERTEXT (still encrypted — safe) onto a real fs (tmpfs) and mount antirevfs
+# from THERE instead of in-place over the overlay.  On a real-fs lower (ext4,
+# native appliance) staging is unnecessary, so 'auto' only stages when the lower
+# is actually overlayfs.  Costs RAM = ciphertext size (fits the container's
+# --shm-size tmpfs); point STAGE_DIR at a disk-backed dir if the tree is large.
+STAGE_LOWER="${AREV_STAGE_LOWER:-auto}"      # auto = stage only when lower is overlayfs | always | never
+STAGE_DIR="${AREV_STAGE_DIR:-/dev/shm/arev}" # real-fs (tmpfs) staging root IN THE TARGET
+
 # Allow-list basenames written to the TARGET's $AUTHZ_PATH when GATE_ENFORCE=1.
 # Match by BASENAME (paths differ under stacked/overlay mounts and per namespace).
 # sim mode: include qemu-aarch64-static (lib/data reads gate on the EMULATOR's
@@ -223,7 +236,7 @@ container_running() {
 # run_in_target CMD...      : run one command in the target (local | container)
 # target_bash < script      : run a bash script in the target, forwarding the
 #                             config env vars below (exported before each call).
-FWD_VARS=(A_OPTS WRITE_BACKING TMPFS_OPTS MOUNTS_NL WDIRS_NL WFILES_NL)
+FWD_VARS=(A_OPTS WRITE_BACKING TMPFS_OPTS MOUNTS_NL WDIRS_NL WFILES_NL STAGE_MODE STAGE_ROOT)
 
 run_in_target() {
     if [ "$MODE" = sim ]; then docker exec -i "$CONTAINER" "$@"; else "$@"; fi
@@ -291,6 +304,7 @@ write_allowlist() {
 # ---- target: mount up --------------------------------------------------------
 do_up() {
     export A_OPTS="$ANTIREVFS_OPTS" WRITE_BACKING TMPFS_OPTS
+    export STAGE_MODE="$STAGE_LOWER" STAGE_ROOT="$STAGE_DIR"
     export MOUNTS_NL="$(nl_join "${MOUNTS[@]}")"
     export WDIRS_NL="$(nl_join "${WRITE_DIRS[@]:-}")"
     export WFILES_NL="$(nl_join "${WRITE_FILES[@]:-}")"
@@ -303,23 +317,55 @@ readarray -t WFILES < <(printf '%s\n' "$WFILES_NL" | sed '/^$/d')
 
 modprobe antirevfs 2>/dev/null || true   # no-op if already loaded on host
 
-# 1) seed write anchors in the LOWER tree BEFORE mounting (dir still writable).
-for spec in "${WDIRS[@]:-}"; do
-    [ -n "$spec" ] || continue
-    root="${spec%%|*}"; rel="${spec#*|}"; mkdir -p "$root/$rel"
-done
-for spec in "${WFILES[@]:-}"; do
-    [ -n "$spec" ] || continue
-    root="${spec%%|*}"; rel="${spec#*|}"
-    mkdir -p "$(dirname "$root/$rel")"; [ -e "$root/$rel" ] || : > "$root/$rel"
-done
-
-# 2) antirevfs, in place, over each tree
+# 0) decide the LOWER for each mount.  Normally in-place (lower == mountpoint),
+#    but if the mountpoint's fs is overlayfs (Docker image layer) antirevfs
+#    cannot positioned-read it on SLES 4.12 -> stage the CIPHERTEXT onto a
+#    real-fs (tmpfs) and mount from there.  Staging reads the raw ciphertext, so
+#    it MUST happen before antirevfs is mounted over the path (guaranteed here:
+#    'up' runs after 'down').  LOWERS[] is index-matched to MOUNTS[].
+LOWERS=()
 for root in "${MOUNTS[@]}"; do
     [ -d "$root" ] || { cerr "not a directory: $root"; exit 1; }
     if mountpoint -q "$root"; then cerr "already mounted: $root (run 'down' first)"; exit 1; fi
-    cerr "antirevfs $root -> $root ($A_OPTS)"
-    mount -t antirevfs -o "$A_OPTS" "$root" "$root" || { cerr "mount failed: $root"; exit 1; }
+    stage=no
+    case "$STAGE_MODE" in
+        always) stage=yes ;;
+        never)  stage=no ;;
+        *)      [ "$(stat -f -c %T "$root" 2>/dev/null)" = overlayfs ] && stage=yes ;;
+    esac
+    if [ "$stage" = yes ]; then
+        tag="$(printf '%s' "${root#/}" | tr '/' '_')"
+        lower="$STAGE_ROOT/$tag"
+        rm -rf "$lower"; mkdir -p "$lower"
+        cerr "stage (overlay lower) $root -> $lower  [$(du -sh "$root" 2>/dev/null | cut -f1)]"
+        cp -a "$root/." "$lower/" || { cerr "stage copy failed: $root"; exit 1; }
+    else
+        lower="$root"
+    fi
+    LOWERS+=("$lower")
+done
+# lower_for <root>: echo the LOWER chosen for a mount root (in-place or staged)
+lower_for() { local i=0 r; for r in "${MOUNTS[@]}"; do
+    [ "$r" = "$1" ] && { printf '%s' "${LOWERS[$i]}"; return; }; i=$((i+1)); done
+    printf '%s' "$1"; }
+
+# 1) seed write anchors in the LOWER (staged copy or in-place dir) before mount.
+for spec in "${WDIRS[@]:-}"; do
+    [ -n "$spec" ] || continue
+    root="${spec%%|*}"; rel="${spec#*|}"; mkdir -p "$(lower_for "$root")/$rel"
+done
+for spec in "${WFILES[@]:-}"; do
+    [ -n "$spec" ] || continue
+    root="${spec%%|*}"; rel="${spec#*|}"; L="$(lower_for "$root")"
+    mkdir -p "$(dirname "$L/$rel")"; [ -e "$L/$rel" ] || : > "$L/$rel"
+done
+
+# 2) antirevfs: lower (staged or in-place) -> mountpoint
+i=0
+for root in "${MOUNTS[@]}"; do
+    lower="${LOWERS[$i]}"; i=$((i+1))
+    cerr "antirevfs $lower -> $root ($A_OPTS)"
+    mount -t antirevfs -o "$A_OPTS" "$lower" "$root" || { cerr "mount failed: $root"; exit 1; }
 done
 
 # 3) anonymous tmpfs over each known write directory
@@ -349,7 +395,7 @@ TARGET_UP
 
 # ---- target: tear down (deepest-first: tmpfs/binds, then antirevfs base) ------
 do_down() {
-    export WRITE_BACKING
+    export WRITE_BACKING STAGE_ROOT="$STAGE_DIR"
     export MOUNTS_NL="$(nl_join "${MOUNTS[@]}")"
     target_bash <<'TARGET_DOWN'
 set -uo pipefail
@@ -357,6 +403,8 @@ readarray -t MOUNTS < <(printf '%s\n' "$MOUNTS_NL" | sed '/^$/d')
 for r in "${MOUNTS[@]}"; do
     for mp in $(awk -v r="$r" '$2==r || index($2, r"/")==1 {print $2}' /proc/mounts | sort -r); do
         if mountpoint -q "$mp"; then
+            # umount -l is expected here: a global LD_PRELOAD lib served from the
+            # mount is mmap'd into every process, so a plain umount is always busy.
             umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || printf '  [target] busy: %s\n' "$mp" >&2
         fi
     done
@@ -364,6 +412,8 @@ done
 if [ -d "$WRITE_BACKING" ] && mountpoint -q "$WRITE_BACKING"; then
     umount "$WRITE_BACKING" 2>/dev/null || umount -l "$WRITE_BACKING" 2>/dev/null || true
 fi
+# reclaim staged ciphertext copies (tmpfs RAM) once their mounts are gone
+[ -n "${STAGE_ROOT:-}" ] && [ -d "$STAGE_ROOT" ] && rm -rf "$STAGE_ROOT"/* 2>/dev/null || true
 printf '  [target] down complete\n' >&2
 TARGET_DOWN
 }
