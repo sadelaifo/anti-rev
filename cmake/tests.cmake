@@ -139,6 +139,17 @@ add_custom_target(test_pythonlib
     USES_TERMINAL
 )
 
+# ── key-mode (split vs single) packer/flag test ───────────────────────
+# Pure Python (hashlib/struct) — no libcrypto/gcc/daemon.  Checks resolve_enc_key
+# derivation + the BFLAG_KEY_SINGLE bundle-flag encoding the stub/daemon/client read.
+add_custom_target(test_key_mode
+    COMMAND ${CMAKE_COMMAND} -E echo "=== key-mode (split vs single) test ==="
+    COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/encryptor/test_key_mode.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    COMMENT "Running key-mode (split vs single) packer/flag test"
+    USES_TERMINAL
+)
+
 # ═══════════════════════════════════════════════════════════════════════
 #  End-to-end tests
 # ═══════════════════════════════════════════════════════════════════════

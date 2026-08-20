@@ -36,6 +36,7 @@ set(TESTS
     test_obfstr           # OBFSTR codegen + runtime decoder smoke test
     test_keysplit_version # keysplit version-field parser (C ksv_parse + Py mirror)
     test_pythonlib        # dependency-free miniyaml + libcrypto GCM (no pip deps)
+    test_key_mode         # key-mode split vs single: derivation + BFLAG_KEY_SINGLE flag
 )
 
 # Tests disabled — need further work:

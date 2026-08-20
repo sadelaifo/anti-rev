@@ -347,6 +347,10 @@ static int write_chunk(int fd, const uint8_t *data, size_t len)
 
 #define BFLAG_HAS_MAIN 0x01 /* one encrypted main entry follows the header */
 #define BFLAG_DAEMON_LIBS 0x02 /* libs served by external daemon */
+#define BFLAG_KEY_SINGLE 0x04 /* key mode: trailer holds the WHOLE key (used
+                               * directly); when clear, key-split is in effect
+                               * (trailer holds only part1, derive_real_key()
+                               * combines it with SHA256(lrxd) + version). */
 
 /* ------------------------------------------------------------------ */
 /*  Daemon protocol v2                                                  */
@@ -1460,6 +1464,27 @@ static int reload_part1_from_trailer(uint8_t part1[KEY_SIZE]) {
     return 0;
 }
 
+/* Read this binary's own key mode from its bundle_flags (the first byte of the
+ * bundle, at the offset stored in the trailer).  Returns 1 for SINGLE-key mode
+ * (trailer holds the whole key, no derivation), 0 for key-split.  On any read
+ * error defaults to 0 (split) — the conservative choice that never treats a
+ * derived-key bundle as single. */
+static int self_key_single(void) {
+    int self = open("/proc/self/exe", O_RDONLY);
+    if (self < 0) return 0;
+    off_t fsize = lseek(self, 0, SEEK_END);
+    uint8_t trailer[48], flags = 0;
+    if (fsize >= 48
+        && pread(self, trailer, 48, fsize - 48) == 48
+        && memcmp(trailer + 40, MAGIC, MAGIC_LEN) == 0) {
+        uint64_t bundle_off = u64le(trailer);
+        if (pread(self, &flags, 1, (off_t) bundle_off) != 1)
+            flags = 0;
+    }
+    close(self);
+    return (flags & BFLAG_KEY_SINGLE) != 0;
+}
+
 /* Recursively search `dir` for a regular file whose basename equals
  * `base`.  Writes the full path to out and returns 1 on first match, 0
  * otherwise.  Skips dotfiles and symlinks (mirrors collect_enc_paths). */
@@ -1536,7 +1561,11 @@ static int handle_get_patch(int client, const char *scan_dir,
         put_u32le(resp, ST_ERROR);
         return send_msg(client, OP_LIB, resp, 4, NULL, 0);
     }
-    if (derive_real_key(part1, key) != 0) {
+    /* SINGLE-key mode: part1 IS the whole key.  Otherwise re-derive (part1 +
+     * SHA256(lrxd) + version) exactly as at startup. */
+    if (self_key_single()) {
+        memcpy(key, part1, KEY_SIZE);
+    } else if (derive_real_key(part1, key) != 0) {
         explicit_bzero(part1, sizeof(part1));
         put_u32le(resp, ST_ERROR);
         return send_msg(client, OP_LIB, resp, 4, NULL, 0);
@@ -3048,12 +3077,24 @@ int main(int argc, char *argv[], char *envp[])
 
     uint64_t bundle_off = u64le(trailer);
 
-    /* 2. Derive the real key from the three split parts.  The trailer
-     *    holds only part1; derive_real_key() combines it with
-     *    SHA256(lrxd) and the SA/version string.  Hard-fail on any
-     *    missing source — never fall back to a usable key. */
+    /* Read bundle_flags (1 byte) up front — its BFLAG_KEY_SINGLE bit selects
+     * the key mode below. */
+    uint8_t bundle_flags;
+    if (pread(self, &bundle_flags, 1, (off_t) bundle_off) != 1) {
+        PERR_INFO("pread bundle_flags");
+        return 1;
+    }
+
+    /* 2. Obtain the real AES key.
+     *    KEY-SPLIT (default, bit clear): the trailer holds only part1 — a
+     *      share; derive_real_key() combines it with SHA256(lrxd) and the
+     *      SA/version string.  Hard-fail on any missing source.
+     *    SINGLE (BFLAG_KEY_SINGLE set): the trailer holds the WHOLE key; use
+     *      it directly — self-contained, no lrxd / no version script. */
     uint8_t key[KEY_SIZE];
-    if (derive_real_key(trailer + 8, key) != 0) {
+    if (bundle_flags & BFLAG_KEY_SINGLE) {
+        memcpy(key, trailer + 8, KEY_SIZE);
+    } else if (derive_real_key(trailer + 8, key) != 0) {
         LOG_INFO("[antirev] key derivation failed -- aborting\n");
         return 1;
     }
@@ -3064,13 +3105,6 @@ int main(int argc, char *argv[], char *envp[])
      * offset arithmetic and never loaded into user-space memory here.
      * ---------------------------------------------------------------- */
     uint8_t tmp[2 + MAX_NAME + 1 + IV_SIZE + TAG_SIZE + 8]; /* max header */
-
-    /* Read bundle_flags (1 byte) */
-    if (pread(self, tmp, 1, (off_t) bundle_off) != 1) {
-        PERR_INFO("pread bundle_flags");
-        return 1;
-    }
-    uint8_t bundle_flags = tmp[0];
 
     file_entry_t main_entry;
     int have_main = (bundle_flags & BFLAG_HAS_MAIN) != 0;
