@@ -39,6 +39,18 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
+
+/* explicit_bzero(3) arrived in glibc 2.25.  Older deployment targets (e.g. SLES
+ * 12 SP5 / glibc 2.22) lack it, so the stub fails to LINK with "undefined
+ * reference to explicit_bzero".  Provide a portable, not-optimized-away
+ * fallback there; newer libcs keep their own (asm-optimized, barrier-backed)
+ * version.  <string.h> above pulled <features.h>, so __GLIBC__ is defined. */
+#if defined(__GLIBC__) && (__GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 25))
+static void explicit_bzero(void *p, size_t n) {
+    volatile unsigned char *v = (volatile unsigned char *)p;
+    while (n--) *v++ = 0;
+}
+#endif
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/syscall.h>
