@@ -617,6 +617,12 @@ def main():
                          "config 'lrxd:' arch->path map.")
     ap.add_argument("--version", dest="pkg_version",
                     help="override config 'version' (the keysplit version value)")
+    ap.add_argument("--key-mode", "--key_mode", dest="key_mode",
+                    choices=["split", "single"], default=None,
+                    help="override config 'key_mode': split (default) = key-split "
+                         "(bound to lrxd + $HOME/SA/version); single = key file is "
+                         "the whole AES key, baked in each trailer (self-contained, "
+                         "no lrxd/version at runtime).")
     args = ap.parse_args()
 
     if args.config_opt and args.config_pos and args.config_opt != args.config_pos:
@@ -842,7 +848,7 @@ def main():
     #           trailer; artifacts are self-contained (no lrxd / no version at
     #           runtime).  Every protected binary carries BFLAG_KEY_SINGLE so the
     #           stub/daemon skip derivation.  `version:` becomes optional.
-    key_mode = cfg.get('key_mode', 'split')
+    key_mode = _resolve(args.key_mode, 'key_mode', 'split')
     if key_mode not in ('split', 'single'):
         sys.exit(f"[error] invalid key_mode '{key_mode}' (must be 'split' or 'single')")
     key_single = (key_mode == 'single')
