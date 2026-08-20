@@ -290,17 +290,30 @@ def _derive_real_key(part1):
     return hashlib.sha256(part1 + part2 + version_bytes).digest()
 
 
+_BFLAG_KEY_SINGLE = 0x04   # mirror of stub.c / protect.py
+
+
 def _load_key(path):
     """Load the real AES key.
 
-    The file/trailer carries only part1 (a 32-byte share); the real key is
-    derived from part1 + SHA256(lrxd) + the version string (see
-    _derive_real_key)."""
-    data = path.read_bytes()
+    KEY-SPLIT (default): the file/trailer carries only part1 (a 32-byte share);
+    the real key is derived from part1 + SHA256(lrxd) + the version string (see
+    _derive_real_key).
 
-    # Check if it's a binary with ANTREV01 trailer (last 48 bytes)
+    SINGLE: the trailer holds the whole key and its bundle_flags carry
+    BFLAG_KEY_SINGLE -> use part1 directly, no derivation (matches a deployment
+    packed with key_mode: single).  For a bare hex key file (no flag to read),
+    ANTIREV_KEY_MODE=single forces single; default is split."""
+    data = path.read_bytes()
+    single = None
+
+    # Check if it's a binary with ANTREV01 trailer (last 48 bytes):
+    #   trailer = [bundle_offset:8][part1:32][MAGIC:8]
     if len(data) > 48 and data[-8:] == b"ANTREV01":
         part1 = data[-40:-8]
+        bundle_off = int.from_bytes(data[-48:-40], "little")
+        if 0 <= bundle_off < len(data):
+            single = bool(data[bundle_off] & _BFLAG_KEY_SINGLE)
     else:
         # Otherwise treat as hex text
         hex_str = data.decode().strip()
@@ -308,7 +321,14 @@ def _load_key(path):
         if len(part1) != KEY_SIZE:
             raise ValueError(f"part1 must be {KEY_SIZE} bytes ({KEY_SIZE * 2} hex chars)")
 
-    return _derive_real_key(part1)
+    if single is None:
+        # Bare hex key file — no in-binary flag to read.  Default to single
+        # (matches protect.py's standalone commands, which default single);
+        # a key-split deployment points the client at the lrxd BINARY (whose
+        # flag is read above) or sets ANTIREV_KEY_MODE=split explicitly.
+        single = os.environ.get("ANTIREV_KEY_MODE", "single").strip().lower() == "single"
+
+    return part1 if single else _derive_real_key(part1)
 
 
 # ── Daemon protocol v2 framing ──────────────────────────────────────

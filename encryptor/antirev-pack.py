@@ -90,7 +90,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import miniyaml   # dependency-free YAML-subset loader (drops the PyYAML dep)
 from protect import (load_or_create_key, encrypt_data, MAGIC,
-                     BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS, derive_real_key)
+                     BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS, BFLAG_KEY_SINGLE,
+                     derive_real_key)
 
 # ELF magic and type constants
 ELF_MAGIC = b'\x7fELF'
@@ -520,7 +521,8 @@ def _encrypt_lib_worker(src: str, dst: str, key: bytes) -> str:
 
 def _protect_exe_worker(src: str, stub: str, dst: str, enc_key: bytes, part1: bytes,
                         daemon_libs: bool = False,
-                        needed_libs: list[str] = None) -> str:
+                        needed_libs: list[str] = None,
+                        key_single: bool = False) -> str:
     """Encrypt an executable and wrap it in the stub launcher.
 
     Key-split: the bundle is encrypted with enc_key (the derived real key),
@@ -547,6 +549,8 @@ def _protect_exe_worker(src: str, stub: str, dst: str, enc_key: bytes, part1: by
     flags = BFLAG_HAS_MAIN
     if daemon_libs:
         flags |= BFLAG_DAEMON_LIBS
+    if key_single:
+        flags |= BFLAG_KEY_SINGLE
 
     # Needed-libs section: tells stub which daemon libs this exe DT_NEEDs
     needed_section = b""
@@ -613,6 +617,12 @@ def main():
                          "config 'lrxd:' arch->path map.")
     ap.add_argument("--version", dest="pkg_version",
                     help="override config 'version' (the keysplit version value)")
+    ap.add_argument("--key-mode", "--key_mode", dest="key_mode",
+                    choices=["split", "single"], default=None,
+                    help="override config 'key_mode': split (default) = key-split "
+                         "(bound to lrxd + $HOME/SA/version); single = key file is "
+                         "the whole AES key, baked in each trailer (self-contained, "
+                         "no lrxd/version at runtime).")
     args = ap.parse_args()
 
     if args.config_opt and args.config_pos and args.config_opt != args.config_pos:
@@ -831,6 +841,20 @@ def main():
 
     print(f"[pack] Libs mode: {libs_mode}")
 
+    # key_mode: split (default) — real key = SHA256(part1 || SHA256(lrxd) ||
+    #           version); binds every artifact to lrxd's presence + the version
+    #           script, requires `version:` at runtime.
+    #           single — the `key:` value IS the whole AES key, baked into each
+    #           trailer; artifacts are self-contained (no lrxd / no version at
+    #           runtime).  Every protected binary carries BFLAG_KEY_SINGLE so the
+    #           stub/daemon skip derivation.  `version:` becomes optional.
+    key_mode = _resolve(args.key_mode, 'key_mode', 'split')
+    if key_mode not in ('split', 'single'):
+        sys.exit(f"[error] invalid key_mode '{key_mode}' (must be 'split' or 'single')")
+    key_single = (key_mode == 'single')
+    daemon_bflags = BFLAG_KEY_SINGLE if key_single else 0
+    print(f"[pack] Key mode: {key_mode}")
+
     # Encrypt libs individually to output_dir as standalone encrypted files,
     # and create a lightweight daemon binary (stub + key, no bundled libs)
     # that reads encrypted libs from disk at runtime
@@ -879,7 +903,10 @@ def main():
         suffix = f'-{arch}' if len(stubs) > 1 else ''
 
         daemon_path = output_dir / f'lrxd{suffix}'
-        bundle = struct.pack("<IB", 0, 0)  # 0 files, no flags
+        # bundle = just the 1-byte flags (no entries).  BFLAG_KEY_SINGLE tells
+        # the daemon at runtime to use its trailer key directly instead of
+        # re-deriving via lrxd+version.
+        bundle = struct.pack("<B", daemon_bflags)
         bundle_offset = len(stub_data)
         trailer = struct.pack("<Q", bundle_offset) + key + MAGIC
         daemon_path.parent.mkdir(parents=True, exist_ok=True)
@@ -924,22 +951,32 @@ def main():
         # derivation is the one built (and moved to `lrxd:` if set) just above —
         # same bytes wherever it now lives, so its SHA256 matches the runtime
         # $HOME/SA/bin/sa/lrxd by construction.
-        version_cfg = _resolve(args.pkg_version, 'version')
-        if version_cfg is None or str(version_cfg).strip() == "":
-            sys.exit("[error] keysplit: config must set 'version' -- the deployment "
-                     "version STRING (e.g. 'V100R001C00').  It must equal what the "
-                     "runtime $HOME/SA/version script parses to: the text after "
-                     "'Version: ', truncated before any 'SPC', whitespace-stripped.")
-        version_field = str(version_cfg).strip().encode()
-        print(f"[pack] key-split: version = "
-              f"{version_field.decode('ascii', 'replace')!r} "
-              f"(hex {version_field.hex()})")
+        if key_single:
+            # SINGLE mode: the `key:` value is the whole AES key; every arch's
+            # artifacts are encrypted with it directly (no lrxd/version binding).
+            # The exe/daemon trailers carry BFLAG_KEY_SINGLE so the stub skips
+            # derivation.  `version:` is not needed.
+            for arch in stubs:
+                real_key_by_arch[arch] = key
+            print("[pack] key mode single: artifacts encrypted with the key file "
+                  "directly (self-contained; no lrxd / no version binding)")
+        else:
+            version_cfg = _resolve(args.pkg_version, 'version')
+            if version_cfg is None or str(version_cfg).strip() == "":
+                sys.exit("[error] keysplit: config must set 'version' -- the deployment "
+                         "version STRING (e.g. 'V100R001C00').  It must equal what the "
+                         "runtime $HOME/SA/version script parses to: the text after "
+                         "'Version: ', truncated before any 'SPC', whitespace-stripped.")
+            version_field = str(version_cfg).strip().encode()
+            print(f"[pack] key-split: version = "
+                  f"{version_field.decode('ascii', 'replace')!r} "
+                  f"(hex {version_field.hex()})")
 
-        for arch in stubs:
-            lrxd_path = built_lrxd[arch]   # built above, moved to `lrxd:` if set
-            real_key_by_arch[arch] = derive_real_key(key, lrxd_path, version_field)
-            print(f"[pack] key-split[{arch}]: real key from {lrxd_path} "
-                  f"+ version field")
+            for arch in stubs:
+                lrxd_path = built_lrxd[arch]   # built above, moved to `lrxd:` if set
+                real_key_by_arch[arch] = derive_real_key(key, lrxd_path, version_field)
+                print(f"[pack] key-split[{arch}]: real key from {lrxd_path} "
+                      f"+ version field")
 
         if libs_mode == 'encrypt' and lib_files:
             print(f"[pack] Encrypting {len(lib_files)} lib(s) individually...")
@@ -1011,6 +1048,7 @@ def main():
                     key,                       # part1: embedded in the trailer
                     exe_daemon_libs,
                     exe_needed.get(rel, []),
+                    key_single,                # set BFLAG_KEY_SINGLE in single mode
                 ): rel
                 for rel, arch, src in exe_files
             }

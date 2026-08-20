@@ -229,6 +229,26 @@ def derive_real_key(part1: bytes, lrxd_path: Path, version_field: bytes) -> byte
 
 BFLAG_HAS_MAIN    = 0x01
 BFLAG_DAEMON_LIBS = 0x02
+BFLAG_KEY_SINGLE  = 0x04   # trailer holds the WHOLE key (single mode); when
+                           # clear, key-split is in effect (trailer = part1)
+
+
+def resolve_enc_key(part1: bytes, key_mode: str,
+                    lrxd_path=None, version_field=None) -> bytes:
+    """The AES key the bundle/libs are actually encrypted with.
+
+    single : the key file value is the whole key -> use it directly (the stub
+             reads it straight from the trailer; no lrxd / no version needed).
+    split  : derive real_key = SHA256(part1 || SHA256(lrxd) || version); the
+             trailer still stores only part1 and the stub re-derives.
+    """
+    if key_mode == "single":
+        return part1
+    if key_mode == "split":
+        if not lrxd_path or version_field is None:
+            sys.exit("[error] --key-mode split requires --lrxd and --version")
+        return derive_real_key(part1, Path(lrxd_path), version_field)
+    sys.exit(f"[error] unknown --key-mode '{key_mode}' (use single|split)")
 
 
 def _build_entry(path: Path, data: bytes, key: bytes) -> bytes:
@@ -372,15 +392,22 @@ def cmd_protect_exe(args):
 
     key = load_or_create_key(key_path)
 
-    # Main exe entry
-    main_data = main_path.read_bytes()
-    main_entry = _build_entry(main_path, main_data, key)
-    print(f"[antirev] Encrypted main: {main_path.name}  "
-          f"({len(main_data):,} bytes)")
+    # Key mode: the trailer always stores `key` (part1); the bytes we ENCRYPT
+    # with are the whole key (single) or the derived real key (split).
+    version_field = args.version.strip().encode() if args.version else None
+    enc_key = resolve_enc_key(key, args.key_mode, args.lrxd, version_field)
 
     bundle_flags = BFLAG_HAS_MAIN
     if daemon_libs:
         bundle_flags |= BFLAG_DAEMON_LIBS
+    if args.key_mode == "single":
+        bundle_flags |= BFLAG_KEY_SINGLE
+
+    # Main exe entry (encrypted with enc_key)
+    main_data = main_path.read_bytes()
+    main_entry = _build_entry(main_path, main_data, enc_key)
+    print(f"[antirev] Encrypted main: {main_path.name}  "
+          f"({len(main_data):,} bytes)  [key-mode={args.key_mode}]")
 
     # Build needed-libs section: tells stub which daemon libs are DT_NEEDED
     # (transitively, including through unencrypted intermediaries)
@@ -416,10 +443,15 @@ def cmd_protect_daemon(args):
 
     key = load_or_create_key(key_path)
 
+    # Key mode is carried in the daemon's OWN bundle_flags so it decrypts libs
+    # the same way the exes were packed (single = trailer key direct; split =
+    # re-derive part1 + SHA256(lrxd) + version).
+    bundle_flags = BFLAG_KEY_SINGLE if args.key_mode == "single" else 0
+
     # Lightweight daemon: stub + trailer, no bundled libs.
     # At runtime it scans its directory for encrypted .so files.
     out_size = _build_protected(stub_path, out_path, key,
-                                b"", bundle_flags=0)
+                                b"", bundle_flags=bundle_flags)
 
     print(f"\n[antirev] Lib daemon binary → {out_path}  ({out_size:,} bytes)")
     print(f"[antirev] Key file          → {key_path}  (keep secret)")
@@ -523,6 +555,16 @@ def main():
     pe.add_argument("--output", required=True, help="Output protected binary")
     pe.add_argument("--daemon-libs", action="store_true",
                     help="Libs served by external daemon")
+    pe.add_argument("--key-mode", choices=["single", "split"], default="single",
+                    help="single (default): key file is the whole AES key, baked "
+                         "in the trailer, self-contained at runtime (no lrxd/"
+                         "version).  split: key-split — encrypt with "
+                         "SHA256(part1||SHA256(lrxd)||version); needs --lrxd + "
+                         "--version and the runtime lrxd/$HOME/SA/version.")
+    pe.add_argument("--lrxd",    default=None,
+                    help="(split only) target arch's lrxd binary (part2 = SHA256 of it)")
+    pe.add_argument("--version", default=None,
+                    help="(split only) deployment version VALUE, e.g. 'V100R001C00'")
 
     # protect-daemon
     pd = sub.add_parser("protect-daemon",
@@ -531,6 +573,9 @@ def main():
     pd.add_argument("--stub",   required=True, help="Pre-compiled stub binary")
     pd.add_argument("--key",    required=True, help="Key file (hex); created if absent")
     pd.add_argument("--output", required=True, help="Output daemon binary")
+    pd.add_argument("--key-mode", choices=["single", "split"], default="single",
+                    help="Must match how the libs/exes were packed (single = "
+                         "trailer key used directly; split = re-derive with lrxd+version).")
 
     # encrypt-lib
     el = sub.add_parser("encrypt-lib", help="Encrypt shared library file(s) in-place")
