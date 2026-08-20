@@ -8,7 +8,7 @@ exactly:
 
 where version_field is the deployment version VALUE — the literal string fed
 to config.yaml `version:` / protect.py --version, which must equal what the
-target's $HOME/SA/version script parses to (text after "Version: ", truncated
+target's $HOME/SW/version script parses to (text after "Version: ", truncated
 before any "SPC", stripped -- see stub.c ksv_parse).
 
 Run it with the same --version value the packer used and compare each line to
@@ -17,8 +17,8 @@ mismatch:
 
   pack side   :  keysplit_expect.py --key antirev.key \
                      --lrxd out/lrxd-aarch64 --version V100R001C00
-  runtime side:  keysplit_expect.py --trailer "$HOME/SA/bin/sa/lrxd" \
-                     --lrxd "$HOME/SA/bin/sa/lrxd" --version V100R001C00
+  runtime side:  keysplit_expect.py --trailer "$HOME/SW/bin/sw/lrxd" \
+                     --lrxd "$HOME/SW/bin/sw/lrxd" --version V100R001C00
 
 --version is the version VALUE (a literal string), taken verbatim (stripped).
 part1 comes from either a hex --key file (what the packer used) or the
@@ -90,7 +90,7 @@ def main() -> None:
     ver = ap.add_mutually_exclusive_group(required=True)
     ver.add_argument("--version",
                      help="version VALUE (literal string, taken verbatim/stripped; "
-                          "must equal what $HOME/SA/version parses to)")
+                          "must equal what $HOME/SW/version parses to)")
     ver.add_argument("--version-script",
                      help="EXECUTE this version script and parse its stdout with the "
                           "runtime rule (dotted -> after first '.'; else after "

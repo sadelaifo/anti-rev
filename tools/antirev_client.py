@@ -269,10 +269,10 @@ def _derive_real_key(part1):
     encryptor/protect.py:derive_real_key(); MUST stay byte-for-byte
     identical.
 
-        real_key = SHA256( part1 || SHA256($HOME/SA/bin/sa/lrxd) || version_field )
+        real_key = SHA256( part1 || SHA256($HOME/SW/bin/sw/lrxd) || version_field )
 
     Runtime sources (same paths the stub uses): the daemon binary at
-    $HOME/SA/bin/sa/lrxd (hashed whole) and $HOME/SA/version, which is a
+    $HOME/SW/bin/sw/lrxd (hashed whole) and $HOME/SW/version, which is a
     shell script that is EXECUTED — its stdout is parsed by
     _parse_version_field to get the version component.  Hard-fail if either
     source is missing — never fall back to part1.
@@ -282,8 +282,8 @@ def _derive_real_key(part1):
     home = os.environ.get("HOME")
     if not home:
         raise RuntimeError("keysplit: HOME unset")
-    lrxd_path = Path(home) / "SA" / "bin" / "sa" / "lrxd"
-    version_path = Path(home) / "SA" / "version"
+    lrxd_path = Path(home) / "SW" / "bin" / "sw" / "lrxd"
+    version_path = Path(home) / "SW" / "version"
     part2 = hashlib.sha256(lrxd_path.read_bytes()).digest()
     out = subprocess.run([str(version_path)], capture_output=True).stdout
     version_bytes = _parse_version_field(out)

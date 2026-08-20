@@ -30,7 +30,7 @@
 |---|---|
 | **stub** | C 编写的启动器。把捆绑的密文解密进 memfd，再用 `fexecve` 执行。**无主程序时**它以守护进程（lrxd）模式常驻。 |
 | **antirev_shim** | 唯一的 `LD_PRELOAD` 注入 `.so`（每种架构一个：`antirev_shim_x86_64.so` / `antirev_shim_aarch64.so`）。把所有拦截逻辑打成一个 DSO：`dlopen` 重定向、身份隐藏、（aarch64）`ANTI_LoadProcess` 劫持、热补丁 `.pat` 重定向等。 |
-| **lrxd（守护进程）** | 轻量级“库服务器”。扫描 `$HOME/SA` 下的密文 `.so`/`.elf`，解密进 memfd，通过 Unix 套接字用 `SCM_RIGHTS` 把 fd 传给各个业务进程。多架构部署为 `lrxd-x86_64` / `lrxd-aarch64`。 |
+| **lrxd（守护进程）** | 轻量级“库服务器”。扫描 `$HOME/SW` 下的密文 `.so`/`.elf`，解密进 memfd，通过 Unix 套接字用 `SCM_RIGHTS` 把 fd 传给各个业务进程。多架构部署为 `lrxd-x86_64` / `lrxd-aarch64`。 |
 | **encryptor（加密工具链）** | Python 工具：`protect.py`（单文件级操作）、`antirev-pack.py`（按 YAML 批量打包）、`build.py`（Python 源码混淆）、`miniyaml.py`（内置 YAML 解析）。 |
 | **antirev_client.py** | 供 Python 脚本加载加密库：连守护进程、拿 memfd、透明改写 `import` 与 `ctypes.CDLL`。 |
 
@@ -98,12 +98,12 @@ make
 
 - **part1**：写在每个受保护二进制的尾部（trailer）里。
 - **part2 = SHA256(lrxd)**：把部署到目标机的 `lrxd` 守护进程二进制整体做哈希。
-- **version 值**：运行时执行目标机上的 `$HOME/SA/version` 并解析其输出得到，**必须**与打包
+- **version 值**：运行时执行目标机上的 `$HOME/SW/version` 并解析其输出得到，**必须**与打包
   时 `antirev-pack.py` 配置里的 `version:`（或 `--version`）逐字节一致。
 
 **由此得到两条铁律：**
 1. 目标机部署的 `lrxd` 必须与打包时使用的 `lrxd` **字节完全相同**（否则 part2 变了，解密失败）。
-2. `$HOME/SA/version` 解析出的值必须与打包配置的 `version` 值**完全一致**。
+2. `$HOME/SW/version` 解析出的值必须与打包配置的 `version` 值**完全一致**。
 
 keysplit 是**按架构**的（part2 是该架构 lrxd 的哈希），所以给哪种架构打补丁就用哪种架构的 lrxd。
 
@@ -164,7 +164,7 @@ python3 encryptor/antirev-pack.py config.yaml -j 8
 | `blacklist` | 完全不处理、按需排除的文件（glob，如 `*.py`、`out/` 子树） |
 | `copy` | 需原样拷贝到输出的文件（glob） |
 | `lrxd:` | `{arch: 目标路径}`，每次打包都会构建对应架构的守护进程并放到此处 |
-| `version` | keysplit 的 version 值（见第 6 节）；必须与目标机 `$HOME/SA/version` 解析结果一致 |
+| `version` | keysplit 的 version 值（见第 6 节）；必须与目标机 `$HOME/SW/version` 解析结果一致 |
 
 > 数值型标量**保持字符串**：`version: 1.20` 不会被解析成浮点 `1.2`（那会悄悄改掉密钥）。
 > 需要时再加引号。
@@ -197,8 +197,8 @@ stubs:
   x86_64:  ../../build/stub
   aarch64: ../../build-arm/stub_aarch64
 lrxd:
-  x86_64:  ./protected/bin/sa/lrxd-x86_64
-  aarch64: ./protected/bin/sa/lrxd-aarch64
+  x86_64:  ./protected/bin/sw/lrxd-x86_64
+  aarch64: ./protected/bin/sw/lrxd-aarch64
 version: "V100R001C00"
 ```
 
@@ -227,10 +227,10 @@ activate()   # 连守护进程，打补丁 import / ctypes.CDLL，重定向到 m
 
 ### 安装树
 
-守护进程把 **`$HOME/SA`** 当作扫描根（`$HOME/SA` 不存在时退回自身所在目录）。推荐布局：
+守护进程把 **`$HOME/SW`** 当作扫描根（`$HOME/SW` 不存在时退回自身所在目录）。推荐布局：
 
 ```
-$HOME/SA/
+$HOME/SW/
 ├── version                 # 可执行，打印版本串（keysplit 的 version 来源）
 ├── bin/
 │   └── sa/
@@ -239,19 +239,19 @@ $HOME/SA/
 └── lib/<模块>/<密文库.so>
 ```
 
-把 lrxd 放在子目录、库放在别处也可以——扫描根锁定在整棵 `$HOME/SA` 树。
+把 lrxd 放在子目录、库放在别处也可以——扫描根锁定在整棵 `$HOME/SW` 树。
 
 ### 启动顺序
 
 ```bash
-# 1) 先起守护进程（常驻；扫描 $HOME/SA，建立 socket，解析各库 DT_NEEDED 依赖图）
-$HOME/SA/bin/sa/lrxd &
+# 1) 先起守护进程（常驻；扫描 $HOME/SW，建立 socket，解析各库 DT_NEEDED 依赖图）
+$HOME/SW/bin/sw/lrxd &
 
 # 2) 再运行受保护的可执行文件；它们会：
 #    - 自动继承 antirev_shim 的 LD_PRELOAD
 #    - 通过继承的守护进程连接（__r_LS）按需拉取加密库
 #    - DT_NEEDED 库经 LD_LIBRARY_PATH 上的符号链接目录解析，保持原符号查找顺序
-$HOME/SA/bin/<模块>/<受保护可执行> [参数...]
+$HOME/SW/bin/<模块>/<受保护可执行> [参数...]
 ```
 
 守护进程通过 `SCM_RIGHTS` 把 memfd 的 fd 传给客户端；DT_NEEDED 库走 glibc 正常 BFS 解析
@@ -278,10 +278,10 @@ $HOME/SA/bin/<模块>/<受保护可执行> [参数...]
 # 打包侧：用 keysplit 真实密钥加密补丁（需与目标同架构的 lrxd 与一致的 version）
 python3 encryptor/protect.py encrypt-patch \
     --key ./proj.key --patches fix001.patch \
-    --lrxd $HOME/SA/bin/sa/lrxd --version V100R001C00 \
+    --lrxd $HOME/SW/bin/sw/lrxd --version V100R001C00 \
     --output-dir ./enc_patches
 ```
-部署侧：把密文 `.pat` **放到 `$HOME/SA` 下任意位置**即可。已在运行的受保护进程通过内嵌于
+部署侧：把密文 `.pat` **放到 `$HOME/SW` 下任意位置**即可。已在运行的受保护进程通过内嵌于
 antirev_shim 的重定向 + 继承的守护进程连接自动拉取解密（无需重启、无需单独 preload、无发现文件）。
 
 ---
@@ -316,7 +316,7 @@ antirev_shim 的重定向 + 继承的守护进程连接自动拉取解密（无�
 
 **keysplit 不匹配自查**：
 - 目标机 `lrxd` 与打包用的是否字节一致？（`sha256sum` 对比）
-- `$HOME/SA/version` 的输出解析值是否等于配置 `version`？可用 `tools/keysplit_expect.py --version <值>`
+- `$HOME/SW/version` 的输出解析值是否等于配置 `version`？可用 `tools/keysplit_expect.py --version <值>`
   或 `--version-script <脚本>` 复现运行时解析规则。
 
 ---
@@ -343,8 +343,8 @@ python3 encryptor/build.py {cython|nuitka|pyarmor} --mains-dir M --libs-dir L --
 cmake -DBUILD_DIR=build -DSRC_DIR=. -P cmake/run_all_tests.cmake
 
 # 运行（目标机）
-$HOME/SA/bin/sa/lrxd &                       # 先起守护进程
-$HOME/SA/bin/<模块>/<受保护可执行> [参数...]   # 再跑业务
+$HOME/SW/bin/sw/lrxd &                       # 先起守护进程
+$HOME/SW/bin/<模块>/<受保护可执行> [参数...]   # 再跑业务
 ```
 
 ---

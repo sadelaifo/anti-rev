@@ -25,7 +25,7 @@ python3 ../../encryptor/protect.py encrypt-patch \
     --key <part1.key> --lrxd <deployed lrxd-aarch64> --version <version-value> \
     --patches say_hello.pat --output-dir <daemon-scan-dir>
 #   --version is the deployment version VALUE (e.g. V100R001C00) — it must
-#   equal what the target's $HOME/SA/version script parses to (text after
+#   equal what the target's $HOME/SW/version script parses to (text after
 #   "Version: ", truncated before any "SPC", stripped).
 
 # 4. Run the target with the patch shim preloaded so its readFile of the

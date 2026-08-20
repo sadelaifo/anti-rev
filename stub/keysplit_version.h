@@ -4,7 +4,7 @@
  *
  * The keysplit real key is SHA256( part1 || SHA256(lrxd) || version_field ).
  * version_field is parsed from the stdout produced by EXECUTING
- * $HOME/SA/version with this rule (MUST stay byte-for-byte identical to the
+ * $HOME/SW/version with this rule (MUST stay byte-for-byte identical to the
  * Python mirrors in encryptor/protect.py:parse_version_field() and
  * tools/antirev_client.py:_parse_version_field(), and to the value the packer
  * feeds verbatim from config.yaml `version:` / protect.py --version).  Two

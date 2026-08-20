@@ -1767,14 +1767,14 @@ static int home_join(const char *rel, char *buf, size_t bufsz) {
     return 0;
 }
 
-/* "$HOME/SA" — the protected suite's install root.  The single source for
- * the "SA" segment: the daemon's lib-scan root and every key-split path
- * build on this instead of re-spelling "SA". */
+/* "$HOME/SW" — the protected suite's install root.  The single source for
+ * the "SW" segment: the daemon's lib-scan root and every key-split path
+ * build on this instead of re-spelling "SW". */
 static int sa_root_path(char *buf, size_t bufsz) {
-    return home_join(OBFSTR("SA"), buf, bufsz);
+    return home_join(OBFSTR("SW"), buf, bufsz);
 }
 
-/* Build "$HOME/SA/<rel>" — a path under the suite root. */
+/* Build "$HOME/SW/<rel>" — a path under the suite root. */
 static int sa_join(const char *rel, char *buf, size_t bufsz) {
     char root[4096];
     if (sa_root_path(root, sizeof(root)) != 0)
@@ -1790,11 +1790,11 @@ static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
                                int *nlibs)
 {
     char dir[4096];
-    /* Lib-scan root is pinned to $HOME/SA — the install tree of the
+    /* Lib-scan root is pinned to $HOME/SW — the install tree of the
      * protected suite — so the daemon (lrxd) can live anywhere under it
-     * (e.g. $HOME/SA/bin) and still serve every encrypted lib in the
-     * tree (e.g. $HOME/SA/lib).  Falls back to the lrxd's own directory
-     * when $HOME/SA is absent (tests/demos not installed under it). */
+     * (e.g. $HOME/SW/bin) and still serve every encrypted lib in the
+     * tree (e.g. $HOME/SW/lib).  Falls back to the lrxd's own directory
+     * when $HOME/SW is absent (tests/demos not installed under it). */
     char sa_root[4096];
     struct stat sa_st;
     if (sa_root_path(sa_root, sizeof(sa_root)) == 0
@@ -2596,7 +2596,7 @@ static int decrypt_own_libs(const char *real_exe, const uint8_t *key, int *lib_f
         /* No encrypted libs to serve — NOT an error.  lrxd is still a valid
          * daemon: the keysplit key anchor AND the .pat hot-patch server
          * (OP_GET_PATCH).  Common for an exe-only deployment (no encrypted
-         * .so anywhere under $HOME/SA).  Start anyway — OP_GET_LIB/OP_LIST
+         * .so anywhere under $HOME/SW).  Start anyway — OP_GET_LIB/OP_LIST
          * simply return empty, OP_GET_PATCH keeps working. */
         LOG_INFO("[antirev] no encrypted libs found -- starting as "
                  "patch/anchor-only daemon\n");
@@ -2650,9 +2650,9 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
     build_and_log_deps_graph(lib_fds, lib_names, *nlibs);
 
     /* Lazy .pat lookup (OP_GET_PATCH) must span the WHOLE install tree
-     * — same root as the lib scan ($HOME/SA) — so a .pat anywhere under it
-     * (e.g. $HOME/SA/lib) is found even though the daemon lives in a subdir
-     * like $HOME/SA/bin/sa.  Fall back to exe_dir when $HOME/SA is absent
+     * — same root as the lib scan ($HOME/SW) — so a .pat anywhere under it
+     * (e.g. $HOME/SW/lib) is found even though the daemon lives in a subdir
+     * like $HOME/SW/bin/sw.  Fall back to exe_dir when $HOME/SW is absent
      * (tests/demos not installed under it), matching scan_encrypted_libs. */
     char patch_root[4096];
     {
@@ -2711,7 +2711,7 @@ static int run_daemon_forever(const char *real_exe, uint8_t *key, int *lib_fds, 
         .lib_fds      = lib_fds,
         .lib_names    = lib_names,
         .nlibs        = *nlibs,
-        .scan_dir     = patch_root,   /* .pat lookup spans $HOME/SA, not just exe_dir */
+        .scan_dir     = patch_root,   /* .pat lookup spans $HOME/SW, not just exe_dir */
     };
 
     pthread_t worker;
@@ -2901,9 +2901,9 @@ static void exec_target(int main_fd, char *const *argv, char **new_env, const ch
 /*    real_key = SHA256( part1 || SHA256(lrxd file) || version )       */
 /*                                                                     */
 /*    part1   : trailer[8..40] (same share in every protected binary)  */
-/*    lrxd    : $HOME/SA/bin/sa/lrxd, whole file (binds the key to     */
+/*    lrxd    : $HOME/SW/bin/sw/lrxd, whole file (binds the key to     */
 /*              lrxd's integrity — patch lrxd and derivation breaks)   */
-/*    version : parsed from $HOME/SA/version's stdout — the text after  */
+/*    version : parsed from $HOME/SW/version's stdout — the text after  */
 /*              "Version: " on its line, truncated before any "SPC",    */
 /*              ASCII-whitespace-stripped (see keysplit_version.h);      */
 /*              binds the key to the deployment version                  */
@@ -2915,12 +2915,12 @@ static void exec_target(int main_fd, char *const *argv, char **new_env, const ch
 /* ------------------------------------------------------------------ */
 
 /* The feature's hardcoded runtime paths, relative to the suite root
- * ($HOME/SA) via sa_join, gathered here so a reviewer sees its filesystem
+ * ($HOME/SW) via sa_join, gathered here so a reviewer sees its filesystem
  * dependencies in one place.  OBFSTR must wrap the literal at the call
  * site (stack-local decode; the codegen only rewrites literal arguments),
  * so each path is a one-line builder rather than a pre-obfuscated global. */
 static int ks_lrxd_path(char *buf, size_t n) {
-    return sa_join(OBFSTR("bin/sa/lrxd"), buf, n);
+    return sa_join(OBFSTR("bin/sw/lrxd"), buf, n);
 }
 static int ks_version_path(char *buf, size_t n) {
     return sa_join(OBFSTR("version"), buf, n);
@@ -2944,7 +2944,7 @@ static void ks_fp(const uint8_t *b, size_t n, char *out /* >=9 */) {
 }
 
 /* The version component of the key is PARSED from the RAW stdout produced by
- * EXECUTING $HOME/SA/version (a shell script): the text after "Version: " on
+ * EXECUTING $HOME/SW/version (a shell script): the text after "Version: " on
  * its line, truncated before any "SPC", then ASCII-whitespace-stripped (see
  * ksv_parse in keysplit_version.h).  The packer feeds the SAME value verbatim
  * from config.yaml `version:` (protect.py / antirev-pack.py) — the two must
@@ -2975,7 +2975,7 @@ static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SI
     { char hx[65]; ks_hex(part2, 32, hx);
       LOG_INFO("[antirev] keysplit[dbg]: hash(lrxd)=%s\n", hx); }
 
-    /* version component = EXECUTE $HOME/SA/version (a shell script) and parse
+    /* version component = EXECUTE $HOME/SW/version (a shell script) and parse
      * its RAW stdout (see ksv_parse below).  Use plain fork+exec, NOT popen:
      * glibc's vfork-based popen
      * corrupts this memfd-heavy parent on aarch64.  Capture stdout only; the
@@ -3023,7 +3023,7 @@ static int derive_real_key(const uint8_t part1[KEY_SIZE], uint8_t out_key[KEY_SI
     if (ksv_parse(vbuf, vlen, OBFSTR("Version: DY"), OBFSTR("SPC"),
                   vfield, sizeof(vfield), &vfield_len) != 0) {
         LOG_INFO("[antirev] keysplit: could not parse version field from "
-                 "$HOME/SA/version output (%zu bytes) -- need a \"Version: \" "
+                 "$HOME/SW/version output (%zu bytes) -- need a \"Version: \" "
                  "line with a non-empty value\n", vlen);
         return -1;
     }
@@ -3100,7 +3100,7 @@ int main(int argc, char *argv[], char *envp[])
     /* 2. Obtain the real AES key.
      *    KEY-SPLIT (default, bit clear): the trailer holds only part1 — a
      *      share; derive_real_key() combines it with SHA256(lrxd) and the
-     *      SA/version string.  Hard-fail on any missing source.
+     *      SW/version string.  Hard-fail on any missing source.
      *    SINGLE (BFLAG_KEY_SINGLE set): the trailer holds the WHOLE key; use
      *      it directly — self-contained, no lrxd / no version script. */
     uint8_t key[KEY_SIZE];

@@ -55,7 +55,7 @@ $VAR / ${VAR} from the environment, e.g. install_dir: $HOME/myapp.
 
 `version:` (required) is the keysplit version component — the literal
 deployment version string, taken verbatim (whitespace-stripped, no other
-processing).  It MUST equal what the target's $HOME/SA/version script parses
+processing).  It MUST equal what the target's $HOME/SW/version script parses
 to at runtime: the text after "Version: " on its line, truncated before any
 "SPC", then stripped.  (e.g. a script printing "Version: V100R001C00SPC010"
 means version: "V100R001C00".)
@@ -620,7 +620,7 @@ def main():
     ap.add_argument("--key-mode", "--key_mode", dest="key_mode",
                     choices=["split", "single"], default=None,
                     help="override config 'key_mode': split (default) = key-split "
-                         "(bound to lrxd + $HOME/SA/version); single = key file is "
+                         "(bound to lrxd + $HOME/SW/version); single = key file is "
                          "the whole AES key, baked in each trailer (self-contained, "
                          "no lrxd/version at runtime).")
     args = ap.parse_args()
@@ -861,7 +861,7 @@ def main():
     # Per-architecture real AES keys.  Under key-split each arch's
     # artifacts are encrypted with a key derived from THAT arch's lrxd, so
     # a multi-arch pack produces one key per arch.  A runtime machine is
-    # single-arch and just hashes its one $HOME/SA/bin/sa/lrxd.  Empty
+    # single-arch and just hashes its one $HOME/SW/bin/sw/lrxd.  Empty
     # until the daemon(s) are built.  The trailer still embeds part1
     # (`key`), never the real key.
     real_key_by_arch = {}
@@ -869,7 +869,7 @@ def main():
     # lrxd is a general keysplit/runtime component, NOT tied to whether this pack
     # produced any protected artifact.  It is (1) the keysplit key anchor — every
     # real key's part2 = SHA256(lrxd), and at runtime the stub re-derives the key
-    # by hashing the deployed $HOME/SA/bin/sa/lrxd — and (2) the .pat hot-patch /
+    # by hashing the deployed $HOME/SW/bin/sw/lrxd — and (2) the .pat hot-patch /
     # ANTI_LoadProcess .elf server.  So we ALWAYS build it (one per configured
     # arch); whether to actually run it at deploy time is the operator's choice.
     # Building the daemon needs only the stub + part1 `key` (the trailer embeds
@@ -943,14 +943,14 @@ def main():
     if produced_protected:
         # Key-split: derive a real key PER ARCH from that arch's lrxd + the
         # version VALUE.  Runtime paths are HARDCODED in the stub
-        # ($HOME/SA/bin/sa/lrxd, $HOME/SA/version); `version:` in config is now
+        # ($HOME/SW/bin/sw/lrxd, $HOME/SW/version); `version:` in config is now
         # the deployment version STRING itself (arch-independent), not a path.
-        # It must equal what the runtime $HOME/SA/version script parses to
+        # It must equal what the runtime $HOME/SW/version script parses to
         # (text after "Version: ", truncated before any "SPC", stripped — see
         # protect.parse_version_field / stub.c ksv_parse).  The lrxd used for
         # derivation is the one built (and moved to `lrxd:` if set) just above —
         # same bytes wherever it now lives, so its SHA256 matches the runtime
-        # $HOME/SA/bin/sa/lrxd by construction.
+        # $HOME/SW/bin/sw/lrxd by construction.
         if key_single:
             # SINGLE mode: the `key:` value is the whole AES key; every arch's
             # artifacts are encrypted with it directly (no lrxd/version binding).
@@ -965,7 +965,7 @@ def main():
             if version_cfg is None or str(version_cfg).strip() == "":
                 sys.exit("[error] keysplit: config must set 'version' -- the deployment "
                          "version STRING (e.g. 'V100R001C00').  It must equal what the "
-                         "runtime $HOME/SA/version script parses to: the text after "
+                         "runtime $HOME/SW/version script parses to: the text after "
                          "'Version: ', truncated before any 'SPC', whitespace-stripped.")
             version_field = str(version_cfg).strip().encode()
             print(f"[pack] key-split: version = "

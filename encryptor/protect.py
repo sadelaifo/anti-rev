@@ -33,8 +33,8 @@ Subcommands:
       (lrxd_<arch>.so).  Same ANTREV01 container as encrypt-lib, but the
       key is the KEYSPLIT-derived real key (part1 + SHA256(lrxd) +
       version), matching what the daemon re-derives in handle_get_patch —
-      so --lrxd must be byte-identical to the target's $HOME/SA/bin/sa/lrxd
-      and --version must equal what the target's $HOME/SA/version parses to
+      so --lrxd must be byte-identical to the target's $HOME/SW/bin/sw/lrxd
+      and --version must equal what the target's $HOME/SW/version parses to
       (the value, not the script).  keysplit is per-arch; pass the lrxd for
       the arch the patch targets.  Basename is preserved so the daemon
       resolves it under its scan dir via OP_GET_PATCH.
@@ -206,12 +206,12 @@ def derive_real_key(part1: bytes, lrxd_path: Path, version_field: bytes) -> byte
 
     part1        : the 32-byte share embedded in every trailer (what
                    load_or_create_key returns).
-    lrxd_path    : the daemon binary deployed at $HOME/SA/bin/sa/lrxd,
+    lrxd_path    : the daemon binary deployed at $HOME/SW/bin/sw/lrxd,
                    hashed whole — binds the key to lrxd's integrity.
     version_field: the deployment version VALUE as raw bytes (already parsed /
                    stripped).  The config-driven packer passes config.yaml
                    `version:` verbatim; the runtime stub derives the same bytes
-                   by parsing $HOME/SA/version's stdout (see parse_version_field).
+                   by parsing $HOME/SW/version's stdout (see parse_version_field).
 
     MUST stay byte-for-byte identical to stub.c derive_real_key() and
     tools/antirev_client.py.
@@ -507,8 +507,8 @@ def cmd_encrypt_patch(args):
     The daemon decrypts a .patch via handle_get_patch ->
     derive_real_key(part1 + SHA256(lrxd) + version), so the key here must
     be derived identically.  --lrxd must be byte-identical to what the target
-    deploys at $HOME/SA/bin/sa/lrxd, and --version must equal what the target's
-    $HOME/SA/version script parses to (the value; NOT the script).  keysplit is
+    deploys at $HOME/SW/bin/sw/lrxd, and --version must equal what the target's
+    $HOME/SW/version script parses to (the value; NOT the script).  keysplit is
     per-arch (part2 = SHA256 of THAT arch's lrxd), so pass the lrxd for the arch
     this patch targets.
 
@@ -560,7 +560,7 @@ def main():
                          "in the trailer, self-contained at runtime (no lrxd/"
                          "version).  split: key-split — encrypt with "
                          "SHA256(part1||SHA256(lrxd)||version); needs --lrxd + "
-                         "--version and the runtime lrxd/$HOME/SA/version.")
+                         "--version and the runtime lrxd/$HOME/SW/version.")
     pe.add_argument("--lrxd",    default=None,
                     help="(split only) target arch's lrxd binary (part2 = SHA256 of it)")
     pe.add_argument("--version", default=None,
@@ -592,11 +592,11 @@ def main():
                     help="One or more hot-patch files (basename should end in .patch)")
     ep.add_argument("--lrxd",       required=True,
                     help="Target arch's lrxd daemon binary (keysplit part2 = "
-                         "SHA256 of this file; must match deployed $HOME/SA/bin/sa/lrxd)")
+                         "SHA256 of this file; must match deployed $HOME/SW/bin/sw/lrxd)")
     ep.add_argument("--version",    required=True,
                     help="version VALUE (keysplit version component; the literal "
                          "deployment version, e.g. 'V100R001C00'.  Must equal what "
-                         "the target's $HOME/SA/version script parses to: text after "
+                         "the target's $HOME/SW/version script parses to: text after "
                          "'Version: ', truncated before any 'SPC', stripped)")
     ep.add_argument("--output-dir", default=None,        help="Write encrypted patches here (default: in-place)")
 
