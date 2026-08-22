@@ -331,7 +331,21 @@ for root in "${MOUNTS[@]}"; do
     case "$STAGE_MODE" in
         always) stage=yes ;;
         never)  stage=no ;;
-        *)      [ "$(stat -f -c %T "$root" 2>/dev/null)" = overlayfs ] && stage=yes ;;
+        *)      # auto: stage iff the fs backing $root is overlay.  Detect via
+                # /proc/self/mountinfo (kernel-reported fstype after the " - "
+                # separator, longest-prefix mount) — robust where `stat -f -c %T`
+                # returns "UNKNOWN" (busybox / qemu-emulated coreutils in the
+                # container don't know the overlay magic).  stat is a fallback.
+                ft="$(awk -v p="$root" '
+                    { mp=$5; sep=0; ftype=""
+                      for (i=6;i<=NF;i++) if ($i=="-") { sep=i; ftype=$(i+1); break }
+                      if (sep && (mp==p || substr(p,1,length(mp)+1)==mp"/" || mp=="/"))
+                          if (length(mp) >= best) { best=length(mp); res=ftype } }
+                    END { print res }' /proc/self/mountinfo 2>/dev/null)"
+                case "$ft" in
+                    overlay|overlayfs) stage=yes ;;
+                    "") [ "$(stat -f -c %T "$root" 2>/dev/null)" = overlayfs ] && stage=yes ;;
+                esac ;;
     esac
     if [ "$stage" = yes ]; then
         tag="$(printf '%s' "${root#/}" | tr '/' '_')"
