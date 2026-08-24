@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 #
-# antirev-mount-inplace.sh — IN-PLACE antirevfs mounts + tmpfs write layers,
-# in either of two deployment modes:
+# antirev-mount-inplace.sh — IN-PLACE antirevfs mounts + tmpfs write layers.
 #
-#   --mode real   (default)  mount directly on THIS host  -> real-mode host
-#                            protection (the actual appliance / native box)
-#   --mode sim               drive the mount INTO a running qemu-user "sim mode"
-#                            slave container via `docker exec`  (ARM64-on-x86)
+# A mode expands to a LIST of mount targets (the host is always one of them):
+#
+#   --mode real   (default)  HOST only.  Mounts the host's own /root/SW in place.
+#                            (The real deployment's ARM64 slave is a separate
+#                            machine — handled separately, later.)
+#   --mode sim               HOST + CONTAINER.  Mounts the host's /root/SW AND,
+#                            via `docker exec`, the slave software inside the
+#                            qemu-user "sim mode" Docker container — the whole
+#                            simulation box in one command.  (Run this ON THE
+#                            HOST; it reaches into the container for you.)
+#
+# So one invocation can bring up both installs; the container half is skipped
+# with a note if the container isn't running.
 #
 # Both modes present the business stack's bin/ and lib/ as DECRYPTED views at the
 # SAME paths where the ciphertext lives.  No separate .enc/ tree, no .antirev-rw
@@ -63,14 +71,14 @@
 # The slave container name is a CONSTANT in the config block (CONTAINER=), not a
 # CLI argument — set it once for your deployment.
 #
-# Usage:
-#   antirev-mount-inplace.sh [--mode real|sim] up       # (default) ensure module + mount now (fails fast if the sim container is down)
-#   antirev-mount-inplace.sh [--mode real|sim] watch    # DAEMON: idle-poll; mount when the container appears, re-mount on restart
-#   antirev-mount-inplace.sh [--mode real|sim] down     # unmount everything (module left loaded)
-#   antirev-mount-inplace.sh [--mode real|sim] status   # show active mounts
+# Usage (run ON THE HOST in every case):
+#   antirev-mount-inplace.sh [--mode real|sim] up       # (default) mount all targets now
+#   antirev-mount-inplace.sh [--mode real|sim] watch    # DAEMON: mount host now; (sim) poll + mount the container when it appears
+#   antirev-mount-inplace.sh [--mode real|sim] down     # unmount all targets (module left loaded)
+#   antirev-mount-inplace.sh [--mode real|sim] status   # show active mounts per target
 #
-#   real: antirev-mount-inplace.sh up
-#   sim : antirev-mount-inplace.sh --mode sim up        # (container must already be running)
+#   real: antirev-mount-inplace.sh up                   # host only
+#   sim : antirev-mount-inplace.sh --mode sim up        # host + container (container skipped if not running)
 #         AREV_MODE=sim ./antirev-mount-inplace.sh up
 #
 # --- Two deployment lifecycles, both supported --------------------------------
@@ -212,9 +220,16 @@ ACTION="${ACTION:-up}"
 log() { printf '[inplace:%s] %s\n' "$MODE" "$*"; }
 die() { printf '[inplace:%s] ERROR: %s\n' "$MODE" "$*" >&2; exit 1; }
 
+# Modes expand to a list of mount targets:
+#   real -> host only            (native appliance; the real ARM64 slave is a
+#                                 separate machine, handled separately later)
+#   sim  -> host AND container   (the whole simulation box: the host's own
+#                                 software + the slave software in the Docker
+#                                 container on the same host)
 case "$MODE" in
-    real) ;;
+    real) TARGETS=(host) ;;
     sim)
+        TARGETS=(host container)
         [ -n "$CONTAINER" ] || die "sim mode needs a container name (set CONTAINER= in config or AREV_CONTAINER=)"
         # docker is REQUIRED for the one-shot actions, but 'watch' must tolerate
         # docker being installed later (client installs the sim stack whenever),
@@ -226,10 +241,16 @@ case "$MODE" in
     *) die "unknown --mode '$MODE' (use real|sim)" ;;
 esac
 
-# sim: is the slave container up right now?  real mode: always "yes" (it's local).
+# Is the slave container up right now?  (Only meaningful for the container target.)
 container_running() {
-    [ "$MODE" = real ] && return 0
     docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -qx true
+}
+
+# Is the current $TARGET available to operate on?  host: always; container: only
+# when it is running.
+target_present() {
+    [ "$TARGET" = container ] || return 0
+    container_running
 }
 
 # ---- executor abstraction ----------------------------------------------------
@@ -238,11 +259,16 @@ container_running() {
 #                             config env vars below (exported before each call).
 FWD_VARS=(A_OPTS WRITE_BACKING TMPFS_OPTS MOUNTS_NL WDIRS_NL WFILES_NL STAGE_MODE STAGE_ROOT)
 
+# The current mount target — "host" (run locally) or "container" (via docker
+# exec).  Set by the target loop in run_up_sequence/do_down_all/etc.  --mode real
+# operates on the host only; --mode sim operates on BOTH host and container.
+TARGET=host
+
 run_in_target() {
-    if [ "$MODE" = sim ]; then docker exec -i "$CONTAINER" "$@"; else "$@"; fi
+    if [ "$TARGET" = container ]; then docker exec -i "$CONTAINER" "$@"; else "$@"; fi
 }
 target_bash() {
-    if [ "$MODE" = sim ]; then
+    if [ "$TARGET" = container ]; then
         local eargs=() v
         for v in "${FWD_VARS[@]}"; do eargs+=(-e "$v"); done
         docker exec -i "${eargs[@]}" "$CONTAINER" bash -s
@@ -450,16 +476,30 @@ TARGET_STATUS
 }
 
 # ---- the full up sequence (shared by 'up' and 'watch') -----------------------
+# Bring up every target for this mode.  Host is always mounted; the container is
+# mounted too under --mode sim (skipped with a note if it isn't running).
 run_up_sequence() {
-    log "tearing down any existing mounts"
-    do_down                 # before reload: live mounts pin the module
-    ensure_module           # host-side, identical in both modes
-    write_allowlist
-    do_up
+    # 1) tear every present target down first (live mounts pin the module).
+    for TARGET in "${TARGETS[@]}"; do
+        target_present || continue
+        log "[$TARGET] tearing down any existing mounts"
+        do_down
+    done
+    # 2) module load/reload — host-side, once, after teardown.
+    ensure_module
+    # 3) mount every present target.
+    for TARGET in "${TARGETS[@]}"; do
+        if ! target_present; then
+            log "[$TARGET] container '$CONTAINER' not running -> skipped (start it, or use 'watch')"
+            continue
+        fi
+        log "[$TARGET] mounting"
+        write_allowlist
+        do_up
+        do_status
+    done
     log "up complete."
-    [ "$MODE" = sim ] && log "SSH into '$CONTAINER' and run the target binary from ${MOUNTS[0]}."
     log "watch for EROFS/'Read-only file system' -> add those paths to WRITE_DIRS/WRITE_FILES and re-run 'up'."
-    do_status
 }
 
 # ---- watch: SHIP case — container boots AFTER us (or restarts) ----------------
@@ -471,20 +511,30 @@ run_up_sequence() {
 # for an arbitrarily long time (the client may install the sim stack weeks after
 # the OS ships) and simply keeps polling until they exist.  In real mode there is
 # no container, so it degrades to a single 'up'.
+# Mount the host now (always available), then — for sim — poll for the container
+# and mount it whenever it (re)appears.  In real mode there is no container, so
+# it degrades to a single host 'up'.
 do_watch() {
+    # host first: mount it immediately and load the module.
+    TARGET=host
+    log "[host] mounting"
+    do_down; ensure_module; write_allowlist; do_up; do_status
+
     if [ "$MODE" = real ]; then
-        log "real mode: nothing to watch; running 'up' once"
-        run_up_sequence
+        log "real mode: no container to watch; done"
         return
     fi
+
     log "watch: polling for container '$CONTAINER' every ${WATCH_INTERVAL}s (backgrounded daemon; idle until it appears)"
     command -v docker >/dev/null 2>&1 || log "docker not present yet; will keep polling until it (and the container) are installed"
+    TARGET=container
     local prev=down
     while :; do
         if container_running; then
             if [ "$prev" = down ]; then
                 log "container '$CONTAINER' is up -> mounting"
-                if run_up_sequence; then prev=up; else log "up failed; retrying next tick"; fi
+                if (do_down; write_allowlist; do_up; do_status); then prev=up
+                else log "container up failed; retrying next tick"; fi
             fi
         else
             prev=down
@@ -496,23 +546,30 @@ do_watch() {
 # ---- dispatch ----------------------------------------------------------------
 case "$ACTION" in
     up)
-        container_running || die "container '$CONTAINER' not running. Boot it (business launcher) then re-run 'up', or use 'watch' to auto-mount on start."
+        # mounts the host always, and the container too under --mode sim
+        # (skipped with a note if the container isn't running).
         run_up_sequence
         ;;
     watch)
         do_watch
         ;;
     down)
-        if ! container_running; then
-            log "container '$CONTAINER' not running; its mounts vanished with it — nothing to do"
-            exit 0
-        fi
-        do_down
+        for TARGET in "${TARGETS[@]}"; do
+            if ! target_present; then
+                log "[$TARGET] container '$CONTAINER' not running; its mounts vanished with it — nothing to do"
+                continue
+            fi
+            log "[$TARGET] tearing down"
+            do_down
+        done
         log "down complete (module left loaded; 'rmmod antirevfs' to fully unload)"
         ;;
     status)
-        if ! container_running; then log "container '$CONTAINER' not running"; exit 0; fi
-        do_status
+        for TARGET in "${TARGETS[@]}"; do
+            if ! target_present; then log "[$TARGET] container '$CONTAINER' not running"; continue; fi
+            log "[$TARGET] status:"
+            do_status
+        done
         ;;
     *)
         die "usage: $0 [--mode real|sim] {up|down|status|watch}"
