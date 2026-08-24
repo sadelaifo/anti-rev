@@ -35,6 +35,7 @@
 #include <linux/limits.h>
 #include <linux/err.h>
 #include <linux/cred.h>		/* current_cred(), GLOBAL_ROOT_UID/GID */
+#include <linux/ratelimit.h>	/* pr_warn_ratelimited (DEFINE_RATELIMIT_STATE) */
 #include <linux/key.h>
 #include <linux/verification.h>
 
