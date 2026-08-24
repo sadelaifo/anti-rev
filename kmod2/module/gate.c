@@ -34,6 +34,7 @@
 #include <linux/string.h>
 #include <linux/limits.h>
 #include <linux/err.h>
+#include <linux/cred.h>		/* current_cred(), GLOBAL_ROOT_UID/GID */
 #include <linux/key.h>
 #include <linux/verification.h>
 
@@ -157,7 +158,7 @@ static struct key *authz_keyring;
 
 int antirevfs_authz_init(void)
 {
-#if defined(CONFIG_ASYMMETRIC_KEY_TYPE) && defined(CONFIG_PKCS7_MESSAGE_PARSER)
+#if defined(CONFIG_SYSTEM_DATA_VERIFICATION)
 	key_ref_t kref;
 	struct key *kr;
 
@@ -190,7 +191,7 @@ int antirevfs_authz_init(void)
 	pr_info("antirevfs: authz vendor key loaded (%u-byte cert)\n",
 		antirev_authz_cert_der_len);
 #else
-	pr_warn("antirevfs: kernel lacks ASYMMETRIC_KEY_TYPE/PKCS7_MESSAGE_PARSER — gate_require_sig will deny\n");
+	pr_warn("antirevfs: kernel lacks CONFIG_SYSTEM_DATA_VERIFICATION (PKCS#7 verify) — gate_require_sig will deny\n");
 #endif
 	return 0;
 }
@@ -208,7 +209,7 @@ void antirevfs_authz_exit(void)
  * missing piece or verify error => false => the list is not trusted. */
 static bool authz_list_signature_ok(const char *list, size_t list_len)
 {
-#if defined(CONFIG_ASYMMETRIC_KEY_TYPE) && defined(CONFIG_PKCS7_MESSAGE_PARSER)
+#if defined(CONFIG_SYSTEM_DATA_VERIFICATION)
 	char *sig;
 	size_t sig_len = 0;
 	int ret;
