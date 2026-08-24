@@ -150,6 +150,13 @@ MOUNTS=(
 GATE_ENFORCE="${AREV_GATE_ENFORCE:-1}"       # 1 = enforce allow-list, 0 = allow all
 GATE_PASSTHROUGH=1                           # 1 = unauth read -> trailer-stripped cipher; 0 = -EACCES
 AUTHZ_PATH=/etc/authorized_apps.txt          # resolved in the TARGET's mount ns (container's /etc in sim)
+# Signed allow-list (tamper-proof).  1 => the list is trusted only if its detached
+# PKCS#7 signature (AUTHZ_SIG_PATH) verifies against the vendor key embedded in
+# the .ko (module/gate_authz_pubkey.h).  In signed mode the tool does NOT write
+# the list — you ship a pre-signed list + .p7s (produced by tools/authz-sign.sh
+# at CI/vendor); the tool only checks they are present and flips the module param.
+GATE_REQUIRE_SIG="${AREV_GATE_REQUIRE_SIG:-0}"   # 1 = require a valid signature on the list
+AUTHZ_SIG_PATH="${AREV_AUTHZ_SIG_PATH:-$AUTHZ_PATH.p7s}"  # detached PKCS#7 (DER)
 ANTIREVFS_OPTS="ro,passdata"                 # antirevfs mount options
 
 # Overlay-lower staging (sim / Docker).  FIELD FACT: on SLES 12 SP5 (4.12.14)
@@ -290,10 +297,11 @@ nl_join() { local a; for a in "$@"; do printf '%s\n' "$a"; done; }
 ensure_module() {
     if [ ! -d /sys/module/antirevfs ]; then
         [ -f "$KO" ] || die "module not loaded and .ko not found: $KO (set AREV_KO=)"
-        log "insmod antirevfs (gate_enforce=$GATE_ENFORCE gate_passthrough_cipher=$GATE_PASSTHROUGH authz_path=$AUTHZ_PATH)"
+        log "insmod antirevfs (gate_enforce=$GATE_ENFORCE gate_require_sig=$GATE_REQUIRE_SIG gate_passthrough_cipher=$GATE_PASSTHROUGH authz_path=$AUTHZ_PATH)"
         insmod "$KO" gate_enforce="$GATE_ENFORCE" \
+            gate_require_sig="$GATE_REQUIRE_SIG" \
             gate_passthrough_cipher="$GATE_PASSTHROUGH" \
-            authz_path="$AUTHZ_PATH" || die "insmod failed"
+            authz_path="$AUTHZ_PATH" authz_sig_path="$AUTHZ_SIG_PATH" || die "insmod failed"
         return
     fi
     if [ "$RELOAD_MODULE" = 1 ]; then
@@ -304,13 +312,15 @@ ensure_module() {
         [ -f "$KO" ] || die ".ko not found for reload: $KO"
         log "insmod antirevfs"
         insmod "$KO" gate_enforce="$GATE_ENFORCE" \
+            gate_require_sig="$GATE_REQUIRE_SIG" \
             gate_passthrough_cipher="$GATE_PASSTHROUGH" \
-            authz_path="$AUTHZ_PATH" || die "insmod failed"
+            authz_path="$AUTHZ_PATH" authz_sig_path="$AUTHZ_SIG_PATH" || die "insmod failed"
         return
     fi
     # keep loaded module; sync runtime-writable gate params
-    log "antirevfs already loaded; syncing runtime-writable gate params"
+    log "antirevfs already loaded; syncing runtime-writable gate params (gate_require_sig=$GATE_REQUIRE_SIG)"
     echo "$GATE_ENFORCE"     > /sys/module/antirevfs/parameters/gate_enforce 2>/dev/null || true
+    echo "$GATE_REQUIRE_SIG" > /sys/module/antirevfs/parameters/gate_require_sig 2>/dev/null || true
     echo "$GATE_PASSTHROUGH" > /sys/module/antirevfs/parameters/gate_passthrough_cipher 2>/dev/null || true
     local cur; cur="$(cat /sys/module/antirevfs/parameters/authz_path 2>/dev/null || echo '?')"
     [ "$cur" = "$AUTHZ_PATH" ] || log "note: loaded authz_path='$cur' (not runtime-writable); rmmod+reload to change"
@@ -319,6 +329,17 @@ ensure_module() {
 # ---- target: gate allow-list -------------------------------------------------
 write_allowlist() {
     [ "$GATE_ENFORCE" = 1 ] || { log "gate off; skipping allow-list"; return 0; }
+    # Signed mode: the list + its .p7s are produced at CI/vendor (with the private
+    # key) and shipped; the tool must NOT overwrite them (that would invalidate
+    # the signature).  Just confirm both are present in the target.
+    if [ "$GATE_REQUIRE_SIG" = 1 ]; then
+        if run_in_target sh -c "[ -r '$AUTHZ_PATH' ] && [ -r '$AUTHZ_SIG_PATH' ]"; then
+            log "signed mode: using pre-signed $AUTHZ_PATH (+ $AUTHZ_SIG_PATH) — not overwriting"
+        else
+            log "WARNING: signed mode but $AUTHZ_PATH and/or $AUTHZ_SIG_PATH missing/unreadable in target -> gate will DENY. Deploy the signed list + .p7s (tools/authz-sign.sh)."
+        fi
+        return 0
+    fi
     if [ "${#ALLOW[@]}" -eq 0 ]; then
         log "WARNING: GATE_ENFORCE=1 but ALLOW[] is empty -> everything will be denied"
     fi
