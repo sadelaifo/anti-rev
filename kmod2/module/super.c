@@ -251,6 +251,11 @@ static int __init antirevfs_init(void)
 		kmem_cache_destroy(antirevfs_inode_cachep);
 		return err;
 	}
+	/* Build the trusted keyring for signed-allow-list mode (no-op when no
+	 * vendor key is embedded).  Non-fatal: a failure here only means signed
+	 * mode will deny; the FS still loads. */
+	if (antirevfs_authz_init())
+		pr_warn("antirevfs: authz keyring init failed; gate_require_sig will deny\n");
 	pr_info("antirevfs: loaded\n");
 	return 0;
 }
@@ -260,6 +265,7 @@ static void __exit antirevfs_exit(void)
 	unregister_filesystem(&antirevfs_fs_type);
 	rcu_barrier();	/* let free_inode RCU callbacks drain before slab free */
 	kmem_cache_destroy(antirevfs_inode_cachep);
+	antirevfs_authz_exit();		/* release the signed-authz keyring */
 	pr_info("antirevfs: unloaded\n");
 }
 

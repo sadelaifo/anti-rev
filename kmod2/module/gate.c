@@ -33,9 +33,17 @@
 #include <linux/dcache.h>
 #include <linux/string.h>
 #include <linux/limits.h>
+#include <linux/err.h>
+#include <linux/key.h>
+#include <linux/verification.h>
 
 #include "compat.h"
 #include "antirevfs.h"
+/* Vendor public key (DER X.509 cert) embedded at build time.  The checked-in
+ * placeholder has antirev_authz_cert_der_len == 0; regenerate it with your real
+ * cert via kmod2/tools/authz-embed-pubkey.sh.  With a zero-length key, signed
+ * mode (gate_require_sig=1) fails safe: every list is rejected. */
+#include "gate_authz_pubkey.h"
 
 #define AUTHZ_MAX_BYTES		(64 * 1024)	/* sanity cap on the allow-list file */
 
@@ -48,6 +56,28 @@ static char authz_path[256] = "/etc/authorized_apps.txt";
 module_param_string(authz_path, authz_path, sizeof(authz_path), 0644);
 MODULE_PARM_DESC(authz_path,
 	"Allow-list file: newline-separated authorized exe paths or basenames");
+
+/*
+ * Tamper-proof allow-list (the "client can't edit it" mode).  When
+ * gate_require_sig=1, the allow-list is only trusted if a detached PKCS#7
+ * signature at authz_sig_path verifies against the vendor public key embedded
+ * in the module (gate_authz_pubkey.h) — so a client editing the plaintext list
+ * de-authorizes it (signature no longer matches) and cannot forge a new one
+ * without the vendor private key.  Default 0 keeps the legacy plaintext list so
+ * existing setups/tests are unaffected; the matching logic is identical either
+ * way — only the TRUST of the list bytes changes.  Fails safe: any error
+ * (missing sig, bad sig, no embedded key, kernel lacking PKCS#7) => list
+ * rejected => deny.
+ */
+static bool gate_require_sig;
+module_param(gate_require_sig, bool, 0644);
+MODULE_PARM_DESC(gate_require_sig,
+	"Require the allow-list to carry a valid detached PKCS#7 signature from the embedded vendor key (0 = trust plaintext list, default)");
+
+static char authz_sig_path[256] = "/etc/authorized_apps.txt.p7s";
+module_param_string(authz_sig_path, authz_sig_path, sizeof(authz_sig_path), 0644);
+MODULE_PARM_DESC(authz_sig_path,
+	"Detached PKCS#7 (DER) signature file for the allow-list (used when gate_require_sig=1)");
 
 /*
  * When gating denies a data read, do we hard-fail it (-EACCES, default) or
@@ -77,14 +107,18 @@ bool antirevfs_gate_passthrough_cipher(void)
  * can edit the list live; step 2 sheds the shared file entirely by reading a
  * signature off the exe itself.
  */
-static char *authz_read_list(void)
+/* Read a whole small file into a kmalloc'd, NUL-terminated buffer.  On success
+ * returns the buffer and (if out_len) sets *out_len to the byte length (NOT
+ * counting the added NUL — the signed content is exactly these bytes).  Caller
+ * kfree()s. */
+static char *authz_read_file(const char *path, size_t *out_len)
 {
 	struct file *f;
 	char *buf;
 	loff_t size, pos = 0;
 	ssize_t n;
 
-	f = filp_open(authz_path, O_RDONLY, 0);
+	f = filp_open(path, O_RDONLY, 0);
 	if (IS_ERR(f))
 		return NULL;
 
@@ -108,7 +142,100 @@ static char *authz_read_list(void)
 		return NULL;
 	}
 	buf[size] = '\0';
+	if (out_len)
+		*out_len = (size_t)size;
 	return buf;
+}
+
+/* ---- signed-allow-list verification (gate_require_sig=1) ------------------- */
+/*
+ * Trusted keyring holding ONLY the embedded vendor cert.  Built once at module
+ * init from gate_authz_pubkey.h.  NULL when no key is embedded (placeholder) or
+ * the kernel lacks the asymmetric-key/PKCS#7 infrastructure.
+ */
+static struct key *authz_keyring;
+
+int antirevfs_authz_init(void)
+{
+#if defined(CONFIG_ASYMMETRIC_KEY_TYPE) && defined(CONFIG_PKCS7_MESSAGE_PARSER)
+	key_ref_t kref;
+	struct key *kr;
+
+	if (antirev_authz_cert_der_len == 0)
+		return 0;		/* placeholder key: signed mode will deny */
+
+	kr = keyring_alloc(".antirev_authz",
+			   GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, current_cred(),
+			   (KEY_POS_ALL & ~KEY_POS_SETATTR) |
+			   KEY_USR_VIEW | KEY_USR_READ | KEY_USR_SEARCH,
+			   KEY_ALLOC_NOT_IN_QUOTA, NULL, NULL);
+	if (IS_ERR(kr)) {
+		pr_warn("antirevfs: authz keyring_alloc failed (%ld)\n", PTR_ERR(kr));
+		return PTR_ERR(kr);
+	}
+
+	kref = key_create_or_update(make_key_ref(kr, 1), "asymmetric", NULL,
+				    antirev_authz_cert_der,
+				    antirev_authz_cert_der_len,
+				    (KEY_POS_ALL & ~KEY_POS_SETATTR) | KEY_USR_VIEW,
+				    KEY_ALLOC_NOT_IN_QUOTA);
+	if (IS_ERR(kref)) {
+		pr_warn("antirevfs: embedding authz cert failed (%ld) — check the DER in gate_authz_pubkey.h\n",
+			PTR_ERR(kref));
+		key_put(kr);
+		return PTR_ERR(kref);
+	}
+	key_ref_put(kref);
+	authz_keyring = kr;
+	pr_info("antirevfs: authz vendor key loaded (%u-byte cert)\n",
+		antirev_authz_cert_der_len);
+#else
+	pr_warn("antirevfs: kernel lacks ASYMMETRIC_KEY_TYPE/PKCS7_MESSAGE_PARSER — gate_require_sig will deny\n");
+#endif
+	return 0;
+}
+
+void antirevfs_authz_exit(void)
+{
+	if (authz_keyring) {
+		key_put(authz_keyring);
+		authz_keyring = NULL;
+	}
+}
+
+/* True iff `list`/`list_len` is covered by a valid detached PKCS#7 signature
+ * (authz_sig_path) chaining to the embedded vendor key.  Fails safe: any
+ * missing piece or verify error => false => the list is not trusted. */
+static bool authz_list_signature_ok(const char *list, size_t list_len)
+{
+#if defined(CONFIG_ASYMMETRIC_KEY_TYPE) && defined(CONFIG_PKCS7_MESSAGE_PARSER)
+	char *sig;
+	size_t sig_len = 0;
+	int ret;
+
+	if (!authz_keyring)		/* no vendor key embedded/loaded */
+		return false;
+
+	sig = authz_read_file(authz_sig_path, &sig_len);
+	if (!sig || sig_len == 0) {
+		kfree(sig);
+		return false;
+	}
+
+	ret = verify_pkcs7_signature(list, list_len, sig, sig_len,
+				     authz_keyring,
+				     VERIFYING_UNSPECIFIED_SIGNATURE,
+				     NULL, NULL);
+	kfree(sig);
+	if (ret) {
+		pr_warn_ratelimited("antirevfs: allow-list signature invalid (%d) — rejecting list\n", ret);
+		return false;
+	}
+	return true;
+#else
+	(void)list; (void)list_len;
+	return false;			/* no PKCS#7 support => can't verify => deny */
+#endif
 }
 
 /*
@@ -142,11 +269,19 @@ static bool authz_list_matches(char *list, const char *exe_path)
 static bool authz_path_listed(const char *path)
 {
 	char *list;
+	size_t list_len = 0;
 	bool ok;
 
-	list = authz_read_list();
+	list = authz_read_file(authz_path, &list_len);
 	if (!list)
 		return false;		/* enforce + no/unreadable list => deny */
+	/* In signed mode, the list bytes must carry a valid vendor signature
+	 * before we trust any entry.  Verify BEFORE authz_list_matches (which
+	 * mutates `list` via strsep). */
+	if (gate_require_sig && !authz_list_signature_ok(list, list_len)) {
+		kfree(list);
+		return false;		/* untrusted/edited list => deny */
+	}
 	ok = authz_list_matches(list, path);
 	kfree(list);
 	return ok;
