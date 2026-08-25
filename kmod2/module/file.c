@@ -27,7 +27,6 @@
 static int antirevfs_ensure_plain(struct inode *inode)
 {
 	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
-	struct inode *lower_inode = antirevfs_lower_inode(inode);
 	struct file *lower_file;
 	void *buf;
 	int ret = 0;
@@ -53,8 +52,10 @@ static int antirevfs_ensure_plain(struct inode *inode)
 	}
 
 	if (ii->encrypted) {
+		/* container_len excludes any appended per-exe signature section,
+		 * so the GCM key trailer is found at the right offset. */
 		ret = antirevfs_decrypt_file(inode->i_sb, lower_file,
-					     i_size_read(lower_inode),
+					     ii->container_len,
 					     buf, ii->plain_len);
 	} else {
 		loff_t pos = 0;
@@ -192,7 +193,7 @@ static int antirevfs_file_open(struct inode *inode, struct file *file)
 				kfree(pd);
 				return PTR_ERR(lower);
 			}
-			lsz = i_size_read(antirevfs_lower_inode(inode));
+			lsz = ii->container_len;	/* excludes any appended sig */
 			pd->lower = lower;
 			pd->limit = lsz > ANTREV_TRAILER_LEN ?
 				    lsz - ANTREV_TRAILER_LEN : 0;

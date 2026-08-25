@@ -97,6 +97,53 @@ int antirevfs_has_trailer(struct file *lower_file, loff_t size)
 	return memcmp(buf, ANTREV_MAGIC, ANTREV_MAGIC_LEN) == 0 ? 1 : 0;
 }
 
+/* Detect an appended ANTRSIG1 signature section:
+ *   [container...][sig:sig_len][sig_len:4 LE][ANTRSIG1:8]
+ * On a signed file: *container_len = start of the sig section, *sig_off = start
+ * of the sig blob, *sig_len = its length, returns 1.  On an unsigned file (ends
+ * in the ANTREV01 key trailer): *container_len = file_size, returns 0.  <0 on
+ * read error or a malformed section. */
+int antirevfs_probe_sig(struct file *lower_file, loff_t file_size,
+			loff_t *container_len, loff_t *sig_off, u32 *sig_len)
+{
+	u8 magic[ANTREV_SIG_MAGIC_LEN];
+	u8 lenbuf[ANTREV_SIG_LENFIELD];
+	loff_t pos;
+	ssize_t n;
+	u32 slen;
+
+	*container_len = file_size;
+	*sig_off = 0;
+	*sig_len = 0;
+
+	if (file_size < ANTREV_SIG_FOOTER_LEN)
+		return 0;
+	pos = file_size - ANTREV_SIG_MAGIC_LEN;
+	n = arev_kernel_read(lower_file, magic, ANTREV_SIG_MAGIC_LEN, &pos);
+	if (n < 0)
+		return (int)n;
+	if (n < ANTREV_SIG_MAGIC_LEN ||
+	    memcmp(magic, ANTREV_SIG_MAGIC, ANTREV_SIG_MAGIC_LEN) != 0)
+		return 0;			/* no appended signature */
+
+	pos = file_size - ANTREV_SIG_FOOTER_LEN;
+	n = arev_kernel_read(lower_file, lenbuf, ANTREV_SIG_LENFIELD, &pos);
+	if (n < 0)
+		return (int)n;
+	if (n < ANTREV_SIG_LENFIELD)
+		return -EIO;
+	slen = (u32)lenbuf[0] | ((u32)lenbuf[1] << 8) |
+	       ((u32)lenbuf[2] << 16) | ((u32)lenbuf[3] << 24);
+	if (slen == 0 || slen > ANTREV_SIG_MAX ||
+	    (loff_t)slen + ANTREV_SIG_FOOTER_LEN > file_size)
+		return -EINVAL;			/* malformed */
+
+	*sig_len = slen;
+	*sig_off = file_size - ANTREV_SIG_FOOTER_LEN - (loff_t)slen;
+	*container_len = *sig_off;
+	return 1;
+}
+
 bool antirevfs_ext_whitelisted(struct antirevfs_sb_info *sbi, const char *name)
 {
 	const char *dot, *list = sbi->passthrough;

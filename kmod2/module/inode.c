@@ -56,8 +56,21 @@ static int antirevfs_classify(struct inode *inode, struct dentry *lower_dentry,
 
 	if (magic) {
 		loff_t sz = i_size_read(lower_inode);
-		int trailer = antirevfs_has_trailer(lower_file, sz);
+		loff_t clen, sig_off;
+		u32 sig_len;
+		int ps, trailer;
 
+		/* An optional per-exe signature is APPENDED after the container;
+		 * find the real container size first so every downstream size
+		 * calc excludes the sig section. */
+		ps = antirevfs_probe_sig(lower_file, sz, &clen, &sig_off, &sig_len);
+		if (ps < 0) {
+			fput(lower_file);
+			return ps;
+		}
+		/* The embedded-key trailer's magic is at the END of the container
+		 * (clen-8), not the file end when a sig is appended. */
+		trailer = antirevfs_has_trailer(lower_file, clen);
 		fput(lower_file);
 		/* An antirevfs container must carry the embedded-key trailer
 		 * (key + trailing magic); a header-magic file without it is a
@@ -65,15 +78,21 @@ static int antirevfs_classify(struct inode *inode, struct dentry *lower_dentry,
 		 * (there is no mount key). */
 		if (trailer < 0)
 			return trailer;
-		if (!trailer || sz < ANTREV_HDR_LEN + ANTREV_TRAILER_LEN)
+		if (!trailer || clen < ANTREV_HDR_LEN + ANTREV_TRAILER_LEN)
 			return -EIO;
 		ii->encrypted = true;
 		ii->open_ok = true;
-		*plain_len = sz - ANTREV_HDR_LEN - ANTREV_TRAILER_LEN;
+		ii->container_len = clen;
+		ii->has_sig = (ps == 1);
+		ii->authz_sig = 0;		/* verified lazily by the gate */
+		*plain_len = clen - ANTREV_HDR_LEN - ANTREV_TRAILER_LEN;
 		return 0;
 	}
 
 	fput(lower_file);
+	ii->container_len = i_size_read(lower_inode);	/* no sig on non-ANTREV01 */
+	ii->has_sig = false;
+	ii->authz_sig = 0;
 	if (sbi->pass_nonelf ||
 	    antirevfs_ext_whitelisted(sbi, lower_dentry->d_name.name)) {
 		/* Plaintext passthrough: an explicit-extension match, or (with
@@ -231,7 +250,7 @@ static int antirevfs_getattr(AREV_GETATTR_PROTO)
 	if (ANTIREVFS_I(inode)->encrypted &&
 	    antirevfs_gate_passthrough_cipher() &&
 	    !antirevfs_task_authorized()) {
-		loff_t csz = i_size_read(antirevfs_lower_inode(inode)) -
+		loff_t csz = ANTIREVFS_I(inode)->container_len -
 			     ANTREV_TRAILER_LEN;
 
 		if (csz < 0)

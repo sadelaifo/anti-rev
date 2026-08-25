@@ -34,6 +34,23 @@
 /* Trailer = embedded key + a trailing magic (so the trailer is self-marking). */
 #define ANTREV_TRAILER_LEN	(ANTREV_KEY_LEN + ANTREV_MAGIC_LEN)
 
+/*
+ * OPTIONAL per-exe authorization signature, APPENDED after the container:
+ *   [container...][sig:sig_len][sig_len:4 LE][ANTRSIG1:8]
+ * where `container` is the whole ANTREV01 blob above and `sig` is a detached
+ * PKCS#7 (DER) over those container bytes, made with the vendor private key
+ * (antirev-fs-pack.py --sign-key).  The module verifies it against the key
+ * embedded in gate_authz_pubkey.h.  Detected by the trailing ANTRSIG1 magic;
+ * when absent the file ends in ANTREV01 (the key trailer) and is treated as
+ * unsigned.  Kept in-file (not an xattr) so it survives tmpfs staging / overlay
+ * / Docker layers / cp -a, none of which reliably preserve user xattrs.
+ */
+#define ANTREV_SIG_MAGIC	"ANTRSIG1"
+#define ANTREV_SIG_MAGIC_LEN	8
+#define ANTREV_SIG_LENFIELD	4			/* u32 LE sig length */
+#define ANTREV_SIG_FOOTER_LEN	(ANTREV_SIG_LENFIELD + ANTREV_SIG_MAGIC_LEN)
+#define ANTREV_SIG_MAX		(16 * 1024)		/* sanity cap on sig blob */
+
 /* Per-mount state.  No key here — keys live in each file's trailer. */
 struct antirevfs_sb_info {
 	struct path	lower_root;		/* the .enc/ subtree */
@@ -52,6 +69,14 @@ struct antirevfs_inode_info {
 	size_t		plain_len;	/* == i_size */
 	bool		encrypted;	/* true: GCM decrypt; false: passthrough copy */
 	bool		open_ok;	/* false: strict-mode reject (return -EIO) */
+	/* Per-exe authorization signature (see ANTREV_SIG_* above).  Computed at
+	 * classify; container_len is the size EXCLUDING any appended sig section
+	 * (== lower i_size when unsigned) and is what all the crypto/size math
+	 * uses.  authz_sig caches the PKCS#7 verdict (a file property): 0 unknown,
+	 * 1 verified-ok, -1 verified-bad — filled lazily by the gate. */
+	loff_t		container_len;	/* bytes before the sig section */
+	bool		has_sig;	/* an ANTRSIG1 section is present */
+	int		authz_sig;	/* 0 unknown / 1 ok / -1 bad (gate cache) */
 	struct inode	vfs_inode;
 };
 
@@ -98,5 +123,10 @@ int antirevfs_has_trailer(struct file *lower_file, loff_t size);  /* >0/0/<0: tr
 int antirevfs_decrypt_file(struct super_block *sb, struct file *lower_file,
 			   loff_t lower_size, void *out, size_t out_len);
 bool antirevfs_ext_whitelisted(struct antirevfs_sb_info *sbi, const char *name);
+/* Detect an appended ANTRSIG1 signature section.  Sets *container_len (bytes
+ * before the section, == file_size when unsigned), *sig_off, *sig_len.
+ * Returns 1 signed, 0 unsigned, <0 on error. */
+int antirevfs_probe_sig(struct file *lower_file, loff_t file_size,
+			loff_t *container_len, loff_t *sig_off, u32 *sig_len);
 
 #endif /* _ANTIREVFS_H */

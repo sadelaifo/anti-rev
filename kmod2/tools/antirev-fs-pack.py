@@ -46,9 +46,19 @@ import concurrent.futures
 import fnmatch
 import json
 import os
+import shutil
+import struct
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+# Per-exe authorization signature: appended after the container so the antirevfs
+# gate (gate_require_sig / per-exe mode) can verify it against the embedded
+# vendor key.  Layout: [container][sig][sig_len:4 LE][ANTRSIG1:8].  Must match
+# ANTREV_SIG_* in kmod2/module/antirevfs.h.
+SIG_MAGIC = b"ANTRSIG1"
 
 # Reuse protect.py's exact crypto so the container format stays in lockstep
 # with what the kernel module's read_folio decrypts.
@@ -94,16 +104,48 @@ def blacklisted(rel: str, patterns: list[str]) -> bool:
     return False
 
 
-def encrypt_one(src: Path, dst: Path, key: bytes) -> int:
+def is_executable_name(name: str) -> bool:
+    """Heuristic exe-vs-lib split for per-exe signing: shared libraries are
+    *.so / *.so.N, everything else that's an ELF is treated as an executable.
+    Only executables need a per-exe signature (the gate authorizes the running
+    process's exe / the exec-load file; libs are gated by the caller's identity),
+    so libs are left unsigned to save space + pack time."""
+    return ".so" not in name
+
+
+def sign_container(container: bytes, key_pem: Path, cert_pem: Path) -> bytes:
+    """Detached PKCS#7 (DER, SHA-256, no signed attrs) over `container`, via
+    openssl cms — the exact form kmod2 verify_pkcs7_signature accepts."""
+    with tempfile.NamedTemporaryFile(delete=False) as tf:
+        tf.write(container)
+        tmp = tf.name
+    try:
+        return subprocess.check_output(
+            ["openssl", "cms", "-sign", "-binary", "-noattr", "-md", "sha256",
+             "-in", tmp, "-signer", str(cert_pem), "-inkey", str(key_pem),
+             "-outform", "DER"], stderr=subprocess.PIPE)
+    finally:
+        os.unlink(tmp)
+
+
+def encrypt_one(src: Path, dst: Path, key: bytes,
+                do_sign: bool = False,
+                sign_key: Path = None, sign_cert: Path = None) -> int:
     """Encrypt src -> dst (ANTREV01 container with embedded-key trailer).
 
     antirevfs has no mount-time key, so each file carries its own AES key in a
     trailer (MAGIC + iv + tag + ct + key + MAGIC); the module reads it at
-    decrypt time.  Returns plaintext byte count.
+    decrypt time.  When do_sign, append a per-exe signature section
+    ([sig][sig_len:4 LE][ANTRSIG1]) over the container bytes.  Returns plaintext
+    byte count.
     """
     data = src.read_bytes()
+    container = make_container(data, key, embed_key=True)
+    if do_sign:
+        sig = sign_container(container, sign_key, sign_cert)
+        container = container + sig + struct.pack("<I", len(sig)) + SIG_MAGIC
     dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_bytes(make_container(data, key, embed_key=True))
+    dst.write_bytes(container)
     try:
         dst.chmod(src.stat().st_mode & 0o777)
     except OSError:
@@ -165,6 +207,23 @@ def main() -> int:
     mirror_plaintext = bool(cfg.get("mirror_plaintext", True))
     workers = args.jobs if args.jobs > 0 else (os.cpu_count() or 4)
 
+    # Per-exe signing (optional): when both sign_key + sign_cert are set, each
+    # ENCRYPTED EXECUTABLE (non-.so ELF) gets a per-exe signature appended so the
+    # antirevfs gate can authorize it without a shipped allow-list.  Paths are
+    # relative to the config file.  Keep sign_key OFF client machines.
+    sign_key = cfg.get("sign_key")
+    sign_cert = cfg.get("sign_cert")
+    signing = bool(sign_key and sign_cert)
+    if signing:
+        sign_key = (cfg_path.parent / _expand(sign_key)).resolve()
+        sign_cert = (cfg_path.parent / _expand(sign_cert)).resolve()
+        if not sign_key.exists() or not sign_cert.exists():
+            sys.exit(f"[error] sign_key/sign_cert not found: {sign_key} / {sign_cert}")
+        if not args.dry_run and shutil.which("openssl") is None:
+            sys.exit("[error] sign_key/sign_cert set but 'openssl' not in PATH "
+                     "(required for per-exe signing)")
+        print(f"[pack] per-exe signing ON (key={sign_key.name}); signing executables")
+
     if not install_dir.is_dir():
         sys.exit(f"[error] install_dir not a directory: {install_dir}")
     if install_dir == output_dir:
@@ -172,7 +231,7 @@ def main() -> int:
 
     key = load_or_create_key(key_path) if not args.dry_run else b"\0" * 32
 
-    enc_jobs: list[tuple[Path, Path]] = []
+    enc_jobs: list[tuple[Path, Path, bool]] = []   # (src, dst, do_sign)
     copy_jobs: list[tuple[Path, Path]] = []
     skipped_blacklist: list[str] = []
     skipped_nonelf: list[str] = []
@@ -207,7 +266,7 @@ def main() -> int:
                     skipped_blacklist.append(rel)
                 continue
             if is_elf(src):
-                enc_jobs.append((src, dst))
+                enc_jobs.append((src, dst, signing and is_executable_name(fn)))
             elif mirror_plaintext:
                 copy_jobs.append((src, dst))
             else:
@@ -216,7 +275,8 @@ def main() -> int:
     total_in = 0
     if not args.dry_run and enc_jobs:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(encrypt_one, s, d, key): s for s, d in enc_jobs}
+            futs = {ex.submit(encrypt_one, s, d, key, ds, sign_key, sign_cert): s
+                    for s, d, ds in enc_jobs}
             for fut in concurrent.futures.as_completed(futs):
                 try:
                     total_in += fut.result()
@@ -237,7 +297,9 @@ def main() -> int:
         "install_dir": str(install_dir),
         "output_dir": str(output_dir),
         "encrypted": sorted(s.relative_to(install_dir).as_posix()
-                            for s, _ in enc_jobs),
+                            for s, _, _ in enc_jobs),
+        "signed": sorted(s.relative_to(install_dir).as_posix()
+                         for s, _, ds in enc_jobs if ds),
         "plaintext": sorted(s.relative_to(install_dir).as_posix()
                             for s, _ in copy_jobs),
         "symlinks": sorted(symlinks),
@@ -276,8 +338,9 @@ def main() -> int:
     # Suggested mount commands per immediate subdir that has any mirrored
     # content (ciphertext and/or mirrored plaintext).
     flag = "--passdata " if mirror_plaintext else ""
+    _all_srcs = [s for s, _, _ in enc_jobs] + [s for s, _ in copy_jobs]
     subs = sorted({Path(s.relative_to(install_dir).as_posix()).parts[0]
-                   for s, _ in (enc_jobs + copy_jobs)
+                   for s in _all_srcs
                    if s.relative_to(install_dir).parts})
     if subs:
         print("\n  Suggested mount (key-free — each file embeds its own key):")
