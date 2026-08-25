@@ -48,6 +48,9 @@ static struct inode *antirevfs_alloc_inode(struct super_block *sb)
 	ii->plain_len = 0;
 	ii->encrypted = false;
 	ii->open_ok = false;
+	ii->container_len = 0;
+	ii->has_sig = false;
+	ii->authz_sig = 0;
 	ii->lower_path.dentry = NULL;
 	ii->lower_path.mnt = NULL;
 	return &ii->vfs_inode;

@@ -30,6 +30,7 @@
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
+#include <linux/vmalloc.h>
 #include <linux/dcache.h>
 #include <linux/string.h>
 #include <linux/limits.h>
@@ -46,6 +47,8 @@
  * cert via kmod2/tools/authz-embed-pubkey.sh.  With a zero-length key, signed
  * mode (gate_require_sig=1) fails safe: every list is rejected. */
 #include "gate_authz_pubkey.h"
+/* Hard-coded basename whitelist (the second pass-type; edit + rebuild). */
+#include "gate_whitelist.h"
 
 #define AUTHZ_MAX_BYTES		(64 * 1024)	/* sanity cap on the allow-list file */
 
@@ -289,31 +292,112 @@ static bool authz_path_listed(const char *path)
 	return ok;
 }
 
-/* Resolve the calling process's executable path and test it against the list. */
-static bool authz_exe_allowed(void)
+/* ---- pass-type 1: hard-coded whitelist (gate_whitelist.h) ------------------ */
+static bool authz_whitelisted(const char *name)
 {
-	struct file *exe;
-	char *pathbuf, *exe_path;
+	const char *const *w;
+
+	if (!name)
+		return false;
+	for (w = antirev_whitelist; *w; w++)
+		if (!strcmp(*w, name))
+			return true;
+	return false;
+}
+
+/* ---- pass-type 2: per-exe in-file signature ------------------------------- */
+/* Verify (and cache on the inode) the appended PKCS#7 signature over an
+ * antirevfs file's container bytes, against the embedded vendor key.  Returns
+ * true iff a valid signature is present.  `inode` must be an antirevfs regular
+ * file inode.  The verdict (a file property) is cached in ii->authz_sig; only
+ * transient errors (open/alloc/read) are left uncached for retry. */
+static bool authz_exe_signed_ok(struct inode *inode)
+{
+#if defined(CONFIG_SYSTEM_DATA_VERIFICATION)
+	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
+	struct file *lf;
+	void *cbuf = NULL;
+	char *sbuf = NULL;
+	loff_t pos, csize, isize;
+	u32 slen;
+	ssize_t n;
+	int vret;
 	bool ok = false;
 
-	if (!current->mm)			/* kernel thread: never authorized */
+	if (!authz_keyring || !ii->has_sig)
 		return false;
+	if (ii->authz_sig)			/* cached verdict */
+		return ii->authz_sig > 0;
 
-	exe = arev_get_mm_exe_file(current->mm);
-	if (!exe)
-		return false;
+	csize = ii->container_len;
+	isize = i_size_read(antirevfs_lower_inode(inode));
+	if (csize <= 0 || csize >= isize) { ii->authz_sig = -1; return false; }
+	if ((loff_t)ANTREV_SIG_FOOTER_LEN + csize > isize) { ii->authz_sig = -1; return false; }
+	slen = (u32)(isize - ANTREV_SIG_FOOTER_LEN - csize);
+	if (slen == 0 || slen > ANTREV_SIG_MAX) { ii->authz_sig = -1; return false; }
+
+	lf = dentry_open(&ii->lower_path, O_RDONLY, current_cred());
+	if (IS_ERR(lf))
+		return false;			/* transient — don't cache */
+
+	cbuf = vmalloc(csize);
+	sbuf = kmalloc(slen, GFP_KERNEL);
+	if (!cbuf || !sbuf)
+		goto out;			/* transient */
+
+	pos = 0;
+	n = arev_kernel_read(lf, cbuf, csize, &pos);
+	if (n != (ssize_t)csize)
+		goto out;			/* transient read error */
+	pos = csize;
+	n = arev_kernel_read(lf, sbuf, slen, &pos);
+	if (n != (ssize_t)slen)
+		goto out;
+
+	vret = verify_pkcs7_signature(cbuf, (size_t)csize, sbuf, slen,
+				      authz_keyring,
+				      VERIFYING_UNSPECIFIED_SIGNATURE, NULL, NULL);
+	ok = (vret == 0);
+	ii->authz_sig = ok ? 1 : -1;		/* definitive: cache it */
+	if (!ok)
+		pr_warn_ratelimited("antirevfs: per-exe signature invalid (%d)\n", vret);
+out:
+	fput(lf);
+	vfree(cbuf);
+	kfree(sbuf);
+	return ok;
+#else
+	(void)inode;
+	return false;
+#endif
+}
+
+/* Combined predicate: an exe passes if its basename is whitelisted OR (it is an
+ * antirevfs file and) it carries a valid per-exe signature. */
+static bool authz_ok(struct inode *inode, const char *name)
+{
+	if (authz_whitelisted(name))
+		return true;
+	if (inode && inode->i_op == &antirevfs_file_iops &&
+	    authz_exe_signed_ok(inode))
+		return true;
+	return false;
+}
+
+/* Legacy allow-list fallback: resolve `f`'s canonical path and match the
+ * (optionally signature-required) list at authz_path.  Deny on any error / no
+ * list.  Inert when no list is deployed — the two pass-types above are primary. */
+static bool authz_list_fallback(struct file *f)
+{
+	char *pathbuf, *p;
+	bool ok = false;
 
 	pathbuf = kmalloc(PATH_MAX, GFP_KERNEL);
-	if (!pathbuf) {
-		fput(exe);
+	if (!pathbuf)
 		return false;
-	}
-
-	exe_path = d_path(&exe->f_path, pathbuf, PATH_MAX);
-	fput(exe);
-	if (!IS_ERR(exe_path))
-		ok = authz_path_listed(exe_path);
-
+	p = d_path(&f->f_path, pathbuf, PATH_MAX);
+	if (!IS_ERR(p))
+		ok = authz_path_listed(p);
 	kfree(pathbuf);
 	return ok;
 }
@@ -324,14 +408,28 @@ static bool authz_exe_allowed(void)
  * calling process may read decrypted content.  Gates on the calling process's
  * executable identity, which is what keeps cp/backups on ciphertext.
  *
- * Step 2 replaces the authz_exe_allowed() body with a signature check; this
- * function's contract and every caller stay identical.
+ * A process passes if its exe is (1) in the hard-coded whitelist, or (2) an
+ * antirevfs file carrying a valid per-exe signature — else the legacy allow-list
+ * (if any is deployed).
  */
 bool antirevfs_task_authorized(void)
 {
+	struct file *exe;
+	bool ok;
+
 	if (!gate_enforce)
 		return true;		/* gating off: behave exactly as before */
-	return authz_exe_allowed();
+	if (!current->mm)		/* kernel thread: never authorized */
+		return false;
+	exe = arev_get_mm_exe_file(current->mm);
+	if (!exe)
+		return false;
+
+	ok = authz_ok(file_inode(exe), exe->f_path.dentry->d_name.name);
+	if (!ok)
+		ok = authz_list_fallback(exe);
+	fput(exe);
+	return ok;
 }
 
 /*
@@ -339,26 +437,16 @@ bool antirevfs_task_authorized(void)
  * current->mm->exe_file becomes this program (it is still the caller, e.g. the
  * shell), so the task gate above would wrongly deny a perfectly authorized
  * binary and make every encrypted executable un-runnable.  For an exec-load we
- * therefore gate on the program's OWN path.  Running a program is not a
- * plaintext-FILE exfiltration vector — no readable plaintext copy is produced;
- * the bytes land only in the new process's executable mapping.
+ * therefore gate on the program's OWN identity: whitelist, or the file's own
+ * per-exe signature, else the legacy list.  Running a program is not a
+ * plaintext-FILE exfiltration vector — the bytes land only in the new process's
+ * executable mapping.
  */
 bool antirevfs_file_authorized(struct file *file)
 {
-	char *pathbuf, *fpath;
-	bool ok = false;
-
 	if (!gate_enforce)
 		return true;
-
-	pathbuf = kmalloc(PATH_MAX, GFP_KERNEL);
-	if (!pathbuf)
-		return false;
-
-	fpath = d_path(&file->f_path, pathbuf, PATH_MAX);
-	if (!IS_ERR(fpath))
-		ok = authz_path_listed(fpath);
-
-	kfree(pathbuf);
-	return ok;
+	if (authz_ok(file_inode(file), file->f_path.dentry->d_name.name))
+		return true;
+	return authz_list_fallback(file);
 }
