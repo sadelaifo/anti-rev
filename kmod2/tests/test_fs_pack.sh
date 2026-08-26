@@ -41,6 +41,9 @@ gcc -shared -fPIC -o "$PROJ/lib/libthird.so" "$WORK/t.c"  # to be blacklisted
 echo '{"cfg":1}' > "$PROJ/lib/data.json"               # non-ELF data file
 printf '#!/usr/bin/env python3\nprint("hi")\n' > "$PROJ/bin/run.py"  # script
 printf 'generated\n' > "$PROJ/lib/notes.txt"           # non-ELF text
+ar rcs "$PROJ/lib/libstatic.a" 2>/dev/null <(:) || printf '!<arch>\nstaticarchive-payload\n' > "$PROJ/lib/libstatic.a"  # non-ELF static archive
+printf '\x6f\x0d\x0d\x0a\x00\x00\x00\x00bytecode-payload' > "$PROJ/lib/mod.pyc"  # non-ELF bytecode
+printf 'not-an-elf-despite-the-name' > "$PROJ/bin/weird.elf"  # .elf WITHOUT ELF magic
 
 cat > "$WORK/config.yaml" <<EOF
 install_dir: $PROJ
@@ -48,6 +51,10 @@ output_dir:  $ENC
 key:         key.hex
 blacklist:
   - libthird.so*
+encrypt_ext:
+  - .a
+  - .pyc
+  - .elf
 EOF
 
 echo "== run the packer =="
@@ -142,5 +149,29 @@ else
 fi
 
 echo
+echo "== 8. encrypt_ext: non-ELF .a/.pyc/.elf encrypted (ANTREV01), not signed =="
+for f in lib/libstatic.a lib/mod.pyc bin/weird.elf; do
+	if [[ -f "$ENC/$f" ]] && head -c8 "$ENC/$f" | grep -q "ANTREV01"; then
+		# must NOT carry a per-exe signature footer (they're not exec-loaded)
+		if [[ "$(tail -c8 "$ENC/$f")" == "ANTRSIG1" ]]; then
+			bad "encrypt_ext file wrongly signed: $f"
+		else
+			ok "encrypt_ext encrypted (unsigned): $f"
+		fi
+	else
+		bad "encrypt_ext file not encrypted: $f"
+	fi
+done
+# and they must be listed under encrypted (not plaintext) in the manifest
+if python3 - "$WORK/antirev-fs-manifest.json" <<'PY'
+import json,sys
+m=json.load(open(sys.argv[1]))
+enc=set(m["encrypted"]); pt=set(m.get("plaintext",[]))
+need={"lib/libstatic.a","lib/mod.pyc","bin/weird.elf"}
+assert need <= enc, f"missing from encrypted: {need-enc}"
+assert not (need & pt), f"wrongly in plaintext: {need & pt}"
+PY
+then ok "manifest lists .a/.pyc/.elf as encrypted"; else bad "encrypt_ext manifest wrong"; fi
+
 echo "== RESULT: $PASS passed, $FAIL failed =="
 [[ $FAIL -eq 0 ]]

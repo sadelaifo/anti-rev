@@ -20,6 +20,12 @@
 #     - libprotobuf.so*              #   (third-party libs that coexist plaintext)
 #     - libdopra.so
 #     - third_party/                 #   trailing '/' = path prefix
+#   encrypt_ext:                     # optional — extra NON-ELF extensions to
+#     - .a                           #   encrypt (static archives, bytecode, ...).
+#     - .pyc                         #   ELF files are always encrypted anyway.
+#     - .elf                         #   A .pyc is only readable through the mount
+#                                    #   if the python interpreter basename is in
+#                                    #   the module's compiled whitelist.
 #   mirror_plaintext: true           # optional, default true — see below
 #
 # mirror_plaintext (default true): produce a COMPLETE mixed-content tree.  ELFs
@@ -113,6 +119,15 @@ def is_executable_name(name: str) -> bool:
     return ".so" not in name
 
 
+def has_encrypt_ext(name: str, exts: list[str]) -> bool:
+    """True iff `name` ends with one of the configured `encrypt_ext` suffixes
+    (case-insensitive).  Lets the packer encrypt non-ELF files (e.g. .a static
+    archives, .pyc bytecode) that ELF-magic detection would otherwise leave as
+    plaintext."""
+    low = name.lower()
+    return any(low.endswith(e) for e in exts)
+
+
 def sign_container(container: bytes, key_pem: Path, cert_pem: Path) -> bytes:
     """Detached PKCS#7 (DER, SHA-256, no signed attrs) over `container`, via
     openssl cms — the exact form kmod2 verify_pkcs7_signature accepts."""
@@ -199,6 +214,17 @@ def main() -> int:
     output_dir = Path(_expand(cfg["output_dir"])).resolve()
     key_path = (cfg_path.parent / _expand(cfg.get("key", "antirev.key"))).resolve()
     patterns = [p.replace("\\", "/") for p in (cfg.get("blacklist") or [])]
+    # encrypt_ext (optional): extra file extensions to encrypt even when they are
+    # NOT ELF (e.g. .a static archives, .pyc bytecode).  Normalized to lowercase
+    # with a leading dot.  ELF files are always encrypted regardless of this.
+    # NOTE: an encrypted non-exec file (e.g. .pyc) is only readable through the
+    # mount by an AUTHORIZED process — for .pyc that means the python interpreter
+    # basename (python3, python3.9, ...) must be in the module's compiled
+    # whitelist (gate_whitelist.h), or nothing can read it.
+    encrypt_ext = []
+    for e in (cfg.get("encrypt_ext") or []):
+        e = e.lower()
+        encrypt_ext.append(e if e.startswith(".") else "." + e)
     # mirror_plaintext (default True): copy non-ELF data files and blacklisted
     # ELFs verbatim into the tree so a complete mixed-content read-only dir
     # (lib/, bin/ with .py/.sh/.txt/.json + third-party plaintext libs) is fully
@@ -265,8 +291,13 @@ def main() -> int:
                 else:
                     skipped_blacklist.append(rel)
                 continue
-            if is_elf(src):
-                enc_jobs.append((src, dst, signing and is_executable_name(fn)))
+            src_is_elf = is_elf(src)
+            if src_is_elf or has_encrypt_ext(fn, encrypt_ext):
+                # Only real ELF executables get a per-exe signature; encrypted
+                # non-ELF files (.a, .pyc) are never exec-loaded, so signing them
+                # is pointless (and would wrongly wrap them in an ANTRSIG1 footer).
+                do_sign = signing and src_is_elf and is_executable_name(fn)
+                enc_jobs.append((src, dst, do_sign))
             elif mirror_plaintext:
                 copy_jobs.append((src, dst))
             else:
@@ -312,7 +343,10 @@ def main() -> int:
 
     # ── summary ──
     tag = "[dry-run] would encrypt" if args.dry_run else "[fs-pack] encrypted"
-    print(f"{tag}: {len(enc_jobs)} ELF(s)"
+    n_ext = sum(1 for s, _, _ in enc_jobs if not is_elf(s))
+    print(f"{tag}: {len(enc_jobs)} file(s)"
+          + (f" ({len(enc_jobs) - n_ext} ELF + {n_ext} by encrypt_ext)"
+             if n_ext else " (ELF)")
           + ("" if args.dry_run else f"  ({total_in:,} plaintext bytes)"))
     print(f"          symlinks mirrored: {len(symlinks)}")
     if mirror_plaintext:
