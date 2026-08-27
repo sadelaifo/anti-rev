@@ -187,13 +187,16 @@ static struct key *authz_keyring;
 
 int antirevfs_authz_init(void)
 {
+#if defined(CONFIG_SYSTEM_DATA_VERIFICATION)
+	key_ref_t kref;
+	struct key *kr;
+#endif
+	/* Declarations must precede statements (kernel -Wdeclaration-after-statement),
+	 * so emit the dev banner only after the block's decls above. */
 #ifdef AREV_DEV_MODE
 	pr_warn("vcachefs: DEV BUILD — runtime enforce toggle + allow-list are ENABLED. NOT FOR SHIPMENT.\n");
 #endif
 #if defined(CONFIG_SYSTEM_DATA_VERIFICATION)
-	key_ref_t kref;
-	struct key *kr;
-
 	if (antirev_authz_cert_der_len == 0)
 		return 0;		/* placeholder key: signed mode will deny */
 
