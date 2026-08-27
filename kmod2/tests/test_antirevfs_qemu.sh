@@ -45,7 +45,7 @@ KMOD="$HERE/.."
 ROOT="$KMOD/.."
 MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
-KEYCTL="$KMOD/tools/antirev-keyctl"
+KEYCTL="$KMOD/tools/vcache-keyctl"
 ENF_PARAM=/sys/module/vcachefs/parameters/gate_enforce
 
 ACC=aarch64-linux-gnu-gcc

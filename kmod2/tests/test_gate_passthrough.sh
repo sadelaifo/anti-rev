@@ -30,7 +30,7 @@ KMOD="$HERE/.."
 ROOT="$KMOD/.."
 MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
-KEYCTL="$KMOD/tools/antirev-keyctl"
+KEYCTL="$KMOD/tools/vcache-keyctl"
 PASS_PARAM=/sys/module/vcachefs/parameters/gate_passthrough_cipher
 
 PASS=0; FAIL=0

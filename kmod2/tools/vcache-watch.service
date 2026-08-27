@@ -1,22 +1,22 @@
-# antirev-sim.service — sim-mode (qemu-in-docker) auto-mount daemon.
+# vcache-watch.service — sim-mode (qemu-in-docker) auto-mount daemon.
 #
-# Backgrounded watcher: idle-polls for the slave container and mounts antirevfs
+# Backgrounded watcher: idle-polls for the slave container and mounts vcachefs
 # in-place over its bin/lib the instant it appears (re-mounting on restart).
 # Survives reboots and tolerates the container/docker being installed weeks after
 # the OS ships.  The install script enables this and returns immediately — the
 # WAITING happens here, in the daemon, never in the installer.
 #
 # Install (adjust the ExecStart path to where you drop the tool):
-#   install -m0755 antirev-mount-inplace.sh /opt/antirev/
-#   install -m0644 antirev-sim.service      /etc/systemd/system/
+#   install -m0755 vcache-mount.sh /opt/vcache/
+#   install -m0644 vcache-watch.service      /etc/systemd/system/
 #   systemctl daemon-reload
-#   systemctl enable --now antirev-sim.service     # non-blocking
+#   systemctl enable --now vcache-watch.service     # non-blocking
 #
 # Set the container name + gate in the tool's config (CONTAINER=, GATE_ENFORCE=)
 # or override via Environment= lines below.
 
 [Unit]
-Description=antirev sim-mode auto-mount (decrypt bin/lib inside the slave container)
+Description=vcache sim-mode auto-mount (decrypt bin/lib inside the slave container)
 # docker.service may not exist yet at enable time (client installs it later);
 # After/Wants on a missing unit is harmless — the daemon polls regardless.
 After=docker.service
@@ -27,9 +27,9 @@ Type=simple
 Environment=AREV_MODE=sim
 # Optional overrides (else taken from the tool's config block):
 # Environment=AREV_CONTAINER=slave
-# Environment=AREV_KO=/opt/antirev/vcachefs.ko
+# Environment=AREV_KO=/opt/vcache/vcachefs.ko
 # Environment=AREV_WATCH_INTERVAL=5
-ExecStart=/opt/antirev/antirev-mount-inplace.sh --mode sim watch
+ExecStart=/opt/vcache/vcache-mount.sh --mode sim watch
 Restart=always
 RestartSec=5
 

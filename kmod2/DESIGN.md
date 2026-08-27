@@ -105,7 +105,7 @@ This makes mixed `bin/` and `lib/` contents work cleanly while keeping strict-mo
 
 The module exposes `read_folio` only. No `write_folio`, no `writepage`. The superblock is mounted `SB_RDONLY` and the directory `inode_operations` carry no `.create`/`.mkdir`/`.unlink`/`.rename`, so the mount is read-only three ways over — any write returns `-EROFS`. Business code does not write `.so` or `.elf` files at runtime, and config writes go to the unprotected `config/` tree.
 
-**But some business software writes lock/log/temp files *inside* `bin/` or `lib/`** (next to the executables), which a bare antirevfs mount rejects. The supported fix keeps the module read-only and adds a writable layer *above* it with stock `overlayfs` (`tools/antirev-mount-rw`):
+**But some business software writes lock/log/temp files *inside* `bin/` or `lib/`** (next to the executables), which a bare antirevfs mount rejects. The supported fix keeps the module read-only and adds a writable layer *above* it with stock `overlayfs` (`tools/vcache-mount-rw`):
 
 ```
 overlayfs(upper = writable ext4)   ← what the app sees (read-write)
@@ -156,7 +156,7 @@ Components deleted or dramatically shrunk:
 | Artifact | Purpose |
 |---|---|
 | `antirev-kmod-dkms_X.Y_all.deb` (or `.rpm`) | Module source + DKMS wrapper. DKMS builds the `.ko` against the customer's running kernel. |
-| `antirev-tools_X.Y.deb` | Userspace utilities: `antirev-keyctl`, `antirev-mount`, install helpers. |
+| `antirev-tools_X.Y.deb` | Userspace utilities: `vcache-keyctl`, `vcache-mount-ro`, install helpers. |
 | `business-software-encrypted_X.Y.tar.zst` | Pre-encrypted business tree. Layout matches the target install layout under `.enc/`. |
 | Key material | TPM-sealed blob / USB dongle / PKCS#11 device, depending on chosen custody mode. |
 
@@ -208,7 +208,7 @@ Before=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/antirev-keyctl unlock-from-tpm
+ExecStart=/usr/sbin/vcache-keyctl unlock-from-tpm
 RemainAfterExit=yes
 
 [Install]
@@ -252,7 +252,7 @@ antirev-encrypt /root/proj/.enc/bin
 antirev-encrypt /root/proj/.enc/lib
 
 # 6. Deliver key
-antirev-keyctl unlock               # technician inserts dongle / unseals TPM
+vcache-keyctl unlock               # technician inserts dongle / unseals TPM
 
 # 7. Mount
 mount -t antirevfs /root/proj/.enc/bin /root/proj/bin
@@ -281,7 +281,7 @@ Maximum pre-staging shrinks the onsite window:
 
 - Ship `antirev-kmod-dkms` and `antirev-tools` via routine maintenance update before technician visit. Module already built and ready to load.
 - Ship encrypted tarball via normal software distribution. Already on disk at `/var/cache/antirev/`.
-- Pre-configure `/etc/fstab` and `antirev-keyctl.service`.
+- Pre-configure `/etc/fstab` and `vcache-keyctl.service`.
 
 Onsite work compresses to:
 
@@ -289,7 +289,7 @@ Onsite work compresses to:
 systemctl stop business-*
 mv /root/proj/{bin,lib} /root/proj/.enc/
 mkdir /root/proj/{bin,lib}
-antirev-keyctl unlock-from-tpm
+vcache-keyctl unlock-from-tpm
 systemctl daemon-reload && mount -a
 tar -xf /var/cache/antirev/business-encrypted.tar.zst -C /root/proj/.enc/
 systemctl start business-*
@@ -331,7 +331,7 @@ systemctl start business-*
 
 1. **Kernel version support range.** Need confirmed kernel versions for both customer arches. VFS interfaces have changed across releases (e.g., `read_folio` is new, older kernels have `readpage`). Decision: do we maintain one module per major kernel series, or a single source with compat shims?
 2. **Stacked FS vs direct aops hook** — chosen stacked FS, but worth a PoC to confirm no glibc-side surprises (path-identity in link-map dedup, dlopen path resolution under stacked-mount).
-3. **Read-write or read-only mounts?** ~~Business code presumably doesn't write `.so` files at runtime.~~ **RESOLVED.** The module stays strictly read-only (simpler, safer — no write path to audit). Some business software *does* write lock/log/temp files inside `bin/`/`lib/` though, so a writable view is provided by stacking a stock `overlayfs` upper over the antirevfs lower (`tools/antirev-mount-rw`, `tests/test_antirevfs_overlay_rw.sh`) rather than by adding a write path to the FS. See "Read-only by design — and the writable-overlay escape hatch" above for the copy-up caveat.
+3. **Read-write or read-only mounts?** ~~Business code presumably doesn't write `.so` files at runtime.~~ **RESOLVED.** The module stays strictly read-only (simpler, safer — no write path to audit). Some business software *does* write lock/log/temp files inside `bin/`/`lib/` though, so a writable view is provided by stacking a stock `overlayfs` upper over the antirevfs lower (`tools/vcache-mount-rw`, `tests/test_antirevfs_overlay_rw.sh`) rather than by adding a write path to the FS. See "Read-only by design — and the writable-overlay escape hatch" above for the copy-up caveat.
 4. **Module signing.** Enforced module signing (Secure Boot / lockdown mode) requires shipping a signed `.ko` or installing the customer's signing key. Add to install pre-flight.
 5. **Key rotation.** How to add a new key to the keyring and re-encrypt artifacts without taking the mount offline. Probably: dual-key support, mount accepts either key, packer rotates on next build.
 6. **fsck / disk-integrity tooling.** Customers running periodic fsck or backup tools will see ciphertext under `.enc/` — confirm no operational surprise (e.g., antivirus alerting on high-entropy files).

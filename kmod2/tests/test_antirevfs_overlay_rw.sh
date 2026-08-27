@@ -1,6 +1,6 @@
 #!/bin/bash
 # Writable-view test for antirevfs: overlayfs writable-upper over a decrypted
-# antirevfs lower (the `antirev-mount-rw` tool).
+# antirevfs lower (the `vcache-mount-rw` tool).
 #
 # Motivation: antirevfs mounts are read-only by design, so business software
 # that writes lock/log/temp files INSIDE bin/ or lib/ (next to the protected
@@ -19,7 +19,7 @@
 # Requires root (insmod/mount).  Run:  sudo bash test_antirevfs_overlay_rw.sh
 set -uo pipefail
 
-# Shared real session keyring for both `antirev-keyctl unlock` and `mount`
+# Shared real session keyring for both `vcache-keyctl unlock` and `mount`
 # (see the long explanation in test_antirevfs.sh).
 if [[ -z "${ANTIREVFS_TEST_SESSION:-}" ]]; then
 	if command -v keyctl >/dev/null 2>&1; then
@@ -34,8 +34,8 @@ KMOD="$HERE/.."
 ROOT="$KMOD/.."
 MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
-KEYCTL="$KMOD/tools/antirev-keyctl"
-MOUNTRW="$KMOD/tools/antirev-mount-rw"
+KEYCTL="$KMOD/tools/vcache-keyctl"
+MOUNTRW="$KMOD/tools/vcache-mount-rw"
 
 PASS=0; FAIL=0
 ok()  { echo "  [PASS] $*"; PASS=$((PASS+1)); }
@@ -80,11 +80,11 @@ else
 fi
 umount "$BARE"
 
-echo "== mount the writable view (antirev-mount-rw) =="
+echo "== mount the writable view (vcache-mount-rw) =="
 if "$MOUNTRW" --passdata --state "$WORK/state" "$ENC" "$MP" >/dev/null; then
 	ok "1. overlayfs accepted antirevfs as lowerdir"
 else
-	bad "1. antirev-mount-rw failed to stack overlay over antirevfs"; dmesg|tail -10; exit 1
+	bad "1. vcache-mount-rw failed to stack overlay over antirevfs"; dmesg|tail -10; exit 1
 fi
 
 echo "== 2. decrypted read through the overlay =="

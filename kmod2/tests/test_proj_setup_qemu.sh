@@ -38,8 +38,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
 MOD="$KMOD/module/vcachefs.ko"
-PACK="$KMOD/tools/antirev-fs-pack.py"
-MOUNTRW="$KMOD/tools/antirev-mount-rw"
+PACK="$KMOD/tools/vcache-pack.py"
+MOUNTRW="$KMOD/tools/vcache-mount-rw"
 ENF=/sys/module/vcachefs/parameters/gate_enforce
 
 ACC=aarch64-linux-gnu-gcc

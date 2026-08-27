@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# antirev-remount-proj.sh — tear down and re-establish the antirevfs mounts
+# vcache-remount.sh — tear down and re-establish the vcachefs mounts
 # for the business stack, reloading the module with the decrypt-auth gate.
 #
-#   /root/proj_protect/lib  (ciphertext) -> /root/proj/lib  (WRITABLE view: overlay over antirevfs)
-#   /root/proj_protect/bin  (ciphertext) -> /root/proj/bin  (WRITABLE view: overlay over antirevfs)
+#   /root/proj_protect/lib  (ciphertext) -> /root/proj/lib  (WRITABLE view: overlay over vcachefs)
+#   /root/proj_protect/bin  (ciphertext) -> /root/proj/bin  (WRITABLE view: overlay over vcachefs)
 #
 # Both trees are mounted as WRITABLE overlay views: decrypted .so/.elf reads
-# fall through to the antirevfs lower, while any runtime write (GUI pid/lock/log
+# fall through to the vcachefs lower, while any runtime write (GUI pid/lock/log
 # files next to the binaries) lands in the overlay's writable upper and NEVER
 # touches the ciphertext tree.
 #
@@ -19,8 +19,8 @@
 set -euo pipefail
 
 ##### ---- configuration: EDIT to match your deployment -------------------------
-KMOD_DIR=/root/antirev/kmod2/module      # dir containing vcachefs.ko
-TOOLS_DIR=/root/antirev/kmod2/tools      # dir with antirev-mount / -mount-rw
+KMOD_DIR=/root/vcache/kmod2/module      # dir containing vcachefs.ko
+TOOLS_DIR=/root/vcache/kmod2/tools      # dir with vcache-mount-ro / -mount-rw
 
 LIB_LOWER=/root/proj_protect/lib
 LIB_MOUNT=/root/proj/lib
@@ -30,13 +30,13 @@ BIN_MOUNT=/root/proj/bin
 GATE_ENFORCE=1                           # 1 = enforce /etc/authorized_apps.txt, 0 = allow all
 GATE_PASSTHROUGH=1                       # 1 = unauthorized read gets trailer-stripped ciphertext; 0 = -EACCES
 AUTHZ_PATH=/etc/authorized_apps.txt
-MOUNT_FLAG=--passdata                    # or:  --passthrough so:py:pyc   (see antirev-mount -h)
+MOUNT_FLAG=--passdata                    # or:  --passthrough so:py:pyc   (see vcache-mount-ro -h)
 LIB_WRITABLE=1                           # 1 = lib is a writable overlay view too (set 0 for read-only lib)
 ##### ---------------------------------------------------------------------------
 
 KO="$KMOD_DIR/vcachefs.ko"
-MOUNT_BIN="$TOOLS_DIR/antirev-mount"
-MOUNTRW_BIN="$TOOLS_DIR/antirev-mount-rw"
+MOUNT_BIN="$TOOLS_DIR/vcache-mount-ro"
+MOUNTRW_BIN="$TOOLS_DIR/vcache-mount-rw"
 
 log() { printf '[remount] %s\n' "$*"; }
 die() { printf '[remount] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -48,8 +48,8 @@ fi
 
 # ---- sanity ------------------------------------------------------------------
 [ -f "$KO" ]        || die "module not found: $KO"
-[ -x "$MOUNT_BIN" ] || die "antirev-mount not found/executable: $MOUNT_BIN"
-[ -x "$MOUNTRW_BIN" ] || die "antirev-mount-rw not found/executable: $MOUNTRW_BIN"
+[ -x "$MOUNT_BIN" ] || die "vcache-mount-ro not found/executable: $MOUNT_BIN"
+[ -x "$MOUNTRW_BIN" ] || die "vcache-mount-rw not found/executable: $MOUNTRW_BIN"
 
 # ---- teardown ----------------------------------------------------------------
 force_down() {
@@ -64,11 +64,11 @@ force_down() {
     umount -l "$mp"
 }
 
-# unmount every antirevfs/overlay mount under the proj trees, deepest first,
-# so a leftover overlay 'dec' lower (under .antirev-rw) can't pin the module.
+# unmount every vcachefs/overlay mount under the proj trees, deepest first,
+# so a leftover overlay 'dec' lower (under .vcache-rw) can't pin the module.
 sweep_proj_mounts() {
     local mps mp
-    mps=$(grep -E 'antirevfs|overlay' /proc/mounts \
+    mps=$(grep -E 'vcachefs|overlay' /proc/mounts \
           | awk '$2 ~ /\/root\/proj/ {print $2}' | sort -r) || true
     for mp in $mps; do force_down "$mp"; done
 }
@@ -76,7 +76,7 @@ sweep_proj_mounts() {
 log "tearing down existing mounts"
 # Always try to collapse a writable overlay on BOTH mountpoints, regardless of
 # this run's mode — a leftover overlay from a previous run (possibly the other
-# mode) must be torn down (overlay then its antirevfs 'dec' lower) before the
+# mode) must be torn down (overlay then its vcachefs 'dec' lower) before the
 # sweep, or the 'dec' mount stays pinned and rmmod fails. Harmless if absent.
 "$MOUNTRW_BIN" --down "$BIN_MOUNT" 2>/dev/null || true
 "$MOUNTRW_BIN" --down "$LIB_MOUNT" 2>/dev/null || true
@@ -85,19 +85,19 @@ sweep_proj_mounts
 # ---- reload module -----------------------------------------------------------
 # /sys/module/vcachefs is authoritative (independent of lsmod / PATH).
 if [ -d /sys/module/vcachefs ]; then
-    log "removing antirevfs module"
+    log "removing vcachefs module"
     if ! rmmod vcachefs 2>/dev/null; then
         log "rmmod failed — module in use (refcnt=$(cat /sys/module/vcachefs/refcnt 2>/dev/null))"
-        log "antirevfs mounts still present in this namespace:"
-        grep antirevfs /proc/mounts || log "  (none — likely a lazy-unmounted mount still held by a"
-        log "   running process, or an antirevfs mount inside a container namespace)"
-        log "processes whose mount namespace still references antirevfs:"
-        grep -l antirevfs /proc/*/mountinfo 2>/dev/null || true
+        log "vcachefs mounts still present in this namespace:"
+        grep vcachefs /proc/mounts || log "  (none — likely a lazy-unmounted mount still held by a"
+        log "   running process, or an vcachefs mount inside a container namespace)"
+        log "processes whose mount namespace still references vcachefs:"
+        grep -l vcachefs /proc/*/mountinfo 2>/dev/null || true
         die "stop the business stack (mmap'd .so files pin the module), then re-run"
     fi
 fi
 [ -d /sys/module/vcachefs ] && die "vcachefs still loaded after rmmod"
-log "loading antirevfs (gate_enforce=$GATE_ENFORCE gate_passthrough_cipher=$GATE_PASSTHROUGH authz_path=$AUTHZ_PATH)"
+log "loading vcachefs (gate_enforce=$GATE_ENFORCE gate_passthrough_cipher=$GATE_PASSTHROUGH authz_path=$AUTHZ_PATH)"
 insmod "$KO" gate_enforce="$GATE_ENFORCE" \
 	gate_passthrough_cipher="$GATE_PASSTHROUGH" \
 	authz_path="$AUTHZ_PATH" || die "insmod failed"
@@ -117,5 +117,5 @@ log "mounting bin (writable view): $BIN_LOWER -> $BIN_MOUNT"
 
 # ---- verify ------------------------------------------------------------------
 log "active proj mounts:"
-grep -E 'antirevfs|overlay' /proc/mounts | grep -E '/root/proj' || true
+grep -E 'vcachefs|overlay' /proc/mounts | grep -E '/root/proj' || true
 log "done — gate_enforce=$(cat /sys/module/vcachefs/parameters/gate_enforce 2>/dev/null)"

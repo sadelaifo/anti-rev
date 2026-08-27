@@ -20,9 +20,9 @@ kmod2/
 │   ├── Makefile         out-of-tree kbuild
 │   └── dkms.conf        DKMS packaging (auto-rebuild on kernel upgrade)
 ├── tools/
-│   ├── antirev-keyctl   install/clear the AES key in the kernel keyring
-│   ├── antirev-mount    thin `mount -t antirevfs` wrapper (read-only view)
-│   └── antirev-mount-rw writable view: overlayfs upper over the antirevfs lower
+│   ├── vcache-keyctl   install/clear the AES key in the kernel keyring
+│   ├── vcache-mount-ro    thin `mount -t antirevfs` wrapper (read-only view)
+│   └── vcache-mount-rw writable view: overlayfs upper over the antirevfs lower
 └── tests/
     └── test_antirevfs.sh end-to-end test (needs root)
 ```
@@ -31,7 +31,7 @@ kmod2/
 
 antirevfs has **no mount-time key**: each encrypted file embeds its own AES-256
 key in a trailer (mirroring the master-branch stub trailer), and the module
-reads it at decrypt time. Produced by `antirev-fs-pack.py` or `protect.py
+reads it at decrypt time. Produced by `vcache-pack.py` or `protect.py
 encrypt-lib --embed-key`:
 
 ```
@@ -113,7 +113,7 @@ sudo insmod kmod2/module/antirevfs.ko        # or: modprobe antirevfs (after dkm
 
 # 2. mount the ciphertext .enc/ tree as a decrypted view — NO key step
 #    (each file carries its own key in a trailer; the module reads it on decrypt)
-sudo kmod2/tools/antirev-mount /root/proj/.enc/lib /root/proj/lib json:md
+sudo kmod2/tools/vcache-mount-ro /root/proj/.enc/lib /root/proj/lib json:md
 #   equivalently:
 #   mount -t antirevfs -o ro,passthrough=json:md /root/proj/.enc/lib /root/proj/lib
 ```
@@ -121,19 +121,19 @@ sudo kmod2/tools/antirev-mount /root/proj/.enc/lib /root/proj/lib json:md
 - `passthrough=` (colon-separated extensions — `,` is the mount-option
   separator) serves matching files verbatim for mixed-content dirs. Any other
   file lacking the `ANTREV01` magic is rejected with `-EIO` (strict mode).
-- `passdata` (`antirev-mount --passdata …`) serves **any** non-`ANTREV01` file
+- `passdata` (`vcache-mount-ro --passdata …`) serves **any** non-`ANTREV01` file
   as plaintext passthrough — for a complete mixed read-only `lib/`/`bin/` tree
   (encrypted ELFs + `.py`/`.sh`/`.txt`/`.json` data + third-party plaintext
-  libs), produced by `antirev-fs-pack.py` with `mirror_plaintext` (default).
+  libs), produced by `vcache-pack.py` with `mirror_plaintext` (default).
   The mount is read-only: redirect any runtime-written files to a writable path
   outside the mount (e.g. an overlayfs upper — see "Writable view" below).
 - No `key=` option and no keyring: keys are embedded per file (above).
 
-### Writable view (overlayfs upper) — `antirev-mount-rw`
+### Writable view (overlayfs upper) — `vcache-mount-rw`
 
 A bare antirevfs mount is **read-only** (decrypt-on-read only; no write path), so
 business software that writes lock/log/temp files *inside* `bin/` or `lib/` —
-next to the protected executables — fails with `-EROFS`. `antirev-mount-rw`
+next to the protected executables — fails with `-EROFS`. `vcache-mount-rw`
 fixes this by stacking a writable `overlayfs` upper on top of the decrypted
 antirevfs lower:
 
@@ -149,31 +149,31 @@ touches the ciphertext tree**.
 
 ```bash
 # mount: writable decrypted view of .enc/bin at bin/
-sudo kmod2/tools/antirev-mount-rw --passdata /root/proj/.enc/bin /root/proj/bin
+sudo kmod2/tools/vcache-mount-rw --passdata /root/proj/.enc/bin /root/proj/bin
 
 # tear down (unmounts overlay then antirevfs, preserves the upper)
-sudo kmod2/tools/antirev-mount-rw --down /root/proj/bin
+sudo kmod2/tools/vcache-mount-rw --down /root/proj/bin
 
 # where do the app's writes (logs/locks/temp) live? — works mounted or not
-sudo kmod2/tools/antirev-mount-rw --status /root/proj/bin
+sudo kmod2/tools/vcache-mount-rw --status /root/proj/bin
 ```
 
 **Where written files persist / retrieving logs after unmount.** While mounted,
 the app reads/writes them at the natural path (`/root/proj/bin/run.log`), exactly
 as in plaintext mode. After `--down`, `bin/` is just the bare mountpoint again,
 but the files are **not lost** — they stay on disk in the upper at
-`/root/proj/.antirev-rw/bin/upper/` (the default upper is disk-backed ext4,
+`/root/proj/.vcache-rw/bin/upper/` (the default upper is disk-backed ext4,
 matching plaintext write semantics; `--down` never deletes it). Use
-`antirev-mount-rw --status <mountpoint>` to print the upper path and list what
+`vcache-mount-rw --status <mountpoint>` to print the upper path and list what
 the app has written, or just re-mount to expose them at `bin/` again. In
 production the overlay normally stays mounted (fstab/systemd), so `bin/run.log`
 is always live; teardown is a maintenance action.
 
 By default the three overlay layers (`dec/` decrypted lower, `upper/` writable,
-`work/`) live under `<dirname mountpoint>/.antirev-rw/<basename mountpoint>`;
+`work/`) live under `<dirname mountpoint>/.vcache-rw/<basename mountpoint>`;
 override with `--state <dir>` (point it at a tmpfs path to wipe writes on
 reboot). `--passthrough <exts>` and `ANTIREV_MOUNT_OPTS` (e.g. `key=<64hex>`)
-work the same as for `antirev-mount`. Covered by `tests/test_antirevfs_overlay_rw.sh`.
+work the same as for `vcache-mount-ro`. Covered by `tests/test_antirevfs_overlay_rw.sh`.
 
 > **Copy-up caveat.** overlayfs copies a file *up* into the writable upper on
 > first modification — and the copy is the **decrypted plaintext**. This only
@@ -195,7 +195,7 @@ of the `.enc/` lower tree is decryptable, so the lower tree must stay
 namespace-isolated and the plaintext exposure is bounded by the mount's
 decrypt-auth gate. This matches the master-branch model (key shipped, obfuscated,
 inside the artifact). Hardening the embedded key (obfuscation / K-of-N split /
-TPM-wrapping the per-file key) is future work; `antirev-keyctl` is retained only
+TPM-wrapping the per-file key) is future work; `vcache-keyctl` is retained only
 for legacy flows and has no effect on a current mount.
 
 ## Test

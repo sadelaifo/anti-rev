@@ -1,22 +1,22 @@
 #!/bin/bash
-# antirev-keyctl — load an AES-256 key into the kernel keyring.
+# vcache-keyctl — load an AES-256 key into the kernel keyring.
 #
-# DEPRECATED for antirevfs: the module no longer reads a mount-time key.  Each
-# encrypted file now embeds its own key in a trailer (see antirev-fs-pack.py /
+# DEPRECATED for vcachefs: the module no longer reads a mount-time key.  Each
+# encrypted file now embeds its own key in a trailer (see vcache-pack.py /
 # protect.py encrypt-lib --embed-key), which the module reads at decrypt time,
-# so `antirev-mount`/`antirev-mount-rw` need no unlock step.  This tool is kept
-# only for legacy/experimental flows; it has no effect on a current antirevfs
+# so `vcache-mount-ro`/`vcache-mount-rw` need no unlock step.  This tool is kept
+# only for legacy/experimental flows; it has no effect on a current vcachefs
 # mount.
 #
 # (Historical behaviour) The module used to look up a "user"-type key named
-# "antirevfs:default" in the mounting process's keyrings; this tool installed
+# "vcachefs:default" in the mounting process's keyrings; this tool installed
 # that key so `mount -t vcachefs` found it.
 #
 # Usage:
-#   antirev-keyctl unlock --keyfile <hexkeyfile>   # 64 hex chars (protect.py keyfile)
-#   antirev-keyctl unlock-from-tpm                 # placeholder for TPM/dongle unseal
-#   antirev-keyctl status                          # show whether the key is present
-#   antirev-keyctl clear                           # revoke the key from the keyring
+#   vcache-keyctl unlock --keyfile <hexkeyfile>   # 64 hex chars (protect.py keyfile)
+#   vcache-keyctl unlock-from-tpm                 # placeholder for TPM/dongle unseal
+#   vcache-keyctl status                          # show whether the key is present
+#   vcache-keyctl clear                           # revoke the key from the keyring
 #
 # Keyring: the session keyring (@s).  The kernel's request_key() from the mount
 # path always searches the mounting task's session keyring, so the unlock and
@@ -27,10 +27,10 @@
 # the key= mount option in fstab, or link @u into the unit's session keyring.
 set -euo pipefail
 
-DESC="antirevfs:default"
+DESC="vcachefs:default"
 KEYRING="@s"
 
-die() { echo "antirev-keyctl: $*" >&2; exit 1; }
+die() { echo "vcache-keyctl: $*" >&2; exit 1; }
 
 find_key() { keyctl search "$KEYRING" user "$DESC" 2>/dev/null || true; }
 
@@ -52,7 +52,7 @@ cmd_unlock() {
 
 	# padd reads the raw payload from stdin (binary-safe, unlike `add`).
 	echo -n "$hex" | xxd -r -p | keyctl padd user "$DESC" "$KEYRING" >/dev/null
-	echo "antirev-keyctl: key '$DESC' installed in $KEYRING"
+	echo "vcache-keyctl: key '$DESC' installed in $KEYRING"
 }
 
 cmd_unlock_from_tpm() {
@@ -62,22 +62,22 @@ cmd_unlock_from_tpm() {
 cmd_status() {
 	local id; id="$(find_key)"
 	if [[ -n "$id" ]]; then
-		echo "antirev-keyctl: key '$DESC' present (id $id)"
+		echo "vcache-keyctl: key '$DESC' present (id $id)"
 	else
-		echo "antirev-keyctl: key '$DESC' NOT present"
+		echo "vcache-keyctl: key '$DESC' NOT present"
 		return 1
 	fi
 }
 
 cmd_clear() {
 	local id; id="$(find_key)"
-	[[ -n "$id" ]] || { echo "antirev-keyctl: no key to clear"; return 0; }
+	[[ -n "$id" ]] || { echo "vcache-keyctl: no key to clear"; return 0; }
 	keyctl revoke "$id" >/dev/null 2>&1 || true
 	keyctl unlink "$id" "$KEYRING" >/dev/null 2>&1 || true
-	echo "antirev-keyctl: key '$DESC' cleared"
+	echo "vcache-keyctl: key '$DESC' cleared"
 }
 
-[[ $# -ge 1 ]] || die "usage: antirev-keyctl {unlock --keyfile F|unlock-from-tpm|status|clear}"
+[[ $# -ge 1 ]] || die "usage: vcache-keyctl {unlock --keyfile F|unlock-from-tpm|status|clear}"
 sub="$1"; shift
 case "$sub" in
 	unlock)          cmd_unlock "$@";;

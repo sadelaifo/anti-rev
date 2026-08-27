@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# antirev-mount-inplace.sh — IN-PLACE antirevfs mounts + tmpfs write layers.
+# vcache-mount.sh — IN-PLACE vcachefs mounts + tmpfs write layers.
 #
 # A mode expands to a LIST of mount targets (the host is always one of them):
 #
@@ -17,27 +17,27 @@
 # with a note if the container isn't running.
 #
 # Both modes present the business stack's bin/ and lib/ as DECRYPTED views at the
-# SAME paths where the ciphertext lives.  No separate .enc/ tree, no .antirev-rw
+# SAME paths where the ciphertext lives.  No separate .enc/ tree, no .vcache-rw
 # overlay, no 'dec' directory — nothing extra on disk to find.  Layout:
 #
 #     ext4  /root/proj/bin                  <- ciphertext at rest (hidden under mount)
-#       '- antirevfs (ro)  /root/proj/bin   <- decrypted read-only view, IN PLACE
+#       '- vcachefs (ro)  /root/proj/bin   <- decrypted read-only view, IN PLACE
 #            |- tmpfs /root/proj/bin/<dir>   <- app writes here (one per known write dir)
 #            '- bind  /root/proj/bin/<file>  <- app writes here (one per stray file)
 #
-# Reads of encrypted .so/.elf decrypt through antirevfs; the app's runtime writes
+# Reads of encrypted .so/.elf decrypt through vcachefs; the app's runtime writes
 # (lock/log/pid) land in ANONYMOUS tmpfs and NEVER touch the ciphertext.  Because
 # the write layers are tmpfs (not an overlayfs upper), there is NO copy-up
 # plaintext hazard and NO backing directory left on disk.
 #
-# antirevfs pins its lower tree by reference at mount time, which is what makes
+# vcachefs pins its lower tree by reference at mount time, which is what makes
 # overmounting a directory onto itself safe (lookups are dentry-relative, never
 # re-resolved by name, so there is no loop).  NOTE: in-place overmount (lower ==
 # mountpoint) is not yet covered by a test in this repo — verify on your kernel
-# (test_antirevfs_inplace_rw.sh) before relying on it in production.
+# (test_vcachefs_inplace_rw.sh) before relying on it in production.
 #
 # --- The two modes share ALL logic; only the EXECUTOR differs ------------------
-# The antirevfs FS type is registered kernel-globally as soon as the .ko is
+# The vcachefs FS type is registered kernel-globally as soon as the .ko is
 # insmod'd on the HOST, so the module is always loaded on the host (kernel is
 # shared with every container).  In `sim` mode the mount/tmpfs/allow-list
 # commands are then run inside the container's mount namespace via `docker exec`
@@ -72,17 +72,17 @@
 # CLI argument — set it once for your deployment.
 #
 # Usage (run ON THE HOST in every case):
-#   antirev-mount-inplace.sh [--mode real|sim] up       # (default) mount all targets now
-#   antirev-mount-inplace.sh [--mode real|sim] watch    # DAEMON: mount host now; (sim) poll + mount the container when it appears
-#   antirev-mount-inplace.sh [--mode real|sim] down     # unmount all targets (module left loaded)
-#   antirev-mount-inplace.sh [--mode real|sim] status   # show active mounts per target
+#   vcache-mount.sh [--mode real|sim] up       # (default) mount all targets now
+#   vcache-mount.sh [--mode real|sim] watch    # DAEMON: mount host now; (sim) poll + mount the container when it appears
+#   vcache-mount.sh [--mode real|sim] down     # unmount all targets (module left loaded)
+#   vcache-mount.sh [--mode real|sim] status   # show active mounts per target
 #
-#   real: antirev-mount-inplace.sh up                   # host only
-#   sim : antirev-mount-inplace.sh --mode sim up        # host + container (container skipped if not running)
-#         AREV_MODE=sim ./antirev-mount-inplace.sh up
+#   real: vcache-mount.sh up                   # host only
+#   sim : vcache-mount.sh --mode sim up        # host + container (container skipped if not running)
+#         AREV_MODE=sim ./vcache-mount.sh up
 #
 # --- Two deployment lifecycles, both supported --------------------------------
-#   SHIP: OS + antirevfs pre-installed, machine shipped WITHOUT the container/
+#   SHIP: OS + vcachefs pre-installed, machine shipped WITHOUT the container/
 #         image; the client installs & boots the sim stack at an UNKNOWN LATER
 #         TIME (days/weeks, across reboots).  The install script must NOT block:
 #         it installs the unit and `systemctl enable --now`s it, then RETURNS.
@@ -97,18 +97,18 @@
 #   The installer is non-blocking; only the daemon blocks — and that is fine, a
 #   daemon is supposed to.  NEVER call 'watch' inline from the install script.
 #
-# systemd (sim ship — antirev-sim.service, see this dir):
+# systemd (sim ship — vcache-watch.service, see this dir):
 #   [Unit]     After=docker.service   Wants=docker.service
-#   [Service]  ExecStart=<path>/antirev-mount-inplace.sh --mode sim watch
+#   [Service]  ExecStart=<path>/vcache-mount.sh --mode sim watch
 #              Restart=always  RestartSec=5
 #   [Install]  WantedBy=multi-user.target
 # install script (returns immediately):
-#   install -m0755 antirev-mount-inplace.sh /opt/antirev/ ; install -m0644 antirev-sim.service /etc/systemd/system/
-#   systemctl daemon-reload ; systemctl enable --now antirev-sim.service   # <- non-blocking; the unit backgrounds
+#   install -m0755 vcache-mount.sh /opt/vcache/ ; install -m0644 vcache-watch.service /etc/systemd/system/
+#   systemctl daemon-reload ; systemctl enable --now vcache-watch.service   # <- non-blocking; the unit backgrounds
 #
-# systemd (real ship — antirev-real.service):
+# systemd (real ship — vcache-mount.service):
 #   [Service]  Type=oneshot  RemainAfterExit=yes
-#              ExecStart=<path>/antirev-mount-inplace.sh --mode real up
+#              ExecStart=<path>/vcache-mount.sh --mode real up
 #   [Install]  WantedBy=multi-user.target   (+ Before=<business-app>.service)
 #
 # Bring-up order (sim, first time): GATE_ENFORCE=0 to prove decrypt+qemu, then
@@ -118,11 +118,11 @@
 # STEALTH (real mode; do this once the write paths are locked): run the WHOLE
 # thing inside a persistent private mount namespace so the mounts are invisible in
 # /proc/mounts of any normal shell, then launch the app inside that namespace:
-#     touch /run/antirev.ns
-#     unshare --mount=/run/antirev.ns --propagation private \
-#         /path/to/antirev-mount-inplace.sh up      # module load is global; mounts land in the ns
-#     nsenter --mount=/run/antirev.ns  /root/proj/bin/<launcher>
-#     # teardown: nsenter --mount=/run/antirev.ns .../antirev-mount-inplace.sh down ; umount /run/antirev.ns
+#     touch /run/vcache.ns
+#     unshare --mount=/run/vcache.ns --propagation private \
+#         /path/to/vcache-mount.sh up      # module load is global; mounts land in the ns
+#     nsenter --mount=/run/vcache.ns  /root/proj/bin/<launcher>
+#     # teardown: nsenter --mount=/run/vcache.ns .../vcache-mount.sh down ; umount /run/vcache.ns
 # (sim mode gets this isolation for free: the container already has its own ns.)
 #
 set -euo pipefail
@@ -131,7 +131,7 @@ set -euo pipefail
 if [ "$(id -u)" -ne 0 ]; then exec sudo -E "$0" "$@"; fi
 
 ##### ---- configuration: EDIT to match your deployment -------------------------
-KMOD_DIR=/root/antirev/kmod2/module          # dir containing vcachefs.ko
+KMOD_DIR=/root/vcache/kmod2/module          # dir containing vcachefs.ko
 KO="${AREV_KO:-$KMOD_DIR/vcachefs.ko}"
 
 # sim mode only: the FIXED name of the slave container (business `docker run
@@ -148,7 +148,7 @@ WATCH_INTERVAL="${AREV_WATCH_INTERVAL:-5}"   # 'watch' poll period (s); daemon i
 # the gate exact (a marker can't appear mid-copy the way a non-empty dir can).
 READY_MARKER="${AREV_READY_MARKER:-}"        # e.g. /root/SW/.arev-ready (empty = non-empty-dir heuristic only)
 
-# In-place mounts: the ciphertext lives AT these paths; antirevfs mounts over
+# In-place mounts: the ciphertext lives AT these paths; vcachefs mounts over
 # them so the same paths show plaintext.  Add/remove trees as needed.
 MOUNTS=(
     /root/proj/bin
@@ -171,14 +171,14 @@ AUTHZ_PATH=/etc/authorized_apps.txt          # resolved in the TARGET's mount ns
 # at CI/vendor); the tool only checks they are present and flips the module param.
 GATE_REQUIRE_SIG="${AREV_GATE_REQUIRE_SIG:-0}"   # 1 = require a valid signature on the list
 AUTHZ_SIG_PATH="${AREV_AUTHZ_SIG_PATH:-$AUTHZ_PATH.p7s}"  # detached PKCS#7 (DER)
-ANTIREVFS_OPTS="ro,passdata"                 # antirevfs mount options
+VCACHEFS_OPTS="ro,passdata"                 # vcachefs mount options
 
 # Overlay-lower staging (sim / Docker).  FIELD FACT: on SLES 12 SP5 (4.12.14)
-# antirevfs cannot positioned-read an *overlayfs* lower — the offset-0 magic read
+# vcachefs cannot positioned-read an *overlayfs* lower — the offset-0 magic read
 # sneaks through (plaintext files work) but the offset-(size-8) trailer read and
 # the decrypt reads return -EIO, so every ENCRYPTED file fails with EIO through a
 # mount whose lower is the Docker image layer (overlay2).  Workaround: copy the
-# CIPHERTEXT (still encrypted — safe) onto a real fs (tmpfs) and mount antirevfs
+# CIPHERTEXT (still encrypted — safe) onto a real fs (tmpfs) and mount vcachefs
 # from THERE instead of in-place over the overlay.  On a real-fs lower (ext4,
 # native appliance) staging is unnecessary, so 'auto' only stages when the lower
 # is actually overlayfs.  Costs RAM = ciphertext size (fits the container's
@@ -206,7 +206,7 @@ ALLOW=(
 # ---- writable locations (PLACEHOLDERS — fill in after testing) ----------------
 # Directories the app writes into.  An anonymous tmpfs is stacked over each; the
 # app then creates files/subdirs freely inside it.  The mountpoint dir is created
-# in the lower (on-disk) tree first, so it exists in the antirevfs view.
+# in the lower (on-disk) tree first, so it exists in the vcachefs view.
 # Format:  "<mount-root>|<relative-subdir>".  Leave commented until known.
 WRITE_DIRS=(
     # "/root/proj/bin|logs"
@@ -223,11 +223,11 @@ WRITE_FILES=(
     # "/root/proj/bin|QtApplication.pid"
 )
 
-WRITE_BACKING=/run/antirev-write             # tmpfs source for per-file binds (NEVER /tmp)
+WRITE_BACKING=/run/vcache-write             # tmpfs source for per-file binds (NEVER /tmp)
 TMPFS_OPTS="mode=0755,nosuid,nodev"
 RELOAD_MODULE="${AREV_RELOAD_MODULE:-0}"     # 1 = rmmod+insmod on 'up'; 0 = use already-loaded module
 ##### ---------------------------------------------------------------------------
-# RELOAD_MODULE defaults to 0: on a shipped machine antirevfs is loaded once at
+# RELOAD_MODULE defaults to 0: on a shipped machine vcachefs is loaded once at
 # boot and must NOT be churned on every container (re)start.  Set
 # AREV_RELOAD_MODULE=1 while iterating on the .ko during development.
 
@@ -410,7 +410,7 @@ write_allowlist() {
 
 # ---- target: mount up --------------------------------------------------------
 do_up() {
-    export A_OPTS="$ANTIREVFS_OPTS" WRITE_BACKING TMPFS_OPTS
+    export A_OPTS="$VCACHEFS_OPTS" WRITE_BACKING TMPFS_OPTS
     export STAGE_MODE="$STAGE_LOWER" STAGE_ROOT="$STAGE_DIR"
     export MOUNTS_NL="$(nl_join "${MOUNTS[@]}")"
     export WDIRS_NL="$(nl_join "${WRITE_DIRS[@]:-}")"
@@ -425,10 +425,10 @@ readarray -t WFILES < <(printf '%s\n' "$WFILES_NL" | sed '/^$/d')
 modprobe vcachefs 2>/dev/null || true   # no-op if already loaded on host
 
 # 0) decide the LOWER for each mount.  Normally in-place (lower == mountpoint),
-#    but if the mountpoint's fs is overlayfs (Docker image layer) antirevfs
+#    but if the mountpoint's fs is overlayfs (Docker image layer) vcachefs
 #    cannot positioned-read it on SLES 4.12 -> stage the CIPHERTEXT onto a
 #    real-fs (tmpfs) and mount from there.  Staging reads the raw ciphertext, so
-#    it MUST happen before antirevfs is mounted over the path (guaranteed here:
+#    it MUST happen before vcachefs is mounted over the path (guaranteed here:
 #    'up' runs after 'down').  LOWERS[] is index-matched to MOUNTS[].
 LOWERS=()
 for root in "${MOUNTS[@]}"; do
@@ -481,7 +481,7 @@ for spec in "${WFILES[@]:-}"; do
     mkdir -p "$(dirname "$L/$rel")"; [ -e "$L/$rel" ] || : > "$L/$rel"
 done
 
-# 2) antirevfs: lower (staged or in-place) -> mountpoint
+# 2) vcachefs: lower (staged or in-place) -> mountpoint
 i=0
 for root in "${MOUNTS[@]}"; do
     lower="${LOWERS[$i]}"; i=$((i+1))
@@ -514,7 +514,7 @@ cerr "up complete"
 TARGET_UP
 }
 
-# ---- target: tear down (deepest-first: tmpfs/binds, then antirevfs base) ------
+# ---- target: tear down (deepest-first: tmpfs/binds, then vcachefs base) ------
 do_down() {
     export WRITE_BACKING STAGE_ROOT="$STAGE_DIR"
     export MOUNTS_NL="$(nl_join "${MOUNTS[@]}")"

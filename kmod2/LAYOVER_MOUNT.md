@@ -76,7 +76,7 @@ default:
 | `/proc/<pid>/maps` | mount-point paths shown | ✅ Byte-identical to plaintext era. |
 | `stat` size | `antirevfs_getattr` reports plaintext logical size | ✅ `ls -l` indistinguishable; true on-disk size (+76 B/file: 36 B header + 40 B trailer) is shielded by the mount with no unprivileged way to observe it. |
 | strict mode / `passdata` / cipher-passthrough | trailer sniffing, path-independent | ✅ Unaffected. |
-| `antirev-mount-rw` (overlay upper) | overlayfs over antirevfs | ⚠️ Becomes a three-layer stack (ext4 → antirevfs → overlay). overlayfs does not care whether its lowerdir is a layover mount; expected to work, must be verified by test. |
+| `vcache-mount-rw` (overlay upper) | overlayfs over antirevfs | ⚠️ Becomes a three-layer stack (ext4 → antirevfs → overlay). overlayfs does not care whether its lowerdir is a layover mount; expected to work, must be verified by test. |
 
 No blocking issue found at the mechanism level.
 
@@ -140,7 +140,7 @@ Residual: the DKMS-rebuild-failure downtime risk of the kernel-module route itse
 
 ### 4. Double self-mount — ✅ eliminable at the root
 
-- **Userspace**: `antirev-mount` refuses if the target is already an antirevfs
+- **Userspace**: `vcache-mount-ro` refuses if the target is already an antirevfs
   mountpoint (`/proc/self/mounts` check).
 - **Kernel-side root fix** (one line in `antirevfs_fill_super`):
   reject when the lower path already resolves onto an antirevfs superblock:
@@ -176,12 +176,12 @@ shared by all encryption schemes, not new costs of the layover design.
 
 ## Implementation plan
 
-1. **Packer**: `antirev-fs-pack.py --in-place` — temp+fsync+rename atomic writes,
+1. **Packer**: `vcache-pack.py --in-place` — temp+fsync+rename atomic writes,
    hard-link inode map, xattr/ACL copying, per-file `.bak` retention, manifest with
    idempotent re-entry, and `--decrypt-in-place` rollback.
 2. **Kernel module**: nested-mount guard in `antirevfs_fill_super` (one-line
    `s_magic` check). No other module changes required by the layover design.
-3. **Tools**: `antirev-mount` accepts `lowerdir == mountpoint`; refuses targets that
+3. **Tools**: `vcache-mount-ro` accepts `lowerdir == mountpoint`; refuses targets that
    are already antirevfs mountpoints. Consider a neutral `ANTIREVFS_NAME`.
 4. **Deployment**: systemd mount units + `RequiresMountsFor=` on business units;
    boot-time `modprobe` smoke unit; rewritten migration runbook.

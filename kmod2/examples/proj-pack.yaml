@@ -1,4 +1,4 @@
-# proj-pack.yaml — reference antirev-fs-pack.py config for the process-manager
+# proj-pack.yaml — reference vcache-pack.py config for the process-manager
 # business stack whose layout is:
 #
 #   ~/proj/bin/<module>/<executable>        protected executables
@@ -23,11 +23,11 @@
 # under a `passdata` mount any non-ANTREV01 file is served verbatim and is never
 # gated, so non-whitelisted descendants load it fine.
 #
-# Pack:   sudo antirev-fs-pack.py proj-pack.yaml
-# Mount:  see antirev-remount-proj.sh (overlay-rw writable views, gate enforced).
+# Pack:   sudo vcache-pack.py proj-pack.yaml
+# Mount:  see vcache-remount.sh (overlay-rw writable views, gate enforced).
 #
 # IMPORTANT — allow-list by BASENAME only (see CLAUDE.md "overlay-rw + gate"):
-# under antirev-mount-rw the same program reports two different absolute paths to
+# under vcache-mount-rw the same program reports two different absolute paths to
 # the gate (the overlay path for data reads vs the antirevfs ".../dec/..." path
 # for its own exec-load), so a full-path entry can never match both. Put bare
 # basenames in /etc/authorized_apps.txt: the process manager, every executable,

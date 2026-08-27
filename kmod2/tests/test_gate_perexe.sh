@@ -15,7 +15,7 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"; KMOD="$HERE/.."; ROOT="$KMOD/.."
-PACK="$ROOT/kmod2/tools/antirev-fs-pack.py"; TOOLS="$KMOD/tools"
+PACK="$ROOT/kmod2/tools/vcache-pack.py"; TOOLS="$KMOD/tools"
 CC="${CC:-$(command -v gcc-12 || command -v gcc-4.8 || command -v gcc)}"
 PASS=0; FAIL=0; ok(){ echo "  [PASS] $*"; PASS=$((PASS+1)); }; bad(){ echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 [[ $EUID -eq 0 ]] || { echo "must run as root"; exit 1; }

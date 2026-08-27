@@ -5,8 +5,8 @@
 #
 #   authz-sign-exe.py <priv.pem> <cert.pem> <binary> [<binary> ...]
 #
-# Layout produced (identical to antirev-fs-pack.py's exe signing, so the kernel's
-# antirevfs_probe_sig()/arev_verify_file_sig() accept it):
+# Layout produced (identical to vcache-pack.py's exe signing, so the kernel's
+# vcachefs_probe_sig()/arev_verify_file_sig() accept it):
 #     [original bytes][sig][sig_len:4 LE][SIG_MAGIC:8]
 # where sig = detached PKCS#7 (DER, SHA-256, no signed attrs) over the ORIGINAL
 # bytes.  Signing is idempotent-guarded: a file that already ends in SIG_MAGIC is
@@ -18,7 +18,7 @@ import sys
 import tempfile
 
 # Must byte-match kmod2/module/antirevfs.h ANTREV_SIG_MAGIC and
-# antirev-fs-pack.py SIG_MAGIC.
+# vcache-pack.py SIG_MAGIC.
 SIG_MAGIC = bytes.fromhex("3d6af0128c55b427")
 
 

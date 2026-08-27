@@ -33,7 +33,7 @@ KMOD="$HERE/.."
 ROOT="$KMOD/.."
 MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
-KEYCTL="$KMOD/tools/antirev-keyctl"
+KEYCTL="$KMOD/tools/vcache-keyctl"
 PARAM=/sys/module/vcachefs/parameters/gate_enforce
 AUTHZ=/etc/authorized_apps.txt          # the documented default path
 

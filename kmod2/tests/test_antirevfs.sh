@@ -17,7 +17,7 @@
 set -uo pipefail
 
 # Re-exec under a fresh, real session keyring shared by every child below this
-# point (the `antirev-keyctl` unlock AND the later `mount`).  The module's
+# point (the `vcache-keyctl` unlock AND the later `mount`).  The module's
 # request_key() runs in the mount process's context, so the key must live in a
 # session keyring that process inherits.  On a root shell that has no session
 # keyring of its own (SLES `su`, ssh/cron root, etc.), `keyctl padd @s` would
@@ -39,7 +39,7 @@ KMOD="$HERE/.."
 ROOT="$KMOD/.."
 MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
-KEYCTL="$KMOD/tools/antirev-keyctl"
+KEYCTL="$KMOD/tools/vcache-keyctl"
 
 PASS=0; FAIL=0
 ok()   { echo "  [PASS] $*"; PASS=$((PASS+1)); }
@@ -184,7 +184,7 @@ fi
 echo "== 7. passdata mode (complete mixed-content read-only tree) =="
 # Same lower tree, mounted with passdata: ANY non-ANTREV01 file is served
 # plaintext (data files, scripts, third-party plaintext ELFs), while encrypted
-# libs still decrypt.  This is the mixed bin/lib case from antirev-fs-pack.py
+# libs still decrypt.  This is the mixed bin/lib case from vcache-pack.py
 # with mirror_plaintext.  Strict mode rejected thirdparty.so / run.sh above;
 # passdata serves them.
 if mount -t vcachefs -o "ro,passdata" "$ENC" "$MP2" 2>/dev/null; then

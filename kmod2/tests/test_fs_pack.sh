@@ -1,5 +1,5 @@
 #!/bin/bash
-# Userspace test for antirev-fs-pack.py (no root / no module needed).
+# Userspace test for vcache-pack.py (no root / no module needed).
 #
 # Verifies the kmod2 ciphertext-tree packer:
 #   1. every ELF (lib + exe) is encrypted into the mirrored .enc tree (ANTREV01)
@@ -15,7 +15,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
-PACK="$KMOD/tools/antirev-fs-pack.py"
+PACK="$KMOD/tools/vcache-pack.py"
 PROTECT="$ROOT/encryptor/protect.py"
 
 PASS=0; FAIL=0
@@ -116,7 +116,7 @@ else
 fi
 
 echo "== 6. manifest written outside the .enc tree, lists plaintext mirror =="
-if [[ -f "$WORK/antirev-fs-manifest.json" ]] && python3 - "$WORK/antirev-fs-manifest.json" <<'PY'
+if [[ -f "$WORK/vcache-fs-manifest.json" ]] && python3 - "$WORK/vcache-fs-manifest.json" <<'PY'
 import json, sys
 m = json.load(open(sys.argv[1]))
 pt = set(m.get("plaintext", []))
@@ -163,7 +163,7 @@ for f in lib/libstatic.a lib/mod.pyc bin/weird.elf; do
 	fi
 done
 # and they must be listed under encrypted (not plaintext) in the manifest
-if python3 - "$WORK/antirev-fs-manifest.json" <<'PY'
+if python3 - "$WORK/vcache-fs-manifest.json" <<'PY'
 import json,sys
 m=json.load(open(sys.argv[1]))
 enc=set(m["encrypted"]); pt=set(m.get("plaintext",[]))

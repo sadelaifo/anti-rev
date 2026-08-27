@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-# antirev-fs-pack.py — config-driven packer for the antirevfs (kmod2) design.
+# vcache-pack.py — config-driven packer for the vcachefs (kmod2) design.
 #
-# Unlike encryptor/antirev-pack.py (which builds the stub + daemon + shim
-# artifacts), this tool produces the *ciphertext lower tree* that antirevfs
+# Unlike encryptor/vcache-pack.py (which builds the stub + daemon + shim
+# artifacts), this tool produces the *ciphertext lower tree* that vcachefs
 # mounts over: it walks an install tree, encrypts every ELF (shared libraries
 # AND executables, detected by ELF magic, not by extension) into a mirrored
 # `.enc/` tree using the same `protect.py encrypt-lib` container format
 # ([magic ANTREV01][iv:12][tag:16][ct...]), and leaves everything else alone.
 #
 # Usage:
-#   antirev-fs-pack.py <config.yaml> [-j N] [--dry-run]
+#   vcache-pack.py <config.yaml> [-j N] [--dry-run]
 #
 # Config (YAML):
 #   install_dir: /root/proj          # tree to scan (required)
@@ -33,11 +33,11 @@
 # resources) AND blacklisted (intentionally-plaintext third-party) ELFs are
 # mirrored VERBATIM (plaintext) into the tree, and symlinks are re-created.  So
 # a real install dir (lib/, bin/ with mixed content) appears in full under the
-# mount.  Mount it with `antirev-mount --passdata` so the module serves every
+# mount.  Mount it with `vcache-mount-ro --passdata` so the module serves every
 # non-ANTREV01 file as plaintext passthrough (read-only); encrypted ELFs are
 # still decrypted + gated.  Because the mount is read-only, any file the app
 # WRITES at runtime (e.g. python-generated .txt, __pycache__) must be redirected
-# to a writable path outside the mount — antirevfs hosts only shipped content.
+# to a writable path outside the mount — vcachefs hosts only shipped content.
 #
 # Set mirror_plaintext: false for a minimal pure-secret tree: only encrypted
 # ELFs + symlinks land in the tree; data files and blacklisted ELFs are omitted
@@ -153,7 +153,7 @@ def encrypt_one(src: Path, dst: Path, key: bytes,
                 sign_key: Path = None, sign_cert: Path = None) -> int:
     """Encrypt src -> dst (ANTREV01 container with embedded-key trailer).
 
-    antirevfs has no mount-time key, so each file carries its own AES key in a
+    vcachefs has no mount-time key, so each file carries its own AES key in a
     trailer (MAGIC + iv + tag + ct + key + MAGIC); the module reads it at
     decrypt time.  When do_sign, append a per-exe signature section
     ([sig][sig_len:4 LE][ANTRSIG1]) over the container bytes.  Returns plaintext
@@ -194,7 +194,7 @@ def copy_verbatim(src: Path, dst: Path) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="antirevfs (kmod2) config-driven ciphertext-tree packer")
+        description="vcachefs (kmod2) config-driven ciphertext-tree packer")
     ap.add_argument("config", help="YAML config file")
     ap.add_argument("-j", "--jobs", type=int, default=0,
                     help="parallel workers (default: CPU count)")
@@ -217,7 +217,7 @@ def main() -> int:
 
     install_dir = Path(_expand(cfg["install_dir"])).resolve()
     output_dir = Path(_expand(cfg["output_dir"])).resolve()
-    key_path = (cfg_path.parent / _expand(cfg.get("key", "antirev.key"))).resolve()
+    key_path = (cfg_path.parent / _expand(cfg.get("key", "vcache.key"))).resolve()
     patterns = [p.replace("\\", "/") for p in (cfg.get("blacklist") or [])]
     # encrypt_ext (optional): extra file extensions to encrypt even when they are
     # NOT ELF (e.g. .a static archives, .pyc bytecode).  Normalized to lowercase
@@ -240,7 +240,7 @@ def main() -> int:
 
     # Per-exe signing (optional): when both sign_key + sign_cert are set, each
     # ENCRYPTED EXECUTABLE (non-.so ELF) gets a per-exe signature appended so the
-    # antirevfs gate can authorize it without a shipped allow-list.  Paths are
+    # vcachefs gate can authorize it without a shipped allow-list.  Paths are
     # relative to the config file.  Keep sign_key OFF client machines.
     sign_key = cfg.get("sign_key")
     sign_cert = cfg.get("sign_cert")
@@ -342,7 +342,7 @@ def main() -> int:
         "skipped_blacklist": sorted(skipped_blacklist),
         "skipped_nonelf": sorted(skipped_nonelf),
     }
-    man_path = (cfg_path.parent / "antirev-fs-manifest.json").resolve()
+    man_path = (cfg_path.parent / "vcache-fs-manifest.json").resolve()
     if not args.dry_run:
         man_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
@@ -371,7 +371,7 @@ def main() -> int:
               "passthrough (read-only).")
     if not mirror_plaintext and (skipped_nonelf or skipped_blacklist):
         print("  NOTE: untouched / blacklisted files do NOT appear under the "
-              "antirevfs mount.\n        Set mirror_plaintext: true, or surface "
+              "vcachefs mount.\n        Set mirror_plaintext: true, or surface "
               "data files via a separate mount / passthrough= list.")
 
     # Suggested mount commands per immediate subdir that has any mirrored
@@ -384,7 +384,7 @@ def main() -> int:
     if subs:
         print("\n  Suggested mount (key-free — each file embeds its own key):")
         for sub in subs:
-            print(f"    sudo antirev-mount {flag}{output_dir/sub} {install_dir/sub}")
+            print(f"    sudo vcache-mount-ro {flag}{output_dir/sub} {install_dir/sub}")
     return 0
 
 

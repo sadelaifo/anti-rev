@@ -1,16 +1,16 @@
 #!/bin/bash
-# antirev-mount-rw — present an encrypted tree as a WRITABLE view.
+# vcache-mount-rw — present an encrypted tree as a WRITABLE view.
 #
-# antirevfs mounts are read-only by design (decrypt-on-read only; no write
+# vcachefs mounts are read-only by design (decrypt-on-read only; no write
 # path).  Business software that writes lock/log/temp files *next to* the
 # protected executables (inside bin/ or lib/) therefore fails with -EROFS on a
-# bare antirevfs mount.  This tool fixes that by stacking, in two layers:
+# bare vcachefs mount.  This tool fixes that by stacking, in two layers:
 #
 #     overlayfs(upper = writable ext4)        <- what the app sees (rw)
 #         |
-#     antirevfs(ro, decrypt-on-read)          <- lower (ciphertext under .enc/)
+#     vcachefs(ro, decrypt-on-read)          <- lower (ciphertext under .enc/)
 #
-# Reads of encrypted .so/.elf fall through to the antirevfs lower and decrypt;
+# Reads of encrypted .so/.elf fall through to the vcachefs lower and decrypt;
 # anything the app writes lands in the overlay's writable upper and NEVER
 # touches the ciphertext tree.
 #
@@ -22,28 +22,28 @@
 # is itself access-controlled / wiped on shutdown if this matters.
 #
 # Usage:
-#   antirev-mount-rw [opts] <encdir> <mountpoint>
-#   antirev-mount-rw --down  <mountpoint>          # tear down (overlay then antirevfs)
+#   vcache-mount-rw [opts] <encdir> <mountpoint>
+#   vcache-mount-rw --down  <mountpoint>          # tear down (overlay then vcachefs)
 #
 # opts:
 #   --passdata            serve ANY non-ANTREV01 file as plaintext passthrough
-#                         (complete mixed bin/lib tree from antirev-fs-pack.py)
+#                         (complete mixed bin/lib tree from vcache-pack.py)
 #   --passthrough <exts>  colon-separated extensions served verbatim (e.g. json:md)
 #   --state <dir>         dir holding the overlay layers dec/ upper/ work/
-#                         (default: <dirname mountpoint>/.antirev-rw/<basename mountpoint>)
+#                         (default: <dirname mountpoint>/.vcache-rw/<basename mountpoint>)
 #
 #   <encdir>      ciphertext tree (e.g. /root/proj/.enc/bin)
 #   <mountpoint>  where the writable decrypted view appears (e.g. /root/proj/bin)
 #
 # No mount-time key is needed — each encrypted file embeds its own AES key in a
-# trailer (pack with antirev-fs-pack.py / protect.py encrypt-lib --embed-key).
+# trailer (pack with vcache-pack.py / protect.py encrypt-lib --embed-key).
 # The upper/work layers must live on a writable filesystem (the default state dir
 # does); for a tmpfs upper that is wiped on reboot, point --state at a tmpfs path.
 set -euo pipefail
 
-die() { echo "antirev-mount-rw: $*" >&2; exit 1; }
+die() { echo "vcache-mount-rw: $*" >&2; exit 1; }
 
-default_state() { echo "$(dirname "$1")/.antirev-rw/$(basename "$1")"; }
+default_state() { echo "$(dirname "$1")/.vcache-rw/$(basename "$1")"; }
 
 # ---- status: where do the app's writes live? --------------------------------
 # Works whether or not the view is currently mounted, so you can find files the
@@ -58,11 +58,11 @@ if [[ "${1:-}" == "--status" ]]; then
 			*)       [[ -z "$mp" ]] || die "extra argument: $1"; mp="$1"; shift ;;
 		esac
 	done
-	[[ -n "$mp" ]] || die "usage: antirev-mount-rw --status [--state <dir>] <mountpoint>"
+	[[ -n "$mp" ]] || die "usage: vcache-mount-rw --status [--state <dir>] <mountpoint>"
 	[[ -n "$state" ]] || state="$(default_state "$mp")"
 	upper="$state/upper"; dec="$state/dec"
 	echo "mountpoint:        $mp        ($(mountpoint -q "$mp"  && echo mounted || echo not-mounted))"
-	echo "antirevfs lower:   $dec        ($(mountpoint -q "$dec" && echo mounted || echo not-mounted))"
+	echo "vcachefs lower:   $dec        ($(mountpoint -q "$dec" && echo mounted || echo not-mounted))"
 	echo "writable upper:    $upper        <- app writes (logs/locks/temp) persist HERE on disk"
 	if [[ -d "$upper" ]]; then
 		echo "files written by the app (in upper):"
@@ -82,13 +82,13 @@ if [[ "${1:-}" == "--down" ]]; then
 			*)       [[ -z "$mp" ]] || die "extra argument: $1"; mp="$1"; shift ;;
 		esac
 	done
-	[[ -n "$mp" ]] || die "usage: antirev-mount-rw --down [--state <dir>] <mountpoint>"
+	[[ -n "$mp" ]] || die "usage: vcache-mount-rw --down [--state <dir>] <mountpoint>"
 	[[ -n "$state" ]] || state="$(default_state "$mp")"
 	dec="$state/dec"
-	# overlay first (it sits on top of antirevfs), then the antirevfs lower.
+	# overlay first (it sits on top of vcachefs), then the vcachefs lower.
 	mountpoint -q "$mp"  && { umount "$mp"  || die "could not umount overlay $mp"; }
-	mountpoint -q "$dec" && { umount "$dec" || die "could not umount antirevfs $dec"; }
-	echo "antirev-mount-rw: torn down $mp"
+	mountpoint -q "$dec" && { umount "$dec" || die "could not umount vcachefs $dec"; }
+	echo "vcache-mount-rw: torn down $mp"
 	echo "  app-written files (logs/locks/temp) persist on disk at: $state/upper"
 	echo "  re-mount to expose them again at $mp, or read them directly there."
 	exit 0
@@ -105,33 +105,33 @@ while [[ $# -gt 0 && "$1" == --* ]]; do
 	esac
 done
 
-[[ $# -eq 2 ]] || die "usage: antirev-mount-rw [opts] <encdir> <mountpoint>"
+[[ $# -eq 2 ]] || die "usage: vcache-mount-rw [opts] <encdir> <mountpoint>"
 enc="$1"; mp="$2"
 [[ -d "$enc" ]] || die "encdir not a directory: $enc"
 [[ -d "$mp"  ]] || die "mountpoint not a directory: $mp"
 [[ -n "$state" ]] || state="$(default_state "$mp")"
 
-dec="$state/dec"          # antirevfs mountpoint  -> overlay lowerdir (ro)
+dec="$state/dec"          # vcachefs mountpoint  -> overlay lowerdir (ro)
 upper="$state/upper"      # overlay upperdir (writable)
 work="$state/work"        # overlay workdir (same fs as upper)
 mkdir -p "$dec" "$upper" "$work"
 
 mountpoint -q "$mp"  && die "already mounted: $mp"
-mountpoint -q "$dec" && die "stale antirevfs mount at $dec (run --down first)"
+mountpoint -q "$dec" && die "stale vcachefs mount at $dec (run --down first)"
 
 # overlay upper and work must share one filesystem.
 updev=$(stat -c %d "$upper"); wkdev=$(stat -c %d "$work")
 [[ "$updev" == "$wkdev" ]] || die "upper ($upper) and work ($work) on different filesystems"
 
-# Layer 1: antirevfs decrypted, read-only view of the ciphertext tree.
+# Layer 1: vcachefs decrypted, read-only view of the ciphertext tree.
 aopts="ro"
 [[ "$passdata" -eq 1 ]] && aopts="$aopts,passdata"
 [[ -n "$pass" ]] && aopts="$aopts,passthrough=$pass"
-[[ -n "${ANTIREV_MOUNT_OPTS:-}" ]] && aopts="$aopts,$ANTIREV_MOUNT_OPTS"
+[[ -n "${VCACHE_MOUNT_OPTS:-}" ]] && aopts="$aopts,$VCACHE_MOUNT_OPTS"
 
 modprobe vcachefs 2>/dev/null || true
 mount -t vcachefs -o "$aopts" "$enc" "$dec" \
-	|| die "antirevfs mount failed (enc=$enc dec=$dec opts=$aopts)"
+	|| die "vcachefs mount failed (enc=$enc dec=$dec opts=$aopts)"
 
 # Layer 2: overlayfs writable upper over the decrypted lower.
 if ! mount -t overlay overlay \
@@ -140,6 +140,6 @@ if ! mount -t overlay overlay \
 	die "overlay mount failed (lower=$dec upper=$upper work=$work mp=$mp)"
 fi
 
-echo "antirev-mount-rw: $mp is now a writable decrypted view of $enc"
+echo "vcache-mount-rw: $mp is now a writable decrypted view of $enc"
 echo "  lower(ro,decrypt) = $dec"
 echo "  upper(writable)   = $upper"

@@ -1,11 +1,11 @@
 #!/bin/bash
-# antirev-mount — mount an encrypted .enc/ subtree as a decrypted antirevfs view.
+# vcache-mount-ro — mount an encrypted .enc/ subtree as a decrypted vcachefs view.
 #
 # Usage:
-#   antirev-mount [--passdata] <lowerdir> <mountpoint> [passthrough-exts]
+#   vcache-mount-ro [--passdata] <lowerdir> <mountpoint> [passthrough-exts]
 #
 #   --passdata        serve ANY non-ANTREV01 file as plaintext passthrough — for
-#                     complete mixed-content read-only trees (antirev-fs-pack.py
+#                     complete mixed-content read-only trees (vcache-pack.py
 #                     with mirror_plaintext).  Supersedes [passthrough-exts].
 #   <lowerdir>        ciphertext tree (e.g. /root/proj/.enc/lib)
 #   <mountpoint>      where the plaintext view appears (e.g. /root/proj/lib)
@@ -13,17 +13,17 @@
 #                     (e.g. json:md) for mixed-content directories
 #
 # No key is needed to mount: each encrypted file embeds its own AES key in a
-# trailer, which the module reads at decrypt time (antirevfs has no mount-time
-# key / keyring lookup).  Pack the tree with antirev-fs-pack.py (it writes the
+# trailer, which the module reads at decrypt time (vcachefs has no mount-time
+# key / keyring lookup).  Pack the tree with vcache-pack.py (it writes the
 # embedded-key container) or protect.py encrypt-lib --embed-key.
 set -euo pipefail
 
-die() { echo "antirev-mount: $*" >&2; exit 1; }
+die() { echo "vcache-mount-ro: $*" >&2; exit 1; }
 
 passdata=0
 if [[ "${1:-}" == "--passdata" ]]; then passdata=1; shift; fi
 
-[[ $# -ge 2 ]] || die "usage: antirev-mount [--passdata] <lowerdir> <mountpoint> [passthrough-exts]"
+[[ $# -ge 2 ]] || die "usage: vcache-mount-ro [--passdata] <lowerdir> <mountpoint> [passthrough-exts]"
 lower="$1"; mp="$2"; pass="${3:-}"
 
 [[ -d "$lower" ]] || die "lowerdir not a directory: $lower"
@@ -32,7 +32,7 @@ lower="$1"; mp="$2"; pass="${3:-}"
 opts="ro"
 [[ "$passdata" -eq 1 ]] && opts="$opts,passdata"
 [[ -n "$pass" ]] && opts="$opts,passthrough=$pass"
-[[ -n "${ANTIREV_MOUNT_OPTS:-}" ]] && opts="$opts,$ANTIREV_MOUNT_OPTS"
+[[ -n "${VCACHE_MOUNT_OPTS:-}" ]] && opts="$opts,$VCACHE_MOUNT_OPTS"
 
 modprobe vcachefs 2>/dev/null || true
 exec mount -t vcachefs -o "$opts" "$lower" "$mp"

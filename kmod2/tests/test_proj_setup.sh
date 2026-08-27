@@ -2,12 +2,12 @@
 # test_proj_setup.sh — end-to-end reproduction of the process-manager business
 # stack on antirevfs, in its REAL production shape:
 #
-#   * ciphertext tree built by antirev-fs-pack.py from a ~/proj-style layout
+#   * ciphertext tree built by vcache-pack.py from a ~/proj-style layout
 #       bin/<module>/{procmgr,executable_x}      encrypted executables
 #       lib/link/<module>/libxxx.so              encrypted business lib
 #       lib/link/sw/libPreload.so                global LD_PRELOAD shim (PLAINTEXT)
 #       lib/link/3rd/libFoo.so                   third-party dep of preload (PLAINTEXT)
-#   * BOTH bin/ and lib/ mounted as WRITABLE overlay views (antirev-mount-rw)
+#   * BOTH bin/ and lib/ mounted as WRITABLE overlay views (vcache-mount-rw)
 #   * decrypt-authorization GATE enforced (gate_enforce=1), allow-list by BASENAME
 #   * a process manager that fork/execs the child by RELATIVE path (cwd=proj),
 #     arg "executable_x,1", with the global LD_PRELOAD + recursive LD_LIBRARY_PATH
@@ -41,8 +41,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
 MOD="$KMOD/module/vcachefs.ko"
-PACK="$KMOD/tools/antirev-fs-pack.py"
-MOUNTRW="$KMOD/tools/antirev-mount-rw"
+PACK="$KMOD/tools/vcache-pack.py"
+MOUNTRW="$KMOD/tools/vcache-mount-rw"
 PROTECT="$ROOT/encryptor/protect.py"
 
 PASS=0; FAIL=0
@@ -162,7 +162,7 @@ gcc -o "$INSTALL/bin/module_x/procmgr" "$WORK/procmgr.c" \
 # data files (mirrored plaintext under passdata)
 printf 'executable_x,1\n' > "$INSTALL/procmgr.conf"
 
-echo "== pack (antirev-fs-pack.py) with the reference blacklist =="
+echo "== pack (vcache-pack.py) with the reference blacklist =="
 cat > "$WORK/proj-pack.yaml" <<EOF
 install_dir: $INSTALL
 output_dir:  $ENCROOT
@@ -176,7 +176,7 @@ python3 "$PACK" "$WORK/proj-pack.yaml" >/dev/null || { echo "pack failed"; exit 
 
 echo "== 1. packer classification + on-disk magic =="
 man_ok=1
-python3 - "$WORK/antirev-fs-manifest.json" <<'PY' || man_ok=0
+python3 - "$WORK/vcache-fs-manifest.json" <<'PY' || man_ok=0
 import json,sys
 m=json.load(open(sys.argv[1]))
 enc=set(m["encrypted"]); pln=set(m["plaintext"])

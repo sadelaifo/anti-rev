@@ -26,7 +26,7 @@ distinguished_name = dn
 x509_extensions    = v3
 prompt             = no
 [dn]
-CN = antirev authorization key
+CN = vcache authorization key
 [v3]
 basicConstraints = critical,CA:FALSE
 keyUsage         = critical,digitalSignature

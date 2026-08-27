@@ -14,7 +14,7 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"; KMOD="$HERE/.."; ROOT="$KMOD/.."
-PACK="$ROOT/kmod2/tools/antirev-fs-pack.py"; TOOLS="$KMOD/tools"
+PACK="$ROOT/kmod2/tools/vcache-pack.py"; TOOLS="$KMOD/tools"
 SIGNEXE="$TOOLS/authz-sign-exe.py"
 CC="${CC:-$(command -v gcc-12 || command -v gcc-4.8 || command -v gcc)}"
 MAGIC_HEX="a74c2e91d63b085f"      # container magic (antirevfs.h ANTREV_MAGIC)

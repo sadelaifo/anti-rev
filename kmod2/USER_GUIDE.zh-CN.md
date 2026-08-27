@@ -73,12 +73,12 @@ stub + shim + 守护进程（lrxd）+ `antirev_client.py`。
 **工具**（`kmod2/tools/`）
 | 工具 | 作用 |
 |---|---|
-| `antirev-fs-pack.py` | 打包器：把安装树里每个 ELF 加密成内嵌密钥容器，产出密文下层树 + JSON 清单 |
-| `antirev-mount` | `mount -t antirevfs` 封装，**只读**视图（零密钥） |
-| `antirev-mount-rw` | **可写**视图：在只读 antirevfs 之上叠加 overlayfs 可写上层 |
-| `antirev-mount-inplace.sh` | **就地覆盖挂载**（Model B，PoC，未测试）——密文与挂载点同路径 |
-| `antirev-remount-proj.sh` | 参考部署脚本：一键 umount→rmmod→insmod→挂载两棵树 |
-| `antirev-keyctl` | **已废弃**（密钥现在按文件内嵌，无挂载密钥），仅为旧流程保留 |
+| `vcache-pack.py` | 打包器：把安装树里每个 ELF 加密成内嵌密钥容器，产出密文下层树 + JSON 清单 |
+| `vcache-mount-ro` | `mount -t antirevfs` 封装，**只读**视图（零密钥） |
+| `vcache-mount-rw` | **可写**视图：在只读 antirevfs 之上叠加 overlayfs 可写上层 |
+| `vcache-mount.sh` | **就地覆盖挂载**（Model B，PoC，未测试）——密文与挂载点同路径 |
+| `vcache-remount.sh` | 参考部署脚本：一键 umount→rmmod→insmod→挂载两棵树 |
+| `vcache-keyctl` | **已废弃**（密钥现在按文件内嵌，无挂载密钥），仅为旧流程保留 |
 
 ---
 
@@ -108,11 +108,11 @@ cat /sys/module/antirevfs/refcnt          # 每个存活挂载 +1
 
 ---
 
-## 6. 打包：`antirev-fs-pack.py`
+## 6. 打包：`vcache-pack.py`
 
 ```bash
-python3 kmod2/tools/antirev-fs-pack.py config.yaml            # 产出密文下层树
-python3 kmod2/tools/antirev-fs-pack.py config.yaml --dry-run  # 只分类不写盘
+python3 kmod2/tools/vcache-pack.py config.yaml            # 产出密文下层树
+python3 kmod2/tools/vcache-pack.py config.yaml --dry-run  # 只分类不写盘
 ```
 
 它按 **ELF 魔数**（不是扩展名）加密**每个 ELF**（库和可执行都加密），产出镜像化的
@@ -153,37 +153,37 @@ grep -A20 '"plaintext"' antirev-fs-manifest.json   # 第三方/数据文件在�
 
 ## 7. 三种挂载方式
 
-### 7.1 只读视图 `antirev-mount`
+### 7.1 只读视图 `vcache-mount-ro`
 
 ```bash
-sudo kmod2/tools/antirev-mount --passdata <密文下层树> <挂载点>
+sudo kmod2/tools/vcache-mount-ro --passdata <密文下层树> <挂载点>
 ```
 `--passdata`：任何非 `ANTREV01` 文件按明文透传（配合 `mirror_plaintext` 的混合内容树）。
 只允许特定扩展名透传时用 `[passthrough-exts]`（冒号分隔，如 `json:md`）。
 
-### 7.2 可写视图 `antirev-mount-rw`（业务在 `bin/`/`lib/` 里写文件时用）
+### 7.2 可写视图 `vcache-mount-rw`（业务在 `bin/`/`lib/` 里写文件时用）
 
 裸 antirevfs 是**三重只读**（`SB_RDONLY` + 无 `write_folio` + 目录 iops 无 create/unlink），
 业务写锁/日志/pid 会 `-EROFS`。方案：保持 antirevfs 只读，在其上叠一层 overlayfs 可写上层。
 
 ```bash
-sudo kmod2/tools/antirev-mount-rw --passdata <密文下层树> <挂载点>
-sudo kmod2/tools/antirev-mount-rw --down <挂载点>          # 拆除（先 overlay 后 antirevfs）
+sudo kmod2/tools/vcache-mount-rw --passdata <密文下层树> <挂载点>
+sudo kmod2/tools/vcache-mount-rw --down <挂载点>          # 拆除（先 overlay 后 antirevfs）
 ```
 - 解密的 `.so`/`.elf` 读**穿透**到 antirevfs 下层；运行时写落到 overlay 上层，**永不触碰** `.enc/` 密文。
-- 层目录默认在 `<挂载点父目录>/.antirev-rw/<挂载点名>/{dec,upper,work}`；`--state <dir>` 可指到
+- 层目录默认在 `<挂载点父目录>/.vcache-rw/<挂载点名>/{dec,upper,work}`；`--state <dir>` 可指到
   tmpfs 以便重启即弃。
 - **拷贝上行注意**：overlayfs 首次**改写一个已存在的加密文件**时会把它**以明文**复制到上层
   （业务不会这么做；新建锁/日志文件不会触发）。
 
-### 7.3 就地覆盖挂载 `antirev-mount-inplace.sh`（Model B，PoC，未测试）
+### 7.3 就地覆盖挂载 `vcache-mount.sh`（Model B，PoC，未测试）
 
-密文与挂载点**同路径**，无并行 `.enc/` 树、无 `.antirev-rw`——`ls` 前后字节一致。写位置用
+密文与挂载点**同路径**，无并行 `.enc/` 树、无 `.vcache-rw`——`ls` 前后字节一致。写位置用
 匿名 tmpfs / bind 处理。编辑脚本顶部 `MOUNTS`/`WRITE_DIRS`/`WRITE_FILES` 后：
 ```bash
-sudo kmod2/tools/antirev-mount-inplace.sh up      # 重载模块 + 就地挂载
-sudo kmod2/tools/antirev-mount-inplace.sh status
-sudo kmod2/tools/antirev-mount-inplace.sh down
+sudo kmod2/tools/vcache-mount.sh up      # 重载模块 + 就地挂载
+sudo kmod2/tools/vcache-mount.sh status
+sudo kmod2/tools/vcache-mount.sh down
 ```
 > ⚠️ 就地覆盖（下层 == 挂载点）**尚无测试覆盖**，投产前请在你的内核上先验证。
 
@@ -227,12 +227,12 @@ echo 1 | sudo tee /sys/module/antirevfs/parameters/gate_enforce
 ## 9. 参考部署布局
 
 密文下层树 `/root/proj_protect/{bin,lib}`，挂到 `/root/proj/{bin,lib}` 作为**可写 overlay 视图**
-（`antirev-mount-rw`）+ `passdata` + `gate_enforce=1` + `/etc/authorized_apps.txt`；业务设了全局
+（`vcache-mount-rw`）+ `passdata` + `gate_enforce=1` + `/etc/authorized_apps.txt`；业务设了全局
 `LD_PRELOAD` 指向自定义 `libPreload.so`。**`bin/` 和 `lib/` 都可写**（业务在两处都写运行时文件）。
 
 一键脚本自动完成 umount→rmmod→insmod→挂载两棵树：
 ```bash
-sudo bash kmod2/tools/antirev-remount-proj.sh
+sudo bash kmod2/tools/vcache-remount.sh
 # 默认 LIB_WRITABLE=1（lib/ 可写）；设 0 则 lib/ 只读
 ```
 
@@ -249,13 +249,13 @@ sudo bash kmod2/tools/antirev-remount-proj.sh
 - **ld.so 失败要看真实 errno，别信笼统文案。** 直接 `head -c 16 <lib> | xxd` 或查 errno：
   `Permission denied`=`EACCES`=门（进程没白名单，或文件还是密文）；`No such file or directory`=`ENOENT`=
   不在搜索路径，或找到但非法 ELF（拿到密文/架构不符）；`Read-only file system`=`EROFS`=往只读挂载里写。
-- **`antirev-mount-rw` 下白名单必须用 basename。** 同一程序在执行加载与数据读两个检查点会呈现
+- **`vcache-mount-rw` 下白名单必须用 basename。** 同一程序在执行加载与数据读两个检查点会呈现
   **两个不同绝对路径**（一个是 overlay 下 `dec/` 路径，一个是 overlay 顶 `/root/proj/...`），只有
   **basename 相同**。全路径条目无法同时匹配一个二进制生命周期的两半。
 - **Python 加载器按解释器身份授权。** 子进程 `import` 加密 `.so`，除非**解释器**（`python3` 等，按
   实际 exec 的 basename）在白名单，或该 `.so` 是明文。第三方扩展模块优先保持明文。
 - **模块重载需要“静默栈”。** mmap 的 `.so` 会钉住超级块（进而钉住模块），`rmmod` 前先停业务；残留的
-  `antirev-mount-rw` `dec` 挂载也钉模块，先 `--down` 收掉。查 `/sys/module/antirevfs/refcnt`（每个存活
+  `vcache-mount-rw` `dec` 挂载也钉模块，先 `--down` 收掉。查 `/sys/module/antirevfs/refcnt`（每个存活
   挂载为 1）。
 
 ---
@@ -318,19 +318,19 @@ make -C kmod2/module CC=<内核的gcc>
 sudo insmod kmod2/module/antirevfs.ko gate_enforce=0
 
 # 打包
-python3 kmod2/tools/antirev-fs-pack.py config.yaml        # [--dry-run]
+python3 kmod2/tools/vcache-pack.py config.yaml        # [--dry-run]
 
 # 挂载（三选一）
-sudo kmod2/tools/antirev-mount    --passdata <密文树> <挂载点>          # 只读
-sudo kmod2/tools/antirev-mount-rw --passdata <密文树> <挂载点>          # 可写；--down 拆除
-sudo kmod2/tools/antirev-mount-inplace.sh up                           # 就地(PoC)
+sudo kmod2/tools/vcache-mount-ro    --passdata <密文树> <挂载点>          # 只读
+sudo kmod2/tools/vcache-mount-rw --passdata <密文树> <挂载点>          # 可写；--down 拆除
+sudo kmod2/tools/vcache-mount.sh up                           # 就地(PoC)
 
 # 开门 + 白名单（basename）
 echo 1 | sudo tee /sys/module/antirevfs/parameters/gate_enforce
 sudoedit /etc/authorized_apps.txt
 
 # 参考部署一键
-sudo bash kmod2/tools/antirev-remount-proj.sh
+sudo bash kmod2/tools/vcache-remount.sh
 ```
 
 ---
