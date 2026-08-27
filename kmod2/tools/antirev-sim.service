@@ -27,7 +27,7 @@ Type=simple
 Environment=AREV_MODE=sim
 # Optional overrides (else taken from the tool's config block):
 # Environment=AREV_CONTAINER=slave
-# Environment=AREV_KO=/opt/antirev/antirevfs.ko
+# Environment=AREV_KO=/opt/antirev/vcachefs.ko
 # Environment=AREV_WATCH_INTERVAL=5
 ExecStart=/opt/antirev/antirev-mount-inplace.sh --mode sim watch
 Restart=always

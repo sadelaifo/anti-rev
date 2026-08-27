@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0
-# Kbuild for the antirevfs out-of-tree kernel module.
+# Kbuild for the antirevfs out-of-tree kernel module (built as vcachefs.ko).
 #
 #   make            # build against the running kernel
 #   make KDIR=/lib/modules/<ver>/build
 #   make clean
 
-obj-m += antirevfs.o
-antirevfs-objs := super.o inode.o file.o crypto.o gate.o
+obj-m += vcachefs.o
+vcachefs-objs := super.o inode.o file.o crypto.o gate.o
 
 # GCC 9+ (-Wmissing-attributes) warns that the module_init/module_exit aliases
 # init_module/cleanup_module don't inherit the __cold that __init/__exit put on

@@ -175,7 +175,7 @@ int antirevfs_authz_init(void)
 			   KEY_USR_VIEW | KEY_USR_READ | KEY_USR_SEARCH,
 			   KEY_ALLOC_NOT_IN_QUOTA, NULL, NULL);
 	if (IS_ERR(kr)) {
-		pr_warn("antirevfs: authz keyring_alloc failed (%ld)\n", PTR_ERR(kr));
+		pr_warn("vcachefs: authz keyring_alloc failed (%ld)\n", PTR_ERR(kr));
 		return PTR_ERR(kr);
 	}
 
@@ -185,17 +185,17 @@ int antirevfs_authz_init(void)
 				    (KEY_POS_ALL & ~KEY_POS_SETATTR) | KEY_USR_VIEW,
 				    KEY_ALLOC_NOT_IN_QUOTA);
 	if (IS_ERR(kref)) {
-		pr_warn("antirevfs: embedding authz cert failed (%ld) — check the DER in gate_authz_pubkey.h\n",
+		pr_warn("vcachefs: embedding authz cert failed (%ld) — check the DER in gate_authz_pubkey.h\n",
 			PTR_ERR(kref));
 		key_put(kr);
 		return PTR_ERR(kref);
 	}
 	key_ref_put(kref);
 	authz_keyring = kr;
-	pr_info("antirevfs: authz vendor key loaded (%u-byte cert)\n",
+	pr_info("vcachefs: authz vendor key loaded (%u-byte cert)\n",
 		antirev_authz_cert_der_len);
 #else
-	pr_warn("antirevfs: kernel lacks CONFIG_SYSTEM_DATA_VERIFICATION (PKCS#7 verify) — gate_require_sig will deny\n");
+	pr_warn("vcachefs: kernel lacks CONFIG_SYSTEM_DATA_VERIFICATION (PKCS#7 verify) — gate_require_sig will deny\n");
 #endif
 	return 0;
 }
@@ -233,7 +233,7 @@ static bool authz_list_signature_ok(const char *list, size_t list_len)
 				     NULL, NULL);
 	kfree(sig);
 	if (ret) {
-		pr_warn_ratelimited("antirevfs: allow-list signature invalid (%d) — rejecting list\n", ret);
+		pr_warn_ratelimited("vcachefs: allow-list signature invalid (%d) — rejecting list\n", ret);
 		return false;
 	}
 	return true;
@@ -360,7 +360,7 @@ static bool authz_exe_signed_ok(struct inode *inode)
 	ok = (vret == 0);
 	ii->authz_sig = ok ? 1 : -1;		/* definitive: cache it */
 	if (!ok)
-		pr_warn_ratelimited("antirevfs: per-exe signature invalid (%d)\n", vret);
+		pr_warn_ratelimited("vcachefs: per-exe signature invalid (%d)\n", vret);
 out:
 	fput(lf);
 	vfree(cbuf);

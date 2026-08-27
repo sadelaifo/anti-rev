@@ -13,8 +13,8 @@
 #include <linux/path.h>
 #include <linux/mutex.h>
 
-#define ANTIREVFS_NAME		"antirevfs"
-#define ANTIREVFS_MAGIC		0x416E5246	/* "AnRF" */
+#define ANTIREVFS_NAME		"vcachefs"
+#define ANTIREVFS_MAGIC		0x9E2B1147	/* non-descriptive sb magic */
 
 /* On-disk container format (antirev-fs-pack.py / protect.py --embed-key):
  *   [magic:8][iv:12][tag:16][ciphertext...][key:32][magic:8]
@@ -25,7 +25,11 @@
  * trailer at decrypt time.  An unauthorized reader is served the file with the
  * trailer stripped — a valid-looking but keyless, undecryptable container.
  */
-#define ANTREV_MAGIC		"ANTREV01"
+/* Non-descriptive 8-byte container magic — MUST byte-match antirev-fs-pack.py's
+ * FS_MAGIC (bytes.fromhex "a74c2e91d63b085f").  Stored as a byte-escape string
+ * literal (no readable marker lands in .rodata / on disk); compared with memcmp
+ * over ANTREV_MAGIC_LEN, so the implicit trailing NUL is irrelevant. */
+#define ANTREV_MAGIC		"\xa7\x4c\x2e\x91\xd6\x3b\x08\x5f"
 #define ANTREV_MAGIC_LEN	8
 #define ANTREV_IV_LEN		12
 #define ANTREV_TAG_LEN		16
@@ -45,7 +49,9 @@
  * unsigned.  Kept in-file (not an xattr) so it survives tmpfs staging / overlay
  * / Docker layers / cp -a, none of which reliably preserve user xattrs.
  */
-#define ANTREV_SIG_MAGIC	"ANTRSIG1"
+/* Non-descriptive 8-byte signature-footer magic — MUST byte-match
+ * antirev-fs-pack.py's SIG_MAGIC (bytes.fromhex "3d6af0128c55b427"). */
+#define ANTREV_SIG_MAGIC	"\x3d\x6a\xf0\x12\x8c\x55\xb4\x27"
 #define ANTREV_SIG_MAGIC_LEN	8
 #define ANTREV_SIG_LENFIELD	4			/* u32 LE sig length */
 #define ANTREV_SIG_FOOTER_LEN	(ANTREV_SIG_LENFIELD + ANTREV_SIG_MAGIC_LEN)

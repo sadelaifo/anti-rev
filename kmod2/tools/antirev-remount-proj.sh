@@ -19,7 +19,7 @@
 set -euo pipefail
 
 ##### ---- configuration: EDIT to match your deployment -------------------------
-KMOD_DIR=/root/antirev/kmod2/module      # dir containing antirevfs.ko
+KMOD_DIR=/root/antirev/kmod2/module      # dir containing vcachefs.ko
 TOOLS_DIR=/root/antirev/kmod2/tools      # dir with antirev-mount / -mount-rw
 
 LIB_LOWER=/root/proj_protect/lib
@@ -34,7 +34,7 @@ MOUNT_FLAG=--passdata                    # or:  --passthrough so:py:pyc   (see a
 LIB_WRITABLE=1                           # 1 = lib is a writable overlay view too (set 0 for read-only lib)
 ##### ---------------------------------------------------------------------------
 
-KO="$KMOD_DIR/antirevfs.ko"
+KO="$KMOD_DIR/vcachefs.ko"
 MOUNT_BIN="$TOOLS_DIR/antirev-mount"
 MOUNTRW_BIN="$TOOLS_DIR/antirev-mount-rw"
 
@@ -83,11 +83,11 @@ log "tearing down existing mounts"
 sweep_proj_mounts
 
 # ---- reload module -----------------------------------------------------------
-# /sys/module/antirevfs is authoritative (independent of lsmod / PATH).
-if [ -d /sys/module/antirevfs ]; then
+# /sys/module/vcachefs is authoritative (independent of lsmod / PATH).
+if [ -d /sys/module/vcachefs ]; then
     log "removing antirevfs module"
-    if ! rmmod antirevfs 2>/dev/null; then
-        log "rmmod failed — module in use (refcnt=$(cat /sys/module/antirevfs/refcnt 2>/dev/null))"
+    if ! rmmod vcachefs 2>/dev/null; then
+        log "rmmod failed — module in use (refcnt=$(cat /sys/module/vcachefs/refcnt 2>/dev/null))"
         log "antirevfs mounts still present in this namespace:"
         grep antirevfs /proc/mounts || log "  (none — likely a lazy-unmounted mount still held by a"
         log "   running process, or an antirevfs mount inside a container namespace)"
@@ -96,7 +96,7 @@ if [ -d /sys/module/antirevfs ]; then
         die "stop the business stack (mmap'd .so files pin the module), then re-run"
     fi
 fi
-[ -d /sys/module/antirevfs ] && die "antirevfs still loaded after rmmod"
+[ -d /sys/module/vcachefs ] && die "vcachefs still loaded after rmmod"
 log "loading antirevfs (gate_enforce=$GATE_ENFORCE gate_passthrough_cipher=$GATE_PASSTHROUGH authz_path=$AUTHZ_PATH)"
 insmod "$KO" gate_enforce="$GATE_ENFORCE" \
 	gate_passthrough_cipher="$GATE_PASSTHROUGH" \
@@ -118,4 +118,4 @@ log "mounting bin (writable view): $BIN_LOWER -> $BIN_MOUNT"
 # ---- verify ------------------------------------------------------------------
 log "active proj mounts:"
 grep -E 'antirevfs|overlay' /proc/mounts | grep -E '/root/proj' || true
-log "done — gate_enforce=$(cat /sys/module/antirevfs/parameters/gate_enforce 2>/dev/null)"
+log "done — gate_enforce=$(cat /sys/module/vcachefs/parameters/gate_enforce 2>/dev/null)"

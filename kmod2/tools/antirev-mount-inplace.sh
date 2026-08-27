@@ -131,8 +131,8 @@ set -euo pipefail
 if [ "$(id -u)" -ne 0 ]; then exec sudo -E "$0" "$@"; fi
 
 ##### ---- configuration: EDIT to match your deployment -------------------------
-KMOD_DIR=/root/antirev/kmod2/module          # dir containing antirevfs.ko
-KO="${AREV_KO:-$KMOD_DIR/antirevfs.ko}"
+KMOD_DIR=/root/antirev/kmod2/module          # dir containing vcachefs.ko
+KO="${AREV_KO:-$KMOD_DIR/vcachefs.ko}"
 
 # sim mode only: the FIXED name of the slave container (business `docker run
 # --name <this>`).  A constant so no per-invocation input is needed; the
@@ -302,9 +302,9 @@ nl_join() { local a; for a in "$@"; do printf '%s\n' "$a"; done; }
 # this is a local operation with no mode branch — real vs sim differs ONLY in
 # where do_up/do_down/write_allowlist land (the executor), never here.
 ensure_module() {
-    if [ ! -d /sys/module/antirevfs ]; then
+    if [ ! -d /sys/module/vcachefs ]; then
         [ -f "$KO" ] || die "module not loaded and .ko not found: $KO (set AREV_KO=)"
-        log "insmod antirevfs (gate_enforce=$GATE_ENFORCE gate_require_sig=$GATE_REQUIRE_SIG gate_passthrough_cipher=$GATE_PASSTHROUGH authz_path=$AUTHZ_PATH)"
+        log "insmod vcachefs (gate_enforce=$GATE_ENFORCE gate_require_sig=$GATE_REQUIRE_SIG gate_passthrough_cipher=$GATE_PASSTHROUGH authz_path=$AUTHZ_PATH)"
         insmod "$KO" gate_enforce="$GATE_ENFORCE" \
             gate_require_sig="$GATE_REQUIRE_SIG" \
             gate_passthrough_cipher="$GATE_PASSTHROUGH" \
@@ -312,12 +312,12 @@ ensure_module() {
         return
     fi
     if [ "$RELOAD_MODULE" = 1 ]; then
-        log "rmmod antirevfs (reload)"
-        if ! rmmod antirevfs 2>/dev/null; then
-            die "rmmod failed (refcnt=$(cat /sys/module/antirevfs/refcnt 2>/dev/null)); run 'down' + stop the app first (mmap'd .so / live mounts pin the module)"
+        log "rmmod vcachefs (reload)"
+        if ! rmmod vcachefs 2>/dev/null; then
+            die "rmmod failed (refcnt=$(cat /sys/module/vcachefs/refcnt 2>/dev/null)); run 'down' + stop the app first (mmap'd .so / live mounts pin the module)"
         fi
         [ -f "$KO" ] || die ".ko not found for reload: $KO"
-        log "insmod antirevfs"
+        log "insmod vcachefs"
         insmod "$KO" gate_enforce="$GATE_ENFORCE" \
             gate_require_sig="$GATE_REQUIRE_SIG" \
             gate_passthrough_cipher="$GATE_PASSTHROUGH" \
@@ -326,10 +326,10 @@ ensure_module() {
     fi
     # keep loaded module; sync runtime-writable gate params
     log "antirevfs already loaded; syncing runtime-writable gate params (gate_require_sig=$GATE_REQUIRE_SIG)"
-    echo "$GATE_ENFORCE"     > /sys/module/antirevfs/parameters/gate_enforce 2>/dev/null || true
-    echo "$GATE_REQUIRE_SIG" > /sys/module/antirevfs/parameters/gate_require_sig 2>/dev/null || true
-    echo "$GATE_PASSTHROUGH" > /sys/module/antirevfs/parameters/gate_passthrough_cipher 2>/dev/null || true
-    local cur; cur="$(cat /sys/module/antirevfs/parameters/authz_path 2>/dev/null || echo '?')"
+    echo "$GATE_ENFORCE"     > /sys/module/vcachefs/parameters/gate_enforce 2>/dev/null || true
+    echo "$GATE_REQUIRE_SIG" > /sys/module/vcachefs/parameters/gate_require_sig 2>/dev/null || true
+    echo "$GATE_PASSTHROUGH" > /sys/module/vcachefs/parameters/gate_passthrough_cipher 2>/dev/null || true
+    local cur; cur="$(cat /sys/module/vcachefs/parameters/authz_path 2>/dev/null || echo '?')"
     [ "$cur" = "$AUTHZ_PATH" ] || log "note: loaded authz_path='$cur' (not runtime-writable); rmmod+reload to change"
 }
 
@@ -377,7 +377,7 @@ readarray -t MOUNTS < <(printf '%s\n' "$MOUNTS_NL" | sed '/^$/d')
 readarray -t WDIRS  < <(printf '%s\n' "$WDIRS_NL"  | sed '/^$/d')
 readarray -t WFILES < <(printf '%s\n' "$WFILES_NL" | sed '/^$/d')
 
-modprobe antirevfs 2>/dev/null || true   # no-op if already loaded on host
+modprobe vcachefs 2>/dev/null || true   # no-op if already loaded on host
 
 # 0) decide the LOWER for each mount.  Normally in-place (lower == mountpoint),
 #    but if the mountpoint's fs is overlayfs (Docker image layer) antirevfs
@@ -441,7 +441,7 @@ i=0
 for root in "${MOUNTS[@]}"; do
     lower="${LOWERS[$i]}"; i=$((i+1))
     cerr "antirevfs $lower -> $root ($A_OPTS)"
-    mount -t antirevfs -o "$A_OPTS" "$lower" "$root" || { cerr "mount failed: $root"; exit 1; }
+    mount -t vcachefs -o "$A_OPTS" "$lower" "$root" || { cerr "mount failed: $root"; exit 1; }
 done
 
 # 3) anonymous tmpfs over each known write directory
@@ -598,7 +598,7 @@ case "$ACTION" in
             log "[$TARGET] tearing down"
             do_down
         done
-        log "down complete (module left loaded; 'rmmod antirevfs' to fully unload)"
+        log "down complete (module left loaded; 'rmmod vcachefs' to fully unload)"
         ;;
     status)
         for TARGET in "${TARGETS[@]}"; do

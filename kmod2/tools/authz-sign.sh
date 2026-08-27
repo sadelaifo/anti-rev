@@ -5,7 +5,7 @@
 #   ./authz-sign.sh authz_priv.pem authz_cert.pem /etc/authorized_apps.txt [out.p7s]
 #
 # Default output: <listfile>.p7s (DER).  Then on the target:
-#   insmod antirevfs.ko gate_enforce=1 gate_require_sig=1
+#   insmod vcachefs.ko gate_enforce=1 gate_require_sig=1
 #   (authz_sig_path defaults to <authz_path>.p7s)
 set -euo pipefail
 KEY="${1:?priv.pem}"; CERT="${2:?cert.pem}"; LIST="${3:?listfile}"
