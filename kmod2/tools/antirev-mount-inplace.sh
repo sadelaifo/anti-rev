@@ -139,6 +139,14 @@ KO="${AREV_KO:-$KMOD_DIR/vcachefs.ko}"
 # AREV_CONTAINER env var can still override it for ad-hoc dev use.
 CONTAINER="${AREV_CONTAINER:-slave}"         # <-- SET this to your container name
 WATCH_INTERVAL="${AREV_WATCH_INTERVAL:-5}"   # 'watch' poll period (s); daemon idles here until the container appears
+# Readiness gate: an in-place mount is read-only and SHADOWS its directory, so
+# all ciphertext must be present BEFORE we mount — otherwise the mount freezes an
+# empty/partial tree and the installer's copy into bin/ lib/ gets EROFS.  We
+# therefore refuse to mount a target until its mount roots are non-empty, and
+# (if set) until READY_MARKER exists in the target.  Set AREV_READY_MARKER to a
+# path the installer `touch`es as the LAST step after copying SW in — that makes
+# the gate exact (a marker can't appear mid-copy the way a non-empty dir can).
+READY_MARKER="${AREV_READY_MARKER:-}"        # e.g. /root/SW/.arev-ready (empty = non-empty-dir heuristic only)
 
 # In-place mounts: the ciphertext lives AT these paths; antirevfs mounts over
 # them so the same paths show plaintext.  Add/remove trees as needed.
@@ -271,6 +279,21 @@ container_running() {
 target_present() {
     [ "$TARGET" = container ] || return 0
     container_running
+}
+
+# Is the target's ciphertext fully in place, so it is safe to mount over it?
+# Every mount root must exist and be non-empty; if READY_MARKER is set it must
+# also exist.  Runs in the current TARGET (host = local, container = docker exec).
+target_ready() {
+    local m
+    for m in "${MOUNTS[@]}"; do
+        run_in_target sh -c "[ -d '$m' ] && [ -n \"\$(ls -A '$m' 2>/dev/null)\" ]" \
+            || return 1
+    done
+    if [ -n "$READY_MARKER" ]; then
+        run_in_target sh -c "[ -e '$READY_MARKER' ]" || return 1
+    fi
+    return 0
 }
 
 # ---- executor abstraction ----------------------------------------------------
@@ -551,6 +574,10 @@ run_up_sequence() {
             log "[$TARGET] container '$CONTAINER' not running -> skipped (start it, or use 'watch')"
             continue
         fi
+        if ! target_ready; then
+            log "[$TARGET] ciphertext NOT ready (a mount root in [${MOUNTS[*]}] is empty${READY_MARKER:+ or $READY_MARKER missing}) -> NOT mounting (an in-place mount would shadow the dir and block the copy). Finish placing the files, then re-run 'up'."
+            continue
+        fi
         log "[$TARGET] mounting"
         write_allowlist
         do_up
@@ -586,13 +613,24 @@ do_watch() {
     log "watch: polling for container '$CONTAINER' every ${WATCH_INTERVAL}s (backgrounded daemon; idle until it appears)"
     command -v docker >/dev/null 2>&1 || log "docker not present yet; will keep polling until it (and the container) are installed"
     TARGET=container
+    # State machine: down (no container) -> waiting (up but ciphertext not yet
+    # in place) -> up (mounted).  We do NOT mount until target_ready, so a
+    # container that comes up BEFORE its bin/ lib/ are copied in is left alone —
+    # the mount can't shadow the dir and block the install copy.
     local prev=down
     while :; do
         if container_running; then
-            if [ "$prev" = down ]; then
-                log "container '$CONTAINER' is up -> mounting"
-                if (do_down; write_allowlist; do_up; do_status); then prev=up
-                else log "container up failed; retrying next tick"; fi
+            if target_ready; then
+                if [ "$prev" != up ]; then
+                    log "container '$CONTAINER' up + ciphertext ready -> mounting"
+                    if (do_down; write_allowlist; do_up; do_status); then prev=up
+                    else log "container mount failed; retrying next tick"; prev=waiting; fi
+                fi
+            else
+                if [ "$prev" != waiting ]; then
+                    log "container '$CONTAINER' up but ciphertext NOT ready (empty ${MOUNTS[*]}${READY_MARKER:+ / no $READY_MARKER}); waiting for the install copy to finish before mounting"
+                    prev=waiting
+                fi
             fi
         else
             prev=down
