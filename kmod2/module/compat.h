@@ -56,6 +56,25 @@ static inline ssize_t arev_kernel_read(struct file *f, void *buf, size_t count,
 }
 
 /*
+ * kernel_write() picked up the modern (file, buf, count, *pos) prototype in the
+ * same 4.14 window as kernel_read (older: kernel_write(file, buf, count, pos)
+ * taking the offset by value).  Same AREV_NEW_KERNEL_READ override applies.
+ */
+static inline ssize_t arev_kernel_write(struct file *f, const void *buf,
+					size_t count, loff_t *pos)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0) || defined(AREV_NEW_KERNEL_READ)
+	return kernel_write(f, buf, count, pos);
+#else
+	ssize_t n = kernel_write(f, (const char *)buf, count, *pos);
+
+	if (n > 0)
+		*pos += n;
+	return n;
+#endif
+}
+
+/*
  * get_mm_exe_file() is defined in kernel/fork.c but is NOT exported to modules
  * on every kernel (e.g. Ubuntu's 6.8.0-x generic build drops the EXPORT_SYMBOL
  * while SLES 4.12 keeps it), so linking against it fails modpost with an
