@@ -172,14 +172,21 @@ ANTIREVFS_OPTS="ro,passdata"                 # antirevfs mount options
 STAGE_LOWER="${AREV_STAGE_LOWER:-auto}"      # auto = stage only when lower is overlayfs | always | never
 STAGE_DIR="${AREV_STAGE_DIR:-/dev/shm/arev}" # real-fs (tmpfs) staging root IN THE TARGET
 
-# Allow-list basenames written to the TARGET's $AUTHZ_PATH when GATE_ENFORCE=1.
-# Match by BASENAME (paths differ under stacked/overlay mounts and per namespace).
-# sim mode: include qemu-aarch64-static (lib/data reads gate on the EMULATOR's
-# identity) plus every slave exe run transparently (its own exec-load is gated).
+# Legacy allow-list basenames, written to the TARGET's $AUTHZ_PATH when
+# GATE_ENFORCE=1 and this array is NON-empty.  Match by BASENAME (paths differ
+# under stacked/overlay mounts and per namespace).
+#
+# PER-EXE / WHITELIST MODEL (recommended): LEAVE THIS EMPTY.  Authorization then
+# comes from per-exe signatures (signed by the vendor, verified against the key
+# embedded in the .ko) + the .ko's compiled whitelist (module/gate_whitelist.h,
+# e.g. qemu-aarch64-static / python3 / java).  With ALLOW[] empty the tool
+# REMOVES any stale $AUTHZ_PATH on every `up`, so a leftover list can't silently
+# re-authorize readers (busybox applets, cp, objdump).  Do NOT list interpreters
+# here in this model — put them in gate_whitelist.h and rebuild the .ko instead.
+#
+# Only populate this array for the LEGACY plaintext-list model (no signatures).
 ALLOW=(
-    # your_slave_exe
-    # python3
-    # qemu-aarch64-static      # sim mode only
+    # your_slave_exe          # legacy model only — prefer per-exe signatures
 )
 
 # ---- writable locations (PLACEHOLDERS — fill in after testing) ----------------
@@ -341,7 +348,15 @@ write_allowlist() {
         return 0
     fi
     if [ "${#ALLOW[@]}" -eq 0 ]; then
-        log "WARNING: GATE_ENFORCE=1 but ALLOW[] is empty -> everything will be denied"
+        # Per-exe signature + compiled-whitelist model: the legacy allow-list is
+        # unused.  REMOVE any stale list in the target rather than leaving one
+        # around — a present, content-ful /etc/authorized_apps.txt authorizes its
+        # entries via the fallback and would silently re-grant plaintext access
+        # (the exact "delete it before mounting" gotcha).  Authorization then
+        # comes only from per-exe signatures + the .ko's compiled whitelist.
+        log "ALLOW[] empty -> per-exe/whitelist gating; removing any stale $AUTHZ_PATH"
+        run_in_target sh -c "rm -f '$AUTHZ_PATH' '$AUTHZ_PATH.p7s'" || true
+        return 0
     fi
     log "writing $AUTHZ_PATH ($( (IFS=,; echo "${ALLOW[*]:-}") ))"
     nl_join "${ALLOW[@]:-}" | run_in_target sh -c "cat > '$AUTHZ_PATH' && chmod 0644 '$AUTHZ_PATH'" \
