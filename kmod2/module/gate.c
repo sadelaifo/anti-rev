@@ -417,6 +417,86 @@ static bool authz_ok(struct inode *inode, const char *name)
 	return false;
 }
 
+/*
+ * Generic vendor-signature check on ANY file (not just a vcachefs-resident
+ * inode): used by the /dev/vcachefs control device to verify a guest binary
+ * (AUTHORIZE_FD) and to gate the ioctls on the caller being the genuine signed
+ * emulator.  Reads the appended ANTREV_SIG footer and verifies the PKCS#7 over
+ * the container bytes against the embedded vendor key.  Fails safe on any error.
+ * Not cached (the file has no vcachefs inode to hang a verdict on).
+ */
+bool arev_verify_file_sig(struct file *f)
+{
+#if defined(CONFIG_SYSTEM_DATA_VERIFICATION)
+	loff_t isize, clen, sig_off;
+	u32 slen, probe_len;
+	void *cbuf = NULL;
+	char *sbuf = NULL;
+	loff_t pos;
+	ssize_t n;
+	int ps, vret;
+	bool ok = false;
+
+	if (!authz_keyring || !f)
+		return false;
+	isize = i_size_read(file_inode(f));
+	ps = antirevfs_probe_sig(f, isize, &clen, &sig_off, &probe_len);
+	if (ps <= 0)				/* <0 error, 0 = no signature */
+		return false;
+	if (clen <= 0 || clen >= isize ||
+	    (loff_t)ANTREV_SIG_FOOTER_LEN + clen > isize)
+		return false;
+	slen = (u32)(isize - ANTREV_SIG_FOOTER_LEN - clen);
+	if (slen == 0 || slen > ANTREV_SIG_MAX)
+		return false;
+
+	cbuf = vmalloc(clen);
+	sbuf = kmalloc(slen, GFP_KERNEL);
+	if (!cbuf || !sbuf)
+		goto out;
+	pos = 0;
+	n = arev_kernel_read(f, cbuf, clen, &pos);
+	if (n != (ssize_t)clen)
+		goto out;
+	pos = clen;
+	n = arev_kernel_read(f, sbuf, slen, &pos);
+	if (n != (ssize_t)slen)
+		goto out;
+	vret = verify_pkcs7_signature(cbuf, (size_t)clen, sbuf, slen,
+				      authz_keyring,
+				      VERIFYING_UNSPECIFIED_SIGNATURE, NULL, NULL);
+	ok = (vret == 0);
+out:
+	vfree(cbuf);
+	kfree(sbuf);
+	return ok;
+#else
+	(void)f;
+	return false;
+#endif
+}
+
+/*
+ * True iff the CURRENT task's exe may drive the /dev/vcachefs control device —
+ * i.e. it is the genuine emulator: its basename is compiled-whitelisted
+ * (e.g. qemu-aarch64-static) OR its binary carries a valid vendor signature.
+ */
+bool arev_ctl_caller_ok(void)
+{
+	struct file *exe;
+	bool ok;
+
+	if (!current->mm)
+		return false;
+	exe = arev_get_mm_exe_file(current->mm);
+	if (!exe)
+		return false;
+	ok = authz_whitelisted(exe->f_path.dentry->d_name.name) ||
+	     arev_verify_file_sig(exe);
+	fput(exe);
+	return ok;
+}
+
 /* Legacy allow-list fallback: resolve `f`'s canonical path and match the
  * (optionally signature-required) list at authz_path.  Deny on any error / no
  * list.  Inert when no list is deployed — the two pass-types above are primary.

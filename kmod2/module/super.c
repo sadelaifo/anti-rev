@@ -259,6 +259,12 @@ static int __init antirevfs_init(void)
 	 * mode will deny; the FS still loads. */
 	if (antirevfs_authz_init())
 		pr_warn("vcachefs: authz keyring init failed; gate_require_sig will deny\n");
+
+	/* /dev/vcachefs control device for the qemu-user gate.  Non-fatal: a
+	 * failure only disables the qemu gate path; the FS still mounts. */
+	if (arev_ctldev_init())
+		pr_warn("vcachefs: control device registration failed; qemu gate unavailable\n");
+
 	pr_info("vcachefs: loaded\n");
 	return 0;
 }
@@ -268,6 +274,7 @@ static void __exit antirevfs_exit(void)
 	unregister_filesystem(&antirevfs_fs_type);
 	rcu_barrier();	/* let free_inode RCU callbacks drain before slab free */
 	kmem_cache_destroy(antirevfs_inode_cachep);
+	arev_ctldev_exit();		/* unregister /dev/vcachefs */
 	antirevfs_authz_exit();		/* release the signed-authz keyring */
 	pr_info("vcachefs: unloaded\n");
 }

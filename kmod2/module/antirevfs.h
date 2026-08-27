@@ -122,6 +122,12 @@ bool antirevfs_file_authorized(struct file *file);	/* exec-load: gate on file's 
 bool antirevfs_gate_passthrough_cipher(void);	/* deny-mode: serve ciphertext vs -EACCES */
 int  antirevfs_authz_init(void);		/* build signed-authz keyring (module init) */
 void antirevfs_authz_exit(void);		/* release it (module exit) */
+bool arev_verify_file_sig(struct file *f);	/* vendor-sig check on any file */
+bool arev_ctl_caller_ok(void);			/* caller may drive /dev/vcachefs? */
+
+/* ctldev.c — /dev/vcachefs control device for the qemu-user gate */
+int  arev_ctldev_init(void);
+void arev_ctldev_exit(void);
 
 /* crypto.c */
 int antirevfs_has_magic(struct file *lower_file);	/* >0 yes, 0 no, <0 err */

@@ -39,3 +39,6 @@ core.*
 
 # CMake tooling
 compile_commands.json
+
+# local qemu working tree (integration captured in kmod2/qemu-gate/)
+qemu-11-memleak-fix/
