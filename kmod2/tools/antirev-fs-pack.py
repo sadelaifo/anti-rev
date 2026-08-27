@@ -60,11 +60,16 @@ import tempfile
 import time
 from pathlib import Path
 
-# Per-exe authorization signature: appended after the container so the antirevfs
-# gate (gate_require_sig / per-exe mode) can verify it against the embedded
-# vendor key.  Layout: [container][sig][sig_len:4 LE][ANTRSIG1:8].  Must match
-# ANTREV_SIG_* in kmod2/module/antirevfs.h.
-SIG_MAGIC = b"ANTRSIG1"
+# On-disk magic bytes.  These are DELIBERATELY non-descriptive (no ASCII marker
+# like "ANTREV01") so shipped ciphertext carries nothing self-documenting — a
+# `head -c8` / `strings` over the tree reveals no project fingerprint.  The
+# kernel module MUST be built with byte-identical values (kmod2/module/antirevfs.h
+# ANTREV_MAGIC / ANTREV_SIG_MAGIC).  Changing them is on-disk-format-affecting:
+# re-pack every file and rebuild the module together.
+#   FS_MAGIC  = container header + embedded-key trailer marker
+#   SIG_MAGIC = per-exe signature footer marker ([container][sig][len:4LE][SIG_MAGIC])
+FS_MAGIC  = bytes.fromhex("a74c2e91d63b085f")
+SIG_MAGIC = bytes.fromhex("3d6af0128c55b427")
 
 # Reuse protect.py's exact crypto so the container format stays in lockstep
 # with what the kernel module's read_folio decrypts.
@@ -155,7 +160,7 @@ def encrypt_one(src: Path, dst: Path, key: bytes,
     byte count.
     """
     data = src.read_bytes()
-    container = make_container(data, key, embed_key=True)
+    container = make_container(data, key, embed_key=True, magic=FS_MAGIC)
     if do_sign:
         sig = sign_container(container, sign_key, sign_cert)
         container = container + sig + struct.pack("<I", len(sig)) + SIG_MAGIC

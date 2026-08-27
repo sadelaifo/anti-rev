@@ -131,8 +131,8 @@ set -euo pipefail
 if [ "$(id -u)" -ne 0 ]; then exec sudo -E "$0" "$@"; fi
 
 ##### ---- configuration: EDIT to match your deployment -------------------------
-KMOD_DIR=/root/antirev/kmod2/module          # dir containing antirevfs.ko
-KO="${AREV_KO:-$KMOD_DIR/antirevfs.ko}"
+KMOD_DIR=/root/antirev/kmod2/module          # dir containing vcachefs.ko
+KO="${AREV_KO:-$KMOD_DIR/vcachefs.ko}"
 
 # sim mode only: the FIXED name of the slave container (business `docker run
 # --name <this>`).  A constant so no per-invocation input is needed; the
@@ -149,6 +149,12 @@ MOUNTS=(
 
 GATE_ENFORCE="${AREV_GATE_ENFORCE:-1}"       # 1 = enforce allow-list, 0 = allow all
 GATE_PASSTHROUGH=1                           # 1 = unauth read -> trailer-stripped cipher; 0 = -EACCES
+# DEV_MODE: does the .ko you load expose the dev-only params (gate_enforce toggle,
+# authz_path allow-list)?  A PRODUCTION vcachefs.ko (built without AREV_DEV_MODE)
+# gates unconditionally and has NO such params — passing them to insmod would
+# fail.  0 (default) = production: insmod only gate_passthrough_cipher, no
+# allow-list.  1 = dev .ko (built AREV_DEV_MODE=1): full param set + allow-list.
+DEV_MODE="${AREV_DEV:-0}"
 AUTHZ_PATH=/etc/authorized_apps.txt          # resolved in the TARGET's mount ns (container's /etc in sim)
 # Signed allow-list (tamper-proof).  1 => the list is trusted only if its detached
 # PKCS#7 signature (AUTHZ_SIG_PATH) verifies against the vendor key embedded in
@@ -301,40 +307,56 @@ nl_join() { local a; for a in "$@"; do printf '%s\n' "$a"; done; }
 # script runs on the slave machine and loads that machine's kernel.  Either way
 # this is a local operation with no mode branch — real vs sim differs ONLY in
 # where do_up/do_down/write_allowlist land (the executor), never here.
+# insmod parameters differ by build: a PRODUCTION vcachefs.ko exposes only
+# gate_passthrough_cipher (it always enforces and has no allow-list); a DEV .ko
+# also takes the gate_enforce toggle + allow-list paths.  Word-split on purpose.
+gate_insmod_params() {
+    if [ "$DEV_MODE" = 1 ]; then
+        printf '%s' "gate_enforce=$GATE_ENFORCE gate_require_sig=$GATE_REQUIRE_SIG gate_passthrough_cipher=$GATE_PASSTHROUGH authz_path=$AUTHZ_PATH authz_sig_path=$AUTHZ_SIG_PATH"
+    else
+        printf '%s' "gate_passthrough_cipher=$GATE_PASSTHROUGH"
+    fi
+}
+gate_mode_label() { [ "$DEV_MODE" = 1 ] && echo "DEV" || echo "production"; }
+
 ensure_module() {
-    if [ ! -d /sys/module/antirevfs ]; then
+    if [ ! -d /sys/module/vcachefs ]; then
         [ -f "$KO" ] || die "module not loaded and .ko not found: $KO (set AREV_KO=)"
-        log "insmod antirevfs (gate_enforce=$GATE_ENFORCE gate_require_sig=$GATE_REQUIRE_SIG gate_passthrough_cipher=$GATE_PASSTHROUGH authz_path=$AUTHZ_PATH)"
-        insmod "$KO" gate_enforce="$GATE_ENFORCE" \
-            gate_require_sig="$GATE_REQUIRE_SIG" \
-            gate_passthrough_cipher="$GATE_PASSTHROUGH" \
-            authz_path="$AUTHZ_PATH" authz_sig_path="$AUTHZ_SIG_PATH" || die "insmod failed"
+        log "insmod vcachefs [$(gate_mode_label)] ($(gate_insmod_params))"
+        insmod "$KO" $(gate_insmod_params) || die "insmod failed"
         return
     fi
     if [ "$RELOAD_MODULE" = 1 ]; then
-        log "rmmod antirevfs (reload)"
-        if ! rmmod antirevfs 2>/dev/null; then
-            die "rmmod failed (refcnt=$(cat /sys/module/antirevfs/refcnt 2>/dev/null)); run 'down' + stop the app first (mmap'd .so / live mounts pin the module)"
+        log "rmmod vcachefs (reload)"
+        if ! rmmod vcachefs 2>/dev/null; then
+            die "rmmod failed (refcnt=$(cat /sys/module/vcachefs/refcnt 2>/dev/null)); run 'down' + stop the app first (mmap'd .so / live mounts pin the module)"
         fi
         [ -f "$KO" ] || die ".ko not found for reload: $KO"
-        log "insmod antirevfs"
-        insmod "$KO" gate_enforce="$GATE_ENFORCE" \
-            gate_require_sig="$GATE_REQUIRE_SIG" \
-            gate_passthrough_cipher="$GATE_PASSTHROUGH" \
-            authz_path="$AUTHZ_PATH" authz_sig_path="$AUTHZ_SIG_PATH" || die "insmod failed"
+        log "insmod vcachefs [$(gate_mode_label)]"
+        insmod "$KO" $(gate_insmod_params) || die "insmod failed"
         return
     fi
-    # keep loaded module; sync runtime-writable gate params
-    log "antirevfs already loaded; syncing runtime-writable gate params (gate_require_sig=$GATE_REQUIRE_SIG)"
-    echo "$GATE_ENFORCE"     > /sys/module/antirevfs/parameters/gate_enforce 2>/dev/null || true
-    echo "$GATE_REQUIRE_SIG" > /sys/module/antirevfs/parameters/gate_require_sig 2>/dev/null || true
-    echo "$GATE_PASSTHROUGH" > /sys/module/antirevfs/parameters/gate_passthrough_cipher 2>/dev/null || true
-    local cur; cur="$(cat /sys/module/antirevfs/parameters/authz_path 2>/dev/null || echo '?')"
-    [ "$cur" = "$AUTHZ_PATH" ] || log "note: loaded authz_path='$cur' (not runtime-writable); rmmod+reload to change"
+    # keep loaded module; sync runtime-writable gate params (dev .ko only —
+    # production has no gate_enforce/authz_path params, so skip those writes).
+    log "vcachefs already loaded; syncing runtime-writable gate params [$(gate_mode_label)]"
+    echo "$GATE_PASSTHROUGH" > /sys/module/vcachefs/parameters/gate_passthrough_cipher 2>/dev/null || true
+    if [ "$DEV_MODE" = 1 ]; then
+        echo "$GATE_ENFORCE"     > /sys/module/vcachefs/parameters/gate_enforce 2>/dev/null || true
+        echo "$GATE_REQUIRE_SIG" > /sys/module/vcachefs/parameters/gate_require_sig 2>/dev/null || true
+        local cur; cur="$(cat /sys/module/vcachefs/parameters/authz_path 2>/dev/null || echo '?')"
+        [ "$cur" = "$AUTHZ_PATH" ] || log "note: loaded authz_path='$cur' (not runtime-writable); rmmod+reload to change"
+    fi
 }
 
 # ---- target: gate allow-list -------------------------------------------------
 write_allowlist() {
+    # Production .ko has no allow-list mechanism at all — authorization is purely
+    # per-exe signature + compiled whitelist.  Nothing to write; make sure no
+    # stale list lingers (a dev .ko would honor it) and return.
+    if [ "$DEV_MODE" != 1 ]; then
+        run_in_target sh -c "rm -f '$AUTHZ_PATH' '$AUTHZ_PATH.p7s'" 2>/dev/null || true
+        return 0
+    fi
     [ "$GATE_ENFORCE" = 1 ] || { log "gate off; skipping allow-list"; return 0; }
     # Signed mode: the list + its .p7s are produced at CI/vendor (with the private
     # key) and shipped; the tool must NOT overwrite them (that would invalidate
@@ -377,7 +399,7 @@ readarray -t MOUNTS < <(printf '%s\n' "$MOUNTS_NL" | sed '/^$/d')
 readarray -t WDIRS  < <(printf '%s\n' "$WDIRS_NL"  | sed '/^$/d')
 readarray -t WFILES < <(printf '%s\n' "$WFILES_NL" | sed '/^$/d')
 
-modprobe antirevfs 2>/dev/null || true   # no-op if already loaded on host
+modprobe vcachefs 2>/dev/null || true   # no-op if already loaded on host
 
 # 0) decide the LOWER for each mount.  Normally in-place (lower == mountpoint),
 #    but if the mountpoint's fs is overlayfs (Docker image layer) antirevfs
@@ -440,8 +462,8 @@ done
 i=0
 for root in "${MOUNTS[@]}"; do
     lower="${LOWERS[$i]}"; i=$((i+1))
-    cerr "antirevfs $lower -> $root ($A_OPTS)"
-    mount -t antirevfs -o "$A_OPTS" "$lower" "$root" || { cerr "mount failed: $root"; exit 1; }
+    cerr "vcachefs $lower -> $root ($A_OPTS)"
+    mount -t vcachefs -o "$A_OPTS" "$lower" "$root" || { cerr "mount failed: $root"; exit 1; }
 done
 
 # 3) anonymous tmpfs over each known write directory
@@ -598,7 +620,7 @@ case "$ACTION" in
             log "[$TARGET] tearing down"
             do_down
         done
-        log "down complete (module left loaded; 'rmmod antirevfs' to fully unload)"
+        log "down complete (module left loaded; 'rmmod vcachefs' to fully unload)"
         ;;
     status)
         for TARGET in "${TARGETS[@]}"; do

@@ -52,37 +52,53 @@
 
 #define AUTHZ_MAX_BYTES		(64 * 1024)	/* sanity cap on the allow-list file */
 
+/*
+ * DEV MODE vs PRODUCTION (compile-time; see AREV_DEV_MODE in the Makefile).
+ *
+ * A runtime toggle IS a backdoor — a client who can `echo 0 >
+ * .../gate_enforce` or drop an /etc/authorized_apps.txt has bypassed the gate.
+ * So the convenience paths are COMPILED OUT of the shipped .ko, not merely
+ * defaulted off:
+ *   PRODUCTION (default):  gate is unconditional; authorization is ONLY per-exe
+ *     signature + the compiled whitelist (gate_whitelist.h).  There is no
+ *     gate_enforce switch and no allow-list file code — nothing a client can
+ *     create/edit/write changes the verdict.
+ *   DEV (-DAREV_DEV_MODE):  adds back the writable gate_enforce toggle (default
+ *     0 = allow-all, for the bring-up sequence) and the editable/​signed
+ *     /etc/authorized_apps.txt fallback.  The dev .ko self-identifies loudly at
+ *     load (see antirevfs_authz_init) and must never ship.
+ */
+#ifdef AREV_DEV_MODE
 static bool gate_enforce;
 module_param(gate_enforce, bool, 0644);
 MODULE_PARM_DESC(gate_enforce,
-	"Enforce per-process decrypt authorization (0 = allow all, default)");
+	"[dev] Enforce per-process authorization (0 = allow all, default)");
 
 static char authz_path[256] = "/etc/authorized_apps.txt";
 module_param_string(authz_path, authz_path, sizeof(authz_path), 0644);
 MODULE_PARM_DESC(authz_path,
-	"Allow-list file: newline-separated authorized exe paths or basenames");
+	"[dev] Allow-list file: newline-separated authorized exe paths or basenames");
 
 /*
  * Tamper-proof allow-list (the "client can't edit it" mode).  When
  * gate_require_sig=1, the allow-list is only trusted if a detached PKCS#7
  * signature at authz_sig_path verifies against the vendor public key embedded
- * in the module (gate_authz_pubkey.h) — so a client editing the plaintext list
- * de-authorizes it (signature no longer matches) and cannot forge a new one
- * without the vendor private key.  Default 0 keeps the legacy plaintext list so
- * existing setups/tests are unaffected; the matching logic is identical either
- * way — only the TRUST of the list bytes changes.  Fails safe: any error
- * (missing sig, bad sig, no embedded key, kernel lacking PKCS#7) => list
- * rejected => deny.
+ * in the module (gate_authz_pubkey.h).  Fails safe on any error.
  */
 static bool gate_require_sig;
 module_param(gate_require_sig, bool, 0644);
 MODULE_PARM_DESC(gate_require_sig,
-	"Require the allow-list to carry a valid detached PKCS#7 signature from the embedded vendor key (0 = trust plaintext list, default)");
+	"[dev] Require the allow-list to carry a valid detached PKCS#7 signature (0 = trust plaintext list, default)");
 
 static char authz_sig_path[256] = "/etc/authorized_apps.txt.p7s";
 module_param_string(authz_sig_path, authz_sig_path, sizeof(authz_sig_path), 0644);
 MODULE_PARM_DESC(authz_sig_path,
-	"Detached PKCS#7 (DER) signature file for the allow-list (used when gate_require_sig=1)");
+	"[dev] Detached PKCS#7 (DER) signature file for the allow-list (used when gate_require_sig=1)");
+#else
+/* Production: gating is unconditional (const true), so the early-out in the
+ * authorized() predicates below never fires and every encrypted open is gated. */
+static const bool gate_enforce = true;
+#endif	/* AREV_DEV_MODE */
 
 /*
  * When gating denies a data read, do we hard-fail it (-EACCES, default) or
@@ -103,6 +119,13 @@ bool antirevfs_gate_passthrough_cipher(void)
 	return gate_passthrough_cipher;
 }
 
+/* modinfo marker so a dev .ko is trivially distinguishable from a shipped one. */
+#ifdef AREV_DEV_MODE
+MODULE_INFO(build, "dev");
+#else
+MODULE_INFO(build, "release");
+#endif
+
 /*
  * Read the whole allow-list file into a NUL-terminated kmalloc buffer.
  * Returns the buffer (caller kfree()s) or NULL on any error / empty / oversize.
@@ -112,10 +135,11 @@ bool antirevfs_gate_passthrough_cipher(void)
  * can edit the list live; step 2 sheds the shared file entirely by reading a
  * signature off the exe itself.
  */
+#ifdef AREV_DEV_MODE
 /* Read a whole small file into a kmalloc'd, NUL-terminated buffer.  On success
  * returns the buffer and (if out_len) sets *out_len to the byte length (NOT
  * counting the added NUL — the signed content is exactly these bytes).  Caller
- * kfree()s. */
+ * kfree()s.  Dev-only: the allow-list machinery is compiled out of production. */
 static char *authz_read_file(const char *path, size_t *out_len)
 {
 	struct file *f;
@@ -151,8 +175,9 @@ static char *authz_read_file(const char *path, size_t *out_len)
 		*out_len = (size_t)size;
 	return buf;
 }
+#endif	/* AREV_DEV_MODE */
 
-/* ---- signed-allow-list verification (gate_require_sig=1) ------------------- */
+/* ---- vendor keyring (per-exe signatures + dev signed-list) ---------------- */
 /*
  * Trusted keyring holding ONLY the embedded vendor cert.  Built once at module
  * init from gate_authz_pubkey.h.  NULL when no key is embedded (placeholder) or
@@ -162,6 +187,9 @@ static struct key *authz_keyring;
 
 int antirevfs_authz_init(void)
 {
+#ifdef AREV_DEV_MODE
+	pr_warn("vcachefs: DEV BUILD — runtime enforce toggle + allow-list are ENABLED. NOT FOR SHIPMENT.\n");
+#endif
 #if defined(CONFIG_SYSTEM_DATA_VERIFICATION)
 	key_ref_t kref;
 	struct key *kr;
@@ -169,13 +197,13 @@ int antirevfs_authz_init(void)
 	if (antirev_authz_cert_der_len == 0)
 		return 0;		/* placeholder key: signed mode will deny */
 
-	kr = keyring_alloc(".antirev_authz",
+	kr = keyring_alloc(".vcachefs",
 			   GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, current_cred(),
 			   (KEY_POS_ALL & ~KEY_POS_SETATTR) |
 			   KEY_USR_VIEW | KEY_USR_READ | KEY_USR_SEARCH,
 			   KEY_ALLOC_NOT_IN_QUOTA, NULL, NULL);
 	if (IS_ERR(kr)) {
-		pr_warn("antirevfs: authz keyring_alloc failed (%ld)\n", PTR_ERR(kr));
+		pr_warn("vcachefs: authz keyring_alloc failed (%ld)\n", PTR_ERR(kr));
 		return PTR_ERR(kr);
 	}
 
@@ -185,17 +213,17 @@ int antirevfs_authz_init(void)
 				    (KEY_POS_ALL & ~KEY_POS_SETATTR) | KEY_USR_VIEW,
 				    KEY_ALLOC_NOT_IN_QUOTA);
 	if (IS_ERR(kref)) {
-		pr_warn("antirevfs: embedding authz cert failed (%ld) — check the DER in gate_authz_pubkey.h\n",
+		pr_warn("vcachefs: embedding authz cert failed (%ld) — check the DER in gate_authz_pubkey.h\n",
 			PTR_ERR(kref));
 		key_put(kr);
 		return PTR_ERR(kref);
 	}
 	key_ref_put(kref);
 	authz_keyring = kr;
-	pr_info("antirevfs: authz vendor key loaded (%u-byte cert)\n",
+	pr_info("vcachefs: authz vendor key loaded (%u-byte cert)\n",
 		antirev_authz_cert_der_len);
 #else
-	pr_warn("antirevfs: kernel lacks CONFIG_SYSTEM_DATA_VERIFICATION (PKCS#7 verify) — gate_require_sig will deny\n");
+	pr_warn("vcachefs: kernel lacks CONFIG_SYSTEM_DATA_VERIFICATION (PKCS#7 verify) — gate_require_sig will deny\n");
 #endif
 	return 0;
 }
@@ -208,6 +236,7 @@ void antirevfs_authz_exit(void)
 	}
 }
 
+#ifdef AREV_DEV_MODE	/* dev-only allow-list matching (plaintext + signed) */
 /* True iff `list`/`list_len` is covered by a valid detached PKCS#7 signature
  * (authz_sig_path) chaining to the embedded vendor key.  Fails safe: any
  * missing piece or verify error => false => the list is not trusted. */
@@ -233,7 +262,7 @@ static bool authz_list_signature_ok(const char *list, size_t list_len)
 				     NULL, NULL);
 	kfree(sig);
 	if (ret) {
-		pr_warn_ratelimited("antirevfs: allow-list signature invalid (%d) — rejecting list\n", ret);
+		pr_warn_ratelimited("vcachefs: allow-list signature invalid (%d) — rejecting list\n", ret);
 		return false;
 	}
 	return true;
@@ -291,6 +320,7 @@ static bool authz_path_listed(const char *path)
 	kfree(list);
 	return ok;
 }
+#endif	/* AREV_DEV_MODE */
 
 /* ---- pass-type 1: hard-coded whitelist (gate_whitelist.h) ------------------ */
 static bool authz_whitelisted(const char *name)
@@ -360,7 +390,7 @@ static bool authz_exe_signed_ok(struct inode *inode)
 	ok = (vret == 0);
 	ii->authz_sig = ok ? 1 : -1;		/* definitive: cache it */
 	if (!ok)
-		pr_warn_ratelimited("antirevfs: per-exe signature invalid (%d)\n", vret);
+		pr_warn_ratelimited("vcachefs: per-exe signature invalid (%d)\n", vret);
 out:
 	fput(lf);
 	vfree(cbuf);
@@ -386,7 +416,11 @@ static bool authz_ok(struct inode *inode, const char *name)
 
 /* Legacy allow-list fallback: resolve `f`'s canonical path and match the
  * (optionally signature-required) list at authz_path.  Deny on any error / no
- * list.  Inert when no list is deployed — the two pass-types above are primary. */
+ * list.  Inert when no list is deployed — the two pass-types above are primary.
+ *
+ * PRODUCTION: compiled to a no-op that always denies, so there is no allow-list
+ * door at all — authorization is strictly whitelist OR per-exe signature. */
+#ifdef AREV_DEV_MODE
 static bool authz_list_fallback(struct file *f)
 {
 	char *pathbuf, *p;
@@ -401,6 +435,9 @@ static bool authz_list_fallback(struct file *f)
 	kfree(pathbuf);
 	return ok;
 }
+#else
+static inline bool authz_list_fallback(struct file *f) { return false; }
+#endif	/* AREV_DEV_MODE */
 
 /*
  * Data-read gate (libraries, cp, source, ...).  antirevfs_file_open() calls

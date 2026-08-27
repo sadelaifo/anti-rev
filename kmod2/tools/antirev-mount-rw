@@ -129,8 +129,8 @@ aopts="ro"
 [[ -n "$pass" ]] && aopts="$aopts,passthrough=$pass"
 [[ -n "${ANTIREV_MOUNT_OPTS:-}" ]] && aopts="$aopts,$ANTIREV_MOUNT_OPTS"
 
-modprobe antirevfs 2>/dev/null || true
-mount -t antirevfs -o "$aopts" "$enc" "$dec" \
+modprobe vcachefs 2>/dev/null || true
+mount -t vcachefs -o "$aopts" "$enc" "$dec" \
 	|| die "antirevfs mount failed (enc=$enc dec=$dec opts=$aopts)"
 
 # Layer 2: overlayfs writable upper over the decrypted lower.

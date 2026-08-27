@@ -24,7 +24,7 @@ command -v openssl >/dev/null || { echo "openssl required"; exit 1; }
 
 W="$(mktemp -d /tmp/arev_perexe.XXXXXX)"
 ENC="$W/enc"; MP="$W/mp"; mkdir -p "$W/install/bin" "$MP"
-cleanup(){ mountpoint -q "$MP" && umount "$MP"; rmmod antirevfs 2>/dev/null; rm -rf "$W"; }
+cleanup(){ mountpoint -q "$MP" && umount "$MP"; rmmod vcachefs 2>/dev/null; rm -rf "$W"; }
 trap cleanup EXIT
 
 echo "== vendor key + throwaway module (embed key + whitelist 'wlloader') =="
@@ -33,8 +33,8 @@ cp -r "$KMOD/module" "$W/module"
 bash "$TOOLS/authz-embed-pubkey.sh" "$W/keys/authz_cert.der" > "$W/module/gate_authz_pubkey.h"
 # add a test whitelist entry
 sed -i 's/^\tNULL$/\t"wlloader",\n\tNULL/' "$W/module/gate_whitelist.h"
-make -C "$W/module" CC="$CC" >"$W/build.log" 2>&1 || { echo "build failed:"; tail -20 "$W/build.log"; exit 1; }
-MOD="$W/module/antirevfs.ko"
+make -C "$W/module" CC="$CC" AREV_DEV_MODE=1 >"$W/build.log" 2>&1 || { echo "build failed:"; tail -20 "$W/build.log"; exit 1; }
+MOD="$W/module/vcachefs.ko"
 
 echo "== build loader (dlopen+call) + a lib; pack+SIGN the tree =="
 cat > "$W/libans.c" <<'EOF'
@@ -67,13 +67,13 @@ python3 "$ROOT/encryptor/protect.py" encrypt-lib --embed-key --key "$W/uk.hex" \
 python3 - "$ENC/bin/uloader" <<'PY'
 import sys,struct
 p=sys.argv[1]; b=open(p,'rb').read()
-if b[-8:]==b'ANTRSIG1':
+if b[-8:]==bytes.fromhex("3d6af0128c55b427"):
     slen=struct.unpack('<I',b[-12:-8])[0]; open(p,'wb').write(b[:-12-slen])
 PY
 
 echo "== load module (gate_enforce=1, per-exe mode; no allow-list) + mount =="
 insmod "$MOD" gate_enforce=1 || { echo insmod failed; dmesg|tail -5; exit 1; }
-mount -t antirevfs -o ro,passdata "$ENC" "$MP" || { echo mount failed; dmesg|tail -5; exit 1; }
+mount -t vcachefs -o ro,passdata "$ENC" "$MP" || { echo mount failed; dmesg|tail -5; exit 1; }
 chmod +x "$MP/bin/sloader" "$MP/bin/uloader" "$MP/bin/wlloader" 2>/dev/null || true
 
 echo "== 1. signed loader runs + reads the encrypted lib =="
@@ -92,7 +92,7 @@ umount "$MP"
 python3 - "$ENC/bin/sloader" <<'PY'
 import sys; p=sys.argv[1]; b=bytearray(open(p,'rb').read()); b[64]^=0xff; open(p,'wb').write(b)
 PY
-mount -t antirevfs -o ro,passdata "$ENC" "$MP"; chmod +x "$MP/bin/sloader" 2>/dev/null || true
+mount -t vcachefs -o ro,passdata "$ENC" "$MP"; chmod +x "$MP/bin/sloader" 2>/dev/null || true
 OUT="$("$MP/bin/sloader" "$MP/bin/libans.so" 2>&1)"; RC=$?
 [[ $RC -ne 0 ]] && ok "tampered signed exe denied (rc=$RC)" || bad "tampered exe ran (integrity broken)"
 
@@ -100,16 +100,16 @@ echo "== 4. whitelisted basename passes (even though we strip its sig) =="
 umount "$MP"
 python3 - "$ENC/bin/wlloader" <<'PY'
 import sys,struct; p=sys.argv[1]; b=open(p,'rb').read()
-if b[-8:]==b'ANTRSIG1':
+if b[-8:]==bytes.fromhex("3d6af0128c55b427"):
     slen=struct.unpack('<I',b[-12:-8])[0]; open(p,'wb').write(b[:-12-slen])
 PY
-mount -t antirevfs -o ro,passdata "$ENC" "$MP"; chmod +x "$MP/bin/wlloader" 2>/dev/null || true
+mount -t vcachefs -o ro,passdata "$ENC" "$MP"; chmod +x "$MP/bin/wlloader" 2>/dev/null || true
 OUT="$("$MP/bin/wlloader" "$MP/bin/libans.so" 2>&1)"; RC=$?
 [[ $RC -eq 0 && "$OUT" == *ans=42* ]] && ok "whitelisted basename authorized (no sig needed)" \
 	|| bad "whitelisted exe denied (rc=$RC: $OUT)"
 
 echo "== 5. control: gate_enforce=0 -> unsigned uloader runs =="
-echo 0 > /sys/module/antirevfs/parameters/gate_enforce
+echo 0 > /sys/module/vcachefs/parameters/gate_enforce
 OUT="$("$MP/bin/uloader" "$MP/bin/libans.so" 2>&1)"; RC=$?
 [[ $RC -eq 0 ]] && ok "gate off -> unsigned runs (proves the gate was enforcing)" \
 	|| bad "gate off still denied (rc=$RC)"

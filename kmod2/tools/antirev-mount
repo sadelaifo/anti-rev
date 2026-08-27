@@ -34,5 +34,5 @@ opts="ro"
 [[ -n "$pass" ]] && opts="$opts,passthrough=$pass"
 [[ -n "${ANTIREV_MOUNT_OPTS:-}" ]] && opts="$opts,$ANTIREV_MOUNT_OPTS"
 
-modprobe antirevfs 2>/dev/null || true
-exec mount -t antirevfs -o "$opts" "$lower" "$mp"
+modprobe vcachefs 2>/dev/null || true
+exec mount -t vcachefs -o "$opts" "$lower" "$mp"

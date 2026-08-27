@@ -167,7 +167,7 @@ static int antirevfs_fill_super(struct super_block *sb, void *data, int silent)
 			&sbi->lower_root);
 	if (err) {
 		if (!silent)
-			pr_err("antirevfs: bad lowerdir '%s': %d\n",
+			pr_err("vcachefs: bad lowerdir '%s': %d\n",
 			       ctx->lowerdir, err);
 		return err;
 	}
@@ -258,8 +258,8 @@ static int __init antirevfs_init(void)
 	 * vendor key is embedded).  Non-fatal: a failure here only means signed
 	 * mode will deny; the FS still loads. */
 	if (antirevfs_authz_init())
-		pr_warn("antirevfs: authz keyring init failed; gate_require_sig will deny\n");
-	pr_info("antirevfs: loaded\n");
+		pr_warn("vcachefs: authz keyring init failed; gate_require_sig will deny\n");
+	pr_info("vcachefs: loaded\n");
 	return 0;
 }
 
@@ -269,13 +269,13 @@ static void __exit antirevfs_exit(void)
 	rcu_barrier();	/* let free_inode RCU callbacks drain before slab free */
 	kmem_cache_destroy(antirevfs_inode_cachep);
 	antirevfs_authz_exit();		/* release the signed-authz keyring */
-	pr_info("antirevfs: unloaded\n");
+	pr_info("vcachefs: unloaded\n");
 }
 
 module_init(antirevfs_init);
 module_exit(antirevfs_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("antirev");
-MODULE_DESCRIPTION("Stacked read-only filesystem decrypting ANTREV01 AES-256-GCM files on page fault");
+MODULE_AUTHOR("vcachefs");
+MODULE_DESCRIPTION("Stacked read-only cache filesystem");
 MODULE_VERSION("0.1");

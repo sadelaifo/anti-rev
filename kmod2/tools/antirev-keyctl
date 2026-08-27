@@ -10,7 +10,7 @@
 #
 # (Historical behaviour) The module used to look up a "user"-type key named
 # "antirevfs:default" in the mounting process's keyrings; this tool installed
-# that key so `mount -t antirevfs` found it.
+# that key so `mount -t vcachefs` found it.
 #
 # Usage:
 #   antirev-keyctl unlock --keyfile <hexkeyfile>   # 64 hex chars (protect.py keyfile)

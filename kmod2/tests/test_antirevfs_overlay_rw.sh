@@ -32,7 +32,7 @@ fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
-MOD="$KMOD/module/antirevfs.ko"
+MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
 KEYCTL="$KMOD/tools/antirev-keyctl"
 MOUNTRW="$KMOD/tools/antirev-mount-rw"
@@ -53,7 +53,7 @@ mkdir -p "$ENC" "$BARE" "$MP"
 cleanup() {
 	"$MOUNTRW" --down "$MP" >/dev/null 2>&1
 	mountpoint -q "$BARE" && umount "$BARE"
-	rmmod antirevfs 2>/dev/null
+	rmmod vcachefs 2>/dev/null
 	"$KEYCTL" clear >/dev/null 2>&1
 	rm -rf "$WORK"
 }
@@ -72,7 +72,7 @@ echo "== load module + key =="
 insmod "$MOD" || { echo "insmod failed"; exit 1; }
 
 echo "== 0. failure mode: bare antirevfs mount rejects writes =="
-mount -t antirevfs -o "ro,passdata" "$ENC" "$BARE" || { echo "bare mount failed"; dmesg|tail -5; exit 1; }
+mount -t vcachefs -o "ro,passdata" "$ENC" "$BARE" || { echo "bare mount failed"; dmesg|tail -5; exit 1; }
 if echo x > "$BARE/app.lock" 2>/dev/null; then
 	bad "bare antirevfs accepted a write (expected -EROFS)"
 else

@@ -77,21 +77,28 @@ def encrypt_data(data: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
     return iv, tag, ct
 
 
-def make_container(data: bytes, key: bytes, embed_key: bool = False) -> bytes:
+def make_container(data: bytes, key: bytes, embed_key: bool = False,
+                   magic: bytes = MAGIC) -> bytes:
     """Build the on-disk encrypted container for `data`.
 
     Default (keyless, daemon/shim form):
-        MAGIC + iv + tag + ct
+        magic + iv + tag + ct
     With embed_key=True (antirevfs form): append a key trailer (the key plus a
-    second MAGIC so the trailer is self-marking), mirroring the master-branch
+    second magic so the trailer is self-marking), mirroring the master-branch
     stub trailer.  The antirevfs kernel module reads the key from this trailer
     at decrypt time, so there is no mount-time key:
-        MAGIC + iv + tag + ct + key + MAGIC
+        magic + iv + tag + ct + key + magic
+
+    `magic` defaults to the daemon/shim `MAGIC` (b"ANTREV01").  The antirevfs
+    (kmod2) packer passes its own non-descriptive magic so the shipped ciphertext
+    carries no self-documenting marker; the kernel module must be built with the
+    identical bytes (see kmod2/module/antirevfs.h ANTREV_MAGIC).  `magic` may be
+    any length; header and trailer both use it.
     """
     iv, tag, ct = encrypt_data(data, key)
-    blob = MAGIC + iv + tag + ct
+    blob = magic + iv + tag + ct
     if embed_key:
-        blob += key + MAGIC
+        blob += key + magic
     return blob
 
 

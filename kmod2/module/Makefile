@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0
-# Kbuild for the antirevfs out-of-tree kernel module.
+# Kbuild for the antirevfs out-of-tree kernel module (built as vcachefs.ko).
 #
 #   make            # build against the running kernel
 #   make KDIR=/lib/modules/<ver>/build
 #   make clean
 
-obj-m += antirevfs.o
-antirevfs-objs := super.o inode.o file.o crypto.o gate.o
+obj-m += vcachefs.o
+vcachefs-objs := super.o inode.o file.o crypto.o gate.o
 
 # GCC 9+ (-Wmissing-attributes) warns that the module_init/module_exit aliases
 # init_module/cleanup_module don't inherit the __cold that __init/__exit put on
@@ -16,6 +16,15 @@ antirevfs-objs := super.o inode.o file.o crypto.o gate.o
 # is benign; silence it only where the compiler recognises the flag (cc-option
 # makes this a no-op on gcc 4.8, which predates both the flag and the warning).
 ccflags-y += $(call cc-option,-Wno-missing-attributes)
+
+# Development build:  make AREV_DEV_MODE=1
+# Compiles IN the runtime `gate_enforce` toggle + the /etc/authorized_apps.txt
+# allow-list (plaintext + signed) for bring-up.  The PRODUCTION build (default,
+# no flag) compiles these OUT: a shipped .ko gates unconditionally and has no
+# allow-list door — authorization is ONLY per-exe signature + the compiled
+# whitelist (gate_whitelist.h).  A dev .ko warns at load and reports
+# `build: dev` in modinfo, so it is never mistaken for a shipped module.
+ccflags-y += $(if $(AREV_DEV_MODE),-DAREV_DEV_MODE)
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)

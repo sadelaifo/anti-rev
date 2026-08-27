@@ -21,7 +21,7 @@ DefaultDependencies=yes
 Type=oneshot
 RemainAfterExit=yes
 Environment=AREV_MODE=real
-# Environment=AREV_KO=/opt/antirev/antirevfs.ko
+# Environment=AREV_KO=/opt/antirev/vcachefs.ko
 ExecStart=/opt/antirev/antirev-mount-inplace.sh --mode real up
 ExecStop=/opt/antirev/antirev-mount-inplace.sh --mode real down
 

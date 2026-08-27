@@ -28,10 +28,10 @@ fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
-MOD="$KMOD/module/antirevfs.ko"
+MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
 KEYCTL="$KMOD/tools/antirev-keyctl"
-PASS_PARAM=/sys/module/antirevfs/parameters/gate_passthrough_cipher
+PASS_PARAM=/sys/module/vcachefs/parameters/gate_passthrough_cipher
 
 PASS=0; FAIL=0
 ok()  { echo "  [PASS] $*"; PASS=$((PASS+1)); }
@@ -46,7 +46,7 @@ mkdir -p "$ENC" "$MP"
 
 cleanup() {
 	mountpoint -q "$MP" && umount "$MP"
-	rmmod antirevfs 2>/dev/null
+	rmmod vcachefs 2>/dev/null
 	"$KEYCTL" clear >/dev/null 2>&1
 	rm -rf "$WORK"
 }
@@ -84,9 +84,10 @@ EOF
 chmod 0644 "$AUTHZ"
 
 echo "== load module (gate_enforce=1, gate_passthrough_cipher=1) + key + mount =="
+# NOTE: requires a dev-mode build (make AREV_DEV_MODE=1)
 insmod "$MOD" gate_enforce=1 gate_passthrough_cipher=1 authz_path="$AUTHZ" \
 	|| { echo "insmod failed"; exit 1; }
-mount -t antirevfs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
+mount -t vcachefs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
 mount | grep -q "$MP" && ok "mounted antirevfs (passthrough-cipher on)" || bad "mount missing"
 
 echo "== 1. authorized program still reads decrypted content =="
@@ -116,10 +117,10 @@ else
 	bad "cp was denied (expected success with stripped ciphertext): $(cat "$WORK/cp.err")"
 fi
 
-echo "== 3. cat (unlisted) yields ciphertext (ANTREV01 magic, not the ELF) =="
-MAGIC="$(head -c 8 "$MP/libtest.so" 2>/dev/null)"
-echo "    first 8 bytes: '$MAGIC'"
-[[ "$MAGIC" == "ANTREV01" ]] && ok "cat sees the ANTREV01 container header (ciphertext)" \
+echo "== 3. cat (unlisted) yields ciphertext (container magic, not the ELF) =="
+MAGIC="$(head -c8 "$MP/libtest.so" 2>/dev/null | xxd -p)"
+echo "    first 8 bytes (hex): '$MAGIC'"
+[[ "$MAGIC" == "a74c2e91d63b085f" ]] && ok "cat sees the container magic header (ciphertext)" \
 	|| bad "cat did not see ciphertext magic (got '$MAGIC')"
 
 echo "== 4. objdump (unlisted) cannot parse it as an ELF =="

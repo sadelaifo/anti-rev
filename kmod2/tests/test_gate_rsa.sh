@@ -35,17 +35,17 @@ WORK="$(mktemp -d /tmp/antirevfs_gate_rsa.XXXXXX)"
 ENC="$WORK/.enc/lib"; MP="$WORK/lib"
 AUTHZ="$WORK/authorized_apps.txt"; SIG="$AUTHZ.p7s"
 mkdir -p "$ENC" "$MP"
-cleanup() { mountpoint -q "$MP" && umount "$MP"; rmmod antirevfs 2>/dev/null; rm -rf "$WORK"; }
+cleanup() { mountpoint -q "$MP" && umount "$MP"; rmmod vcachefs 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 echo "== 1) vendor key + throwaway module embedding it =="
 bash "$TOOLS/authz-keygen.sh" "$WORK/keys" >/dev/null 2>&1 || { echo "keygen failed"; exit 1; }
 cp -r "$KMOD/module" "$WORK/module"
 bash "$TOOLS/authz-embed-pubkey.sh" "$WORK/keys/authz_cert.der" > "$WORK/module/gate_authz_pubkey.h"
-if ! make -C "$WORK/module" CC="$CC" >/"$WORK/build.log" 2>&1; then
+if ! make -C "$WORK/module" CC="$CC" AREV_DEV_MODE=1 >/"$WORK/build.log" 2>&1; then
 	echo "module build failed:"; tail -20 "$WORK/build.log"; exit 1
 fi
-MOD="$WORK/module/antirevfs.ko"
+MOD="$WORK/module/vcachefs.ko"
 [[ -f "$MOD" ]] || { echo "no .ko built"; exit 1; }
 
 echo "== 2) build + encrypt a test lib, build a loader =="
@@ -75,7 +75,7 @@ insmod "$MOD" gate_enforce=1 gate_require_sig=1 \
 	authz_path="$AUTHZ" authz_sig_path="$SIG" || { echo "insmod failed"; dmesg|tail -5; exit 1; }
 dmesg | tail -3 | grep -qi 'authz vendor key loaded' && ok "module loaded the embedded vendor key" \
 	|| skip "no 'vendor key loaded' log (check CONFIG_PKCS7_MESSAGE_PARSER)"
-mount -t antirevfs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg|tail -5; exit 1; }
+mount -t vcachefs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg|tail -5; exit 1; }
 
 echo "== 1. signed list + authorized program decrypts =="
 OUT="$("$WORK/loader" "$MP/libtest.so" 2>&1)"; RC=$?
@@ -101,12 +101,12 @@ OUT="$("$WORK/loader" "$MP/libtest.so" 2>&1)"; RC=$?
 mv "$SIG.bak" "$SIG"
 
 echo "== 5. control: gate_require_sig=0 honors the plaintext (edited) list =="
-echo 0 > /sys/module/antirevfs/parameters/gate_require_sig
+echo 0 > /sys/module/vcachefs/parameters/gate_require_sig
 printf '# plaintext\n%s\n' "$WORK/loader" > "$AUTHZ"   # unsigned, but require_sig off
 OUT="$("$WORK/loader" "$MP/libtest.so" 2>&1)"; RC=$?
 [[ $RC -eq 0 ]] && ok "require_sig=0 -> plaintext list honored (proves the sig gate is the enforcer)" \
 	|| bad "require_sig=0 still denied (rc=$RC)"
-echo 1 > /sys/module/antirevfs/parameters/gate_require_sig
+echo 1 > /sys/module/vcachefs/parameters/gate_require_sig
 
 echo
 echo "== RESULT: $PASS passed, $FAIL failed =="
