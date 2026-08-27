@@ -17,6 +17,15 @@ vcachefs-objs := super.o inode.o file.o crypto.o gate.o
 # makes this a no-op on gcc 4.8, which predates both the flag and the warning).
 ccflags-y += $(call cc-option,-Wno-missing-attributes)
 
+# Development build:  make AREV_DEV_MODE=1
+# Compiles IN the runtime `gate_enforce` toggle + the /etc/authorized_apps.txt
+# allow-list (plaintext + signed) for bring-up.  The PRODUCTION build (default,
+# no flag) compiles these OUT: a shipped .ko gates unconditionally and has no
+# allow-list door — authorization is ONLY per-exe signature + the compiled
+# whitelist (gate_whitelist.h).  A dev .ko warns at load and reports
+# `build: dev` in modinfo, so it is never mistaken for a shipped module.
+ccflags-y += $(if $(AREV_DEV_MODE),-DAREV_DEV_MODE)
+
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
 
