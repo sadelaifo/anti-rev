@@ -40,5 +40,9 @@ core.*
 # CMake tooling
 compile_commands.json
 
-# local qemu working tree (integration captured in kmod2/qemu-gate/)
-qemu-11-memleak-fix/
+# qemu: exclude system-emulation firmware/blobs (linux-user build doesn't need them)
+qemu-11-memleak-fix/qemu-11-memleak-fix/roms/
+# qemu: test SSH private keys blocked by GitHub push protection (not build inputs)
+qemu-11-memleak-fix/qemu-11-memleak-fix/tests/keys/id_rsa
+qemu-11-memleak-fix/qemu-11-memleak-fix/tests/keys/vagrant
+qemu-11-memleak-fix/qemu-11-memleak-fix/tests/lcitool/libvirt-ci/tests/data/utils/ssh_keypair/in/id_ed25519
