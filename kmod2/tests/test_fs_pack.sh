@@ -62,7 +62,7 @@ python3 "$PACK" "$WORK/config.yaml" || { echo "packer failed"; exit 1; }
 
 echo "== 1. ELFs encrypted into mirror with ANTREV01 magic =="
 for f in lib/libtest.so.1.0 bin/app; do
-	if [[ -f "$ENC/$f" ]] && head -c8 "$ENC/$f" | grep -q "ANTREV01"; then
+	if [[ -f "$ENC/$f" ]] && [ "$(head -c8 "$ENC/$f" | xxd -p)" = "a74c2e91d63b085f" ]; then
 		ok "encrypted: $f"
 	else
 		bad "missing/!magic: $f"
@@ -81,7 +81,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 enc, plain, keyf = sys.argv[1:4]
 key = bytes.fromhex(open(keyf).read().strip())
 blob = open(enc, "rb").read()
-assert blob[:8] == b"ANTREV01" and blob[-8:] == b"ANTREV01", "missing header/trailer magic"
+assert blob[:8] == bytes.fromhex("a74c2e91d63b085f") and blob[-8:] == bytes.fromhex("a74c2e91d63b085f"), "missing header/trailer magic"
 assert blob[-40:-8] == key, "embedded trailer key != packer key"
 iv, tag, ct = blob[8:20], blob[20:36], blob[36:-40]
 dec = AESGCM(key).decrypt(iv, ct + tag, None)
@@ -92,7 +92,7 @@ PY
 echo "== 3. non-ELF data files mirrored VERBATIM (plaintext, in tree) =="
 for f in lib/data.json bin/run.py lib/notes.txt; do
 	if [[ -f "$ENC/$f" ]] && cmp -s "$ENC/$f" "$PROJ/$f" \
-		&& ! head -c8 "$ENC/$f" | grep -q "ANTREV01"; then
+		&& [ "$(head -c8 "$ENC/$f" | xxd -p)" != "a74c2e91d63b085f" ]; then
 		ok "mirrored plaintext (no magic): $f"
 	else
 		bad "not mirrored byte-identically / has magic: $f"
@@ -102,7 +102,7 @@ done
 
 echo "== 4. blacklisted ELF mirrored plaintext (in tree, no ANTREV01) =="
 if [[ -f "$ENC/lib/libthird.so" ]] && cmp -s "$ENC/lib/libthird.so" "$PROJ/lib/libthird.so" \
-	&& ! head -c8 "$ENC/lib/libthird.so" | grep -q "ANTREV01"; then
+	&& [ "$(head -c8 "$ENC/lib/libthird.so" | xxd -p)" != "a74c2e91d63b085f" ]; then
 	ok "libthird.so (blacklisted) mirrored plaintext"
 else
 	bad "blacklisted lib not mirrored plaintext / has magic"
@@ -151,9 +151,9 @@ fi
 echo
 echo "== 8. encrypt_ext: non-ELF .a/.pyc/.elf encrypted (ANTREV01), not signed =="
 for f in lib/libstatic.a lib/mod.pyc bin/weird.elf; do
-	if [[ -f "$ENC/$f" ]] && head -c8 "$ENC/$f" | grep -q "ANTREV01"; then
+	if [[ -f "$ENC/$f" ]] && [ "$(head -c8 "$ENC/$f" | xxd -p)" = "a74c2e91d63b085f" ]; then
 		# must NOT carry a per-exe signature footer (they're not exec-loaded)
-		if [[ "$(tail -c8 "$ENC/$f")" == "ANTRSIG1" ]]; then
+		if [[ "$(tail -c8 "$ENC/$f" | xxd -p)" == "3d6af0128c55b427" ]]; then
 			bad "encrypt_ext file wrongly signed: $f"
 		else
 			ok "encrypt_ext encrypted (unsigned): $f"

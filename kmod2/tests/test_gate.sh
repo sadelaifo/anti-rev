@@ -28,10 +28,10 @@ fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
-MOD="$KMOD/module/antirevfs.ko"
+MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
 KEYCTL="$KMOD/tools/antirev-keyctl"
-PARAM=/sys/module/antirevfs/parameters/gate_enforce
+PARAM=/sys/module/vcachefs/parameters/gate_enforce
 
 PASS=0; FAIL=0
 ok()  { echo "  [PASS] $*"; PASS=$((PASS+1)); }
@@ -46,7 +46,7 @@ mkdir -p "$ENC" "$MP"
 
 cleanup() {
 	mountpoint -q "$MP" && umount "$MP"
-	rmmod antirevfs 2>/dev/null
+	rmmod vcachefs 2>/dev/null
 	"$KEYCTL" clear >/dev/null 2>&1
 	rm -rf "$WORK"
 }
@@ -103,8 +103,9 @@ EOF
 chmod 0644 "$AUTHZ"
 
 echo "== load module (gate_enforce=1) + key + mount =="
+# NOTE: requires a dev-mode build (make AREV_DEV_MODE=1)
 insmod "$MOD" gate_enforce=1 authz_path="$AUTHZ" || { echo "insmod failed"; exit 1; }
-mount -t antirevfs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
+mount -t vcachefs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
 mount | grep -q "$MP" && ok "mounted antirevfs (gating enforced)" || bad "mount missing"
 
 echo "== 1. authorized program may read decrypted content =="

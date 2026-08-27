@@ -37,7 +37,7 @@ fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
-MOD="$KMOD/module/antirevfs.ko"
+MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
 KEYCTL="$KMOD/tools/antirev-keyctl"
 
@@ -55,7 +55,7 @@ mkdir -p "$ENC" "$MP" "$MP2"
 cleanup() {
 	mountpoint -q "$MP2" && umount "$MP2"
 	mountpoint -q "$MP" && umount "$MP"
-	rmmod antirevfs 2>/dev/null
+	rmmod vcachefs 2>/dev/null
 	"$KEYCTL" clear >/dev/null 2>&1
 	rm -rf "$WORK"
 }
@@ -88,7 +88,7 @@ ln -s nonexistent  "$ENC/broken_link"     # genuinely dangling target
 
 echo "== load module + key + mount =="
 insmod "$MOD" || { echo "insmod failed"; exit 1; }
-mount -t antirevfs -o "ro,passthrough=json" "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
+mount -t vcachefs -o "ro,passthrough=json" "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
 mount | grep -q "$MP" && ok "mounted antirevfs at $MP" || bad "mount missing"
 
 echo "== 1. decrypt correctness =="
@@ -187,7 +187,7 @@ echo "== 7. passdata mode (complete mixed-content read-only tree) =="
 # libs still decrypt.  This is the mixed bin/lib case from antirev-fs-pack.py
 # with mirror_plaintext.  Strict mode rejected thirdparty.so / run.sh above;
 # passdata serves them.
-if mount -t antirevfs -o "ro,passdata" "$ENC" "$MP2" 2>/dev/null; then
+if mount -t vcachefs -o "ro,passdata" "$ENC" "$MP2" 2>/dev/null; then
 	ok "mounted antirevfs with passdata"
 	# encrypted lib still decrypts
 	cmp -s "$MP2/libtest.so" "$WORK/libtest.plain.so" \

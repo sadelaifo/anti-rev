@@ -40,7 +40,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
-MOD="$KMOD/module/antirevfs.ko"
+MOD="$KMOD/module/vcachefs.ko"
 PACK="$KMOD/tools/antirev-fs-pack.py"
 MOUNTRW="$KMOD/tools/antirev-mount-rw"
 PROTECT="$ROOT/encryptor/protect.py"
@@ -62,7 +62,7 @@ SBIN="$WORK/state-bin"; SLIB="$WORK/state-lib"
 cleanup() {
 	"$MOUNTRW" --down --state "$SBIN" "$PROJ/bin" >/dev/null 2>&1
 	"$MOUNTRW" --down --state "$SLIB" "$PROJ/lib" >/dev/null 2>&1
-	rmmod antirevfs 2>/dev/null
+	rmmod vcachefs 2>/dev/null
 	rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -188,13 +188,14 @@ assert need_pln<=pln, f"missing plaintext: {need_pln-pln}"
 PY
 [[ $man_ok -eq 1 ]] && ok "1a. manifest: business ELFs encrypted, preload+3rd plaintext" \
                      || bad "1a. manifest classification wrong"
-hdr(){ head -c8 "$1" | grep -q ANTREV01; }
+hdr(){ [ "$(head -c8 "$1" | xxd -p)" = "a74c2e91d63b085f" ]; }
 hdr "$ENCROOT/lib/link/module_x/libxxx.so" && ! hdr "$ENCROOT/lib/link/sw/libPreload.so" \
 	&& ! hdr "$ENCROOT/lib/link/3rd/libFoo.so" \
 	&& ok "1b. on-disk: libxxx.so ANTREV01; libPreload.so + libFoo.so plaintext" \
 	|| bad "1b. on-disk magic classification wrong"
 
 echo "== load module (gate_enforce=1, passthrough-cipher=1) + mount rw views =="
+# NOTE: requires a dev-mode build (make AREV_DEV_MODE=1)
 insmod "$MOD" gate_enforce=1 gate_passthrough_cipher=1 authz_path="$AUTHZ" \
 	|| { echo "insmod failed"; exit 1; }
 "$MOUNTRW" --passdata --state "$SLIB" "$ENCROOT/lib" "$PROJ/lib" >/dev/null \
@@ -259,8 +260,8 @@ ENCSZ=$(stat -c%s "$ENCROOT/lib/link/module_x/libxxx.so")
 LEAKSZ=$(stat -c%s "$LEAK" 2>/dev/null || echo -1)
 if cmp -s "$LEAK" "$WORK/libxxx.plain.so"; then
 	bad "6. cp exfiltrated PLAINTEXT through the mount"
-elif head -c8 "$LEAK" 2>/dev/null | grep -q ANTREV01 && [[ "$LEAKSZ" -eq $((ENCSZ-40)) ]]; then
-	ok "6. cp got a trailer-stripped keyless ANTREV01 container ($LEAKSZ == enc-40); no plaintext, no key"
+elif [ "$(head -c8 "$LEAK" 2>/dev/null | xxd -p)" = "a74c2e91d63b085f" ] && [[ "$LEAKSZ" -eq $((ENCSZ-40)) ]]; then
+	ok "6. cp got a trailer-stripped keyless container ($LEAKSZ == enc-40); no plaintext, no key"
 else
 	bad "6. unexpected cp result (size=$LEAKSZ enc=$ENCSZ)"
 fi

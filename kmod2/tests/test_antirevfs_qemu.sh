@@ -43,10 +43,10 @@ fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
-MOD="$KMOD/module/antirevfs.ko"
+MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
 KEYCTL="$KMOD/tools/antirev-keyctl"
-ENF_PARAM=/sys/module/antirevfs/parameters/gate_enforce
+ENF_PARAM=/sys/module/vcachefs/parameters/gate_enforce
 
 ACC=aarch64-linux-gnu-gcc
 QEMU="$(command -v qemu-aarch64-static || true)"
@@ -80,7 +80,7 @@ mkdir -p "$ENC" "$MP"
 
 cleanup() {
 	mountpoint -q "$MP" && umount "$MP"
-	rmmod antirevfs 2>/dev/null
+	rmmod vcachefs 2>/dev/null
 	"$KEYCTL" clear >/dev/null 2>&1
 	rm -rf "$WORK"
 }
@@ -131,8 +131,9 @@ QBASE="$(basename "$QEMU")"   # qemu-aarch64-static
 echo "    emulator basename to whitelist: $QBASE"
 
 echo "== load module + key + mount (gate off first: validate pure emulation) =="
+# NOTE: requires a dev-mode build (make AREV_DEV_MODE=1)
 insmod "$MOD" gate_enforce=0 authz_path="$AUTHZ" || { echo "insmod failed"; exit 1; }
-mount -t antirevfs -o ro,passdata "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
+mount -t vcachefs -o ro,passdata "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
 mount | grep -q "$MP" && ok "mounted antirevfs (passdata)" || bad "mount missing"
 
 echo "== 1. arch-agnostic decrypt: ARM64 .so decrypts through the x86 module =="
@@ -143,8 +144,8 @@ cmp -s "$MP/libtest_arm.so" "$WORK/libtest_arm.plain.so" \
 MACH="$(od -An -tx2 -j18 -N2 "$MP/libtest_arm.so" | tr -d ' ')"
 [[ "$MACH" == "00b7" ]] && ok "decrypted view reports e_machine=AARCH64 (0xb7)" \
 	|| bad "decrypted view e_machine=$MACH (expected 00b7)"
-head -c 8 "$ENC/libtest_arm.so" | grep -q ANTREV01 \
-	&& ok "lower .enc file is ANTREV01 ciphertext" || bad "lower not ciphertext"
+[ "$(head -c8 "$ENC/libtest_arm.so" | xxd -p)" = "a74c2e91d63b085f" ] \
+	&& ok "lower .enc file is container-magic ciphertext" || bad "lower not ciphertext"
 
 echo "== 2. qemu-user runs ARM64 code that dlopens the ENCRYPTED ARM64 .so =="
 OUT="$("$QEMU" "$WORK/loader_arm" "$MP/libtest_arm.so" 2>&1)"; RC=$?

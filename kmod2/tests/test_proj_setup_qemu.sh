@@ -37,10 +37,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
-MOD="$KMOD/module/antirevfs.ko"
+MOD="$KMOD/module/vcachefs.ko"
 PACK="$KMOD/tools/antirev-fs-pack.py"
 MOUNTRW="$KMOD/tools/antirev-mount-rw"
-ENF=/sys/module/antirevfs/parameters/gate_enforce
+ENF=/sys/module/vcachefs/parameters/gate_enforce
 
 ACC=aarch64-linux-gnu-gcc
 QEMU="$(command -v qemu-aarch64-static || true)"
@@ -74,7 +74,7 @@ AUTHZ="$WORK/authorized_apps.txt"; SBIN="$WORK/state-bin"; SLIB="$WORK/state-lib
 cleanup() {
 	"$MOUNTRW" --down --state "$SBIN" "$PROJ/bin" >/dev/null 2>&1
 	"$MOUNTRW" --down --state "$SLIB" "$PROJ/lib" >/dev/null 2>&1
-	rmmod antirevfs 2>/dev/null
+	rmmod vcachefs 2>/dev/null
 	rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -145,6 +145,7 @@ blacklist:
 EOF
 python3 "$PACK" "$WORK/proj-pack.yaml" >/dev/null || { echo "pack failed"; exit 1; }
 
+# NOTE: requires a dev-mode build (make AREV_DEV_MODE=1)
 insmod "$MOD" gate_enforce=0 gate_passthrough_cipher=1 authz_path="$AUTHZ" \
 	|| { echo "insmod failed"; exit 1; }
 "$MOUNTRW" --passdata --state "$SLIB" "$ENCROOT/lib" "$PROJ/lib" >/dev/null \
@@ -164,8 +165,8 @@ cmp -s "$PROJ/lib/link/module_x/libxxx.so" "$WORK/libxxx.plain.so" \
 MACH="$(od -An -tx2 -j18 -N2 "$PROJ/lib/link/module_x/libxxx.so" | tr -d ' ')"
 [[ "$MACH" == "00b7" ]] && ok "1b. decrypted view is AARCH64 (e_machine 0xb7)" \
 	|| bad "1b. e_machine=$MACH (expected 00b7)"
-head -c8 "$ENCROOT/lib/link/module_x/libxxx.so" | grep -q ANTREV01 \
-	&& ok "1c. lower .enc lib is ANTREV01 ciphertext" || bad "1c. lower not ciphertext"
+[ "$(head -c8 "$ENCROOT/lib/link/module_x/libxxx.so" | xxd -p)" = "a74c2e91d63b085f" ] \
+	&& ok "1c. lower .enc lib is container-magic ciphertext" || bad "1c. lower not ciphertext"
 
 echo "== 2. gate OFF: transparent fork/exec chain runs under qemu =="
 OUT="$(run_pm)"; RC=$?
@@ -217,7 +218,7 @@ LEAK="$WORK/leak.so"; cp "$PROJ/lib/link/module_x/libxxx.so" "$LEAK" 2>/dev/null
 ENCSZ=$(stat -c%s "$ENCROOT/lib/link/module_x/libxxx.so"); LEAKSZ=$(stat -c%s "$LEAK" 2>/dev/null || echo -1)
 if cmp -s "$LEAK" "$WORK/libxxx.plain.so"; then
 	bad "6. host cp exfiltrated the plaintext ARM64 lib"
-elif head -c8 "$LEAK" 2>/dev/null | grep -q ANTREV01 && [[ "$LEAKSZ" -eq $((ENCSZ-40)) ]]; then
+elif [ "$(head -c8 "$LEAK" 2>/dev/null | xxd -p)" = "a74c2e91d63b085f" ] && [[ "$LEAKSZ" -eq $((ENCSZ-40)) ]]; then
 	ok "6. host cp got a trailer-stripped keyless container ($LEAKSZ == enc-40); no plaintext escapes"
 else
 	bad "6. unexpected cp result (size=$LEAKSZ enc=$ENCSZ)"

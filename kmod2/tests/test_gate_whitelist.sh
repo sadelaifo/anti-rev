@@ -31,10 +31,10 @@ fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
-MOD="$KMOD/module/antirevfs.ko"
+MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
 KEYCTL="$KMOD/tools/antirev-keyctl"
-PARAM=/sys/module/antirevfs/parameters/gate_enforce
+PARAM=/sys/module/vcachefs/parameters/gate_enforce
 AUTHZ=/etc/authorized_apps.txt          # the documented default path
 
 PASS=0; FAIL=0
@@ -54,7 +54,7 @@ if [[ -e "$AUTHZ" ]]; then AUTHZ_BAK="$(mktemp)"; cp -a "$AUTHZ" "$AUTHZ_BAK"; f
 
 cleanup() {
 	mountpoint -q "$MP" && umount "$MP"
-	rmmod antirevfs 2>/dev/null
+	rmmod vcachefs 2>/dev/null
 	"$KEYCTL" clear >/dev/null 2>&1
 	if [[ -n "$AUTHZ_BAK" ]]; then cp -a "$AUTHZ_BAK" "$AUTHZ"; rm -f "$AUTHZ_BAK";
 	else rm -f "$AUTHZ"; fi
@@ -88,8 +88,9 @@ chmod 0644 "$AUTHZ"
 cat "$AUTHZ" | sed 's/^/    /'
 
 echo "== load module (gate_enforce=1, default authz_path) + key + mount =="
+# NOTE: requires a dev-mode build (make AREV_DEV_MODE=1)
 insmod "$MOD" gate_enforce=1 || { echo "insmod failed"; exit 1; }
-mount -t antirevfs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
+mount -t vcachefs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
 mount | grep -q "$MP" && ok "mounted antirevfs (gating enforced)" || bad "mount missing"
 
 echo "== 1. every whitelisted program runs =="
