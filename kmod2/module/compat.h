@@ -56,21 +56,28 @@ static inline ssize_t arev_kernel_read(struct file *f, void *buf, size_t count,
 }
 
 /*
- * kernel_write() picked up the modern (file, buf, count, *pos) prototype in the
- * same 4.14 window as kernel_read (older: kernel_write(file, buf, count, pos)
- * taking the offset by value).  Same AREV_NEW_KERNEL_READ override applies.
+ * kernel_write() got the modern (file, buf, count, *pos) prototype in 4.14
+ * (older: kernel_write(file, buf, count, pos) with the offset BY VALUE).
+ *
+ * IMPORTANT: kernel_read and kernel_write did NOT necessarily change together on
+ * enterprise kernels.  FIELD FACT: SLES 12 SP5 (4.12.14-120) ships the OLD
+ * kernel_read but the NEW kernel_write — so this must NOT reuse the
+ * AREV_NEW_KERNEL_READ guard.  Default to the modern prototype (correct for
+ * mainline 4.14+, Ubuntu 6.8, AND SLES 12 SP5); define AREV_OLD_KERNEL_WRITE
+ * only for a genuinely pre-4.14 kernel that did NOT backport it (symptom without
+ * the flag there: "makes integer from pointer without a cast" on arg 4).
  */
 static inline ssize_t arev_kernel_write(struct file *f, const void *buf,
 					size_t count, loff_t *pos)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0) || defined(AREV_NEW_KERNEL_READ)
-	return kernel_write(f, buf, count, pos);
-#else
+#if defined(AREV_OLD_KERNEL_WRITE)
 	ssize_t n = kernel_write(f, (const char *)buf, count, *pos);
 
 	if (n > 0)
 		*pos += n;
 	return n;
+#else
+	return kernel_write(f, buf, count, pos);
 #endif
 }
 
