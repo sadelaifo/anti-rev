@@ -51,4 +51,4 @@ qemu-11-memleak-fix/qemu-11-memleak-fix/tests/lcitool/libvirt-ci/tests/data/util
 .wsl_build.sh
 .wsl_build.log
 glib-*.tar.xz
-qemu-aarch64-static
+/qemu-aarch64-static
