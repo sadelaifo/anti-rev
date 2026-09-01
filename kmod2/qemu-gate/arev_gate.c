@@ -34,7 +34,8 @@ static char **g_roots;          /* protected absolute path prefixes */
 static int   g_nroots;
 static FILE *arev_log_fp;
 
-static void arev_logf(const char *fmt, ...)
+static void __attribute__((format(printf, 1, 2)))
+arev_logf(const char *fmt, ...)
 {
     va_list ap;
     if (!arev_log_fp) {

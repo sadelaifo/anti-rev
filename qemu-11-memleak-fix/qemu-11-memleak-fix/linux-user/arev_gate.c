@@ -32,19 +32,20 @@ static bool  g_inited;          /* arev_gate_init() ran */
 static bool  g_authorized;      /* current guest authorized? */
 static char **g_roots;          /* protected absolute path prefixes */
 static int   g_nroots;
-static FILE *g_log;
+static FILE *arev_logfile;
 
-static void arev_logf(const char *fmt, ...)
+static void __attribute__((format(printf, 1, 2)))
+arev_logf(const char *fmt, ...)
 {
     va_list ap;
-    if (!g_log) {
+    if (!arev_logfile) {
         return;
     }
     va_start(ap, fmt);
-    vfprintf(g_log, fmt, ap);
+    vfprintf(arev_logfile, fmt, ap);
     va_end(ap);
-    fputc('\n', g_log);
-    fflush(g_log);
+    fputc('\n', arev_logfile);
+    fflush(arev_logfile);
 }
 
 void arev_gate_init(void)
@@ -58,7 +59,7 @@ void arev_gate_init(void)
 
     env = getenv("AREV_GATE_LOG");
     if (env && *env) {
-        g_log = fopen(env, "ae");
+        arev_logfile = fopen(env, "ae");
     }
 
     env = getenv("AREV_GATE");

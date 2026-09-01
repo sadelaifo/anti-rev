@@ -46,3 +46,9 @@ qemu-11-memleak-fix/qemu-11-memleak-fix/roms/
 qemu-11-memleak-fix/qemu-11-memleak-fix/tests/keys/id_rsa
 qemu-11-memleak-fix/qemu-11-memleak-fix/tests/keys/vagrant
 qemu-11-memleak-fix/qemu-11-memleak-fix/tests/lcitool/libvirt-ci/tests/data/utils/ssh_keypair/in/id_ed25519
+
+# WSL build scratch + artifacts (rebuildable; do not commit)
+.wsl_build.sh
+.wsl_build.log
+glib-*.tar.xz
+qemu-aarch64-static
