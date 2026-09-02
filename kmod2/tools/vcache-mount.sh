@@ -556,6 +556,24 @@ done
 TARGET_STATUS
 }
 
+# /dev/vcachefs is a host-global misc device the module (ctldev.c) creates for
+# the qemu-user gate.  A container has its OWN /dev, so the node won't appear
+# there automatically — create it inside the target with the host's major:minor.
+# Idempotent: the host already has the node, so this is a no-op for the host.
+ensure_ctldev() {
+    local mm
+    mm="$(cat /sys/class/misc/vcachefs/dev 2>/dev/null)" || {
+        log "[$TARGET] /sys/class/misc/vcachefs/dev absent (module built without ctldev?); qemu gate unavailable"
+        return 0
+    }
+    if run_in_target sh -c '[ -e /dev/vcachefs ]'; then
+        return 0
+    fi
+    log "[$TARGET] creating /dev/vcachefs (c ${mm%:*} ${mm#*:}) for the qemu gate"
+    run_in_target sh -c "mknod /dev/vcachefs c ${mm%:*} ${mm#*:} && chmod 0666 /dev/vcachefs" \
+        || log "[$TARGET] WARNING: mknod /dev/vcachefs failed; qemu gate will be inactive"
+}
+
 # ---- the full up sequence (shared by 'up' and 'watch') -----------------------
 # Bring up every target for this mode.  Host is always mounted; the container is
 # mounted too under --mode sim (skipped with a note if it isn't running).
@@ -581,6 +599,7 @@ run_up_sequence() {
         log "[$TARGET] mounting"
         write_allowlist
         do_up
+        ensure_ctldev
         do_status
     done
     log "up complete."
@@ -603,7 +622,7 @@ do_watch() {
     # host first: mount it immediately and load the module.
     TARGET=host
     log "[host] mounting"
-    do_down; ensure_module; write_allowlist; do_up; do_status
+    do_down; ensure_module; write_allowlist; do_up; ensure_ctldev; do_status
 
     if [ "$MODE" = real ]; then
         log "real mode: no container to watch; done"
@@ -623,7 +642,7 @@ do_watch() {
             if target_ready; then
                 if [ "$prev" != up ]; then
                     log "container '$CONTAINER' up + ciphertext ready -> mounting"
-                    if (do_down; write_allowlist; do_up; do_status); then prev=up
+                    if (do_down; write_allowlist; do_up; ensure_ctldev; do_status); then prev=up
                     else log "container mount failed; retrying next tick"; prev=waiting; fi
                 fi
             else
