@@ -183,11 +183,64 @@ static int arev_open_cipher(const char *path)
     return arg.out_fd;
 }
 
+/*
+ * Resolve `path` (possibly relative, possibly openat-relative to `dirfd`) to an
+ * absolute, canonical path in `out`, so relative paths / cwd tricks / .. /
+ * symlinks cannot bypass the protected-root check.  Returns true on success.
+ */
+static bool arev_resolve(int dirfd, const char *path, char *out, size_t outsz)
+{
+    char joined[PATH_MAX];
+
+    if (path[0] == '/') {
+        if (realpath(path, out)) {
+            return true;
+        }
+        /* file may not exist yet — keep the absolute path as-is */
+        if (strlen(path) >= outsz) {
+            return false;
+        }
+        strcpy(out, path);
+        return true;
+    }
+    /* relative: prepend cwd (AT_FDCWD) or the dirfd's directory */
+    if (dirfd == AT_FDCWD) {
+        char cwd[PATH_MAX];
+        if (!getcwd(cwd, sizeof(cwd))) {
+            return false;
+        }
+        if (snprintf(joined, sizeof(joined), "%s/%s", cwd, path) >= (int)sizeof(joined)) {
+            return false;
+        }
+    } else {
+        char link[64], base[PATH_MAX];
+        ssize_t n;
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", dirfd);
+        n = readlink(link, base, sizeof(base) - 1);
+        if (n < 0) {
+            return false;
+        }
+        base[n] = '\0';
+        if (snprintf(joined, sizeof(joined), "%s/%s", base, path) >= (int)sizeof(joined)) {
+            return false;
+        }
+    }
+    if (realpath(joined, out)) {
+        return true;
+    }
+    if (strlen(joined) >= outsz) {
+        return false;
+    }
+    strcpy(out, joined);
+    return true;
+}
+
 int arev_gate_open(int dirfd, const char *host_pathname, int flags)
 {
+    char resolved[PATH_MAX];
+    const char *p;
     int fd;
 
-    (void)dirfd;                /* only absolute paths are gated for now */
     if (!g_active) {
         return -2;              /* inactive: normal open */
     }
@@ -196,7 +249,17 @@ int arev_gate_open(int dirfd, const char *host_pathname, int flags)
     if ((flags & O_ACCMODE) != O_RDONLY) {
         return -2;
     }
-    if (!arev_is_protected(host_pathname)) {
+    /* Resolve to an absolute canonical path FIRST — a relative path (e.g.
+     * `objdump FOO` from inside the dir) or openat(dirfd,...) must not slip past
+     * the protected-root check.  If we cannot resolve it, be conservative: a
+     * path we can't classify is treated as unprotected only when the gate is
+     * off anyway; here we fall through to a normal open (resolution failure is
+     * effectively never for a real open the guest is about to do). */
+    if (!arev_resolve(dirfd, host_pathname, resolved, sizeof(resolved))) {
+        return -2;
+    }
+    p = resolved;
+    if (!arev_is_protected(p)) {
         return -2;              /* not a protected file */
     }
     if (g_authorized) {
@@ -207,10 +270,10 @@ int arev_gate_open(int dirfd, const char *host_pathname, int flags)
 
     /* Unauthorized guest reading a protected file: serve keyless ciphertext.
      * NEVER fall through to a normal open here (that would leak plaintext). */
-    fd = arev_open_cipher(host_pathname);
+    fd = arev_open_cipher(p);
     if (fd >= 0) {
         arev_logf("open '%s': unauthorized -> keyless ciphertext (fd %d)",
-                  host_pathname, fd);
+                  p, fd);
         return fd;
     }
     switch (errno) {
@@ -221,13 +284,13 @@ int arev_gate_open(int dirfd, const char *host_pathname, int flags)
         /* Not a gateable regular file (missing / directory / non-container):
          * dirs & metadata are not a plaintext-leak vector -> normal open. */
         arev_logf("open '%s': unauthorized, not a gateable file (%s) -> passthrough",
-                  host_pathname, strerror(errno));
+                  p, strerror(errno));
         return -2;
     default:
         /* Anything else (EACCES = we are not the signed qemu, EIO, ...) must
          * DENY rather than risk leaking plaintext. */
         arev_logf("open '%s': unauthorized, cipher fetch failed (%s) -> DENY",
-                  host_pathname, strerror(errno));
+                  p, strerror(errno));
         errno = EACCES;
         return -1;
     }
