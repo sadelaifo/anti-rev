@@ -132,6 +132,17 @@ static long do_open_cipher(unsigned long arg)
 		ret = PTR_ERR(out);
 		goto put_lf;
 	}
+	/*
+	 * shmem_file_setup() builds the file via alloc_file_pseudo(), which — unlike
+	 * a normal open() through do_dentry_open() — does NOT set FMODE_LSEEK.  With
+	 * that bit clear, vfs_llseek() returns -ESPIPE ("illegal seek"), so an
+	 * unauthorized reader (objdump/less/…) fails its very first seek instead of
+	 * cleanly reading the keyless container and reporting "file format not
+	 * recognized".  The shmem file IS seekable (shmem_file_operations.llseek),
+	 * so advertise it.  f_pos stays 0 — the ciphertext below is written with an
+	 * explicit loff_t (&wpos), never touching out->f_pos.
+	 */
+	out->f_mode |= FMODE_LSEEK;
 
 	buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!buf) {
