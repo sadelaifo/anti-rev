@@ -38,7 +38,12 @@
 
 /* AREV_IOC_AUTHORIZE_FD: verify the vendor signature of the file at `fd`.
  * fget/fput are used (not fdget/struct fd) — the struct fd layout changed in
- * recent kernels, whereas fget has been stable across the 4.12..6.8 range. */
+ * recent kernels, whereas fget has been stable across the 4.12..6.8 range.
+ *
+ * arev_verify_authorize_fd() (not arev_verify_file_sig) covers the common case
+ * where the guest binary is ENCRYPTED on the vcachefs mount: the fd qemu opened
+ * is the mount's decrypted view (signature footer stripped), so the signature
+ * must be read from the LOWER container, not the fd bytes. */
 static long do_authorize_fd(unsigned long arg)
 {
 	struct file *f = fget((int)arg);
@@ -46,7 +51,7 @@ static long do_authorize_fd(unsigned long arg)
 
 	if (!f)
 		return -EBADF;
-	ok = arev_verify_file_sig(f);
+	ok = arev_verify_authorize_fd(f);
 	fput(f);
 	return ok ? 0 : -EACCES;
 }

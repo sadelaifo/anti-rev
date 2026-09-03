@@ -17,7 +17,12 @@
 #define ANTIREVFS_GATE_WHITELIST_H
 
 static const char *const antirev_whitelist[] = {
-	"qemu-aarch64-static",
+	/*
+	 * NOTE: qemu-aarch64-static is intentionally NOT here — it is pinned by
+	 * name+SHA-256 in gate_trusted_hashes.h so only a specific qemu build is
+	 * trusted (a plain basename match would trust any file so named).  List
+	 * here only interpreters/launchers you accept by basename alone.
+	 */
 	/* "python3", */
 	/* "your-launcher", */
 	NULL

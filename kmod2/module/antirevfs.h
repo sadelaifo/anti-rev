@@ -123,6 +123,7 @@ bool antirevfs_gate_passthrough_cipher(void);	/* deny-mode: serve ciphertext vs 
 int  antirevfs_authz_init(void);		/* build signed-authz keyring (module init) */
 void antirevfs_authz_exit(void);		/* release it (module exit) */
 bool arev_verify_file_sig(struct file *f);	/* vendor-sig check on any file */
+bool arev_verify_authorize_fd(struct file *f);	/* AUTHORIZE_FD: lower-container sig for vcachefs fds */
 bool arev_ctl_caller_ok(void);			/* caller may drive /dev/vcachefs? */
 
 /* ctldev.c — /dev/vcachefs control device for the qemu-user gate */

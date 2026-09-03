@@ -39,6 +39,8 @@
 #include <linux/ratelimit.h>	/* pr_warn_ratelimited (DEFINE_RATELIMIT_STATE) */
 #include <linux/key.h>
 #include <linux/verification.h>
+#include <linux/spinlock.h>
+#include <crypto/hash.h>
 
 #include "compat.h"
 #include "antirevfs.h"
@@ -49,6 +51,8 @@
 #include "gate_authz_pubkey.h"
 /* Hard-coded basename whitelist (the second pass-type; edit + rebuild). */
 #include "gate_whitelist.h"
+/* Name + exact-SHA-256 pinned callers (e.g. the trusted qemu build). */
+#include "gate_trusted_hashes.h"
 
 #define AUTHZ_MAX_BYTES		(64 * 1024)	/* sanity cap on the allow-list file */
 
@@ -325,6 +329,168 @@ static bool authz_path_listed(const char *path)
 }
 #endif	/* AREV_DEV_MODE */
 
+/* ---- pinned-build check: basename + exact SHA-256 (gate_trusted_hashes.h) --- */
+/*
+ * Verdicts.  NOMATCH means the basename is not pinned at all (fall through to the
+ * whitelist / signature checks); OK / BADHASH are terminal for a pinned name.
+ */
+enum { AREV_HASH_NOMATCH = 0, AREV_HASH_OK = 1, AREV_HASH_BADHASH = 2 };
+
+/*
+ * Tiny verdict cache so the hot path (qemu opening many libs, each re-checking
+ * its own exe) hashes the ~tens-of-MB emulator ONCE per boot, not per open.
+ * Keyed on (s_dev, i_ino, size); a replaced binary almost always changes at
+ * least the inode or size.  Only pinned-name verdicts (OK/BADHASH) are cached —
+ * a non-pinned basename never reaches here (see the name pre-filter below).
+ */
+struct arev_hash_cache_ent {
+	dev_t		dev;
+	unsigned long	ino;
+	loff_t		size;
+	int		verdict;	/* 0 = empty slot */
+};
+#define AREV_HCACHE_N 8
+static struct arev_hash_cache_ent arev_hcache[AREV_HCACHE_N];
+static DEFINE_SPINLOCK(arev_hcache_lock);
+
+static int hcache_lookup(struct inode *in, loff_t sz)
+{
+	int i, v = 0;
+
+	spin_lock(&arev_hcache_lock);
+	for (i = 0; i < AREV_HCACHE_N; i++) {
+		if (arev_hcache[i].verdict &&
+		    arev_hcache[i].dev == in->i_sb->s_dev &&
+		    arev_hcache[i].ino == in->i_ino &&
+		    arev_hcache[i].size == sz) {
+			v = arev_hcache[i].verdict;
+			break;
+		}
+	}
+	spin_unlock(&arev_hcache_lock);
+	return v;
+}
+
+static void hcache_store(struct inode *in, loff_t sz, int verdict)
+{
+	static int rr;
+	int i, slot = -1;
+
+	spin_lock(&arev_hcache_lock);
+	for (i = 0; i < AREV_HCACHE_N; i++) {		/* refresh existing */
+		if (arev_hcache[i].verdict &&
+		    arev_hcache[i].dev == in->i_sb->s_dev &&
+		    arev_hcache[i].ino == in->i_ino &&
+		    arev_hcache[i].size == sz) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0)
+		for (i = 0; i < AREV_HCACHE_N; i++)	/* free slot */
+			if (!arev_hcache[i].verdict) { slot = i; break; }
+	if (slot < 0)
+		slot = rr++ % AREV_HCACHE_N;		/* round-robin evict */
+	arev_hcache[slot].dev = in->i_sb->s_dev;
+	arev_hcache[slot].ino = in->i_ino;
+	arev_hcache[slot].size = sz;
+	arev_hcache[slot].verdict = verdict;
+	spin_unlock(&arev_hcache_lock);
+}
+
+/* SHA-256 of the whole file into out[32].  Returns 0 on success, <0 on error. */
+static int arev_file_sha256(struct file *f, u8 out[32])
+{
+	struct crypto_shash *tfm;
+	struct shash_desc *desc;
+	void *buf;
+	loff_t pos = 0, size, rem;
+	int ret;
+
+	tfm = crypto_alloc_shash("sha256", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+	desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL);
+	if (!desc) {
+		crypto_free_shash(tfm);
+		return -ENOMEM;
+	}
+	desc->tfm = tfm;
+	buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!buf) {
+		ret = -ENOMEM;
+		goto free_desc;
+	}
+	ret = crypto_shash_init(desc);
+	if (ret)
+		goto free_buf;
+	size = i_size_read(file_inode(f));
+	rem = size;
+	while (rem > 0) {
+		size_t chunk = rem < PAGE_SIZE ? (size_t)rem : PAGE_SIZE;
+		ssize_t n = arev_kernel_read(f, buf, chunk, &pos);
+
+		if (n <= 0) {
+			ret = n < 0 ? (int)n : -EIO;
+			goto free_buf;
+		}
+		ret = crypto_shash_update(desc, buf, n);
+		if (ret)
+			goto free_buf;
+		rem -= n;
+	}
+	ret = crypto_shash_final(desc, out);
+free_buf:
+	kfree(buf);
+free_desc:
+	kfree(desc);
+	crypto_free_shash(tfm);
+	return ret;
+}
+
+/*
+ * Pinned-build gate for `exe`.  Fast pre-filter: if the basename is not pinned
+ * at all, return NOMATCH without hashing (so cp/python3/... pay nothing).  For a
+ * pinned name, require the exact SHA-256 of any same-named entry; else BADHASH.
+ */
+static int authz_hash_check(struct file *exe)
+{
+	const struct arev_trusted_hash *e;
+	const char *name;
+	struct inode *in;
+	loff_t size;
+	u8 digest[32];
+	int cached, name_pinned = 0;
+
+	if (!exe)
+		return AREV_HASH_NOMATCH;
+	name = exe->f_path.dentry->d_name.name;
+	for (e = arev_trusted_hashes; e->name; e++)
+		if (!strcmp(e->name, name)) { name_pinned = 1; break; }
+	if (!name_pinned)
+		return AREV_HASH_NOMATCH;
+
+	in = file_inode(exe);
+	size = i_size_read(in);
+	cached = hcache_lookup(in, size);
+	if (cached)
+		return cached;
+
+	if (arev_file_sha256(exe, digest) != 0)
+		return AREV_HASH_BADHASH;	/* can't hash -> fail (don't cache) */
+
+	for (e = arev_trusted_hashes; e->name; e++)
+		if (!strcmp(e->name, name) &&
+		    !memcmp(e->sha256, digest, sizeof(digest))) {
+			hcache_store(in, size, AREV_HASH_OK);
+			return AREV_HASH_OK;
+		}
+	pr_warn_ratelimited("vcachefs: pinned caller '%s' failed SHA-256 pin -> denied\n",
+			    name);
+	hcache_store(in, size, AREV_HASH_BADHASH);
+	return AREV_HASH_BADHASH;
+}
+
 /* ---- pass-type 1: hard-coded whitelist (gate_whitelist.h) ------------------ */
 static bool authz_whitelisted(const char *name)
 {
@@ -405,10 +571,20 @@ out:
 #endif
 }
 
-/* Combined predicate: an exe passes if its basename is whitelisted OR (it is an
- * antirevfs file and) it carries a valid per-exe signature. */
-static bool authz_ok(struct inode *inode, const char *name)
+/* Combined predicate: an exe passes if it matches a pinned name+SHA-256 build,
+ * OR its basename is whitelisted, OR (it is an antirevfs file and) it carries a
+ * valid per-exe signature.  A pinned name whose hash does NOT match is a hard
+ * deny — it never falls through to the weaker checks. */
+static bool authz_ok(struct file *exe)
 {
+	struct inode *inode = file_inode(exe);
+	const char *name = exe->f_path.dentry->d_name.name;
+	int h = authz_hash_check(exe);
+
+	if (h == AREV_HASH_OK)
+		return true;
+	if (h == AREV_HASH_BADHASH)
+		return false;		/* pinned name, wrong build -> deny */
 	if (authz_whitelisted(name))
 		return true;
 	if (inode && inode->i_op == &antirevfs_file_iops &&
@@ -477,6 +653,29 @@ out:
 }
 
 /*
+ * AUTHORIZE_FD helper for the /dev/vcachefs control device.  qemu passes the fd
+ * it opened for the guest binary; if that fd resolves to a vcachefs inode the
+ * mount has already served DECRYPTED plaintext with the appended signature
+ * footer STRIPPED, so verifying the fd's bytes directly (arev_verify_file_sig)
+ * would always find "no signature" and wrongly deny an encrypted+signed guest.
+ * The signature actually lives in the LOWER .enc container, so verify against
+ * that via authz_exe_signed_ok(inode) (which reads the lower file + footer and
+ * caches the verdict on the inode).  A plaintext on-disk signed exe (option-1
+ * guest, not a vcachefs file) still verifies the footer on the file itself.
+ */
+bool arev_verify_authorize_fd(struct file *f)
+{
+	struct inode *inode;
+
+	if (!f)
+		return false;
+	inode = file_inode(f);
+	if (inode && inode->i_op == &antirevfs_file_iops)
+		return authz_exe_signed_ok(inode);
+	return arev_verify_file_sig(f);
+}
+
+/*
  * True iff the CURRENT task's exe may drive the /dev/vcachefs control device —
  * i.e. it is the genuine emulator: its basename is compiled-whitelisted
  * (e.g. qemu-aarch64-static) OR its binary carries a valid vendor signature.
@@ -485,14 +684,25 @@ bool arev_ctl_caller_ok(void)
 {
 	struct file *exe;
 	bool ok;
+	int h;
 
 	if (!current->mm)
 		return false;
 	exe = arev_get_mm_exe_file(current->mm);
 	if (!exe)
 		return false;
-	ok = authz_whitelisted(exe->f_path.dentry->d_name.name) ||
-	     arev_verify_file_sig(exe);
+	/* A pinned name (e.g. qemu-aarch64-static) MUST match its SHA-256 build;
+	 * a same-named but wrong binary is denied outright.  A non-pinned caller
+	 * may still drive the device via the basename whitelist or a valid
+	 * vendor signature on its own file. */
+	h = authz_hash_check(exe);
+	if (h == AREV_HASH_OK)
+		ok = true;
+	else if (h == AREV_HASH_BADHASH)
+		ok = false;
+	else
+		ok = authz_whitelisted(exe->f_path.dentry->d_name.name) ||
+		     arev_verify_file_sig(exe);
 	fput(exe);
 	return ok;
 }
@@ -545,7 +755,7 @@ bool antirevfs_task_authorized(void)
 	if (!exe)
 		return false;
 
-	ok = authz_ok(file_inode(exe), exe->f_path.dentry->d_name.name);
+	ok = authz_ok(exe);
 	if (!ok)
 		ok = authz_list_fallback(exe);
 	fput(exe);
@@ -566,7 +776,7 @@ bool antirevfs_file_authorized(struct file *file)
 {
 	if (!gate_enforce)
 		return true;
-	if (authz_ok(file_inode(file), file->f_path.dentry->d_name.name))
+	if (authz_ok(file))
 		return true;
 	return authz_list_fallback(file);
 }
