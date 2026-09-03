@@ -25,6 +25,17 @@
 #include "arev_gate.h"
 #include "arev_uapi.h"
 
+/*
+ * Compile-time default protected roots (colon-separated absolute prefixes).
+ * The gate protects these even when AREV_PROTECT_ROOTS is unset, so the
+ * environment cannot be used to disable protection (fail-closed).  Edit for your
+ * deployment, or override at build time with
+ *   -DAREV_DEFAULT_PROTECT_ROOTS='"/root/SW:/opt/app"'
+ */
+#ifndef AREV_DEFAULT_PROTECT_ROOTS
+#define AREV_DEFAULT_PROTECT_ROOTS "/root/SW"
+#endif
+
 /* Per qemu process (linux-user forks/re-execs per guest, so this is per-guest). */
 static int   g_ctl = -1;        /* /dev/vcachefs fd, or -1 */
 static bool  g_active;          /* device opened */
@@ -48,6 +59,26 @@ arev_logf(const char *fmt, ...)
     fflush(arev_logfile);
 }
 
+/* Append the colon-separated absolute prefixes in `s` to the protected-root
+ * list.  NULL/empty is ignored; non-absolute entries are skipped. */
+static void arev_add_roots(const char *s)
+{
+    char *dup, *save = NULL, *tok;
+
+    if (!s || !*s) {
+        return;
+    }
+    dup = strdup(s);
+    for (tok = strtok_r(dup, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
+        if (tok[0] != '/') {
+            continue;           /* only absolute prefixes are meaningful */
+        }
+        g_roots = g_renew(char *, g_roots, g_nroots + 1);
+        g_roots[g_nroots++] = g_strdup(tok);
+    }
+    free(dup);
+}
+
 void arev_gate_init(void)
 {
     const char *env;
@@ -68,20 +99,11 @@ void arev_gate_init(void)
         return;                 /* stays inactive */
     }
 
-    /* Parse AREV_PROTECT_ROOTS (colon-separated absolute prefixes). */
-    env = getenv("AREV_PROTECT_ROOTS");
-    if (env && *env) {
-        char *dup = strdup(env);
-        char *save = NULL, *tok;
-        for (tok = strtok_r(dup, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
-            if (tok[0] != '/') {
-                continue;       /* only absolute prefixes are meaningful */
-            }
-            g_roots = g_renew(char *, g_roots, g_nroots + 1);
-            g_roots[g_nroots++] = g_strdup(tok);
-        }
-        free(dup);
-    }
+    /* Protected roots: a compile-time DEFAULT (fail-closed — the gate protects
+     * these even with no env set, so an SSH shell / cron / forgotten launch
+     * path cannot bypass it) PLUS whatever AREV_PROTECT_ROOTS adds. */
+    arev_add_roots(AREV_DEFAULT_PROTECT_ROOTS);
+    arev_add_roots(getenv("AREV_PROTECT_ROOTS"));
 
     g_ctl = open(AREV_DEV_PATH, O_RDWR | O_CLOEXEC);
     if (g_ctl < 0) {
