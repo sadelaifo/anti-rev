@@ -69,7 +69,10 @@ docker image inspect "$QEMU_BASE_IMAGE" >/dev/null 2>&1 || die "image '$QEMU_BAS
 say "checking gate qemu pin"
 GOT_SHA=$(sha256sum "$GATE_QEMU" | cut -d' ' -f1)
 echo "  sha256($GATE_QEMU) = $GOT_SHA"
-strings "$GATE_QEMU" | grep -q AREV_PROTECT_ROOTS \
+# grep the file DIRECTLY (-a = treat binary as text).  Do NOT pipe `strings | grep -q`:
+# under `set -o pipefail`, grep -q closes the pipe on first match, strings dies with
+# SIGPIPE (141), and pipefail reports the pipeline as failed even though it matched.
+grep -qa AREV_PROTECT_ROOTS "$GATE_QEMU" \
   || die "'$GATE_QEMU' has no gate compiled in (no AREV_PROTECT_ROOTS)"
 if [ "$GOT_SHA" != "$EXPECTED_SHA" ]; then
   echo "  WARNING: does NOT match the pinned digest ($EXPECTED_SHA)."
@@ -93,26 +96,35 @@ EOF
 }
 
 # verify_image <image> <expect_qemu:0|1>
+# NB: all grep checks read FILES, never `producer | grep -q` — that combination
+# trips `set -o pipefail` via SIGPIPE (see the gate-qemu pin check above).
 verify_image() {
-  local img="$1" want_qemu="$2" cid tmp qref rc=0
+  local img="$1" want_qemu="$2" cid tmp list qref qbin rc=0
   cid=$(docker create "$img" /x)          # /x = dummy cmd, never executed
-  tmp=$(mktemp)
+  tmp=$(mktemp); list=$(mktemp)
   docker export "$cid" > "$tmp"; docker rm "$cid" >/dev/null
-  if tar tf "$tmp" | grep -qE "$SW_PATHS_REGEX"; then
-    echo "  !! SW paths STILL present:"; tar tf "$tmp" | grep -E "$SW_PATHS_REGEX" | head; rc=1
+  tar tf "$tmp" > "$list"                  # member listing to a file (no pipe)
+  if grep -qE "$SW_PATHS_REGEX" "$list"; then
+    echo "  !! SW paths STILL present:"; grep -E "$SW_PATHS_REGEX" "$list" | head; rc=1
   else
     echo "  OK: no SW paths"
   fi
   if [ "$want_qemu" = 1 ]; then
     qref="${QEMU_DEST#/}"
-    if tar tf "$tmp" | grep -qx "$qref" && \
-       tar xO -f "$tmp" "$qref" | strings | grep -q AREV_PROTECT_ROOTS; then
-      echo "  OK: gate qemu present + compiled-in at $QEMU_DEST"
+    if grep -qx "$qref" "$list"; then
+      qbin=$(mktemp)
+      tar xO -f "$tmp" "$qref" > "$qbin" 2>/dev/null || true
+      if grep -qa AREV_PROTECT_ROOTS "$qbin"; then
+        echo "  OK: gate qemu present + compiled-in at $QEMU_DEST"
+      else
+        echo "  !! qemu at $QEMU_DEST has NO gate compiled in"; rc=1
+      fi
+      rm -f "$qbin"
     else
-      echo "  !! gate qemu missing/plain at $QEMU_DEST"; rc=1
+      echo "  !! qemu not found at $QEMU_DEST"; rc=1
     fi
   fi
-  rm -f "$tmp"; return $rc
+  rm -f "$tmp" "$list"; return $rc
 }
 
 # ---- collect metadata from the source container (import drops it otherwise) ----
