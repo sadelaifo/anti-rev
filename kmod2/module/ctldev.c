@@ -13,7 +13,7 @@
  *       (authorized guests just read the mount and share the decrypted cache).
  *
  * Both ioctls are gated on the caller being the genuine emulator
- * (arev_ctl_caller_ok(): whitelisted basename or a signed exe).  Opening the
+ * (vcf_ctl_caller_ok(): whitelisted basename or a signed exe).  Opening the
  * device is unrestricted (mode 0666); all enforcement is per-ioctl.
  *
  * NOTE: not yet built/tested on a real kernel.  The kernel-version-sensitive
@@ -33,14 +33,14 @@
 #include <linux/version.h>
 
 #include "compat.h"
-#include "antirevfs.h"
+#include "vcachefs.h"
 #include "arev_uapi.h"
 
 /* AREV_IOC_AUTHORIZE_FD: verify the vendor signature of the file at `fd`.
  * fget/fput are used (not fdget/struct fd) — the struct fd layout changed in
  * recent kernels, whereas fget has been stable across the 4.12..6.8 range.
  *
- * arev_verify_authorize_fd() (not arev_verify_file_sig) covers the common case
+ * vcf_verify_authorize_fd() (not vcf_verify_file_sig) covers the common case
  * where the guest binary is ENCRYPTED on the vcachefs mount: the fd qemu opened
  * is the mount's decrypted view (signature footer stripped), so the signature
  * must be read from the LOWER container, not the fd bytes. */
@@ -51,7 +51,7 @@ static long do_authorize_fd(unsigned long arg)
 
 	if (!f)
 		return -EBADF;
-	ok = arev_verify_authorize_fd(f);
+	ok = vcf_verify_authorize_fd(f);
 	fput(f);
 	return ok ? 0 : -EACCES;
 }
@@ -69,7 +69,7 @@ static long do_open_cipher(unsigned long arg)
 	char *pathbuf;
 	struct path p;
 	struct inode *inode;
-	struct antirevfs_inode_info *ii;
+	struct vcachefs_inode_info *ii;
 	struct file *lf, *out;
 	void *buf;
 	loff_t rpos = 0, wpos = 0, outlen, remaining;
@@ -97,7 +97,7 @@ static long do_open_cipher(unsigned long arg)
 		return ret;
 
 	inode = d_inode(p.dentry);
-	if (inode->i_sb->s_magic != ANTIREVFS_MAGIC) {
+	if (inode->i_sb->s_magic != VCACHEFS_MAGIC) {
 		ret = -EINVAL;			/* not a vcachefs file */
 		goto put_path;
 	}
@@ -105,7 +105,7 @@ static long do_open_cipher(unsigned long arg)
 		ret = -EISDIR;			/* dir/special: not a leak vector */
 		goto put_path;
 	}
-	ii = ANTIREVFS_I(inode);
+	ii = VCACHEFS_I(inode);
 	if (!ii->lower_path.dentry) {
 		ret = -EINVAL;
 		goto put_path;
@@ -152,7 +152,7 @@ static long do_open_cipher(unsigned long arg)
 	remaining = outlen;
 	while (remaining > 0) {
 		size_t chunk = remaining < PAGE_SIZE ? (size_t)remaining : PAGE_SIZE;
-		ssize_t rn = arev_kernel_read(lf, buf, chunk, &rpos);
+		ssize_t rn = vcf_kernel_read(lf, buf, chunk, &rpos);
 		ssize_t wn;
 
 		if (rn <= 0) {
@@ -160,7 +160,7 @@ static long do_open_cipher(unsigned long arg)
 			kfree(buf);
 			goto put_out;
 		}
-		wn = arev_kernel_write(out, buf, rn, &wpos);
+		wn = vcf_kernel_write(out, buf, rn, &wpos);
 		if (wn != rn) {
 			ret = wn < 0 ? wn : -EIO;
 			kfree(buf);
@@ -196,9 +196,9 @@ put_path:
 	return ret;
 }
 
-static long arev_ctl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+static long vcf_ctl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-	if (!arev_ctl_caller_ok())
+	if (!vcf_ctl_caller_ok())
 		return -EACCES;		/* only the genuine emulator */
 
 	switch (cmd) {
@@ -211,28 +211,28 @@ static long arev_ctl_ioctl(struct file *filp, unsigned int cmd, unsigned long ar
 	}
 }
 
-static const struct file_operations arev_ctl_fops = {
+static const struct file_operations vcf_ctl_fops = {
 	.owner		= THIS_MODULE,
-	.unlocked_ioctl	= arev_ctl_ioctl,
+	.unlocked_ioctl	= vcf_ctl_ioctl,
 #ifdef CONFIG_COMPAT
-	.compat_ioctl	= arev_ctl_ioctl,	/* fixed-width UAPI: same handler */
+	.compat_ioctl	= vcf_ctl_ioctl,	/* fixed-width UAPI: same handler */
 #endif
 	.llseek		= noop_llseek,
 };
 
-static struct miscdevice arev_ctl_dev = {
+static struct miscdevice vcf_ctl_dev = {
 	.minor	= MISC_DYNAMIC_MINOR,
 	.name	= AREV_DEV_NAME,		/* -> /dev/vcachefs */
-	.fops	= &arev_ctl_fops,
+	.fops	= &vcf_ctl_fops,
 	.mode	= 0666,				/* open is free; ioctls are gated */
 };
 
-int arev_ctldev_init(void)
+int vcf_ctldev_init(void)
 {
-	return misc_register(&arev_ctl_dev);
+	return misc_register(&vcf_ctl_dev);
 }
 
-void arev_ctldev_exit(void)
+void vcf_ctldev_exit(void)
 {
-	misc_deregister(&arev_ctl_dev);
+	misc_deregister(&vcf_ctl_dev);
 }

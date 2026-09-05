@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * antirevfs decryption-authorization gate.
+ * vcachefs decryption-authorization gate.
  *
  * This file is the ONE place that decides whether the *calling process* is
- * allowed to read decrypted (plaintext) content through an antirevfs mount.
- * antirevfs_file_open() calls antirevfs_task_authorized() for every open of an
+ * allowed to read decrypted (plaintext) content through an vcachefs mount.
+ * vcachefs_file_open() calls vcachefs_task_authorized() for every open of an
  * encrypted file; an unauthorized process gets -EACCES and can therefore only
  * ever reach the lower .enc/ ciphertext (via the lower tree directly).
  *
@@ -43,7 +43,7 @@
 #include <crypto/hash.h>
 
 #include "compat.h"
-#include "antirevfs.h"
+#include "vcachefs.h"
 /* Vendor public key (DER X.509 cert) embedded at build time.  The checked-in
  * placeholder has antirev_authz_cert_der_len == 0; regenerate it with your real
  * cert via kmod2/tools/authz-embed-pubkey.sh.  With a zero-length key, signed
@@ -70,7 +70,7 @@
  *   DEV (-DAREV_DEV_MODE):  adds back the writable gate_enforce toggle (default
  *     0 = allow-all, for the bring-up sequence) and the editable/​signed
  *     /etc/authorized_apps.txt fallback.  The dev .ko self-identifies loudly at
- *     load (see antirevfs_authz_init) and must never ship.
+ *     load (see vcachefs_authz_init) and must never ship.
  */
 #ifdef AREV_DEV_MODE
 static bool gate_enforce;
@@ -118,7 +118,7 @@ module_param(gate_passthrough_cipher, bool, 0644);
 MODULE_PARM_DESC(gate_passthrough_cipher,
 	"On deny, serve lower ciphertext instead of -EACCES (0 = deny, default)");
 
-bool antirevfs_gate_passthrough_cipher(void)
+bool vcachefs_gate_passthrough_cipher(void)
 {
 	return gate_passthrough_cipher;
 }
@@ -167,7 +167,7 @@ static char *authz_read_file(const char *path, size_t *out_len)
 		return NULL;
 	}
 
-	n = arev_kernel_read(f, buf, size, &pos);
+	n = vcf_kernel_read(f, buf, size, &pos);
 	filp_close(f, NULL);
 
 	if (n != size) {
@@ -189,7 +189,7 @@ static char *authz_read_file(const char *path, size_t *out_len)
  */
 static struct key *authz_keyring;
 
-int antirevfs_authz_init(void)
+int vcachefs_authz_init(void)
 {
 #if defined(CONFIG_SYSTEM_DATA_VERIFICATION)
 	key_ref_t kref;
@@ -235,7 +235,7 @@ int antirevfs_authz_init(void)
 	return 0;
 }
 
-void antirevfs_authz_exit(void)
+void vcachefs_authz_exit(void)
 {
 	if (authz_keyring) {
 		key_put(authz_keyring);
@@ -343,31 +343,31 @@ enum { AREV_HASH_NOMATCH = 0, AREV_HASH_OK = 1, AREV_HASH_BADHASH = 2 };
  * least the inode or size.  Only pinned-name verdicts (OK/BADHASH) are cached —
  * a non-pinned basename never reaches here (see the name pre-filter below).
  */
-struct arev_hash_cache_ent {
+struct vcf_hash_cache_ent {
 	dev_t		dev;
 	unsigned long	ino;
 	loff_t		size;
 	int		verdict;	/* 0 = empty slot */
 };
 #define AREV_HCACHE_N 8
-static struct arev_hash_cache_ent arev_hcache[AREV_HCACHE_N];
-static DEFINE_SPINLOCK(arev_hcache_lock);
+static struct vcf_hash_cache_ent vcf_hcache[AREV_HCACHE_N];
+static DEFINE_SPINLOCK(vcf_hcache_lock);
 
 static int hcache_lookup(struct inode *in, loff_t sz)
 {
 	int i, v = 0;
 
-	spin_lock(&arev_hcache_lock);
+	spin_lock(&vcf_hcache_lock);
 	for (i = 0; i < AREV_HCACHE_N; i++) {
-		if (arev_hcache[i].verdict &&
-		    arev_hcache[i].dev == in->i_sb->s_dev &&
-		    arev_hcache[i].ino == in->i_ino &&
-		    arev_hcache[i].size == sz) {
-			v = arev_hcache[i].verdict;
+		if (vcf_hcache[i].verdict &&
+		    vcf_hcache[i].dev == in->i_sb->s_dev &&
+		    vcf_hcache[i].ino == in->i_ino &&
+		    vcf_hcache[i].size == sz) {
+			v = vcf_hcache[i].verdict;
 			break;
 		}
 	}
-	spin_unlock(&arev_hcache_lock);
+	spin_unlock(&vcf_hcache_lock);
 	return v;
 }
 
@@ -376,30 +376,30 @@ static void hcache_store(struct inode *in, loff_t sz, int verdict)
 	static int rr;
 	int i, slot = -1;
 
-	spin_lock(&arev_hcache_lock);
+	spin_lock(&vcf_hcache_lock);
 	for (i = 0; i < AREV_HCACHE_N; i++) {		/* refresh existing */
-		if (arev_hcache[i].verdict &&
-		    arev_hcache[i].dev == in->i_sb->s_dev &&
-		    arev_hcache[i].ino == in->i_ino &&
-		    arev_hcache[i].size == sz) {
+		if (vcf_hcache[i].verdict &&
+		    vcf_hcache[i].dev == in->i_sb->s_dev &&
+		    vcf_hcache[i].ino == in->i_ino &&
+		    vcf_hcache[i].size == sz) {
 			slot = i;
 			break;
 		}
 	}
 	if (slot < 0)
 		for (i = 0; i < AREV_HCACHE_N; i++)	/* free slot */
-			if (!arev_hcache[i].verdict) { slot = i; break; }
+			if (!vcf_hcache[i].verdict) { slot = i; break; }
 	if (slot < 0)
 		slot = rr++ % AREV_HCACHE_N;		/* round-robin evict */
-	arev_hcache[slot].dev = in->i_sb->s_dev;
-	arev_hcache[slot].ino = in->i_ino;
-	arev_hcache[slot].size = sz;
-	arev_hcache[slot].verdict = verdict;
-	spin_unlock(&arev_hcache_lock);
+	vcf_hcache[slot].dev = in->i_sb->s_dev;
+	vcf_hcache[slot].ino = in->i_ino;
+	vcf_hcache[slot].size = sz;
+	vcf_hcache[slot].verdict = verdict;
+	spin_unlock(&vcf_hcache_lock);
 }
 
 /* SHA-256 of the whole file into out[32].  Returns 0 on success, <0 on error. */
-static int arev_file_sha256(struct file *f, u8 out[32])
+static int vcf_file_sha256(struct file *f, u8 out[32])
 {
 	struct crypto_shash *tfm;
 	struct shash_desc *desc;
@@ -428,7 +428,7 @@ static int arev_file_sha256(struct file *f, u8 out[32])
 	rem = size;
 	while (rem > 0) {
 		size_t chunk = rem < PAGE_SIZE ? (size_t)rem : PAGE_SIZE;
-		ssize_t n = arev_kernel_read(f, buf, chunk, &pos);
+		ssize_t n = vcf_kernel_read(f, buf, chunk, &pos);
 
 		if (n <= 0) {
 			ret = n < 0 ? (int)n : -EIO;
@@ -453,9 +453,9 @@ free_desc:
  * at all, return NOMATCH without hashing (so cp/python3/... pay nothing).  For a
  * pinned name, require the exact SHA-256 of any same-named entry; else BADHASH.
  */
-static int authz_hash_check(struct file *exe)
+static int az_h(struct file *exe)
 {
-	const struct arev_trusted_hash *e;
+	const struct vcf_trusted_hash *e;
 	const char *name;
 	struct inode *in;
 	loff_t size;
@@ -465,7 +465,7 @@ static int authz_hash_check(struct file *exe)
 	if (!exe)
 		return AREV_HASH_NOMATCH;
 	name = exe->f_path.dentry->d_name.name;
-	for (e = arev_trusted_hashes; e->name; e++)
+	for (e = vcf_trusted_hashes; e->name; e++)
 		if (!strcmp(e->name, name)) { name_pinned = 1; break; }
 	if (!name_pinned)
 		return AREV_HASH_NOMATCH;
@@ -476,10 +476,10 @@ static int authz_hash_check(struct file *exe)
 	if (cached)
 		return cached;
 
-	if (arev_file_sha256(exe, digest) != 0)
+	if (vcf_file_sha256(exe, digest) != 0)
 		return AREV_HASH_BADHASH;	/* can't hash -> fail (don't cache) */
 
-	for (e = arev_trusted_hashes; e->name; e++)
+	for (e = vcf_trusted_hashes; e->name; e++)
 		if (!strcmp(e->name, name) &&
 		    !memcmp(e->sha256, digest, sizeof(digest))) {
 			hcache_store(in, size, AREV_HASH_OK);
@@ -506,14 +506,14 @@ static bool authz_whitelisted(const char *name)
 
 /* ---- pass-type 2: per-exe in-file signature ------------------------------- */
 /* Verify (and cache on the inode) the appended PKCS#7 signature over an
- * antirevfs file's container bytes, against the embedded vendor key.  Returns
- * true iff a valid signature is present.  `inode` must be an antirevfs regular
+ * vcachefs file's container bytes, against the embedded vendor key.  Returns
+ * true iff a valid signature is present.  `inode` must be an vcachefs regular
  * file inode.  The verdict (a file property) is cached in ii->authz_sig; only
  * transient errors (open/alloc/read) are left uncached for retry. */
-static bool authz_exe_signed_ok(struct inode *inode)
+static bool az_s(struct inode *inode)
 {
 #if defined(CONFIG_SYSTEM_DATA_VERIFICATION)
-	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
 	struct file *lf;
 	void *cbuf = NULL;
 	char *sbuf = NULL;
@@ -529,7 +529,7 @@ static bool authz_exe_signed_ok(struct inode *inode)
 		return ii->authz_sig > 0;
 
 	csize = ii->container_len;
-	isize = i_size_read(antirevfs_lower_inode(inode));
+	isize = i_size_read(vcachefs_lower_inode(inode));
 	if (csize <= 0 || csize >= isize) { ii->authz_sig = -1; return false; }
 	if ((loff_t)ANTREV_SIG_FOOTER_LEN + csize > isize) { ii->authz_sig = -1; return false; }
 	slen = (u32)(isize - ANTREV_SIG_FOOTER_LEN - csize);
@@ -545,11 +545,11 @@ static bool authz_exe_signed_ok(struct inode *inode)
 		goto out;			/* transient */
 
 	pos = 0;
-	n = arev_kernel_read(lf, cbuf, csize, &pos);
+	n = vcf_kernel_read(lf, cbuf, csize, &pos);
 	if (n != (ssize_t)csize)
 		goto out;			/* transient read error */
 	pos = csize;
-	n = arev_kernel_read(lf, sbuf, slen, &pos);
+	n = vcf_kernel_read(lf, sbuf, slen, &pos);
 	if (n != (ssize_t)slen)
 		goto out;
 
@@ -572,14 +572,14 @@ out:
 }
 
 /* Combined predicate: an exe passes if it matches a pinned name+SHA-256 build,
- * OR its basename is whitelisted, OR (it is an antirevfs file and) it carries a
+ * OR its basename is whitelisted, OR (it is an vcachefs file and) it carries a
  * valid per-exe signature.  A pinned name whose hash does NOT match is a hard
  * deny — it never falls through to the weaker checks. */
 static bool authz_ok(struct file *exe)
 {
 	struct inode *inode = file_inode(exe);
 	const char *name = exe->f_path.dentry->d_name.name;
-	int h = authz_hash_check(exe);
+	int h = az_h(exe);
 
 	if (h == AREV_HASH_OK)
 		return true;
@@ -587,8 +587,8 @@ static bool authz_ok(struct file *exe)
 		return false;		/* pinned name, wrong build -> deny */
 	if (authz_whitelisted(name))
 		return true;
-	if (inode && inode->i_op == &antirevfs_file_iops &&
-	    authz_exe_signed_ok(inode))
+	if (inode && inode->i_op == &vcachefs_file_iops &&
+	    az_s(inode))
 		return true;
 	return false;
 }
@@ -601,7 +601,7 @@ static bool authz_ok(struct file *exe)
  * the container bytes against the embedded vendor key.  Fails safe on any error.
  * Not cached (the file has no vcachefs inode to hang a verdict on).
  */
-bool arev_verify_file_sig(struct file *f)
+bool vcf_verify_file_sig(struct file *f)
 {
 #if defined(CONFIG_SYSTEM_DATA_VERIFICATION)
 	loff_t isize, clen, sig_off;
@@ -616,7 +616,7 @@ bool arev_verify_file_sig(struct file *f)
 	if (!authz_keyring || !f)
 		return false;
 	isize = i_size_read(file_inode(f));
-	ps = antirevfs_probe_sig(f, isize, &clen, &sig_off, &probe_len);
+	ps = vcachefs_probe_sig(f, isize, &clen, &sig_off, &probe_len);
 	if (ps <= 0)				/* <0 error, 0 = no signature */
 		return false;
 	if (clen <= 0 || clen >= isize ||
@@ -631,11 +631,11 @@ bool arev_verify_file_sig(struct file *f)
 	if (!cbuf || !sbuf)
 		goto out;
 	pos = 0;
-	n = arev_kernel_read(f, cbuf, clen, &pos);
+	n = vcf_kernel_read(f, cbuf, clen, &pos);
 	if (n != (ssize_t)clen)
 		goto out;
 	pos = clen;
-	n = arev_kernel_read(f, sbuf, slen, &pos);
+	n = vcf_kernel_read(f, sbuf, slen, &pos);
 	if (n != (ssize_t)slen)
 		goto out;
 	vret = verify_pkcs7_signature(cbuf, (size_t)clen, sbuf, slen,
@@ -656,23 +656,23 @@ out:
  * AUTHORIZE_FD helper for the /dev/vcachefs control device.  qemu passes the fd
  * it opened for the guest binary; if that fd resolves to a vcachefs inode the
  * mount has already served DECRYPTED plaintext with the appended signature
- * footer STRIPPED, so verifying the fd's bytes directly (arev_verify_file_sig)
+ * footer STRIPPED, so verifying the fd's bytes directly (vcf_verify_file_sig)
  * would always find "no signature" and wrongly deny an encrypted+signed guest.
  * The signature actually lives in the LOWER .enc container, so verify against
- * that via authz_exe_signed_ok(inode) (which reads the lower file + footer and
+ * that via az_s(inode) (which reads the lower file + footer and
  * caches the verdict on the inode).  A plaintext on-disk signed exe (option-1
  * guest, not a vcachefs file) still verifies the footer on the file itself.
  */
-bool arev_verify_authorize_fd(struct file *f)
+bool vcf_verify_authorize_fd(struct file *f)
 {
 	struct inode *inode;
 
 	if (!f)
 		return false;
 	inode = file_inode(f);
-	if (inode && inode->i_op == &antirevfs_file_iops)
-		return authz_exe_signed_ok(inode);
-	return arev_verify_file_sig(f);
+	if (inode && inode->i_op == &vcachefs_file_iops)
+		return az_s(inode);
+	return vcf_verify_file_sig(f);
 }
 
 /*
@@ -680,7 +680,7 @@ bool arev_verify_authorize_fd(struct file *f)
  * i.e. it is the genuine emulator: its basename is compiled-whitelisted
  * (e.g. qemu-aarch64-static) OR its binary carries a valid vendor signature.
  */
-bool arev_ctl_caller_ok(void)
+bool vcf_ctl_caller_ok(void)
 {
 	struct file *exe;
 	bool ok;
@@ -688,21 +688,21 @@ bool arev_ctl_caller_ok(void)
 
 	if (!current->mm)
 		return false;
-	exe = arev_get_mm_exe_file(current->mm);
+	exe = vcf_get_mm_exe_file(current->mm);
 	if (!exe)
 		return false;
 	/* A pinned name (e.g. qemu-aarch64-static) MUST match its SHA-256 build;
 	 * a same-named but wrong binary is denied outright.  A non-pinned caller
 	 * may still drive the device via the basename whitelist or a valid
 	 * vendor signature on its own file. */
-	h = authz_hash_check(exe);
+	h = az_h(exe);
 	if (h == AREV_HASH_OK)
 		ok = true;
 	else if (h == AREV_HASH_BADHASH)
 		ok = false;
 	else
 		ok = authz_whitelisted(exe->f_path.dentry->d_name.name) ||
-		     arev_verify_file_sig(exe);
+		     vcf_verify_file_sig(exe);
 	fput(exe);
 	return ok;
 }
@@ -733,16 +733,16 @@ static inline bool authz_list_fallback(struct file *f) { return false; }
 #endif	/* AREV_DEV_MODE */
 
 /*
- * Data-read gate (libraries, cp, source, ...).  antirevfs_file_open() calls
+ * Data-read gate (libraries, cp, source, ...).  vcachefs_file_open() calls
  * this for every NON-exec open of an encrypted file; returns true if the
  * calling process may read decrypted content.  Gates on the calling process's
  * executable identity, which is what keeps cp/backups on ciphertext.
  *
  * A process passes if its exe is (1) in the hard-coded whitelist, or (2) an
- * antirevfs file carrying a valid per-exe signature — else the legacy allow-list
+ * vcachefs file carrying a valid per-exe signature — else the legacy allow-list
  * (if any is deployed).
  */
-bool antirevfs_task_authorized(void)
+bool vcachefs_task_authorized(void)
 {
 	struct file *exe;
 	bool ok;
@@ -751,7 +751,7 @@ bool antirevfs_task_authorized(void)
 		return true;		/* gating off: behave exactly as before */
 	if (!current->mm)		/* kernel thread: never authorized */
 		return false;
-	exe = arev_get_mm_exe_file(current->mm);
+	exe = vcf_get_mm_exe_file(current->mm);
 	if (!exe)
 		return false;
 
@@ -772,7 +772,7 @@ bool antirevfs_task_authorized(void)
  * plaintext-FILE exfiltration vector — the bytes land only in the new process's
  * executable mapping.
  */
-bool antirevfs_file_authorized(struct file *file)
+bool vcachefs_file_authorized(struct file *file)
 {
 	if (!gate_enforce)
 		return true;

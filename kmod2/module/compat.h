@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * antirevfs cross-kernel compatibility shims.
+ * vcachefs cross-kernel compatibility shims.
  *
  * Primary targets: SLES 12 (4.12.14-default) and mainline 6.8.  Version guards
  * use LINUX_VERSION_CODE, which on enterprise distro kernels reflects the base
@@ -8,8 +8,8 @@
  * wrong for your kernel, override it with the AREV_* defines documented below
  * (pass e.g. `make EXTRA_CFLAGS=-DAREV_NEW_KERNEL_READ`).
  */
-#ifndef _ANTIREVFS_COMPAT_H
-#define _ANTIREVFS_COMPAT_H
+#ifndef _VCACHEFS_COMPAT_H
+#define _VCACHEFS_COMPAT_H
 
 #include <linux/version.h>
 #include <linux/fs.h>
@@ -41,7 +41,7 @@
  * and did not advance a position.  Define AREV_NEW_KERNEL_READ if your <4.14
  * distro kernel backported the new prototype.
  */
-static inline ssize_t arev_kernel_read(struct file *f, void *buf, size_t count,
+static inline ssize_t vcf_kernel_read(struct file *f, void *buf, size_t count,
 				       loff_t *pos)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0) || defined(AREV_NEW_KERNEL_READ)
@@ -67,7 +67,7 @@ static inline ssize_t arev_kernel_read(struct file *f, void *buf, size_t count,
  * only for a genuinely pre-4.14 kernel that did NOT backport it (symptom without
  * the flag there: "makes integer from pointer without a cast" on arg 4).
  */
-static inline ssize_t arev_kernel_write(struct file *f, const void *buf,
+static inline ssize_t vcf_kernel_write(struct file *f, const void *buf,
 					size_t count, loff_t *pos)
 {
 #if defined(AREV_OLD_KERNEL_WRITE)
@@ -90,7 +90,7 @@ static inline ssize_t arev_kernel_write(struct file *f, const void *buf,
  * get_file_rcu() prototype changed in 6.7 (commit 0ede61d8589c) from a
  * try-get-on-a-bare-pointer macro to a function taking the __rcu slot address.
  */
-static inline struct file *arev_get_mm_exe_file(struct mm_struct *mm)
+static inline struct file *vcf_get_mm_exe_file(struct mm_struct *mm)
 {
 	struct file *exe_file;
 
@@ -119,9 +119,9 @@ static inline struct file *arev_get_mm_exe_file(struct mm_struct *mm)
  * the kernel opens the binary in alloc_bprm() *before* bprm_execve() sets
  * in_execve=1, so it still reads 0 at this point.  Test both flag homes.
  */
-static inline bool arev_is_exec_open(struct file *file)
+static inline bool vcf_is_exec_open(struct file *file)
 {
 	return (file->f_mode & FMODE_EXEC) || (file->f_flags & __FMODE_EXEC);
 }
 
-#endif /* _ANTIREVFS_COMPAT_H */
+#endif /* _VCACHEFS_COMPAT_H */

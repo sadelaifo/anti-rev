@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * antirevfs file ops + address_space ops.
+ * vcachefs file ops + address_space ops.
  *
  * read_folio is the heart of the design: the first page fault on a file
  * triggers a one-shot whole-file AES-256-GCM decrypt into a per-inode buffer
  * (GCM tag verified once), and every read_folio then copies the requested page
  * out of that buffer into the page cache.  Because the page cache is keyed on
- * the (shared) antirevfs inode, all processes mmapping the file share the
+ * the (shared) vcachefs inode, all processes mmapping the file share the
  * decrypted physical pages with no daemon and no fd passing.
  */
 #include <linux/fs.h>
@@ -21,12 +21,12 @@
 #include <linux/uio.h>
 
 #include "compat.h"
-#include "antirevfs.h"
+#include "vcachefs.h"
 
 /* Lazy, idempotent whole-file decrypt into ii->plain. */
-static int antirevfs_ensure_plain(struct inode *inode)
+static int vcachefs_ensure_plain(struct inode *inode)
 {
-	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
 	struct file *lower_file;
 	void *buf;
 	int ret = 0;
@@ -54,12 +54,12 @@ static int antirevfs_ensure_plain(struct inode *inode)
 	if (ii->encrypted) {
 		/* container_len excludes any appended per-exe signature section,
 		 * so the GCM key trailer is found at the right offset. */
-		ret = antirevfs_decrypt_file(inode->i_sb, lower_file,
+		ret = vcachefs_decrypt_file(inode->i_sb, lower_file,
 					     ii->container_len,
 					     buf, ii->plain_len);
 	} else {
 		loff_t pos = 0;
-		ssize_t n = arev_kernel_read(lower_file, buf, ii->plain_len, &pos);
+		ssize_t n = vcf_kernel_read(lower_file, buf, ii->plain_len, &pos);
 
 		ret = (n == (ssize_t)ii->plain_len) ? 0 : (n < 0 ? n : -EIO);
 	}
@@ -80,15 +80,15 @@ out:
  * We never enable large folios, so a folio is always a single page here.
  * Returns 0 on success; does NOT touch the page/folio lock or uptodate state.
  */
-static int antirevfs_fill_page(struct inode *inode, struct page *page)
+static int vcachefs_fill_page(struct inode *inode, struct page *page)
 {
-	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
 	loff_t off = (loff_t)page->index << PAGE_SHIFT;
 	size_t copy = 0;
 	void *kaddr;
 	int ret;
 
-	ret = antirevfs_ensure_plain(inode);
+	ret = vcachefs_ensure_plain(inode);
 	if (ret)
 		return ret;
 
@@ -107,10 +107,10 @@ static int antirevfs_fill_page(struct inode *inode, struct page *page)
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
-static int antirevfs_read_folio(struct file *file, struct folio *folio)
+static int vcachefs_read_folio(struct file *file, struct folio *folio)
 {
 	struct page *page = folio_page(folio, 0);
-	int ret = antirevfs_fill_page(folio->mapping->host, page);
+	int ret = vcachefs_fill_page(folio->mapping->host, page);
 
 	if (!ret)
 		folio_mark_uptodate(folio);
@@ -118,9 +118,9 @@ static int antirevfs_read_folio(struct file *file, struct folio *folio)
 	return ret;
 }
 #else
-static int antirevfs_readpage(struct file *file, struct page *page)
+static int vcachefs_readpage(struct file *file, struct page *page)
 {
-	int ret = antirevfs_fill_page(page->mapping->host, page);
+	int ret = vcachefs_fill_page(page->mapping->host, page);
 
 	if (!ret)
 		SetPageUptodate(page);
@@ -135,14 +135,14 @@ static int antirevfs_readpage(struct file *file, struct page *page)
  * lower size minus the key trailer, so the embedded key is never served.  The
  * unauthorized reader thus gets a valid-looking but keyless ANTREV01 container.
  */
-struct antirevfs_passthrough {
+struct vcachefs_passthrough {
 	struct file	*lower;
 	loff_t		limit;		/* lower_size - ANTREV_TRAILER_LEN */
 };
 
-static int antirevfs_file_open(struct inode *inode, struct file *file)
+static int vcachefs_file_open(struct inode *inode, struct file *file)
 {
-	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
 
 	if (!ii->open_ok)
 		return -EIO;	/* strict mode: unencrypted, non-whitelisted */
@@ -163,10 +163,10 @@ static int antirevfs_file_open(struct inode *inode, struct file *file)
 	 *    process's exe identity, which is what keeps cp on ciphertext.
 	 */
 	if (ii->encrypted) {
-		if (arev_is_exec_open(file)) {
-			if (!antirevfs_file_authorized(file))
+		if (vcf_is_exec_open(file)) {
+			if (!vcachefs_file_authorized(file))
 				return -EACCES;
-		} else if (!antirevfs_task_authorized()) {
+		} else if (!vcachefs_task_authorized()) {
 			/*
 			 * Unauthorized data read.  Default: deny (-EACCES).  With
 			 * gate_passthrough_cipher: serve the lower .enc/ ciphertext
@@ -177,11 +177,11 @@ static int antirevfs_file_open(struct inode *inode, struct file *file)
 			 * plaintext) page cache entirely.  The withheld trailer is
 			 * what keeps the embedded key out of the reader's hands.
 			 */
-			struct antirevfs_passthrough *pd;
+			struct vcachefs_passthrough *pd;
 			struct file *lower;
 			loff_t lsz;
 
-			if (!antirevfs_gate_passthrough_cipher())
+			if (!vcachefs_gate_passthrough_cipher())
 				return -EACCES;
 
 			pd = kmalloc(sizeof(*pd), GFP_KERNEL);
@@ -206,7 +206,7 @@ static int antirevfs_file_open(struct inode *inode, struct file *file)
 
 /*
  * Below: the ciphertext-passthrough data ops.  They are reached only when
- * antirevfs_file_open() put an antirevfs_passthrough in ->private_data (an
+ * vcachefs_file_open() put an vcachefs_passthrough in ->private_data (an
  * unauthorized read under gate_passthrough_cipher); otherwise ->private_data is
  * NULL and we fall through to the normal decrypt-via-page-cache generics.
  * Every data path is served from the lower file but CAPPED at pd->limit (lower
@@ -217,9 +217,9 @@ static int antirevfs_file_open(struct inode *inode, struct file *file)
  */
 
 /* Bounce the lower (ciphertext) file into the reader's iter, page at a time,
- * but never past `limit`.  Built on arev_kernel_read + copy_to_iter — the
+ * but never past `limit`.  Built on vcf_kernel_read + copy_to_iter — the
  * lowest-common-denominator primitives present on both the 4.12 and 6.8 targets. */
-static ssize_t antirevfs_passthrough_read(struct file *lower, loff_t limit,
+static ssize_t vcachefs_passthrough_read(struct file *lower, loff_t limit,
 					  struct iov_iter *to, loff_t *ppos)
 {
 	size_t want = iov_iter_count(to);
@@ -241,7 +241,7 @@ static ssize_t antirevfs_passthrough_read(struct file *lower, loff_t limit,
 	while (want) {
 		size_t chunk = min(want, (size_t)PAGE_SIZE);
 		loff_t pos = *ppos;
-		ssize_t n = arev_kernel_read(lower, buf, chunk, &pos);
+		ssize_t n = vcf_kernel_read(lower, buf, chunk, &pos);
 		size_t copied;
 
 		if (n <= 0) {
@@ -263,13 +263,13 @@ static ssize_t antirevfs_passthrough_read(struct file *lower, loff_t limit,
 	return total;
 }
 
-static ssize_t antirevfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
+static ssize_t vcachefs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
-	struct antirevfs_passthrough *pd = iocb->ki_filp->private_data;
+	struct vcachefs_passthrough *pd = iocb->ki_filp->private_data;
 
 	if (pd) {
 		loff_t pos = iocb->ki_pos;
-		ssize_t ret = antirevfs_passthrough_read(pd->lower, pd->limit,
+		ssize_t ret = vcachefs_passthrough_read(pd->lower, pd->limit,
 							 to, &pos);
 
 		iocb->ki_pos = pos;
@@ -278,7 +278,7 @@ static ssize_t antirevfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	return generic_file_read_iter(iocb, to);
 }
 
-static int antirevfs_mmap(struct file *file, struct vm_area_struct *vma)
+static int vcachefs_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	/* Unauthorized passthrough: refuse mmap.  A file-backed mapping of the
 	 * lower file would surface the key trailer in the final page (it can't
@@ -288,11 +288,11 @@ static int antirevfs_mmap(struct file *file, struct vm_area_struct *vma)
 	return generic_file_mmap(file, vma);
 }
 
-static ssize_t antirevfs_splice_read(struct file *in, loff_t *ppos,
+static ssize_t vcachefs_splice_read(struct file *in, loff_t *ppos,
 				     struct pipe_inode_info *pipe,
 				     size_t len, unsigned int flags)
 {
-	struct antirevfs_passthrough *pd = in->private_data;
+	struct vcachefs_passthrough *pd = in->private_data;
 
 	if (pd) {
 		if (!pd->lower->f_op->splice_read)
@@ -312,9 +312,9 @@ static ssize_t antirevfs_splice_read(struct file *in, loff_t *ppos,
 #endif
 }
 
-static loff_t antirevfs_llseek(struct file *file, loff_t offset, int whence)
+static loff_t vcachefs_llseek(struct file *file, loff_t offset, int whence)
 {
-	struct antirevfs_passthrough *pd = file->private_data;
+	struct vcachefs_passthrough *pd = file->private_data;
 
 	/* Seek against the exposed (trailer-stripped) length so SEEK_END lands
 	 * at the limit, not the real ciphertext end. */
@@ -324,9 +324,9 @@ static loff_t antirevfs_llseek(struct file *file, loff_t offset, int whence)
 	return generic_file_llseek(file, offset, whence);
 }
 
-static int antirevfs_file_release(struct inode *inode, struct file *file)
+static int vcachefs_file_release(struct inode *inode, struct file *file)
 {
-	struct antirevfs_passthrough *pd = file->private_data;
+	struct vcachefs_passthrough *pd = file->private_data;
 
 	if (pd) {
 		file->private_data = NULL;
@@ -338,7 +338,7 @@ static int antirevfs_file_release(struct inode *inode, struct file *file)
 
 /*
  * Directory reads must keep ONE lower directory file open for the whole
- * lifetime of the antirevfs dir file.  A getdents(2) on a large directory spans
+ * lifetime of the vcachefs dir file.  A getdents(2) on a large directory spans
  * multiple ->iterate_shared calls, and stateful lower filesystems (ext4 htree,
  * overlayfs) hold their readdir cursor / dedup cache in the lower file's
  * private_data across those calls.  Re-opening the lower dir per call (as an
@@ -347,9 +347,9 @@ static int antirevfs_file_release(struct inode *inode, struct file *file)
  * return in a single getdents buffer (e.g. a real bin/ or lib/ tree).  Open the
  * lower dir once in ->open, reuse it here, release it in ->release.
  */
-static int antirevfs_dir_open(struct inode *inode, struct file *file)
+static int vcachefs_dir_open(struct inode *inode, struct file *file)
 {
-	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
 	struct file *lower;
 
 	lower = dentry_open(&ii->lower_path, O_RDONLY | O_DIRECTORY,
@@ -360,7 +360,7 @@ static int antirevfs_dir_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static int antirevfs_dir_release(struct inode *inode, struct file *file)
+static int vcachefs_dir_release(struct inode *inode, struct file *file)
 {
 	struct file *lower = file->private_data;
 
@@ -371,7 +371,7 @@ static int antirevfs_dir_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static int antirevfs_dir_iterate(struct file *file, struct dir_context *ctx)
+static int vcachefs_dir_iterate(struct file *file, struct dir_context *ctx)
 {
 	struct file *lower = file->private_data;
 	int ret;
@@ -385,27 +385,27 @@ static int antirevfs_dir_iterate(struct file *file, struct dir_context *ctx)
 	return ret;
 }
 
-const struct address_space_operations antirevfs_aops = {
+const struct address_space_operations vcachefs_aops = {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
-	.read_folio	= antirevfs_read_folio,
+	.read_folio	= vcachefs_read_folio,
 #else
-	.readpage	= antirevfs_readpage,
+	.readpage	= vcachefs_readpage,
 #endif
 };
 
-const struct file_operations antirevfs_file_fops = {
-	.open		= antirevfs_file_open,
-	.release	= antirevfs_file_release,
-	.read_iter	= antirevfs_read_iter,
-	.mmap		= antirevfs_mmap,
-	.splice_read	= antirevfs_splice_read,
-	.llseek		= antirevfs_llseek,
+const struct file_operations vcachefs_file_fops = {
+	.open		= vcachefs_file_open,
+	.release	= vcachefs_file_release,
+	.read_iter	= vcachefs_read_iter,
+	.mmap		= vcachefs_mmap,
+	.splice_read	= vcachefs_splice_read,
+	.llseek		= vcachefs_llseek,
 };
 
-const struct file_operations antirevfs_dir_fops = {
-	.open		= antirevfs_dir_open,
-	.release	= antirevfs_dir_release,
-	.iterate_shared	= antirevfs_dir_iterate,
+const struct file_operations vcachefs_dir_fops = {
+	.open		= vcachefs_dir_open,
+	.release	= vcachefs_dir_release,
+	.iterate_shared	= vcachefs_dir_iterate,
 	.read		= generic_read_dir,
 	.llseek		= generic_file_llseek,
 };

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * antirevfs crypto: ANTREV01 trailer detection and AES-256-GCM decrypt of a
+ * vcachefs crypto: ANTREV01 trailer detection and AES-256-GCM decrypt of a
  * whole file into a caller-provided plaintext buffer.
  *
  * The container is [magic:8][iv:12][tag:16][ct...].  The kernel's gcm(aes)
@@ -16,7 +16,7 @@
 #include <crypto/aead.h>
 
 #include "compat.h"
-#include "antirevfs.h"
+#include "vcachefs.h"
 
 /*
  * crypto async-wait helper.  The DECLARE_CRYPTO_WAIT / crypto_req_done /
@@ -25,10 +25,10 @@
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
 
-typedef struct crypto_wait arev_crypto_wait_t;
+typedef struct crypto_wait vcf_crypto_wait_t;
 #define AREV_DECLARE_WAIT(name)		DECLARE_CRYPTO_WAIT(name)
-#define arev_aead_done			crypto_req_done
-static inline int arev_aead_wait(int err, arev_crypto_wait_t *w)
+#define vcf_aead_done			crypto_req_done
+static inline int vcf_aead_wait(int err, vcf_crypto_wait_t *w)
 {
 	return crypto_wait_req(err, w);
 }
@@ -38,21 +38,21 @@ static inline int arev_aead_wait(int err, arev_crypto_wait_t *w)
 typedef struct {
 	struct completion completion;
 	int err;
-} arev_crypto_wait_t;
+} vcf_crypto_wait_t;
 #define AREV_DECLARE_WAIT(name)						\
-	arev_crypto_wait_t name = {					\
+	vcf_crypto_wait_t name = {					\
 		COMPLETION_INITIALIZER_ONSTACK((name).completion), 0	\
 	}
-static void arev_aead_done(struct crypto_async_request *req, int err)
+static void vcf_aead_done(struct crypto_async_request *req, int err)
 {
-	arev_crypto_wait_t *w = req->data;
+	vcf_crypto_wait_t *w = req->data;
 
 	if (err == -EINPROGRESS)
 		return;
 	w->err = err;
 	complete(&w->completion);
 }
-static int arev_aead_wait(int err, arev_crypto_wait_t *w)
+static int vcf_aead_wait(int err, vcf_crypto_wait_t *w)
 {
 	if (err == -EINPROGRESS || err == -EBUSY) {
 		wait_for_completion(&w->completion);
@@ -63,13 +63,13 @@ static int arev_aead_wait(int err, arev_crypto_wait_t *w)
 
 #endif
 
-int antirevfs_has_magic(struct file *lower_file)
+int vcachefs_has_magic(struct file *lower_file)
 {
 	char buf[ANTREV_MAGIC_LEN];
 	loff_t pos = 0;
 	ssize_t n;
 
-	n = arev_kernel_read(lower_file, buf, sizeof(buf), &pos);
+	n = vcf_kernel_read(lower_file, buf, sizeof(buf), &pos);
 	if (n < 0)
 		return n;
 	if (n < ANTREV_MAGIC_LEN)
@@ -79,8 +79,8 @@ int antirevfs_has_magic(struct file *lower_file)
 
 /* True if the file's last 8 bytes are the ANTREV magic — i.e. it carries the
  * embedded-key trailer (key + trailing magic).  Used to confirm a header-magic
- * file is a complete antirevfs container before computing the plaintext size. */
-int antirevfs_has_trailer(struct file *lower_file, loff_t size)
+ * file is a complete vcachefs container before computing the plaintext size. */
+int vcachefs_has_trailer(struct file *lower_file, loff_t size)
 {
 	char buf[ANTREV_MAGIC_LEN];
 	loff_t pos;
@@ -89,7 +89,7 @@ int antirevfs_has_trailer(struct file *lower_file, loff_t size)
 	if (size < ANTREV_HDR_LEN + ANTREV_TRAILER_LEN)
 		return 0;
 	pos = size - ANTREV_MAGIC_LEN;
-	n = arev_kernel_read(lower_file, buf, sizeof(buf), &pos);
+	n = vcf_kernel_read(lower_file, buf, sizeof(buf), &pos);
 	if (n < 0)
 		return n;
 	if (n < ANTREV_MAGIC_LEN)
@@ -103,7 +103,7 @@ int antirevfs_has_trailer(struct file *lower_file, loff_t size)
  * of the sig blob, *sig_len = its length, returns 1.  On an unsigned file (ends
  * in the ANTREV01 key trailer): *container_len = file_size, returns 0.  <0 on
  * read error or a malformed section. */
-int antirevfs_probe_sig(struct file *lower_file, loff_t file_size,
+int vcachefs_probe_sig(struct file *lower_file, loff_t file_size,
 			loff_t *container_len, loff_t *sig_off, u32 *sig_len)
 {
 	u8 magic[ANTREV_SIG_MAGIC_LEN];
@@ -119,7 +119,7 @@ int antirevfs_probe_sig(struct file *lower_file, loff_t file_size,
 	if (file_size < ANTREV_SIG_FOOTER_LEN)
 		return 0;
 	pos = file_size - ANTREV_SIG_MAGIC_LEN;
-	n = arev_kernel_read(lower_file, magic, ANTREV_SIG_MAGIC_LEN, &pos);
+	n = vcf_kernel_read(lower_file, magic, ANTREV_SIG_MAGIC_LEN, &pos);
 	if (n < 0)
 		return (int)n;
 	if (n < ANTREV_SIG_MAGIC_LEN ||
@@ -127,7 +127,7 @@ int antirevfs_probe_sig(struct file *lower_file, loff_t file_size,
 		return 0;			/* no appended signature */
 
 	pos = file_size - ANTREV_SIG_FOOTER_LEN;
-	n = arev_kernel_read(lower_file, lenbuf, ANTREV_SIG_LENFIELD, &pos);
+	n = vcf_kernel_read(lower_file, lenbuf, ANTREV_SIG_LENFIELD, &pos);
 	if (n < 0)
 		return (int)n;
 	if (n < ANTREV_SIG_LENFIELD)
@@ -144,7 +144,7 @@ int antirevfs_probe_sig(struct file *lower_file, loff_t file_size,
 	return 1;
 }
 
-bool antirevfs_ext_whitelisted(struct antirevfs_sb_info *sbi, const char *name)
+bool vcachefs_ext_whitelisted(struct vcachefs_sb_info *sbi, const char *name)
 {
 	const char *dot, *list = sbi->passthrough;
 	size_t ext_len, tok_len;
@@ -173,7 +173,7 @@ bool antirevfs_ext_whitelisted(struct antirevfs_sb_info *sbi, const char *name)
 	return false;
 }
 
-int antirevfs_decrypt_file(struct super_block *sb, struct file *lower_file,
+int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 			   loff_t lower_size, void *out, size_t out_len)
 {
 	struct crypto_aead *tfm;
@@ -199,13 +199,13 @@ int antirevfs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	/* Read the embedded key from the trailer (just before the trailing
 	 * magic).  Read it each decrypt; never cached in the inode/sb. */
 	pos = lower_size - ANTREV_TRAILER_LEN;
-	n = arev_kernel_read(lower_file, key, ANTREV_KEY_LEN, &pos);
+	n = vcf_kernel_read(lower_file, key, ANTREV_KEY_LEN, &pos);
 	if (n != ANTREV_KEY_LEN)
 		return n < 0 ? n : -EIO;
 
 	/* Read IV (after the magic). */
 	pos = ANTREV_MAGIC_LEN;
-	n = arev_kernel_read(lower_file, iv, ANTREV_IV_LEN, &pos);
+	n = vcf_kernel_read(lower_file, iv, ANTREV_IV_LEN, &pos);
 	if (n != ANTREV_IV_LEN) {
 		ret = n < 0 ? n : -EIO;
 		goto out_key;
@@ -219,13 +219,13 @@ int antirevfs_decrypt_file(struct super_block *sb, struct file *lower_file,
 
 	/* tag first (file layout), then ciphertext after it: build [ct||tag]. */
 	pos = ANTREV_MAGIC_LEN + ANTREV_IV_LEN;
-	n = arev_kernel_read(lower_file, buf + ct_len, ANTREV_TAG_LEN, &pos);
+	n = vcf_kernel_read(lower_file, buf + ct_len, ANTREV_TAG_LEN, &pos);
 	if (n != ANTREV_TAG_LEN) {
 		ret = n < 0 ? n : -EIO;
 		goto out_buf;
 	}
 	pos = ANTREV_HDR_LEN;
-	n = arev_kernel_read(lower_file, buf, ct_len, &pos);
+	n = vcf_kernel_read(lower_file, buf, ct_len, &pos);
 	if (n != (ssize_t)ct_len) {
 		ret = n < 0 ? n : -EIO;
 		goto out_buf;
@@ -255,11 +255,11 @@ int antirevfs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	sg_init_one(&sg, buf, buf_len);
 	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
 				  CRYPTO_TFM_REQ_MAY_SLEEP,
-				  arev_aead_done, &wait);
+				  vcf_aead_done, &wait);
 	aead_request_set_crypt(req, &sg, &sg, buf_len, iv);
 	aead_request_set_ad(req, 0);
 
-	ret = arev_aead_wait(crypto_aead_decrypt(req), &wait);
+	ret = vcf_aead_wait(crypto_aead_decrypt(req), &wait);
 	if (ret == 0)
 		memcpy(out, buf, ct_len);	/* tag verified */
 
