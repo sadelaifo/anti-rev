@@ -33,7 +33,6 @@ KMOD="$HERE/.."
 ROOT="$KMOD/.."
 MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
-KEYCTL="$KMOD/tools/vcache-keyctl"
 PARAM=/sys/module/vcachefs/parameters/gate_enforce
 AUTHZ=/etc/authorized_apps.txt          # the documented default path
 
@@ -55,7 +54,6 @@ if [[ -e "$AUTHZ" ]]; then AUTHZ_BAK="$(mktemp)"; cp -a "$AUTHZ" "$AUTHZ_BAK"; f
 cleanup() {
 	mountpoint -q "$MP" && umount "$MP"
 	rmmod vcachefs 2>/dev/null
-	"$KEYCTL" clear >/dev/null 2>&1
 	if [[ -n "$AUTHZ_BAK" ]]; then cp -a "$AUTHZ_BAK" "$AUTHZ"; rm -f "$AUTHZ_BAK";
 	else rm -f "$AUTHZ"; fi
 	rm -rf "$WORK"

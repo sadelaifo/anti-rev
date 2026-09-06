@@ -39,7 +39,6 @@ KMOD="$HERE/.."
 ROOT="$KMOD/.."
 MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
-KEYCTL="$KMOD/tools/vcache-keyctl"
 
 PASS=0; FAIL=0
 ok()   { echo "  [PASS] $*"; PASS=$((PASS+1)); }
@@ -56,7 +55,6 @@ cleanup() {
 	mountpoint -q "$MP2" && umount "$MP2"
 	mountpoint -q "$MP" && umount "$MP"
 	rmmod vcachefs 2>/dev/null
-	"$KEYCTL" clear >/dev/null 2>&1
 	rm -rf "$WORK"
 }
 trap cleanup EXIT
