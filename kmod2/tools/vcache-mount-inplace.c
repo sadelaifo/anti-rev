@@ -2,27 +2,23 @@
 //
 // vcache-mount-inplace — compiled, statically-linked twin of vcache-mount.sh.
 //
-// Same UX as the shell orchestrator:
-//     vcache-mount-inplace [--mode real|sim] {up|down|status|watch}
-// but the logic is compiled, so a `cat`/`strings` of the shipped binary does
-// NOT hand a rookie the architecture (comments never reach the binary; only a
-// handful of terse log/option strings do).  This is the artifact you SHIP when
-// the client runs the qemu/Docker sim stack — where a readable .sh would leak
-// the whole design.
+// Same UX ([--mode real|sim] {up|down|status|watch}) but the logic is compiled
+// AND every design-revealing string literal is XOR-obfuscated via the project's
+// obfstr layer (stub/obfstr.h + tools/obfstr_gen.py).  So neither `cat` nor
+// `strings` on the shipped binary reveals the architecture — see the Makefile's
+// obfstr-codegen step (literals in scanner-recognized calls — open/fopen/
+// snprintf/strcmp/syscall/getenv/execvp/... — are auto-encrypted; the rest are
+// hand-wrapped OBFSTR("...") below).
 //
-// It performs IN-PLACE vcachefs mounts (lower == mountpoint) plus tmpfs write
-// layers, exactly like the shell tool.  Real mode operates on the host only;
-// sim mode operates on the host AND, via docker inspect + setns() into the
-// container's mount namespace, the slave software inside the sim container.
-// "Only the executor differs": host runs the routines directly; container runs
-// the SAME routines after setns(CLONE_NEWNS) redirects '/' to the container
-// root (kernel mntns_install), so mount(2) lands inside the container.
+// In-place vcachefs mounts + tmpfs write layers; real = host only, sim = host +
+// (via docker inspect + setns into the container's mount ns) the sim container.
 //
-// Config is baked in below and overridable by the same AREV_* env vars the
-// shell tool honors (edit + rebuild, or export at runtime).
+// Build:  make -C kmod2/tools vcache-mount-inplace   (runs the obfstr codegen,
+//         then a static build).  Run as root (re-execs with sudo -E).
 //
-// Build:  make -C kmod2/tools vcache-mount-inplace   (static binary)
-// Run as root (it re-execs with sudo -E; insmod + docker + mount need it).
+// obfstr lifetime rule (see stub/obfstr.h): an OBFSTR() decode lives only until
+// the CALLING function returns.  Values stored in globals are therefore
+// strdup(OBFSTR(...))'d; values used inline are wrapped directly.
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -41,73 +37,76 @@
 #include <sys/wait.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include "obfstr.h"
 
 /* ==========================================================================
  *  EDIT ME — per-deployment defaults (compiled in; each is also overridable
- *  at runtime by the matching AREV_* env var).  These string/number literals
- *  live in the source only; see the Makefile's obfuscation note for how they
- *  are kept out of `strings` in the shipped binary.
+ *  at runtime by the matching AREV_* env var).  The string values are wrapped
+ *  in OBFSTR(...) so the obfstr codegen keeps them out of `strings`; edit the
+ *  text inside the quotes as normal.  Numeric values are plain (numbers don't
+ *  leak the design).
  * ========================================================================== */
-#define CFG_KMOD_DIR      "/root/vcache/kmod2/module"  /* dir holding vcachefs.ko */
-#define CFG_KO            ""            /* explicit .ko path; "" => KMOD_DIR/vcachefs.ko */
-#define CFG_CONTAINER     "slave"       /* sim: business `docker run --name` */
+#define CFG_KMOD_DIR      OBFSTR("/root/vcache/kmod2/module") /* dir holding vcachefs.ko */
+#define CFG_KO            ""           /* explicit .ko path; "" => KMOD_DIR/vcachefs.ko */
+#define CFG_CONTAINER     OBFSTR("slave")       /* sim: business `docker run --name` */
+#define CFG_READY_MARKER  ""            /* installer's last-touched marker; "" => dir-nonempty */
+#define CFG_AUTHZ_PATH    OBFSTR("/etc/authorized_apps.txt")
+#define CFG_VCACHE_OPTS   OBFSTR("ro,passdata")
+#define CFG_STAGE_MODE    OBFSTR("auto")        /* auto | always | never */
+#define CFG_STAGE_DIR     OBFSTR("/dev/shm/arev")
+#define CFG_WRITE_BACKING OBFSTR("/run/vcache-write")
+#define CFG_TMPFS_OPTS    OBFSTR("mode=0755,nosuid,nodev")
+#define CFG_MODE          OBFSTR("real")        /* default --mode */
+
 #define CFG_WATCH_SECS    5             /* watch poll period (s) */
-#define CFG_READY_MARKER  ""            /* file the installer touches last; "" => dir-nonempty heuristic */
-#define CFG_AUTHZ_PATH    "/etc/authorized_apps.txt"
 #define CFG_GATE_ENFORCE  1             /* 1 = enforce (dev .ko only) */
 #define CFG_GATE_PASS     1             /* 1 = unauth read -> trailer-stripped cipher */
 #define CFG_DEV_MODE      0             /* 1 ONLY for a dev .ko (AREV_DEV_MODE build) */
 #define CFG_REQUIRE_SIG   0             /* 1 = signed allow-list (dev .ko) */
 #define CFG_RELOAD        0             /* 1 = rmmod+insmod on 'up' */
-#define CFG_VCACHE_OPTS   "ro,passdata"
-#define CFG_STAGE_MODE    "auto"        /* auto | always | never (overlay-lower staging) */
-#define CFG_STAGE_DIR     "/dev/shm/arev"
-#define CFG_WRITE_BACKING "/run/vcache-write"
-#define CFG_TMPFS_OPTS    "mode=0755,nosuid,nodev"
 
-/* Lists — keep the trailing comma on every entry (empty macro => just NULL). */
-#define CFG_MOUNTS        "/root/proj/bin", "/root/proj/lib",
+/* Lists — trailing comma on each entry; empty macro => just NULL. */
+#define CFG_MOUNTS        OBFSTR("/root/proj/bin"), OBFSTR("/root/proj/lib"),
 #define CFG_ALLOW                            /* legacy model only; prefer per-exe sigs */
-#define CFG_WRITE_DIRS                       /* e.g.  "/root/proj/bin|logs", */
-#define CFG_WRITE_FILES                      /* e.g.  "/root/proj/bin|QtApplication.pid", */
+#define CFG_WRITE_DIRS                       /* e.g.  OBFSTR("/root/proj/bin|logs"), */
+#define CFG_WRITE_FILES                      /* e.g.  OBFSTR("/root/proj/bin|QtApplication.pid"), */
 /* ======================= end EDIT ME ====================================== */
 
 /* ------------------------------------------------------------------ config */
 
-static const char *KO;                 /* path to vcachefs.ko */
-static const char *CONTAINER;          /* sim: business `docker run --name` */
-static int         WATCH_INTERVAL;     /* watch poll period (s) */
-static const char *READY_MARKER;       /* "" => non-empty-dir heuristic only */
+static const char *KO;
+static const char *CONTAINER;
+static int         WATCH_INTERVAL;
+static const char *READY_MARKER;
 static const char *AUTHZ_PATH;
 static const char *AUTHZ_SIG_PATH;
 static int         GATE_ENFORCE, GATE_PASSTHROUGH, DEV_MODE, GATE_REQUIRE_SIG;
 static int         RELOAD_MODULE;
-static const char *VCACHEFS_OPTS;      /* e.g. "ro,passdata" */
-static const char *STAGE_MODE;         /* auto | always | never */
-static const char *STAGE_DIR;          /* real-fs (tmpfs) staging root */
-static const char *WRITE_BACKING;      /* tmpfs source for per-file binds */
+static const char *VCACHEFS_OPTS;
+static const char *STAGE_MODE;
+static const char *STAGE_DIR;
+static const char *WRITE_BACKING;
 static const char *TMPFS_OPTS;
 
-static char      **MOUNTS;             /* NULL-terminated list of mount roots */
-static char      **ALLOWL;             /* NULL-terminated allow-list basenames */
-static char      **WRITE_DIRS;         /* "root|rel" entries */
-static char      **WRITE_FILES;        /* "root|rel" entries */
+static char      **MOUNTS;
+static char      **ALLOWL;
+static char      **WRITE_DIRS;
+static char      **WRITE_FILES;
 
-static int         MODE_SIM;           /* 0 = real, 1 = sim */
-static const char *ACTION;             /* up | down | status | watch */
+static int         MODE_SIM;
+static const char *ACTION;
 
-/* current mount target */
-static int         IN_CONTAINER;       /* 0 = host, 1 = container */
-static pid_t       G_CPID;             /* container init pid (sim) */
-static char        CTL_MM[64];         /* host /sys/class/misc/vcachefs/dev */
+static int         IN_CONTAINER;
+static pid_t       G_CPID;
+static char        CTL_MM[64];
 
 /* ------------------------------------------------------------- tiny helpers */
 
 static void xlog(const char *fmt, ...)
 {
 	va_list ap; va_start(ap, fmt);
-	fprintf(stderr, "[vc:%s%s] ", MODE_SIM ? "sim" : "real",
-		IN_CONTAINER ? ":ctr" : "");
+	fprintf(stderr, "[vc:%s%s] ", MODE_SIM ? OBFSTR("sim") : OBFSTR("real"),
+		IN_CONTAINER ? OBFSTR(":ctr") : "");
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
 	va_end(ap);
@@ -116,7 +115,7 @@ static void xlog(const char *fmt, ...)
 static void die(const char *fmt, ...)
 {
 	va_list ap; va_start(ap, fmt);
-	fprintf(stderr, "[vc:%s] ERROR: ", MODE_SIM ? "sim" : "real");
+	fprintf(stderr, "[vc:%s] ERROR: ", MODE_SIM ? OBFSTR("sim") : OBFSTR("real"));
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
 	va_end(ap);
@@ -129,17 +128,26 @@ static const char *env_def(const char *k, const char *d)
 static int env_int(const char *k, int d)
 { const char *v = getenv(k); return (v && *v) ? atoi(v) : d; }
 
-/* Build a NULL-terminated list from a whitespace-separated env var, or copy
- * the compile-time default when unset. */
-static char **list_from_env(const char *k, const char *const *def)
+/* Build a NULL-terminated list by strdup'ing each vararg (until NULL). */
+static char **build_list(const char *first, ...)
+{
+	int cap = 8, n = 0;
+	char **a = calloc(cap, sizeof *a);
+	va_list ap; va_start(ap, first);
+	for (const char *s = first; s; s = va_arg(ap, const char *)) {
+		if (n + 1 >= cap) { cap *= 2; a = realloc(a, cap * sizeof *a); }
+		a[n++] = strdup(s);
+	}
+	va_end(ap);
+	a[n] = NULL;
+	return a;
+}
+
+/* Split a whitespace-separated env var into a list, or NULL when unset. */
+static char **list_env(const char *k)
 {
 	const char *v = getenv(k);
-	if (!v || !*v) {
-		int n = 0; while (def[n]) n++;
-		char **a = calloc(n + 1, sizeof *a);
-		for (int i = 0; i < n; i++) a[i] = strdup(def[i]);
-		return a;
-	}
+	if (!v || !*v) return NULL;
 	char *copy = strdup(v);
 	int cap = 8, n = 0;
 	char **a = calloc(cap, sizeof *a);
@@ -157,8 +165,7 @@ static int list_len(char **a) { int n = 0; while (a && a[n]) n++; return n; }
 
 /* ------------------------------------------------------------- subprocesses */
 
-/* Run argv, capture stdout (trimmed of trailing newline). Returns exit code. */
-static int run_capture(char *const argv[], char *out, size_t outsz)
+static int run_capture(const char *const argv[], char *out, size_t outsz)
 {
 	int pf[2];
 	if (pipe(pf) != 0) return -1;
@@ -169,7 +176,7 @@ static int run_capture(char *const argv[], char *out, size_t outsz)
 		close(pf[0]); close(pf[1]);
 		int nul = open("/dev/null", O_WRONLY);
 		if (nul >= 0) dup2(nul, 2);
-		execvp(argv[0], argv);
+		execvp(argv[0], (char *const *)argv);
 		_exit(127);
 	}
 	close(pf[1]);
@@ -184,12 +191,11 @@ static int run_capture(char *const argv[], char *out, size_t outsz)
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-/* Run argv to completion, inheriting stdio. Returns exit code. */
-static int run_status(char *const argv[])
+static int run_status(const char *const argv[])
 {
 	fflush(NULL);
 	pid_t p = fork();
-	if (p == 0) { execvp(argv[0], argv); _exit(127); }
+	if (p == 0) { execvp(argv[0], (char *const *)argv); _exit(127); }
 	int st; waitpid(p, &st, 0);
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
@@ -199,8 +205,8 @@ static int run_status(char *const argv[])
 static pid_t container_pid(void)
 {
 	char buf[64];
-	char *av[] = { "docker", "inspect", "-f", "{{.State.Pid}}",
-		       (char *)CONTAINER, NULL };
+	const char *av[] = { OBFSTR("docker"), OBFSTR("inspect"), OBFSTR("-f"),
+			     OBFSTR("{{.State.Pid}}"), CONTAINER, NULL };
 	if (run_capture(av, buf, sizeof buf) != 0) return -1;
 	long p = atol(buf);
 	return p > 0 ? (pid_t)p : -1;
@@ -209,15 +215,15 @@ static pid_t container_pid(void)
 static int container_running(void)
 {
 	char buf[32];
-	char *av[] = { "docker", "inspect", "-f", "{{.State.Running}}",
-		       (char *)CONTAINER, NULL };
+	const char *av[] = { OBFSTR("docker"), OBFSTR("inspect"), OBFSTR("-f"),
+			     OBFSTR("{{.State.Running}}"), CONTAINER, NULL };
 	if (run_capture(av, buf, sizeof buf) != 0) return 0;
 	return strncmp(buf, "true", 4) == 0;
 }
 
 /* ------------------------------------------------------- module management */
 
-static int module_loaded(void) { return access("/sys/module/vcachefs", F_OK) == 0; }
+static int module_loaded(void) { return access(OBFSTR("/sys/module/vcachefs"), F_OK) == 0; }
 
 static char *insmod_params(char *buf, size_t n)
 {
@@ -235,10 +241,10 @@ static char *insmod_params(char *buf, size_t n)
 static void finit_ko(void)
 {
 	int fd = open(KO, O_RDONLY);
-	if (fd < 0) die("open %s: %s", KO, strerror(errno));
+	if (fd < 0) die(OBFSTR("open %s: %s"), KO, strerror(errno));
 	char p[512];
 	if (syscall(SYS_finit_module, fd, insmod_params(p, sizeof p), 0) != 0)
-		die("finit_module: %s", strerror(errno));
+		die(OBFSTR("finit_module: %s"), strerror(errno));
 	close(fd);
 }
 
@@ -252,39 +258,36 @@ static void write_param(const char *name, const char *val)
 	close(fd);
 }
 
-/* Host-side, once, after teardown — the module backs the kernel that serves
- * both host and (privileged, shared-kernel) container mounts. */
 static void ensure_module(void)
 {
 	char p[512];
 	if (!module_loaded()) {
 		if (access(KO, F_OK) != 0)
-			die("module not loaded and .ko missing: %s (set AREV_KO=)", KO);
-		xlog("insmod vcachefs (%s)", insmod_params(p, sizeof p));
+			die(OBFSTR("module not loaded and .ko missing: %s (set AREV_KO=)"), KO);
+		xlog(OBFSTR("insmod vcachefs (%s)"), insmod_params(p, sizeof p));
 		finit_ko();
 		return;
 	}
 	if (RELOAD_MODULE) {
-		xlog("rmmod vcachefs (reload)");
-		if (syscall(SYS_delete_module, "vcachefs", O_NONBLOCK) != 0)
-			die("rmmod failed (module pinned by live mounts/mmap); "
-			    "run 'down' and stop the app first");
-		if (access(KO, F_OK) != 0) die(".ko missing for reload: %s", KO);
-		xlog("insmod vcachefs");
+		xlog(OBFSTR("rmmod vcachefs (reload)"));
+		if (syscall(SYS_delete_module, OBFSTR("vcachefs"), O_NONBLOCK) != 0)
+			die(OBFSTR("rmmod failed (module pinned by live mounts/mmap); "
+			           "run 'down' and stop the app first"));
+		if (access(KO, F_OK) != 0) die(OBFSTR(".ko missing for reload: %s"), KO);
+		xlog(OBFSTR("insmod vcachefs"));
 		finit_ko();
 		return;
 	}
-	/* keep loaded module; sync runtime-writable params */
 	{ char v[8]; snprintf(v, sizeof v, "%d", GATE_PASSTHROUGH);
-	  write_param("gate_passthrough_cipher", v); }
+	  write_param(OBFSTR("gate_passthrough_cipher"), v); }
 	if (DEV_MODE) {
 		char v[8];
 		snprintf(v, sizeof v, "%d", GATE_ENFORCE);
-		write_param("gate_enforce", v);
+		write_param(OBFSTR("gate_enforce"), v);
 		snprintf(v, sizeof v, "%d", GATE_REQUIRE_SIG);
-		write_param("gate_require_sig", v);
+		write_param(OBFSTR("gate_require_sig"), v);
 	}
-	xlog("vcachefs already loaded; params synced");
+	xlog(OBFSTR("vcachefs already loaded; params synced"));
 }
 
 static void read_ctl_mm(void)
@@ -317,7 +320,6 @@ static int mkdir_p(const char *path)
 	return 0;
 }
 
-/* Parse one /proc/self/mountinfo line into mountpoint + fstype. */
 static int mi_line(char *line, char *mp, size_t mpn, char *fs, size_t fsn)
 {
 	char *fields[24]; int i = 0, dash = -1;
@@ -333,7 +335,6 @@ static int mi_line(char *line, char *mp, size_t mpn, char *fs, size_t fsn)
 	return 0;
 }
 
-/* Longest-prefix fstype of the mount backing 'path' (current mount ns). */
 static void backing_fstype(const char *path, char *out, size_t n)
 {
 	out[0] = 0;
@@ -346,7 +347,7 @@ static void backing_fstype(const char *path, char *out, size_t n)
 		if (mi_line(copy, mp, sizeof mp, fs, sizeof fs) != 0) continue;
 		size_t l = strlen(mp);
 		int match = !strcmp(mp, path) ||
-			    (!strcmp(mp, "/") ) ||
+			    !strcmp(mp, "/") ||
 			    (strncmp(path, mp, l) == 0 && path[l] == '/');
 		if (match && l >= best) { best = l; snprintf(out, n, "%s", fs); }
 	}
@@ -368,7 +369,6 @@ static int is_mountpoint(const char *path)
 	return found;
 }
 
-/* Collect mountpoints == root or under root/, deepest-first. Caller frees. */
 static int collect_submounts(const char *root, char ***out)
 {
 	FILE *f = fopen("/proc/self/mountinfo", "r");
@@ -389,7 +389,6 @@ static int collect_submounts(const char *root, char ***out)
 		}
 	}
 	fclose(f);
-	/* sort deepest-first (longest path) */
 	for (int a = 0; a < n; a++)
 		for (int b = a + 1; b < n; b++)
 			if (strlen(arr[b]) > strlen(arr[a])) {
@@ -399,7 +398,6 @@ static int collect_submounts(const char *root, char ***out)
 	return n;
 }
 
-/* Split "ro,passdata,nosuid" into MS_* flags + fs-specific data string. */
 static unsigned long opts_split(const char *opts, char *data, size_t dn)
 {
 	unsigned long fl = 0;
@@ -409,7 +407,7 @@ static unsigned long opts_split(const char *opts, char *data, size_t dn)
 	for (char *save, *t = strtok_r(tmp, ",", &save); t;
 	     t = strtok_r(NULL, ",", &save)) {
 		if      (!strcmp(t, "ro"))     fl |= MS_RDONLY;
-		else if (!strcmp(t, "rw"))     ; /* default */
+		else if (!strcmp(t, "rw"))     ;
 		else if (!strcmp(t, "nosuid")) fl |= MS_NOSUID;
 		else if (!strcmp(t, "nodev"))  fl |= MS_NODEV;
 		else if (!strcmp(t, "noexec")) fl |= MS_NOEXEC;
@@ -422,12 +420,9 @@ static unsigned long opts_split(const char *opts, char *data, size_t dn)
 }
 
 static void rm_rf(const char *path)
-{ char *av[] = { "rm", "-rf", (char *)path, NULL }; run_status(av); }
+{ const char *av[] = { OBFSTR("rm"), OBFSTR("-rf"), path, NULL }; run_status(av); }
 
 /* --------------------------------------------------- per-target operations */
-/* These run IN the target's mount namespace (host: current process; container:
- * a forked child after setns).  Absolute paths therefore resolve correctly in
- * whichever namespace we are in. */
 
 static const char *spec_root(const char *spec, char *buf, size_t n)
 { const char *bar = strchr(spec, '|');
@@ -442,11 +437,10 @@ static int do_up(void)
 	int n = list_len(MOUNTS);
 	char **lowers = calloc(n + 1, sizeof *lowers);
 
-	/* 0) choose LOWER per mount: in-place, or staged when lower is overlay. */
 	for (int i = 0; i < n; i++) {
 		const char *root = MOUNTS[i];
-		if (!is_dir(root)) die("not a directory: %s", root);
-		if (is_mountpoint(root)) die("already mounted: %s (run 'down' first)", root);
+		if (!is_dir(root)) die(OBFSTR("not a directory: %s"), root);
+		if (is_mountpoint(root)) die(OBFSTR("already mounted: %s (run 'down' first)"), root);
 		int stage = 0;
 		if      (!strcmp(STAGE_MODE, "always")) stage = 1;
 		else if (!strcmp(STAGE_MODE, "never"))  stage = 0;
@@ -461,18 +455,17 @@ static int do_up(void)
 			snprintf(lower, 4096, "%s/%s", STAGE_DIR, tag);
 			rm_rf(lower);
 			mkdir_p(lower);
-			xlog("stage (overlay lower) %s -> %s", root, lower);
+			xlog(OBFSTR("stage (overlay lower) %s -> %s"), root, lower);
 			char src[4096];
 			snprintf(src, sizeof src, "%s/.", root);
-			char *av[] = { "cp", "-a", src, lower, NULL };
-			if (run_status(av) != 0) die("stage copy failed: %s", root);
+			const char *av[] = { OBFSTR("cp"), OBFSTR("-a"), src, lower, NULL };
+			if (run_status(av) != 0) die(OBFSTR("stage copy failed: %s"), root);
 			lowers[i] = lower;
 		} else {
 			lowers[i] = strdup(root);
 		}
 	}
 
-	/* 1) seed write anchors in the LOWER before mounting over it. */
 	for (int i = 0; WRITE_DIRS[i]; i++) {
 		char root[4096]; spec_root(WRITE_DIRS[i], root, sizeof root);
 		for (int j = 0; j < n; j++) if (!strcmp(MOUNTS[j], root)) {
@@ -492,36 +485,33 @@ static int do_up(void)
 		}
 	}
 
-	/* 2) vcachefs: lower -> mountpoint (in place or staged). */
 	for (int i = 0; i < n; i++) {
 		char data[128];
 		unsigned long fl = opts_split(VCACHEFS_OPTS, data, sizeof data);
-		xlog("vcachefs %s -> %s (%s)", lowers[i], MOUNTS[i], VCACHEFS_OPTS);
-		if (mount(lowers[i], MOUNTS[i], "vcachefs", fl,
+		xlog(OBFSTR("vcachefs %s -> %s (%s)"), lowers[i], MOUNTS[i], VCACHEFS_OPTS);
+		if (mount(lowers[i], MOUNTS[i], OBFSTR("vcachefs"), fl,
 			  data[0] ? data : NULL) != 0)
-			die("mount vcachefs %s: %s", MOUNTS[i], strerror(errno));
+			die(OBFSTR("mount vcachefs %s: %s"), MOUNTS[i], strerror(errno));
 	}
 
-	/* 3) anonymous tmpfs over each known write directory. */
 	for (int i = 0; WRITE_DIRS[i]; i++) {
 		char root[4096]; spec_root(WRITE_DIRS[i], root, sizeof root);
 		char mp[4096], data[128];
 		snprintf(mp, sizeof mp, "%s/%s", root, spec_rel(WRITE_DIRS[i]));
 		unsigned long fl = opts_split(TMPFS_OPTS, data, sizeof data);
-		xlog("tmpfs %s", mp);
-		if (mount("tmpfs", mp, "tmpfs", fl, data[0] ? data : NULL) != 0)
-			die("tmpfs %s: %s", mp, strerror(errno));
+		xlog(OBFSTR("tmpfs %s"), mp);
+		if (mount(OBFSTR("tmpfs"), mp, OBFSTR("tmpfs"), fl, data[0] ? data : NULL) != 0)
+			die(OBFSTR("tmpfs %s: %s"), mp, strerror(errno));
 	}
 
-	/* 4) per-file writable binds (tmpfs-backed source). */
 	if (WRITE_FILES[0]) {
 		char data[128];
 		unsigned long fl = opts_split(TMPFS_OPTS, data, sizeof data);
 		mkdir_p(WRITE_BACKING);
 		if (!is_mountpoint(WRITE_BACKING) &&
-		    mount("tmpfs", WRITE_BACKING, "tmpfs", fl,
+		    mount(OBFSTR("tmpfs"), WRITE_BACKING, OBFSTR("tmpfs"), fl,
 			  data[0] ? data : NULL) != 0)
-			die("tmpfs %s: %s", WRITE_BACKING, strerror(errno));
+			die(OBFSTR("tmpfs %s: %s"), WRITE_BACKING, strerror(errno));
 		for (int i = 0; WRITE_FILES[i]; i++) {
 			char root[4096]; spec_root(WRITE_FILES[i], root, sizeof root);
 			const char *rel = spec_rel(WRITE_FILES[i]);
@@ -531,12 +521,12 @@ static int do_up(void)
 			snprintf(srcp, sizeof srcp, "%s/%s", WRITE_BACKING, tag);
 			int fd = open(srcp, O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd);
 			snprintf(dst, sizeof dst, "%s/%s", root, rel);
-			xlog("bind %s -> %s", srcp, dst);
+			xlog(OBFSTR("bind %s -> %s"), srcp, dst);
 			if (mount(srcp, dst, NULL, MS_BIND, NULL) != 0)
-				die("bind %s: %s", dst, strerror(errno));
+				die(OBFSTR("bind %s: %s"), dst, strerror(errno));
 		}
 	}
-	xlog("up complete");
+	xlog(OBFSTR("up complete"));
 	return 0;
 }
 
@@ -547,7 +537,7 @@ static int do_down(void)
 		for (int j = 0; j < m; j++) {
 			if (umount2(subs[j], 0) != 0 &&
 			    umount2(subs[j], MNT_DETACH) != 0)
-				xlog("busy: %s", subs[j]);
+				xlog(OBFSTR("busy: %s"), subs[j]);
 			free(subs[j]);
 		}
 		free(subs);
@@ -555,7 +545,7 @@ static int do_down(void)
 	if (is_mountpoint(WRITE_BACKING))
 		if (umount2(WRITE_BACKING, 0) != 0) umount2(WRITE_BACKING, MNT_DETACH);
 	if (STAGE_DIR && *STAGE_DIR) rm_rf(STAGE_DIR);
-	xlog("down complete");
+	xlog(OBFSTR("down complete"));
 	return 0;
 }
 
@@ -563,12 +553,12 @@ static int do_status(void)
 {
 	for (int i = 0; MOUNTS[i]; i++) {
 		if (is_mountpoint(MOUNTS[i])) {
-			printf("  %-22s mounted\n", MOUNTS[i]);
+			fprintf(stdout, "  %-22s mounted\n", MOUNTS[i]);
 			char **subs; int m = collect_submounts(MOUNTS[i], &subs);
-			for (int j = m - 1; j >= 0; j--) { printf("      %s\n", subs[j]); free(subs[j]); }
+			for (int j = m - 1; j >= 0; j--) { fprintf(stdout, "      %s\n", subs[j]); free(subs[j]); }
 			free(subs);
 		} else {
-			printf("  %-22s not-mounted\n", MOUNTS[i]);
+			fprintf(stdout, "  %-22s not-mounted\n", MOUNTS[i]);
 		}
 	}
 	fflush(stdout);
@@ -577,47 +567,46 @@ static int do_status(void)
 
 static int write_allowlist(void)
 {
-	if (!DEV_MODE) {                       /* production .ko: no list at all */
+	if (!DEV_MODE) {
 		unlink(AUTHZ_PATH); unlink(AUTHZ_SIG_PATH);
 		return 0;
 	}
-	if (!GATE_ENFORCE) { xlog("gate off; skipping allow-list"); return 0; }
+	if (!GATE_ENFORCE) { xlog(OBFSTR("gate off; skipping allow-list")); return 0; }
 	if (GATE_REQUIRE_SIG) {
 		if (access(AUTHZ_PATH, R_OK) == 0 && access(AUTHZ_SIG_PATH, R_OK) == 0)
-			xlog("signed mode: using pre-signed %s (+ .p7s)", AUTHZ_PATH);
+			xlog(OBFSTR("signed mode: using pre-signed %s (+ .p7s)"), AUTHZ_PATH);
 		else
-			xlog("WARNING: signed mode but list/.p7s missing -> gate DENIES");
+			xlog(OBFSTR("WARNING: signed mode but list/.p7s missing -> gate DENIES"));
 		return 0;
 	}
 	if (list_len(ALLOWL) == 0) {
-		xlog("ALLOW empty -> per-exe/whitelist gating; removing stale %s", AUTHZ_PATH);
+		xlog(OBFSTR("ALLOW empty -> per-exe/whitelist gating; removing stale %s"), AUTHZ_PATH);
 		unlink(AUTHZ_PATH); unlink(AUTHZ_SIG_PATH);
 		return 0;
 	}
 	FILE *f = fopen(AUTHZ_PATH, "w");
-	if (!f) die("cannot write %s: %s", AUTHZ_PATH, strerror(errno));
+	if (!f) die(OBFSTR("cannot write %s: %s"), AUTHZ_PATH, strerror(errno));
 	for (int i = 0; ALLOWL[i]; i++) fprintf(f, "%s\n", ALLOWL[i]);
 	fclose(f);
 	chmod(AUTHZ_PATH, 0644);
-	xlog("wrote %s", AUTHZ_PATH);
+	xlog(OBFSTR("wrote %s"), AUTHZ_PATH);
 	return 0;
 }
 
 static int ensure_ctldev(void)
 {
-	if (!CTL_MM[0]) { xlog("no /sys/class/misc/vcachefs/dev; qemu gate unavailable"); return 0; }
-	if (access("/dev/vcachefs", F_OK) == 0) return 0;
+	if (!CTL_MM[0]) { xlog(OBFSTR("no ctl dev node; qemu gate unavailable")); return 0; }
+	if (access(OBFSTR("/dev/vcachefs"), F_OK) == 0) return 0;
 	unsigned maj, min;
 	if (sscanf(CTL_MM, "%u:%u", &maj, &min) != 2) return 0;
-	xlog("mknod /dev/vcachefs c %u %u", maj, min);
-	if (mknod("/dev/vcachefs", S_IFCHR | 0666, makedev(maj, min)) != 0)
-		xlog("WARNING: mknod /dev/vcachefs: %s", strerror(errno));
+	xlog(OBFSTR("mknod /dev/vcachefs c %u %u"), maj, min);
+	if (mknod(OBFSTR("/dev/vcachefs"), S_IFCHR | 0666, makedev(maj, min)) != 0)
+		xlog(OBFSTR("WARNING: mknod failed: %s"), strerror(errno));
 	else
-		chmod("/dev/vcachefs", 0666);
+		chmod(OBFSTR("/dev/vcachefs"), 0666);
 	return 0;
 }
 
-/* readiness: every mount root exists + non-empty, and (if set) READY_MARKER. */
 static int target_ready(void)
 {
 	for (int i = 0; MOUNTS[i]; i++) {
@@ -635,7 +624,6 @@ static int target_ready(void)
 	return 1;
 }
 
-/* full per-target "up" body (runs in target ns) */
 static int target_up_body(void)
 {
 	write_allowlist();
@@ -647,9 +635,6 @@ static int target_up_body(void)
 
 /* ---------------------------------------------------------- target executor */
 
-/* Run fn() in the current target: host => directly; container => fork + setns
- * into the container's mount namespace, so the SAME routine's mount(2)/mkdir/…
- * land inside the container.  Returns fn()'s status (child exit code). */
 static int run_in_target(int (*fn)(void))
 {
 	if (!IN_CONTAINER) return fn();
@@ -668,11 +653,9 @@ static int run_in_target(int (*fn)(void))
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-/* target present? host: always; container: only when running. */
 static int target_present(void)
 { return !IN_CONTAINER || container_running(); }
 
-/* Set the current target (updates G_CPID for the container). */
 static void set_target(int container)
 {
 	IN_CONTAINER = container;
@@ -681,8 +664,6 @@ static void set_target(int container)
 
 /* --------------------------------------------------------------- dispatch */
 
-/* Iterate the mode's targets: host always; +container in sim.  cb gets the
- * container flag (0/1). */
 static void for_each_target(void (*cb)(int))
 {
 	cb(0);
@@ -693,17 +674,16 @@ static void up_one(int container)
 {
 	set_target(container);
 	if (!target_present()) {
-		xlog("[%s] container '%s' not running -> skipped (start it, or use 'watch')",
-		     container ? "ctr" : "host", CONTAINER);
+		xlog(OBFSTR("[%s] not running -> skipped (start it, or use 'watch')"),
+		     container ? OBFSTR("ctr") : OBFSTR("host"));
 		return;
 	}
 	if (run_in_target(target_ready) != 1) {
-		xlog("[%s] ciphertext NOT ready (a mount root is empty%s) -> not mounting",
-		     container ? "ctr" : "host",
-		     (READY_MARKER && *READY_MARKER) ? " or marker missing" : "");
+		xlog(OBFSTR("[%s] ciphertext NOT ready -> not mounting"),
+		     container ? OBFSTR("ctr") : OBFSTR("host"));
 		return;
 	}
-	xlog("[%s] mounting", container ? "ctr" : "host");
+	xlog(OBFSTR("[%s] mounting"), container ? OBFSTR("ctr") : OBFSTR("host"));
 	run_in_target(target_up_body);
 }
 
@@ -711,14 +691,15 @@ static void down_one(int container)
 {
 	set_target(container);
 	if (!target_present()) {
-		xlog("[%s] not running; its mounts vanished with it", container ? "ctr" : "host");
+		xlog(OBFSTR("[%s] not running; its mounts vanished with it"),
+		     container ? OBFSTR("ctr") : OBFSTR("host"));
 		return;
 	}
-	xlog("[%s] tearing down", container ? "ctr" : "host");
+	xlog(OBFSTR("[%s] tearing down"), container ? OBFSTR("ctr") : OBFSTR("host"));
 	run_in_target(do_down);
 }
 
-static void down_pre(int container)  /* teardown pass before module (re)load */
+static void down_pre(int container)
 {
 	set_target(container);
 	if (!target_present()) return;
@@ -728,45 +709,42 @@ static void down_pre(int container)  /* teardown pass before module (re)load */
 static void status_one(int container)
 {
 	set_target(container);
-	if (!target_present()) { xlog("[%s] not running", container ? "ctr" : "host"); return; }
-	xlog("[%s] status:", container ? "ctr" : "host");
+	if (!target_present()) { xlog(OBFSTR("[%s] not running"), container ? OBFSTR("ctr") : OBFSTR("host")); return; }
+	xlog(OBFSTR("[%s] status:"), container ? OBFSTR("ctr") : OBFSTR("host"));
 	run_in_target(do_status);
 }
 
 static void run_up_sequence(void)
 {
-	for_each_target(down_pre);       /* live mounts pin the module */
+	for_each_target(down_pre);
 	IN_CONTAINER = 0; ensure_module(); read_ctl_mm();
 	for_each_target(up_one);
-	xlog("up complete. Watch for EROFS -> add paths to WRITE_DIRS/WRITE_FILES and re-run 'up'.");
+	xlog(OBFSTR("up complete. Watch for EROFS -> add paths to WRITE_DIRS/WRITE_FILES and re-run 'up'."));
 }
 
 static void do_watch(void)
 {
-	/* host first: mount immediately + load module.  target_up_body already
-	 * runs write_allowlist in the correct ns, so we do not call it here. */
 	set_target(0);
 	run_in_target(do_down);
 	ensure_module(); read_ctl_mm();
 	run_in_target(target_up_body);
 
-	if (!MODE_SIM) { xlog("real mode: no container to watch; done"); return; }
+	if (!MODE_SIM) { xlog(OBFSTR("real mode: no container to watch; done")); return; }
 
-	xlog("watch: polling for '%s' every %ds (idle until it appears)",
-	     CONTAINER, WATCH_INTERVAL);
+	xlog(OBFSTR("watch: polling for '%s' every %ds"), CONTAINER, WATCH_INTERVAL);
 	int prev = 0;   /* 0 down, 1 waiting, 2 up */
 	for (;;) {
 		set_target(1);
 		if (container_running()) {
 			if (run_in_target(target_ready) == 1) {
 				if (prev != 2) {
-					xlog("container up + ready -> mounting");
+					xlog(OBFSTR("container up + ready -> mounting"));
 					run_in_target(do_down);
 					run_in_target(target_up_body);
 					prev = 2;
 				}
 			} else if (prev != 1) {
-				xlog("container up but ciphertext NOT ready; waiting for install copy");
+				xlog(OBFSTR("container up but ciphertext NOT ready; waiting"));
 				prev = 1;
 			}
 		} else {
@@ -783,60 +761,54 @@ static void become_root(int argc, char **argv)
 {
 	if (geteuid() == 0) return;
 	char self[4096];
-	ssize_t r = readlink("/proc/self/exe", self, sizeof self - 1);
+	ssize_t r = readlink(OBFSTR("/proc/self/exe"), self, sizeof self - 1);
 	if (r < 0) { perror("readlink"); exit(1); }
 	self[r] = 0;
-	char **na = calloc(argc + 3, sizeof *na);
+	const char **na = calloc(argc + 3, sizeof *na);
 	int i = 0;
-	na[i++] = "sudo"; na[i++] = "-E"; na[i++] = self;
+	na[i++] = OBFSTR("sudo"); na[i++] = OBFSTR("-E"); na[i++] = self;
 	for (int j = 1; j < argc; j++) na[i++] = argv[j];
 	na[i] = NULL;
-	execvp("sudo", na);
+	execvp(na[0], (char *const *)na);
 	perror("execvp sudo"); exit(1);
 }
-
-static const char *const DEF_MOUNTS[] = { CFG_MOUNTS NULL };
-static const char *const DEF_ALLOW[]  = { CFG_ALLOW NULL };
-static const char *const DEF_WDIRS[]  = { CFG_WRITE_DIRS NULL };
-static const char *const DEF_WFILES[] = { CFG_WRITE_FILES NULL };
 
 static void load_config(void)
 {
 	static char ko_buf[4096], sig_buf[4096];
-	const char *kmod_dir = env_def("AREV_KMOD_DIR", CFG_KMOD_DIR);
-	const char *ko = getenv("AREV_KO");
-	if (!ko || !*ko) ko = CFG_KO;                 /* baked default (may be empty) */
-	if (!ko || !*ko) { snprintf(ko_buf, sizeof ko_buf, "%s/vcachefs.ko", kmod_dir); ko = ko_buf; }
-	KO = ko;
+	const char *kmod_dir = env_def(OBFSTR("AREV_KMOD_DIR"), CFG_KMOD_DIR);
+	const char *envko = getenv("AREV_KO");
+	const char *ko = (envko && *envko) ? envko : CFG_KO;
+	if (!*ko) { snprintf(ko_buf, sizeof ko_buf, "%s/vcachefs.ko", kmod_dir); ko = ko_buf; }
+	KO = strdup(ko);
 
-	CONTAINER       = env_def("AREV_CONTAINER", CFG_CONTAINER);
-	WATCH_INTERVAL  = env_int("AREV_WATCH_INTERVAL", CFG_WATCH_SECS);
-	READY_MARKER    = env_def("AREV_READY_MARKER", CFG_READY_MARKER);
-	AUTHZ_PATH      = env_def("AREV_AUTHZ_PATH", CFG_AUTHZ_PATH);
+	CONTAINER       = strdup(env_def(OBFSTR("AREV_CONTAINER"), CFG_CONTAINER));
+	WATCH_INTERVAL  = env_int(OBFSTR("AREV_WATCH_INTERVAL"), CFG_WATCH_SECS);
+	READY_MARKER    = strdup(env_def(OBFSTR("AREV_READY_MARKER"), CFG_READY_MARKER));
+	AUTHZ_PATH      = strdup(env_def(OBFSTR("AREV_AUTHZ_PATH"), CFG_AUTHZ_PATH));
 	const char *sig = getenv("AREV_AUTHZ_SIG_PATH");
 	if (!sig || !*sig) { snprintf(sig_buf, sizeof sig_buf, "%s.p7s", AUTHZ_PATH); sig = sig_buf; }
-	AUTHZ_SIG_PATH  = sig;
-	GATE_ENFORCE    = env_int("AREV_GATE_ENFORCE", CFG_GATE_ENFORCE);
-	GATE_PASSTHROUGH= env_int("AREV_GATE_PASSTHROUGH", CFG_GATE_PASS);
-	DEV_MODE        = env_int("AREV_DEV", CFG_DEV_MODE);
-	GATE_REQUIRE_SIG= env_int("AREV_GATE_REQUIRE_SIG", CFG_REQUIRE_SIG);
-	RELOAD_MODULE   = env_int("AREV_RELOAD_MODULE", CFG_RELOAD);
-	VCACHEFS_OPTS   = env_def("AREV_VCACHEFS_OPTS", CFG_VCACHE_OPTS);
-	STAGE_MODE      = env_def("AREV_STAGE_LOWER", CFG_STAGE_MODE);
-	STAGE_DIR       = env_def("AREV_STAGE_DIR", CFG_STAGE_DIR);
-	WRITE_BACKING   = env_def("AREV_WRITE_BACKING", CFG_WRITE_BACKING);
-	TMPFS_OPTS      = env_def("AREV_TMPFS_OPTS", CFG_TMPFS_OPTS);
+	AUTHZ_SIG_PATH  = strdup(sig);
+	GATE_ENFORCE    = env_int(OBFSTR("AREV_GATE_ENFORCE"), CFG_GATE_ENFORCE);
+	GATE_PASSTHROUGH= env_int(OBFSTR("AREV_GATE_PASSTHROUGH"), CFG_GATE_PASS);
+	DEV_MODE        = env_int(OBFSTR("AREV_DEV"), CFG_DEV_MODE);
+	GATE_REQUIRE_SIG= env_int(OBFSTR("AREV_GATE_REQUIRE_SIG"), CFG_REQUIRE_SIG);
+	RELOAD_MODULE   = env_int(OBFSTR("AREV_RELOAD_MODULE"), CFG_RELOAD);
+	VCACHEFS_OPTS   = strdup(env_def(OBFSTR("AREV_VCACHEFS_OPTS"), CFG_VCACHE_OPTS));
+	STAGE_MODE      = strdup(env_def(OBFSTR("AREV_STAGE_LOWER"), CFG_STAGE_MODE));
+	STAGE_DIR       = strdup(env_def(OBFSTR("AREV_STAGE_DIR"), CFG_STAGE_DIR));
+	WRITE_BACKING   = strdup(env_def(OBFSTR("AREV_WRITE_BACKING"), CFG_WRITE_BACKING));
+	TMPFS_OPTS      = strdup(env_def(OBFSTR("AREV_TMPFS_OPTS"), CFG_TMPFS_OPTS));
 
-	MOUNTS      = list_from_env("AREV_MOUNTS", DEF_MOUNTS);
-	ALLOWL      = list_from_env("AREV_ALLOW", DEF_ALLOW);
-	WRITE_DIRS  = list_from_env("AREV_WRITE_DIRS", DEF_WDIRS);
-	WRITE_FILES = list_from_env("AREV_WRITE_FILES", DEF_WFILES);
+	MOUNTS      = list_env(OBFSTR("AREV_MOUNTS"));      if (!MOUNTS)      MOUNTS      = build_list(CFG_MOUNTS NULL);
+	ALLOWL      = list_env(OBFSTR("AREV_ALLOW"));       if (!ALLOWL)      ALLOWL      = build_list(CFG_ALLOW NULL);
+	WRITE_DIRS  = list_env(OBFSTR("AREV_WRITE_DIRS"));  if (!WRITE_DIRS)  WRITE_DIRS  = build_list(CFG_WRITE_DIRS NULL);
+	WRITE_FILES = list_env(OBFSTR("AREV_WRITE_FILES")); if (!WRITE_FILES) WRITE_FILES = build_list(CFG_WRITE_FILES NULL);
 }
 
 static void usage(void)
 {
-	fprintf(stderr,
-		"usage: vcache-mount-inplace [--mode real|sim] {up|down|status|watch}\n");
+	fprintf(stderr, "usage: vcache-mount-inplace [--mode real|sim] {up|down|status|watch}\n");
 	exit(2);
 }
 
@@ -844,7 +816,7 @@ int main(int argc, char **argv)
 {
 	become_root(argc, argv);
 
-	const char *mode = env_def("AREV_MODE", "real");
+	const char *mode = env_def(OBFSTR("AREV_MODE"), CFG_MODE);
 	ACTION = NULL;
 	for (int i = 1; i < argc; i++) {
 		if      (!strcmp(argv[i], "--mode") && i + 1 < argc) mode = argv[++i];
@@ -855,23 +827,24 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) usage();
 		else { fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(); }
 	}
-	if (!ACTION) ACTION = "up";
+	if (!ACTION) ACTION = OBFSTR("up");
 
 	if      (!strcmp(mode, "real")) MODE_SIM = 0;
 	else if (!strcmp(mode, "sim"))  MODE_SIM = 1;
-	else die("unknown --mode '%s' (use real|sim)", mode);
+	else die(OBFSTR("unknown --mode '%s' (use real|sim)"), mode);
 
 	load_config();
 
 	if (MODE_SIM && strcmp(ACTION, "watch") != 0) {
-		char buf[16]; char *av[] = { "docker", "--version", NULL };
-		if (run_capture(av, buf, sizeof buf) != 0) die("docker not found (sim mode)");
+		char buf[16];
+		const char *av[] = { OBFSTR("docker"), OBFSTR("--version"), NULL };
+		if (run_capture(av, buf, sizeof buf) != 0) die(OBFSTR("docker not found (sim mode)"));
 	}
 
 	if      (!strcmp(ACTION, "up"))     run_up_sequence();
 	else if (!strcmp(ACTION, "watch"))  do_watch();
 	else if (!strcmp(ACTION, "down"))   { for_each_target(down_one);
-					      xlog("down complete (module left loaded; 'rmmod vcachefs' to unload)"); }
+					      xlog(OBFSTR("down complete (module left loaded; 'rmmod vcachefs' to unload)")); }
 	else if (!strcmp(ACTION, "status")) for_each_target(status_one);
 	else usage();
 	return 0;

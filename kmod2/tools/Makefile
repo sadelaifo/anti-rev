@@ -1,31 +1,47 @@
 # Build the shippable static mount helpers.  Static so they run on any x86-64
 # client box regardless of its glibc version; carry no shell commentary.
-CC      ?= gcc
-CFLAGS  ?= -O2 -Wall -Wno-format-truncation
-# -s strips the symbol table (function/var names) from the link.
-# --gc-sections drops unreferenced code/data (fewer stray strings, smaller bin).
-LDFLAGS ?= -static -s -Wl,--gc-sections
+CC       ?= gcc
+CFLAGS   ?= -O2 -Wall -Wno-format-truncation
+# -s strips the symbol table; --gc-sections drops unreferenced code/data.
+LDFLAGS  ?= -static -s -Wl,--gc-sections
 SECFLAGS ?= -ffunction-sections -fdata-sections
 
-# vcache-mount           : minimal single-tree ro/rw helper (explicit args)
-# vcache-mount-inplace   : compiled twin of vcache-mount.sh (--mode real|sim,
-#                          up|down|status|watch; in-place mounts + tmpfs layers;
-#                          sim reaches the container via docker inspect + setns)
-#
-# NOTE on `strings`: a STATIC binary always contains libc's own strings, so the
-# output is never empty.  Symbol stripping (above) removes OUR function names,
-# but OUR string literals (paths, "vcachefs", "docker", gate-param names, log
-# text) still appear.  To keep those out of `strings` too, compile-time string
-# obfuscation is required (see the OBF layer / obfgen when enabled).  Verify:
-#     strings vcache-mount-inplace | grep -iE 'vcachefs|proj|docker|gate_' || echo clean
+# obfstr string-obfuscation layer (shared with the stub build):
+#   stub/obfstr.h        — runtime XOR decoder + OBFSTR() marker
+#   tools/obfstr_gen.py  — codegen: rewrites OBFSTR("x")/scanned-call literals
+#                          into pre-encrypted _OBF(0x..) bytes before gcc
+STUB    := ../../stub
+OBFGEN  := ../../tools/obfstr_gen.py
+OBFDIR  := obf
+PY      ?= python3
+
 all: vcache-mount vcache-mount-inplace
 
+# Minimal single-tree ro/rw helper (explicit args) — not obfuscated.
 vcache-mount: vcache-mount.c
 	$(CC) $(CFLAGS) $(SECFLAGS) $(LDFLAGS) -o $@ $<
 
-vcache-mount-inplace: vcache-mount-inplace.c
-	$(CC) $(CFLAGS) $(SECFLAGS) $(LDFLAGS) -o $@ $<
+# Compiled twin of vcache-mount.sh.  Its string literals are XOR-obfuscated:
+# obfstr_gen.py rewrites this source into $(OBFDIR)/ with encrypted bytes, then
+# gcc compiles THAT against stub/obfstr.h.  Result: `strings` shows none of our
+# design tokens (a static binary still carries libc's own strings — that noise
+# is unavoidable and is good camouflage).  Verify:
+#   strings vcache-mount-inplace | grep -iE 'vcachefs|proj|docker|gate_|AREV_|passdata' || echo clean
+# If python3 is missing the raw source still compiles (OBFSTR is a passthrough),
+# but the literals are NOT hidden — a loud warning is printed.
+$(OBFDIR)/vcache-mount-inplace.c: vcache-mount-inplace.c $(OBFGEN)
+	@if command -v $(PY) >/dev/null 2>&1; then \
+	   echo "obfstr-codegen vcache-mount-inplace.c"; \
+	   $(PY) $(OBFGEN) --out-dir $(OBFDIR) $< ; \
+	 else \
+	   echo "WARNING: $(PY) not found -> building WITHOUT string obfuscation (strings WILL leak)"; \
+	   mkdir -p $(OBFDIR) && cp $< $(OBFDIR)/ ; \
+	 fi
+
+vcache-mount-inplace: $(OBFDIR)/vcache-mount-inplace.c
+	$(CC) $(CFLAGS) $(SECFLAGS) -I$(STUB) $(LDFLAGS) -o $@ $<
 
 clean:
 	rm -f vcache-mount vcache-mount-inplace
+	rm -rf $(OBFDIR)
 .PHONY: all clean
