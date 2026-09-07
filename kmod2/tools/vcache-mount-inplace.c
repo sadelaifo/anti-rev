@@ -42,6 +42,36 @@
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 
+/* ==========================================================================
+ *  EDIT ME — per-deployment defaults (compiled in; each is also overridable
+ *  at runtime by the matching AREV_* env var).  These string/number literals
+ *  live in the source only; see the Makefile's obfuscation note for how they
+ *  are kept out of `strings` in the shipped binary.
+ * ========================================================================== */
+#define CFG_KMOD_DIR      "/root/vcache/kmod2/module"  /* dir holding vcachefs.ko */
+#define CFG_KO            ""            /* explicit .ko path; "" => KMOD_DIR/vcachefs.ko */
+#define CFG_CONTAINER     "slave"       /* sim: business `docker run --name` */
+#define CFG_WATCH_SECS    5             /* watch poll period (s) */
+#define CFG_READY_MARKER  ""            /* file the installer touches last; "" => dir-nonempty heuristic */
+#define CFG_AUTHZ_PATH    "/etc/authorized_apps.txt"
+#define CFG_GATE_ENFORCE  1             /* 1 = enforce (dev .ko only) */
+#define CFG_GATE_PASS     1             /* 1 = unauth read -> trailer-stripped cipher */
+#define CFG_DEV_MODE      0             /* 1 ONLY for a dev .ko (AREV_DEV_MODE build) */
+#define CFG_REQUIRE_SIG   0             /* 1 = signed allow-list (dev .ko) */
+#define CFG_RELOAD        0             /* 1 = rmmod+insmod on 'up' */
+#define CFG_VCACHE_OPTS   "ro,passdata"
+#define CFG_STAGE_MODE    "auto"        /* auto | always | never (overlay-lower staging) */
+#define CFG_STAGE_DIR     "/dev/shm/arev"
+#define CFG_WRITE_BACKING "/run/vcache-write"
+#define CFG_TMPFS_OPTS    "mode=0755,nosuid,nodev"
+
+/* Lists — keep the trailing comma on every entry (empty macro => just NULL). */
+#define CFG_MOUNTS        "/root/proj/bin", "/root/proj/lib",
+#define CFG_ALLOW                            /* legacy model only; prefer per-exe sigs */
+#define CFG_WRITE_DIRS                       /* e.g.  "/root/proj/bin|logs", */
+#define CFG_WRITE_FILES                      /* e.g.  "/root/proj/bin|QtApplication.pid", */
+/* ======================= end EDIT ME ====================================== */
+
 /* ------------------------------------------------------------------ config */
 
 static const char *KO;                 /* path to vcachefs.ko */
@@ -765,39 +795,42 @@ static void become_root(int argc, char **argv)
 	perror("execvp sudo"); exit(1);
 }
 
-static const char *const DEF_MOUNTS[] = { "/root/proj/bin", "/root/proj/lib", NULL };
-static const char *const DEF_EMPTY[]  = { NULL };
+static const char *const DEF_MOUNTS[] = { CFG_MOUNTS NULL };
+static const char *const DEF_ALLOW[]  = { CFG_ALLOW NULL };
+static const char *const DEF_WDIRS[]  = { CFG_WRITE_DIRS NULL };
+static const char *const DEF_WFILES[] = { CFG_WRITE_FILES NULL };
 
 static void load_config(void)
 {
 	static char ko_buf[4096], sig_buf[4096];
-	const char *kmod_dir = env_def("AREV_KMOD_DIR", "/root/vcache/kmod2/module");
+	const char *kmod_dir = env_def("AREV_KMOD_DIR", CFG_KMOD_DIR);
 	const char *ko = getenv("AREV_KO");
+	if (!ko || !*ko) ko = CFG_KO;                 /* baked default (may be empty) */
 	if (!ko || !*ko) { snprintf(ko_buf, sizeof ko_buf, "%s/vcachefs.ko", kmod_dir); ko = ko_buf; }
 	KO = ko;
 
-	CONTAINER       = env_def("AREV_CONTAINER", "slave");
-	WATCH_INTERVAL  = env_int("AREV_WATCH_INTERVAL", 5);
-	READY_MARKER    = env_def("AREV_READY_MARKER", "");
-	AUTHZ_PATH      = env_def("AREV_AUTHZ_PATH", "/etc/authorized_apps.txt");
+	CONTAINER       = env_def("AREV_CONTAINER", CFG_CONTAINER);
+	WATCH_INTERVAL  = env_int("AREV_WATCH_INTERVAL", CFG_WATCH_SECS);
+	READY_MARKER    = env_def("AREV_READY_MARKER", CFG_READY_MARKER);
+	AUTHZ_PATH      = env_def("AREV_AUTHZ_PATH", CFG_AUTHZ_PATH);
 	const char *sig = getenv("AREV_AUTHZ_SIG_PATH");
 	if (!sig || !*sig) { snprintf(sig_buf, sizeof sig_buf, "%s.p7s", AUTHZ_PATH); sig = sig_buf; }
 	AUTHZ_SIG_PATH  = sig;
-	GATE_ENFORCE    = env_int("AREV_GATE_ENFORCE", 1);
-	GATE_PASSTHROUGH= env_int("AREV_GATE_PASSTHROUGH", 1);
-	DEV_MODE        = env_int("AREV_DEV", 0);
-	GATE_REQUIRE_SIG= env_int("AREV_GATE_REQUIRE_SIG", 0);
-	RELOAD_MODULE   = env_int("AREV_RELOAD_MODULE", 0);
-	VCACHEFS_OPTS   = env_def("AREV_VCACHEFS_OPTS", "ro,passdata");
-	STAGE_MODE      = env_def("AREV_STAGE_LOWER", "auto");
-	STAGE_DIR       = env_def("AREV_STAGE_DIR", "/dev/shm/arev");
-	WRITE_BACKING   = env_def("AREV_WRITE_BACKING", "/run/vcache-write");
-	TMPFS_OPTS      = env_def("AREV_TMPFS_OPTS", "mode=0755,nosuid,nodev");
+	GATE_ENFORCE    = env_int("AREV_GATE_ENFORCE", CFG_GATE_ENFORCE);
+	GATE_PASSTHROUGH= env_int("AREV_GATE_PASSTHROUGH", CFG_GATE_PASS);
+	DEV_MODE        = env_int("AREV_DEV", CFG_DEV_MODE);
+	GATE_REQUIRE_SIG= env_int("AREV_GATE_REQUIRE_SIG", CFG_REQUIRE_SIG);
+	RELOAD_MODULE   = env_int("AREV_RELOAD_MODULE", CFG_RELOAD);
+	VCACHEFS_OPTS   = env_def("AREV_VCACHEFS_OPTS", CFG_VCACHE_OPTS);
+	STAGE_MODE      = env_def("AREV_STAGE_LOWER", CFG_STAGE_MODE);
+	STAGE_DIR       = env_def("AREV_STAGE_DIR", CFG_STAGE_DIR);
+	WRITE_BACKING   = env_def("AREV_WRITE_BACKING", CFG_WRITE_BACKING);
+	TMPFS_OPTS      = env_def("AREV_TMPFS_OPTS", CFG_TMPFS_OPTS);
 
 	MOUNTS      = list_from_env("AREV_MOUNTS", DEF_MOUNTS);
-	ALLOWL      = list_from_env("AREV_ALLOW", DEF_EMPTY);
-	WRITE_DIRS  = list_from_env("AREV_WRITE_DIRS", DEF_EMPTY);
-	WRITE_FILES = list_from_env("AREV_WRITE_FILES", DEF_EMPTY);
+	ALLOWL      = list_from_env("AREV_ALLOW", DEF_ALLOW);
+	WRITE_DIRS  = list_from_env("AREV_WRITE_DIRS", DEF_WDIRS);
+	WRITE_FILES = list_from_env("AREV_WRITE_FILES", DEF_WFILES);
 }
 
 static void usage(void)
