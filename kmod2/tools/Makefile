@@ -2,7 +2,8 @@
 # own glibc); carry no shell commentary.  For a self-contained binary that runs
 # regardless of the box's glibc version, override:  make LDFLAGS='-static -s -Wl,--gc-sections'
 CC       ?= gcc
-CFLAGS   ?= -O2 -Wall -Wno-format-truncation
+# -Wno-comment: stub/obfstr.h's ASCII-art docs contain "/*" inside a comment.
+CFLAGS   ?= -O2 -Wall -Wno-format-truncation -Wno-comment
 # -s strips the symbol table; --gc-sections drops unreferenced code/data.
 LDFLAGS  ?= -s -Wl,--gc-sections
 SECFLAGS ?= -ffunction-sections -fdata-sections

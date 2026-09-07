@@ -65,11 +65,13 @@
 #define CFG_REQUIRE_SIG   0             /* 1 = signed allow-list (dev .ko) */
 #define CFG_RELOAD        0             /* 1 = rmmod+insmod on 'up' */
 
-/* Lists — trailing comma on each entry; empty macro => just NULL. */
-#define CFG_MOUNTS        OBFSTR("/root/proj/bin"), OBFSTR("/root/proj/lib"),
-#define CFG_ALLOW                            /* legacy model only; prefer per-exe sigs */
-#define CFG_WRITE_DIRS                       /* e.g.  OBFSTR("/root/proj/bin|logs"), */
-#define CFG_WRITE_FILES                      /* e.g.  OBFSTR("/root/proj/bin|QtApplication.pid"), */
+/* Lists — ONE whitespace-separated string (no commas).  Wrap the whole string
+ * in OBFSTR(...) to obfuscate it; "" = empty list.  WRITE_* entries are
+ * "<mount-root>|<relative-path>", space-separated. */
+#define CFG_MOUNTS        OBFSTR("/root/proj/bin /root/proj/lib")
+#define CFG_ALLOW         ""                 /* legacy model only; prefer per-exe sigs */
+#define CFG_WRITE_DIRS    ""                 /* e.g. OBFSTR("/root/proj/bin|logs") */
+#define CFG_WRITE_FILES   ""                 /* e.g. OBFSTR("/root/proj/bin|QtApplication.pid") */
 /* ======================= end EDIT ME ====================================== */
 
 /* ------------------------------------------------------------------ config */
@@ -128,38 +130,28 @@ static const char *env_def(const char *k, const char *d)
 static int env_int(const char *k, int d)
 { const char *v = getenv(k); return (v && *v) ? atoi(v) : d; }
 
-/* Build a NULL-terminated list by strdup'ing each vararg (until NULL). */
-static char **build_list(const char *first, ...)
+/* Split a whitespace-separated string into a NULL-terminated list (empty list
+ * for NULL/""). */
+static char **split_ws(const char *v)
 {
 	int cap = 8, n = 0;
 	char **a = calloc(cap, sizeof *a);
-	va_list ap; va_start(ap, first);
-	for (const char *s = first; s; s = va_arg(ap, const char *)) {
-		if (n + 1 >= cap) { cap *= 2; a = realloc(a, cap * sizeof *a); }
-		a[n++] = strdup(s);
+	if (v && *v) {
+		char *copy = strdup(v);
+		for (char *save, *t = strtok_r(copy, " \t\n", &save); t;
+		     t = strtok_r(NULL, " \t\n", &save)) {
+			if (n + 1 >= cap) { cap *= 2; a = realloc(a, cap * sizeof *a); }
+			a[n++] = strdup(t);
+		}
+		free(copy);
 	}
-	va_end(ap);
 	a[n] = NULL;
 	return a;
 }
 
-/* Split a whitespace-separated env var into a list, or NULL when unset. */
+/* A whitespace-separated env var as a list, or NULL when unset. */
 static char **list_env(const char *k)
-{
-	const char *v = getenv(k);
-	if (!v || !*v) return NULL;
-	char *copy = strdup(v);
-	int cap = 8, n = 0;
-	char **a = calloc(cap, sizeof *a);
-	for (char *save, *t = strtok_r(copy, " \t\n", &save); t;
-	     t = strtok_r(NULL, " \t\n", &save)) {
-		if (n + 1 >= cap) { cap *= 2; a = realloc(a, cap * sizeof *a); }
-		a[n++] = strdup(t);
-	}
-	a[n] = NULL;
-	free(copy);
-	return a;
-}
+{ const char *v = getenv(k); return (v && *v) ? split_ws(v) : NULL; }
 
 static int list_len(char **a) { int n = 0; while (a && a[n]) n++; return n; }
 
@@ -407,11 +399,10 @@ static unsigned long opts_split(const char *opts, char *data, size_t dn)
 	for (char *save, *t = strtok_r(tmp, ",", &save); t;
 	     t = strtok_r(NULL, ",", &save)) {
 		if      (!strcmp(t, "ro"))     fl |= MS_RDONLY;
-		else if (!strcmp(t, "rw"))     ;
 		else if (!strcmp(t, "nosuid")) fl |= MS_NOSUID;
 		else if (!strcmp(t, "nodev"))  fl |= MS_NODEV;
 		else if (!strcmp(t, "noexec")) fl |= MS_NOEXEC;
-		else {
+		else if (strcmp(t, "rw")) {    /* not "rw" (default) -> fs-specific data */
 			if (data[0]) strncat(data, ",", dn - strlen(data) - 1);
 			strncat(data, t, dn - strlen(data) - 1);
 		}
@@ -800,10 +791,10 @@ static void load_config(void)
 	WRITE_BACKING   = strdup(env_def(OBFSTR("AREV_WRITE_BACKING"), CFG_WRITE_BACKING));
 	TMPFS_OPTS      = strdup(env_def(OBFSTR("AREV_TMPFS_OPTS"), CFG_TMPFS_OPTS));
 
-	MOUNTS      = list_env(OBFSTR("AREV_MOUNTS"));      if (!MOUNTS)      MOUNTS      = build_list(CFG_MOUNTS NULL);
-	ALLOWL      = list_env(OBFSTR("AREV_ALLOW"));       if (!ALLOWL)      ALLOWL      = build_list(CFG_ALLOW NULL);
-	WRITE_DIRS  = list_env(OBFSTR("AREV_WRITE_DIRS"));  if (!WRITE_DIRS)  WRITE_DIRS  = build_list(CFG_WRITE_DIRS NULL);
-	WRITE_FILES = list_env(OBFSTR("AREV_WRITE_FILES")); if (!WRITE_FILES) WRITE_FILES = build_list(CFG_WRITE_FILES NULL);
+	MOUNTS      = list_env(OBFSTR("AREV_MOUNTS"));      if (!MOUNTS)      MOUNTS      = split_ws(CFG_MOUNTS);
+	ALLOWL      = list_env(OBFSTR("AREV_ALLOW"));       if (!ALLOWL)      ALLOWL      = split_ws(CFG_ALLOW);
+	WRITE_DIRS  = list_env(OBFSTR("AREV_WRITE_DIRS"));  if (!WRITE_DIRS)  WRITE_DIRS  = split_ws(CFG_WRITE_DIRS);
+	WRITE_FILES = list_env(OBFSTR("AREV_WRITE_FILES")); if (!WRITE_FILES) WRITE_FILES = split_ws(CFG_WRITE_FILES);
 }
 
 static void usage(void)
