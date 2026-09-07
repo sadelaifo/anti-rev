@@ -528,18 +528,27 @@ static int do_up(void)
 
 static int do_down(void)
 {
+	/* Re-scan each pass: one snapshot can miss mounts stacked on the same path
+	 * (from an earlier run) or revealed as outer layers come off.  Lazy detach
+	 * removes a busy mount from the namespace, so the list converges. */
 	for (int i = 0; MOUNTS[i]; i++) {
-		char **subs; int m = collect_submounts(MOUNTS[i], &subs);
-		for (int j = 0; j < m; j++) {
-			if (umount2(subs[j], 0) != 0 &&
-			    umount2(subs[j], MNT_DETACH) != 0)
-				xlog(OBFSTR("busy: %s"), subs[j]);
-			free(subs[j]);
+		int left = 1;
+		for (int pass = 0; pass < 16 && left; pass++) {
+			char **subs; int m = collect_submounts(MOUNTS[i], &subs);
+			left = 0;
+			for (int j = 0; j < m; j++) {
+				if (umount2(subs[j], 0) != 0 &&
+				    umount2(subs[j], MNT_DETACH) != 0) {
+					xlog(OBFSTR("busy: %s"), subs[j]);
+					left = 1;   /* couldn't remove it — retry next pass */
+				}
+				free(subs[j]);
+			}
+			free(subs);
 		}
-		free(subs);
 	}
-	if (is_mountpoint(WRITE_BACKING))
-		if (umount2(WRITE_BACKING, 0) != 0) umount2(WRITE_BACKING, MNT_DETACH);
+	while (is_mountpoint(WRITE_BACKING))
+		if (umount2(WRITE_BACKING, 0) != 0 && umount2(WRITE_BACKING, MNT_DETACH) != 0) break;
 	if (STAGE_DIR && *STAGE_DIR) rm_rf(STAGE_DIR);
 	xlog(OBFSTR("down complete"));
 	return 0;
@@ -631,19 +640,32 @@ static int target_up_body(void)
 
 /* ---------------------------------------------------------- target executor */
 
+/* Run fn() inside the container.  We must enter BOTH the mount ns (so mount(2)
+ * lands there) AND the PID ns (so the container's /proc/self resolves — without
+ * it /proc/self/mountinfo is read against the container's pidns, which the host
+ * task isn't in, and comes back empty => nothing gets enumerated/unmounted).
+ * CLONE_NEWPID only takes effect for CHILDREN, so we fork once more after the
+ * setns pair; that grandchild is the one truly inside the container. */
 static int run_in_target(int (*fn)(void))
 {
 	if (!IN_CONTAINER) return fn();
-	char ns[64];
-	snprintf(ns, sizeof ns, "/proc/%d/ns/mnt", (int)G_CPID);
+	char nsm[64], nsp[64];
+	snprintf(nsm, sizeof nsm, "/proc/%d/ns/mnt", (int)G_CPID);
+	snprintf(nsp, sizeof nsp, "/proc/%d/ns/pid", (int)G_CPID);
 	fflush(NULL);
 	pid_t c = fork();
 	if (c == 0) {
-		int fd = open(ns, O_RDONLY);
-		if (fd < 0) { fprintf(stderr, "open %s: %s\n", ns, strerror(errno)); _exit(3); }
-		if (setns(fd, CLONE_NEWNS) != 0) { fprintf(stderr, "setns: %s\n", strerror(errno)); _exit(4); }
-		close(fd);
-		_exit(fn() & 0xff);
+		int pfd = open(nsp, O_RDONLY);          /* pid ns (best-effort) */
+		int mfd = open(nsm, O_RDONLY);          /* mount ns (required) */
+		if (mfd < 0) { fprintf(stderr, "open %s: %s\n", nsm, strerror(errno)); _exit(3); }
+		if (pfd >= 0) setns(pfd, CLONE_NEWPID); /* affects our next fork()'s child */
+		if (setns(mfd, CLONE_NEWNS) != 0) { fprintf(stderr, "setns mnt: %s\n", strerror(errno)); _exit(4); }
+		if (pfd >= 0) close(pfd);
+		close(mfd);
+		pid_t g = fork();                        /* grandchild: in container pid+mnt ns */
+		if (g == 0) _exit(fn() & 0xff);
+		int gst; waitpid(g, &gst, 0);
+		_exit(WIFEXITED(gst) ? WEXITSTATUS(gst) : 5);
 	}
 	int st; waitpid(c, &st, 0);
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
