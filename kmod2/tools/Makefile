@@ -1,9 +1,10 @@
-# Build the shippable static mount helpers.  Static so they run on any x86-64
-# client box regardless of its glibc version; carry no shell commentary.
+# Build the shippable mount helpers.  Dynamically linked (against the target's
+# own glibc); carry no shell commentary.  For a self-contained binary that runs
+# regardless of the box's glibc version, override:  make LDFLAGS='-static -s -Wl,--gc-sections'
 CC       ?= gcc
 CFLAGS   ?= -O2 -Wall -Wno-format-truncation
 # -s strips the symbol table; --gc-sections drops unreferenced code/data.
-LDFLAGS  ?= -static -s -Wl,--gc-sections
+LDFLAGS  ?= -s -Wl,--gc-sections
 SECFLAGS ?= -ffunction-sections -fdata-sections
 
 # obfstr string-obfuscation layer (shared with the stub build):
@@ -24,8 +25,8 @@ vcache-mount: vcache-mount.c
 # Compiled twin of vcache-mount.sh.  Its string literals are XOR-obfuscated:
 # obfstr_gen.py rewrites this source into $(OBFDIR)/ with encrypted bytes, then
 # gcc compiles THAT against stub/obfstr.h.  Result: `strings` shows none of our
-# design tokens (a static binary still carries libc's own strings — that noise
-# is unavoidable and is good camouflage).  Verify:
+# design tokens (a dynamic binary still shows a few loader refs like libc.so.6
+# and imported symbol names — never our literals).  Verify:
 #   strings vcache-mount-inplace | grep -iE 'vcachefs|proj|docker|gate_|AREV_|passdata' || echo clean
 # If python3 is missing the raw source still compiles (OBFSTR is a passthrough),
 # but the literals are NOT hidden — a loud warning is printed.
