@@ -3,7 +3,9 @@
 # regardless of the box's glibc version, override:  make LDFLAGS='-static -s -Wl,--gc-sections'
 CC       ?= gcc
 # -Wno-comment: stub/obfstr.h's ASCII-art docs contain "/*" inside a comment.
-CFLAGS   ?= -O2 -Wall -Wno-format-truncation -Wno-comment
+# -Wno-misleading-indentation: the obfstr codegen packs literals onto single
+#   lines, which trips this stylistic warning on otherwise-correct code.
+CFLAGS   ?= -O2 -Wall -Wno-format-truncation -Wno-comment -Wno-misleading-indentation
 # -s strips the symbol table; --gc-sections drops unreferenced code/data.
 LDFLAGS  ?= -s -Wl,--gc-sections
 SECFLAGS ?= -ffunction-sections -fdata-sections

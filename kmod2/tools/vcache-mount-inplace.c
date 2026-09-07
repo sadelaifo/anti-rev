@@ -416,9 +416,14 @@ static void rm_rf(const char *path)
 /* --------------------------------------------------- per-target operations */
 
 static const char *spec_root(const char *spec, char *buf, size_t n)
-{ const char *bar = strchr(spec, '|');
-  size_t l = bar ? (size_t)(bar - spec) : strlen(spec);
-  if (l >= n) l = n - 1; memcpy(buf, spec, l); buf[l] = 0; return buf; }
+{
+	const char *bar = strchr(spec, '|');
+	size_t l = bar ? (size_t)(bar - spec) : strlen(spec);
+	if (l >= n) l = n - 1;
+	memcpy(buf, spec, l);
+	buf[l] = 0;
+	return buf;
+}
 
 static const char *spec_rel(const char *spec)
 { const char *bar = strchr(spec, '|'); return bar ? bar + 1 : ""; }
