@@ -17,6 +17,26 @@ vcachefs-objs := super.o inode.o file.o crypto.o gate.o ctldev.o
 # makes this a no-op on gcc 4.8, which predates both the flag and the warning).
 ccflags-y += $(call cc-option,-Wno-missing-attributes)
 
+# A kernel's arch Makefile can inject hardening flags that a stale toolchain
+# rejects.  On aarch64, -mbranch-protection=pac-ret (gcc>=9) and
+# -fpatchable-function-entry (gcc>=8) are added when the kernel enables pointer
+# auth / dynamic ftrace.  When the module is built with an OLDER compiler than
+# the one that built the kernel — e.g. a company-pinned gcc 7.3 against a kernel
+# built with gcc 10 (openEuler 22.03 / EulerOS SP11) — gcc aborts with
+# "unrecognized command line option".  Detect support with cc-option and strip
+# ONLY the flags THIS compiler rejects: a modern toolchain keeps full hardening,
+# an old one still builds.  The .ko stays loadable — PAC return-signing and
+# ftrace patchable-entries are self-contained per-function properties, not part
+# of the module<->kernel ABI, so a module lacking them interoperates fine (it is
+# simply not itself PAC-protected or ftrace-able).  Harmless no-op on x86 / on
+# any compiler that accepts the flags.
+ifeq ($(call cc-option,-mbranch-protection=pac-ret+leaf),)
+ccflags-remove-y += -mbranch-protection=pac-ret+leaf
+endif
+ifeq ($(call cc-option,-fpatchable-function-entry=2),)
+ccflags-remove-y += -fpatchable-function-entry=2
+endif
+
 # Development build:  make AREV_DEV_MODE=1
 # Compiles IN the runtime `gate_enforce` toggle + the /etc/authorized_apps.txt
 # allow-list (plaintext + signed) for bring-up.  The PRODUCTION build (default,
