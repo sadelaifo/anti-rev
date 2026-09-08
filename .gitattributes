@@ -15,3 +15,17 @@
 *.p7s   binary
 # Prebuilt static mounters (no file extension)
 kmod2/tools/prebuilt/vcache-mount-* binary
+
+# Build/source files must stay LF on EVERY platform (incl. Windows checkouts):
+# the Linux kernel build + gcc read these, and a CRLF Makefile breaks `make`
+# with "missing separator". eol=lf forces LF regardless of core.autocrlf.
+*.c        text eol=lf
+*.h        text eol=lf
+*.sh       text eol=lf
+*.py       text eol=lf
+*.yaml     text eol=lf
+*.yml      text eol=lf
+*.mk       text eol=lf
+Makefile   text eol=lf
+Kbuild     text eol=lf
+dkms.conf  text eol=lf
