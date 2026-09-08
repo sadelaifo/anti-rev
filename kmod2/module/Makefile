@@ -37,6 +37,18 @@ ifeq ($(call cc-option,-fpatchable-function-entry=2),)
 ccflags-remove-y += -fpatchable-function-entry=2
 endif
 
+# Same story for arm64's per-task stack-protector canary
+# (CONFIG_STACKPROTECTOR_PER_TASK): the kernel adds -mstack-protector-guard=sysreg
+# / -guard-reg=sp_el0 / -guard-offset=<N> (gcc>=9) so the canary is read from
+# sp_el0+offset instead of a global.  gcc 7.3 doesn't know these options.  Strip
+# them when unsupported (probe with the always-valid =global mode); gcc then falls
+# back to the global __stack_chk_guard canary — still defined and EXPORT_SYMBOL'd
+# on arm64 — so the module keeps -fstack-protector-strong, just not the per-task
+# variant.  The guard-offset value is config-dependent, so match with a wildcard.
+ifeq ($(call cc-option,-mstack-protector-guard=global),)
+ccflags-remove-y += -mstack-protector-guard=% -mstack-protector-guard-reg=% -mstack-protector-guard-offset=%
+endif
+
 # Development build:  make AREV_DEV_MODE=1
 # Compiles IN the runtime `gate_enforce` toggle + the /etc/authorized_apps.txt
 # allow-list (plaintext + signed) for bring-up.  The PRODUCTION build (default,
