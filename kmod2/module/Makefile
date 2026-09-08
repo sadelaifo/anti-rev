@@ -41,8 +41,11 @@ endif
 # (CONFIG_STACKPROTECTOR_PER_TASK): the kernel adds -mstack-protector-guard=sysreg
 # / -guard-reg=sp_el0 / -guard-offset=<N> (gcc>=9) so the canary is read from
 # sp_el0+offset instead of a global.  gcc 7.3 doesn't know these options, so strip
-# them when unsupported (probe with the always-valid =global mode; guard-offset is
-# config-dependent, matched with a wildcard).
+# them when unsupported.  Probe with the EXACT set the kernel itself tests for
+# CC_HAVE_STACKPROTECTOR_SYSREG (sysreg + reg + offset) — NOT -guard=global: a
+# compiler can accept =global while rejecting the arm64-only =sysreg value, so a
+# =global probe would wrongly report support and leave =sysreg on the command line.
+# guard-offset is config-dependent, matched with a wildcard on removal.
 #
 # BUT once stripped, gcc falls back to emitting the GLOBAL __stack_chk_guard
 # canary — and an arm64 kernel built for the per-task canary does NOT export
@@ -52,7 +55,7 @@ endif
 # (after the kernel's -fstack-protector-strong in KBUILD_CFLAGS) and, being last on
 # the command line, wins.  Only the module's own frames lose the canary; a modern
 # toolchain keeps the full per-task protection and never enters this branch.
-ifeq ($(call cc-option,-mstack-protector-guard=global),)
+ifeq ($(call cc-option,-mstack-protector-guard=sysreg -mstack-protector-guard-reg=sp_el0 -mstack-protector-guard-offset=0),)
 ccflags-remove-y += -mstack-protector-guard=% -mstack-protector-guard-reg=% -mstack-protector-guard-offset=%
 ccflags-y += -fno-stack-protector
 endif
