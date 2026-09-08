@@ -33,8 +33,35 @@ PWD  := $(shell pwd)
 # Pass CC explicitly if your default toolchain differs, e.g. `make CC=gcc-12`.
 MAKE_ARGS := $(if $(CC),CC=$(CC))
 
+# Release builds scrub the module's symbol table so `nm vcachefs.ko`, `strings`,
+# and post-load /proc/kallsyms reveal none of the vcachefs_*/arev_* implementation
+# symbol names.  After kbuild's relocatable link every cross-file reference is
+# already resolved internally, and this module EXPORT_SYMBOLs nothing, so the only
+# globals the loader still needs are its init/exit entry points and __this_module.
+# `objcopy -G` keeps exactly those global and demotes every other global symbol to
+# local; `strip --strip-unneeded` then removes the now-local names (and debug info).
+# The result still loads cleanly (vermagic/.modinfo untouched) — it just carries no
+# implementation names.  Dev builds (AREV_DEV_MODE) keep the full table for oops
+# decoding.
+STRIP   ?= $(CROSS_COMPILE)strip
+OBJCOPY ?= $(CROSS_COMPILE)objcopy
+NM      ?= $(CROSS_COMPILE)nm
+
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) $(MAKE_ARGS) modules
+ifndef AREV_DEV_MODE
+	@# Rename every defined implementation symbol (vcachefs_*/vcf_* and their
+	@# __pfx_ CFI aliases) to an opaque token.  Relocations reference symbols by
+	@# table index, not by name, so renaming the name string is transparent to
+	@# the module loader — the .ko still loads, but `nm`/`strings`/kallsyms no
+	@# longer reveal what any routine does (decrypt/gate/authz/...).  --strip-unneeded
+	@# then drops debug info and any now-unreferenced names.
+	@$(NM) --defined-only $(PWD)/vcachefs.ko | \
+	  awk '$$3 ~ /vcachefs_|vcf_/ { printf "%s z%08x\n", $$3, NR }' > $(PWD)/.symmap
+	@test -s $(PWD)/.symmap && $(OBJCOPY) --redefine-syms=$(PWD)/.symmap $(PWD)/vcachefs.ko || true
+	@rm -f $(PWD)/.symmap
+	$(STRIP) --strip-unneeded $(PWD)/vcachefs.ko
+endif
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean

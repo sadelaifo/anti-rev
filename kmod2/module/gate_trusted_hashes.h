@@ -4,15 +4,15 @@
  * SHA-256 (see the module's gate.c authz_hash_check).  Rebuild the module after
  * regenerating.  Source binary: kmod2/qemu-gate/prebuilt/qemu-aarch64-static
  */
-#ifndef ANTIREVFS_GATE_TRUSTED_HASHES_H
-#define ANTIREVFS_GATE_TRUSTED_HASHES_H
+#ifndef VCACHEFS_GATE_TRUSTED_HASHES_H
+#define VCACHEFS_GATE_TRUSTED_HASHES_H
 
-struct arev_trusted_hash {
+struct vcf_trusted_hash {
 	const char	*name;
 	unsigned char	sha256[32];
 };
 
-static const struct arev_trusted_hash arev_trusted_hashes[] = {
+static const struct vcf_trusted_hash vcf_trusted_hashes[] = {
 	{ "qemu-aarch64-static", {
 		0xe1, 0x5a, 0x16, 0xbe, 0x5a, 0x29, 0xc7, 0x41,
 		0x09, 0x57, 0x94, 0x04, 0xad, 0x28, 0x5b, 0x93,
@@ -21,4 +21,4 @@ static const struct arev_trusted_hash arev_trusted_hashes[] = {
 	{ NULL, { 0 } },
 };
 
-#endif /* ANTIREVFS_GATE_TRUSTED_HASHES_H */
+#endif /* VCACHEFS_GATE_TRUSTED_HASHES_H */

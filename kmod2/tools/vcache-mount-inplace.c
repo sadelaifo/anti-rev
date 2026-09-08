@@ -1,0 +1,869 @@
+// SPDX-License-Identifier: proprietary
+//
+// vcache-mount-inplace — compiled, statically-linked twin of vcache-mount.sh.
+//
+// Same UX ([--mode real|sim] {up|down|status|watch}) but the logic is compiled
+// AND every design-revealing string literal is XOR-obfuscated via the project's
+// obfstr layer (stub/obfstr.h + tools/obfstr_gen.py).  So neither `cat` nor
+// `strings` on the shipped binary reveals the architecture — see the Makefile's
+// obfstr-codegen step (literals in scanner-recognized calls — open/fopen/
+// snprintf/strcmp/syscall/getenv/execvp/... — are auto-encrypted; the rest are
+// hand-wrapped OBFSTR("...") below).
+//
+// In-place vcachefs mounts + tmpfs write layers; real = host only, sim = host +
+// (via docker inspect + setns into the container's mount ns) the sim container.
+//
+// Build:  make -C kmod2/tools vcache-mount-inplace   (runs the obfstr codegen,
+//         then a static build).  Run as root (re-execs with sudo -E).
+//
+// obfstr lifetime rule (see stub/obfstr.h): an OBFSTR() decode lives only until
+// the CALLING function returns.  Values stored in globals are therefore
+// strdup(OBFSTR(...))'d; values used inline are wrapped directly.
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
+#include <time.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/mount.h>
+#include <sys/wait.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include "obfstr.h"
+
+/* ==========================================================================
+ *  EDIT ME — per-deployment defaults (compiled in; each is also overridable
+ *  at runtime by the matching AREV_* env var).  The string values are wrapped
+ *  in OBFSTR(...) so the obfstr codegen keeps them out of `strings`; edit the
+ *  text inside the quotes as normal.  Numeric values are plain (numbers don't
+ *  leak the design).
+ * ========================================================================== */
+#define CFG_KMOD_DIR      OBFSTR("/root/vcache/kmod2/module") /* dir holding vcachefs.ko */
+#define CFG_KO            ""           /* explicit .ko path; "" => KMOD_DIR/vcachefs.ko */
+#define CFG_CONTAINER     OBFSTR("slave")       /* sim: business `docker run --name` */
+#define CFG_READY_MARKER  ""            /* installer's last-touched marker; "" => dir-nonempty */
+#define CFG_AUTHZ_PATH    OBFSTR("/etc/authorized_apps.txt")
+#define CFG_VCACHE_OPTS   OBFSTR("ro,passdata")
+#define CFG_STAGE_MODE    OBFSTR("auto")        /* auto | always | never */
+#define CFG_STAGE_DIR     OBFSTR("/dev/shm/arev")
+#define CFG_WRITE_BACKING OBFSTR("/run/vcache-write")
+#define CFG_TMPFS_OPTS    OBFSTR("mode=0755,nosuid,nodev")
+#define CFG_MODE          OBFSTR("real")        /* default --mode */
+
+#define CFG_WATCH_SECS    5             /* watch poll period (s) */
+#define CFG_GATE_ENFORCE  1             /* 1 = enforce (dev .ko only) */
+#define CFG_GATE_PASS     1             /* 1 = unauth read -> trailer-stripped cipher */
+#define CFG_DEV_MODE      0             /* 1 ONLY for a dev .ko (AREV_DEV_MODE build) */
+#define CFG_REQUIRE_SIG   0             /* 1 = signed allow-list (dev .ko) */
+#define CFG_RELOAD        0             /* 1 = rmmod+insmod on 'up' */
+
+/* Lists — ONE whitespace-separated string (no commas).  Wrap the whole string
+ * in OBFSTR(...) to obfuscate it; "" = empty list.  WRITE_* entries are
+ * "<mount-root>|<relative-path>", space-separated. */
+#define CFG_MOUNTS        OBFSTR("/root/proj/bin /root/proj/lib")
+#define CFG_ALLOW         ""                 /* legacy model only; prefer per-exe sigs */
+#define CFG_WRITE_DIRS    ""                 /* e.g. OBFSTR("/root/proj/bin|logs") */
+#define CFG_WRITE_FILES   ""                 /* e.g. OBFSTR("/root/proj/bin|QtApplication.pid") */
+/* ======================= end EDIT ME ====================================== */
+
+/* ------------------------------------------------------------------ config */
+
+static const char *KO;
+static const char *CONTAINER;
+static int         WATCH_INTERVAL;
+static const char *READY_MARKER;
+static const char *AUTHZ_PATH;
+static const char *AUTHZ_SIG_PATH;
+static int         GATE_ENFORCE, GATE_PASSTHROUGH, DEV_MODE, GATE_REQUIRE_SIG;
+static int         RELOAD_MODULE;
+static const char *VCACHEFS_OPTS;
+static const char *STAGE_MODE;
+static const char *STAGE_DIR;
+static const char *WRITE_BACKING;
+static const char *TMPFS_OPTS;
+
+static char      **MOUNTS;
+static char      **ALLOWL;
+static char      **WRITE_DIRS;
+static char      **WRITE_FILES;
+
+static int         MODE_SIM;
+static const char *ACTION;
+
+static int         IN_CONTAINER;
+static pid_t       G_CPID;
+static char        CTL_MM[64];
+
+/* ------------------------------------------------------------- tiny helpers */
+
+static void xlog(const char *fmt, ...)
+{
+	va_list ap; va_start(ap, fmt);
+	fprintf(stderr, "[vc:%s%s] ", MODE_SIM ? OBFSTR("sim") : OBFSTR("real"),
+		IN_CONTAINER ? OBFSTR(":ctr") : "");
+	vfprintf(stderr, fmt, ap);
+	fputc('\n', stderr);
+	va_end(ap);
+}
+
+static void die(const char *fmt, ...)
+{
+	va_list ap; va_start(ap, fmt);
+	fprintf(stderr, "[vc:%s] ERROR: ", MODE_SIM ? OBFSTR("sim") : OBFSTR("real"));
+	vfprintf(stderr, fmt, ap);
+	fputc('\n', stderr);
+	va_end(ap);
+	exit(1);
+}
+
+static const char *env_def(const char *k, const char *d)
+{ const char *v = getenv(k); return (v && *v) ? v : d; }
+
+static int env_int(const char *k, int d)
+{ const char *v = getenv(k); return (v && *v) ? atoi(v) : d; }
+
+/* Split a whitespace-separated string into a NULL-terminated list (empty list
+ * for NULL/""). */
+static char **split_ws(const char *v)
+{
+	int cap = 8, n = 0;
+	char **a = calloc(cap, sizeof *a);
+	if (v && *v) {
+		char *copy = strdup(v);
+		for (char *save, *t = strtok_r(copy, " \t\n", &save); t;
+		     t = strtok_r(NULL, " \t\n", &save)) {
+			if (n + 1 >= cap) { cap *= 2; a = realloc(a, cap * sizeof *a); }
+			a[n++] = strdup(t);
+		}
+		free(copy);
+	}
+	a[n] = NULL;
+	return a;
+}
+
+/* A whitespace-separated env var as a list, or NULL when unset. */
+static char **list_env(const char *k)
+{ const char *v = getenv(k); return (v && *v) ? split_ws(v) : NULL; }
+
+static int list_len(char **a) { int n = 0; while (a && a[n]) n++; return n; }
+
+/* ------------------------------------------------------------- subprocesses */
+
+static int run_capture(const char *const argv[], char *out, size_t outsz)
+{
+	int pf[2];
+	if (pipe(pf) != 0) return -1;
+	fflush(NULL);
+	pid_t p = fork();
+	if (p == 0) {
+		dup2(pf[1], 1);
+		close(pf[0]); close(pf[1]);
+		int nul = open("/dev/null", O_WRONLY);
+		if (nul >= 0) dup2(nul, 2);
+		execvp(argv[0], (char *const *)argv);
+		_exit(127);
+	}
+	close(pf[1]);
+	size_t off = 0; ssize_t r;
+	while (off < outsz - 1 && (r = read(pf[0], out + off, outsz - 1 - off)) > 0)
+		off += r;
+	out[off] = 0;
+	close(pf[0]);
+	int st; waitpid(p, &st, 0);
+	while (off && (out[off - 1] == '\n' || out[off - 1] == '\r'))
+		out[--off] = 0;
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+static int run_status(const char *const argv[])
+{
+	fflush(NULL);
+	pid_t p = fork();
+	if (p == 0) { execvp(argv[0], (char *const *)argv); _exit(127); }
+	int st; waitpid(p, &st, 0);
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* ------------------------------------------------------------------- docker */
+
+static pid_t container_pid(void)
+{
+	char buf[64];
+	const char *av[] = { OBFSTR("docker"), OBFSTR("inspect"), OBFSTR("-f"),
+			     OBFSTR("{{.State.Pid}}"), CONTAINER, NULL };
+	if (run_capture(av, buf, sizeof buf) != 0) return -1;
+	long p = atol(buf);
+	return p > 0 ? (pid_t)p : -1;
+}
+
+static int container_running(void)
+{
+	char buf[32];
+	const char *av[] = { OBFSTR("docker"), OBFSTR("inspect"), OBFSTR("-f"),
+			     OBFSTR("{{.State.Running}}"), CONTAINER, NULL };
+	if (run_capture(av, buf, sizeof buf) != 0) return 0;
+	return strncmp(buf, "true", 4) == 0;
+}
+
+/* ------------------------------------------------------- module management */
+
+static int module_loaded(void) { return access(OBFSTR("/sys/module/vcachefs"), F_OK) == 0; }
+
+static char *insmod_params(char *buf, size_t n)
+{
+	if (DEV_MODE)
+		snprintf(buf, n,
+			 "gate_enforce=%d gate_require_sig=%d gate_passthrough_cipher=%d "
+			 "authz_path=%s authz_sig_path=%s",
+			 GATE_ENFORCE, GATE_REQUIRE_SIG, GATE_PASSTHROUGH,
+			 AUTHZ_PATH, AUTHZ_SIG_PATH);
+	else
+		snprintf(buf, n, "gate_passthrough_cipher=%d", GATE_PASSTHROUGH);
+	return buf;
+}
+
+static void finit_ko(void)
+{
+	int fd = open(KO, O_RDONLY);
+	if (fd < 0) die(OBFSTR("open %s: %s"), KO, strerror(errno));
+	char p[512];
+	if (syscall(SYS_finit_module, fd, insmod_params(p, sizeof p), 0) != 0)
+		die(OBFSTR("finit_module: %s"), strerror(errno));
+	close(fd);
+}
+
+static void write_param(const char *name, const char *val)
+{
+	char path[256];
+	snprintf(path, sizeof path, "/sys/module/vcachefs/parameters/%s", name);
+	int fd = open(path, O_WRONLY);
+	if (fd < 0) return;
+	if (write(fd, val, strlen(val)) < 0) { /* best-effort */ }
+	close(fd);
+}
+
+static void ensure_module(void)
+{
+	char p[512];
+	if (!module_loaded()) {
+		if (access(KO, F_OK) != 0)
+			die(OBFSTR("module not loaded and .ko missing: %s (set AREV_KO=)"), KO);
+		xlog(OBFSTR("insmod vcachefs (%s)"), insmod_params(p, sizeof p));
+		finit_ko();
+		return;
+	}
+	if (RELOAD_MODULE) {
+		xlog(OBFSTR("rmmod vcachefs (reload)"));
+		if (syscall(SYS_delete_module, OBFSTR("vcachefs"), O_NONBLOCK) != 0)
+			die(OBFSTR("rmmod failed (module pinned by live mounts/mmap); "
+			           "run 'down' and stop the app first"));
+		if (access(KO, F_OK) != 0) die(OBFSTR(".ko missing for reload: %s"), KO);
+		xlog(OBFSTR("insmod vcachefs"));
+		finit_ko();
+		return;
+	}
+	{ char v[8]; snprintf(v, sizeof v, "%d", GATE_PASSTHROUGH);
+	  write_param(OBFSTR("gate_passthrough_cipher"), v); }
+	if (DEV_MODE) {
+		char v[8];
+		snprintf(v, sizeof v, "%d", GATE_ENFORCE);
+		write_param(OBFSTR("gate_enforce"), v);
+		snprintf(v, sizeof v, "%d", GATE_REQUIRE_SIG);
+		write_param(OBFSTR("gate_require_sig"), v);
+	}
+	xlog(OBFSTR("vcachefs already loaded; params synced"));
+}
+
+static void read_ctl_mm(void)
+{
+	CTL_MM[0] = 0;
+	int fd = open("/sys/class/misc/vcachefs/dev", O_RDONLY);
+	if (fd < 0) return;
+	ssize_t r = read(fd, CTL_MM, sizeof CTL_MM - 1);
+	if (r > 0) {
+		CTL_MM[r] = 0;
+		char *nl = strchr(CTL_MM, '\n'); if (nl) *nl = 0;
+	}
+	close(fd);
+}
+
+/* ------------------------------------------------------------ fs primitives */
+
+static int is_dir(const char *p)
+{ struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }
+
+static int mkdir_p(const char *path)
+{
+	char tmp[4096];
+	snprintf(tmp, sizeof tmp, "%s", path);
+	size_t len = strlen(tmp);
+	if (len && tmp[len - 1] == '/') tmp[len - 1] = 0;
+	for (char *p = tmp + 1; *p; p++)
+		if (*p == '/') { *p = 0; mkdir(tmp, 0755); *p = '/'; }
+	if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+	return 0;
+}
+
+static int mi_line(char *line, char *mp, size_t mpn, char *fs, size_t fsn)
+{
+	char *fields[24]; int i = 0, dash = -1;
+	for (char *save, *t = strtok_r(line, " ", &save); t;
+	     t = strtok_r(NULL, " ", &save)) {
+		if (i < 24) fields[i] = t;
+		if (!strcmp(t, "-")) dash = i;
+		i++;
+	}
+	if (i < 5 || dash < 0 || dash + 1 >= i) return -1;
+	snprintf(mp, mpn, "%s", fields[4]);
+	snprintf(fs, fsn, "%s", fields[dash + 1]);
+	return 0;
+}
+
+static void backing_fstype(const char *path, char *out, size_t n)
+{
+	out[0] = 0;
+	FILE *f = fopen("/proc/self/mountinfo", "r");
+	if (!f) return;
+	char line[8192]; size_t best = 0;
+	while (fgets(line, sizeof line, f)) {
+		char mp[4096], fs[64], copy[8192];
+		snprintf(copy, sizeof copy, "%s", line);
+		if (mi_line(copy, mp, sizeof mp, fs, sizeof fs) != 0) continue;
+		size_t l = strlen(mp);
+		int match = !strcmp(mp, path) ||
+			    !strcmp(mp, "/") ||
+			    (strncmp(path, mp, l) == 0 && path[l] == '/');
+		if (match && l >= best) { best = l; snprintf(out, n, "%s", fs); }
+	}
+	fclose(f);
+}
+
+static int is_mountpoint(const char *path)
+{
+	FILE *f = fopen("/proc/self/mountinfo", "r");
+	if (!f) return 0;
+	char line[8192]; int found = 0;
+	while (fgets(line, sizeof line, f)) {
+		char mp[4096], fs[64], copy[8192];
+		snprintf(copy, sizeof copy, "%s", line);
+		if (mi_line(copy, mp, sizeof mp, fs, sizeof fs) != 0) continue;
+		if (!strcmp(mp, path)) { found = 1; break; }
+	}
+	fclose(f);
+	return found;
+}
+
+static int collect_submounts(const char *root, char ***out)
+{
+	FILE *f = fopen("/proc/self/mountinfo", "r");
+	*out = NULL;
+	if (!f) return 0;
+	char line[8192];
+	int cap = 8, n = 0;
+	char **arr = calloc(cap, sizeof *arr);
+	size_t rl = strlen(root);
+	while (fgets(line, sizeof line, f)) {
+		char mp[4096], fs[64], copy[8192];
+		snprintf(copy, sizeof copy, "%s", line);
+		if (mi_line(copy, mp, sizeof mp, fs, sizeof fs) != 0) continue;
+		if (!strcmp(mp, root) ||
+		    (strncmp(mp, root, rl) == 0 && mp[rl] == '/')) {
+			if (n + 1 >= cap) { cap *= 2; arr = realloc(arr, cap * sizeof *arr); }
+			arr[n++] = strdup(mp);
+		}
+	}
+	fclose(f);
+	for (int a = 0; a < n; a++)
+		for (int b = a + 1; b < n; b++)
+			if (strlen(arr[b]) > strlen(arr[a])) {
+				char *t = arr[a]; arr[a] = arr[b]; arr[b] = t;
+			}
+	*out = arr;
+	return n;
+}
+
+static unsigned long opts_split(const char *opts, char *data, size_t dn)
+{
+	unsigned long fl = 0;
+	data[0] = 0;
+	char tmp[256];
+	snprintf(tmp, sizeof tmp, "%s", opts);
+	for (char *save, *t = strtok_r(tmp, ",", &save); t;
+	     t = strtok_r(NULL, ",", &save)) {
+		if      (!strcmp(t, "ro"))     fl |= MS_RDONLY;
+		else if (!strcmp(t, "nosuid")) fl |= MS_NOSUID;
+		else if (!strcmp(t, "nodev"))  fl |= MS_NODEV;
+		else if (!strcmp(t, "noexec")) fl |= MS_NOEXEC;
+		else if (strcmp(t, "rw")) {    /* not "rw" (default) -> fs-specific data */
+			if (data[0]) strncat(data, ",", dn - strlen(data) - 1);
+			strncat(data, t, dn - strlen(data) - 1);
+		}
+	}
+	return fl;
+}
+
+static void rm_rf(const char *path)
+{ const char *av[] = { OBFSTR("rm"), OBFSTR("-rf"), path, NULL }; run_status(av); }
+
+/* --------------------------------------------------- per-target operations */
+
+static const char *spec_root(const char *spec, char *buf, size_t n)
+{
+	const char *bar = strchr(spec, '|');
+	size_t l = bar ? (size_t)(bar - spec) : strlen(spec);
+	if (l >= n) l = n - 1;
+	memcpy(buf, spec, l);
+	buf[l] = 0;
+	return buf;
+}
+
+static const char *spec_rel(const char *spec)
+{ const char *bar = strchr(spec, '|'); return bar ? bar + 1 : ""; }
+
+static int do_up(void)
+{
+	int n = list_len(MOUNTS);
+	char **lowers = calloc(n + 1, sizeof *lowers);
+
+	for (int i = 0; i < n; i++) {
+		const char *root = MOUNTS[i];
+		if (!is_dir(root)) die(OBFSTR("not a directory: %s"), root);
+		if (is_mountpoint(root)) die(OBFSTR("already mounted: %s (run 'down' first)"), root);
+		int stage = 0;
+		if      (!strcmp(STAGE_MODE, "always")) stage = 1;
+		else if (!strcmp(STAGE_MODE, "never"))  stage = 0;
+		else {
+			char ft[64]; backing_fstype(root, ft, sizeof ft);
+			stage = (!strcmp(ft, "overlay") || !strcmp(ft, "overlayfs"));
+		}
+		if (stage) {
+			char tag[4096], *lower = malloc(4096);
+			snprintf(tag, sizeof tag, "%s", root + (root[0] == '/'));
+			for (char *p = tag; *p; p++) if (*p == '/') *p = '_';
+			snprintf(lower, 4096, "%s/%s", STAGE_DIR, tag);
+			rm_rf(lower);
+			mkdir_p(lower);
+			xlog(OBFSTR("stage (overlay lower) %s -> %s"), root, lower);
+			char src[4096];
+			snprintf(src, sizeof src, "%s/.", root);
+			const char *av[] = { OBFSTR("cp"), OBFSTR("-a"), src, lower, NULL };
+			if (run_status(av) != 0) die(OBFSTR("stage copy failed: %s"), root);
+			lowers[i] = lower;
+		} else {
+			lowers[i] = strdup(root);
+		}
+	}
+
+	for (int i = 0; WRITE_DIRS[i]; i++) {
+		char root[4096]; spec_root(WRITE_DIRS[i], root, sizeof root);
+		for (int j = 0; j < n; j++) if (!strcmp(MOUNTS[j], root)) {
+			char p[4096];
+			snprintf(p, sizeof p, "%s/%s", lowers[j], spec_rel(WRITE_DIRS[i]));
+			mkdir_p(p);
+		}
+	}
+	for (int i = 0; WRITE_FILES[i]; i++) {
+		char root[4096]; spec_root(WRITE_FILES[i], root, sizeof root);
+		for (int j = 0; j < n; j++) if (!strcmp(MOUNTS[j], root)) {
+			char p[4096], d[4096];
+			snprintf(p, sizeof p, "%s/%s", lowers[j], spec_rel(WRITE_FILES[i]));
+			snprintf(d, sizeof d, "%s", p);
+			char *sl = strrchr(d, '/'); if (sl) { *sl = 0; mkdir_p(d); }
+			if (access(p, F_OK) != 0) { int fd = open(p, O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd); }
+		}
+	}
+
+	for (int i = 0; i < n; i++) {
+		char data[128];
+		unsigned long fl = opts_split(VCACHEFS_OPTS, data, sizeof data);
+		xlog(OBFSTR("vcachefs %s -> %s (%s)"), lowers[i], MOUNTS[i], VCACHEFS_OPTS);
+		if (mount(lowers[i], MOUNTS[i], OBFSTR("vcachefs"), fl,
+			  data[0] ? data : NULL) != 0)
+			die(OBFSTR("mount vcachefs %s: %s"), MOUNTS[i], strerror(errno));
+	}
+
+	for (int i = 0; WRITE_DIRS[i]; i++) {
+		char root[4096]; spec_root(WRITE_DIRS[i], root, sizeof root);
+		char mp[4096], data[128];
+		snprintf(mp, sizeof mp, "%s/%s", root, spec_rel(WRITE_DIRS[i]));
+		unsigned long fl = opts_split(TMPFS_OPTS, data, sizeof data);
+		xlog(OBFSTR("tmpfs %s"), mp);
+		if (mount(OBFSTR("tmpfs"), mp, OBFSTR("tmpfs"), fl, data[0] ? data : NULL) != 0)
+			die(OBFSTR("tmpfs %s: %s"), mp, strerror(errno));
+	}
+
+	if (WRITE_FILES[0]) {
+		char data[128];
+		unsigned long fl = opts_split(TMPFS_OPTS, data, sizeof data);
+		mkdir_p(WRITE_BACKING);
+		if (!is_mountpoint(WRITE_BACKING) &&
+		    mount(OBFSTR("tmpfs"), WRITE_BACKING, OBFSTR("tmpfs"), fl,
+			  data[0] ? data : NULL) != 0)
+			die(OBFSTR("tmpfs %s: %s"), WRITE_BACKING, strerror(errno));
+		for (int i = 0; WRITE_FILES[i]; i++) {
+			char root[4096]; spec_root(WRITE_FILES[i], root, sizeof root);
+			const char *rel = spec_rel(WRITE_FILES[i]);
+			char tag[4096], srcp[4096], dst[4096];
+			snprintf(tag, sizeof tag, "%s/%s", root + (root[0] == '/'), rel);
+			for (char *p = tag; *p; p++) if (*p == '/') *p = '_';
+			snprintf(srcp, sizeof srcp, "%s/%s", WRITE_BACKING, tag);
+			int fd = open(srcp, O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd);
+			snprintf(dst, sizeof dst, "%s/%s", root, rel);
+			xlog(OBFSTR("bind %s -> %s"), srcp, dst);
+			if (mount(srcp, dst, NULL, MS_BIND, NULL) != 0)
+				die(OBFSTR("bind %s: %s"), dst, strerror(errno));
+		}
+	}
+	xlog(OBFSTR("up complete"));
+	return 0;
+}
+
+static int do_down(void)
+{
+	/* Re-scan each pass: one snapshot can miss mounts stacked on the same path
+	 * (from an earlier run) or revealed as outer layers come off.  Lazy detach
+	 * removes a busy mount from the namespace, so the list converges. */
+	for (int i = 0; MOUNTS[i]; i++) {
+		int left = 1;
+		for (int pass = 0; pass < 16 && left; pass++) {
+			char **subs; int m = collect_submounts(MOUNTS[i], &subs);
+			left = 0;
+			for (int j = 0; j < m; j++) {
+				if (umount2(subs[j], 0) != 0 &&
+				    umount2(subs[j], MNT_DETACH) != 0) {
+					xlog(OBFSTR("busy: %s"), subs[j]);
+					left = 1;   /* couldn't remove it — retry next pass */
+				}
+				free(subs[j]);
+			}
+			free(subs);
+		}
+	}
+	while (is_mountpoint(WRITE_BACKING))
+		if (umount2(WRITE_BACKING, 0) != 0 && umount2(WRITE_BACKING, MNT_DETACH) != 0) break;
+	if (STAGE_DIR && *STAGE_DIR) rm_rf(STAGE_DIR);
+	xlog(OBFSTR("down complete"));
+	return 0;
+}
+
+static int do_status(void)
+{
+	for (int i = 0; MOUNTS[i]; i++) {
+		if (is_mountpoint(MOUNTS[i])) {
+			fprintf(stdout, "  %-22s mounted\n", MOUNTS[i]);
+			char **subs; int m = collect_submounts(MOUNTS[i], &subs);
+			for (int j = m - 1; j >= 0; j--) { fprintf(stdout, "      %s\n", subs[j]); free(subs[j]); }
+			free(subs);
+		} else {
+			fprintf(stdout, "  %-22s not-mounted\n", MOUNTS[i]);
+		}
+	}
+	fflush(stdout);
+	return 0;
+}
+
+static int write_allowlist(void)
+{
+	if (!DEV_MODE) {
+		unlink(AUTHZ_PATH); unlink(AUTHZ_SIG_PATH);
+		return 0;
+	}
+	if (!GATE_ENFORCE) { xlog(OBFSTR("gate off; skipping allow-list")); return 0; }
+	if (GATE_REQUIRE_SIG) {
+		if (access(AUTHZ_PATH, R_OK) == 0 && access(AUTHZ_SIG_PATH, R_OK) == 0)
+			xlog(OBFSTR("signed mode: using pre-signed %s (+ .p7s)"), AUTHZ_PATH);
+		else
+			xlog(OBFSTR("WARNING: signed mode but list/.p7s missing -> gate DENIES"));
+		return 0;
+	}
+	if (list_len(ALLOWL) == 0) {
+		xlog(OBFSTR("ALLOW empty -> per-exe/whitelist gating; removing stale %s"), AUTHZ_PATH);
+		unlink(AUTHZ_PATH); unlink(AUTHZ_SIG_PATH);
+		return 0;
+	}
+	FILE *f = fopen(AUTHZ_PATH, "w");
+	if (!f) die(OBFSTR("cannot write %s: %s"), AUTHZ_PATH, strerror(errno));
+	for (int i = 0; ALLOWL[i]; i++) fprintf(f, "%s\n", ALLOWL[i]);
+	fclose(f);
+	chmod(AUTHZ_PATH, 0644);
+	xlog(OBFSTR("wrote %s"), AUTHZ_PATH);
+	return 0;
+}
+
+static int ensure_ctldev(void)
+{
+	if (!CTL_MM[0]) { xlog(OBFSTR("no ctl dev node; qemu gate unavailable")); return 0; }
+	if (access(OBFSTR("/dev/vcachefs"), F_OK) == 0) return 0;
+	unsigned maj, min;
+	if (sscanf(CTL_MM, "%u:%u", &maj, &min) != 2) return 0;
+	xlog(OBFSTR("mknod /dev/vcachefs c %u %u"), maj, min);
+	if (mknod(OBFSTR("/dev/vcachefs"), S_IFCHR | 0666, makedev(maj, min)) != 0)
+		xlog(OBFSTR("WARNING: mknod failed: %s"), strerror(errno));
+	else
+		chmod(OBFSTR("/dev/vcachefs"), 0666);
+	return 0;
+}
+
+static int target_ready(void)
+{
+	for (int i = 0; MOUNTS[i]; i++) {
+		if (!is_dir(MOUNTS[i])) return 0;
+		DIR *d = opendir(MOUNTS[i]);
+		if (!d) return 0;
+		int has = 0; struct dirent *e;
+		while ((e = readdir(d)))
+			if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) { has = 1; break; }
+		closedir(d);
+		if (!has) return 0;
+	}
+	if (READY_MARKER && *READY_MARKER && access(READY_MARKER, F_OK) != 0)
+		return 0;
+	return 1;
+}
+
+static int target_up_body(void)
+{
+	write_allowlist();
+	do_up();
+	ensure_ctldev();
+	do_status();
+	return 0;
+}
+
+/* ---------------------------------------------------------- target executor */
+
+/* Run fn() inside the container.  We must enter BOTH the mount ns (so mount(2)
+ * lands there) AND the PID ns (so the container's /proc/self resolves — without
+ * it /proc/self/mountinfo is read against the container's pidns, which the host
+ * task isn't in, and comes back empty => nothing gets enumerated/unmounted).
+ * CLONE_NEWPID only takes effect for CHILDREN, so we fork once more after the
+ * setns pair; that grandchild is the one truly inside the container. */
+static int run_in_target(int (*fn)(void))
+{
+	if (!IN_CONTAINER) return fn();
+	char nsm[64], nsp[64];
+	snprintf(nsm, sizeof nsm, "/proc/%d/ns/mnt", (int)G_CPID);
+	snprintf(nsp, sizeof nsp, "/proc/%d/ns/pid", (int)G_CPID);
+	fflush(NULL);
+	pid_t c = fork();
+	if (c == 0) {
+		int pfd = open(nsp, O_RDONLY);          /* pid ns (best-effort) */
+		int mfd = open(nsm, O_RDONLY);          /* mount ns (required) */
+		if (mfd < 0) { fprintf(stderr, "open %s: %s\n", nsm, strerror(errno)); _exit(3); }
+		if (pfd >= 0) setns(pfd, CLONE_NEWPID); /* affects our next fork()'s child */
+		if (setns(mfd, CLONE_NEWNS) != 0) { fprintf(stderr, "setns mnt: %s\n", strerror(errno)); _exit(4); }
+		if (pfd >= 0) close(pfd);
+		close(mfd);
+		pid_t g = fork();                        /* grandchild: in container pid+mnt ns */
+		if (g == 0) _exit(fn() & 0xff);
+		int gst; waitpid(g, &gst, 0);
+		_exit(WIFEXITED(gst) ? WEXITSTATUS(gst) : 5);
+	}
+	int st; waitpid(c, &st, 0);
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+static int target_present(void)
+{ return !IN_CONTAINER || container_running(); }
+
+static void set_target(int container)
+{
+	IN_CONTAINER = container;
+	if (container) G_CPID = container_pid();
+}
+
+/* --------------------------------------------------------------- dispatch */
+
+static void for_each_target(void (*cb)(int))
+{
+	cb(0);
+	if (MODE_SIM) cb(1);
+}
+
+static void up_one(int container)
+{
+	set_target(container);
+	if (!target_present()) {
+		xlog(OBFSTR("[%s] not running -> skipped (start it, or use 'watch')"),
+		     container ? OBFSTR("ctr") : OBFSTR("host"));
+		return;
+	}
+	if (run_in_target(target_ready) != 1) {
+		xlog(OBFSTR("[%s] ciphertext NOT ready -> not mounting"),
+		     container ? OBFSTR("ctr") : OBFSTR("host"));
+		return;
+	}
+	xlog(OBFSTR("[%s] mounting"), container ? OBFSTR("ctr") : OBFSTR("host"));
+	run_in_target(target_up_body);
+}
+
+static void down_one(int container)
+{
+	set_target(container);
+	if (!target_present()) {
+		xlog(OBFSTR("[%s] not running; its mounts vanished with it"),
+		     container ? OBFSTR("ctr") : OBFSTR("host"));
+		return;
+	}
+	xlog(OBFSTR("[%s] tearing down"), container ? OBFSTR("ctr") : OBFSTR("host"));
+	run_in_target(do_down);
+}
+
+static void down_pre(int container)
+{
+	set_target(container);
+	if (!target_present()) return;
+	run_in_target(do_down);
+}
+
+static void status_one(int container)
+{
+	set_target(container);
+	if (!target_present()) { xlog(OBFSTR("[%s] not running"), container ? OBFSTR("ctr") : OBFSTR("host")); return; }
+	xlog(OBFSTR("[%s] status:"), container ? OBFSTR("ctr") : OBFSTR("host"));
+	run_in_target(do_status);
+}
+
+static void run_up_sequence(void)
+{
+	for_each_target(down_pre);
+	IN_CONTAINER = 0; ensure_module(); read_ctl_mm();
+	for_each_target(up_one);
+	xlog(OBFSTR("up complete. Watch for EROFS -> add paths to WRITE_DIRS/WRITE_FILES and re-run 'up'."));
+}
+
+static void do_watch(void)
+{
+	set_target(0);
+	run_in_target(do_down);
+	ensure_module(); read_ctl_mm();
+	run_in_target(target_up_body);
+
+	if (!MODE_SIM) { xlog(OBFSTR("real mode: no container to watch; done")); return; }
+
+	xlog(OBFSTR("watch: polling for '%s' every %ds"), CONTAINER, WATCH_INTERVAL);
+	int prev = 0;   /* 0 down, 1 waiting, 2 up */
+	for (;;) {
+		set_target(1);
+		if (container_running()) {
+			if (run_in_target(target_ready) == 1) {
+				if (prev != 2) {
+					xlog(OBFSTR("container up + ready -> mounting"));
+					run_in_target(do_down);
+					run_in_target(target_up_body);
+					prev = 2;
+				}
+			} else if (prev != 1) {
+				xlog(OBFSTR("container up but ciphertext NOT ready; waiting"));
+				prev = 1;
+			}
+		} else {
+			prev = 0;
+		}
+		struct timespec ts = { WATCH_INTERVAL, 0 };
+		nanosleep(&ts, NULL);
+	}
+}
+
+/* --------------------------------------------------------------- bootstrap */
+
+static void become_root(int argc, char **argv)
+{
+	if (geteuid() == 0) return;
+	char self[4096];
+	ssize_t r = readlink(OBFSTR("/proc/self/exe"), self, sizeof self - 1);
+	if (r < 0) { perror("readlink"); exit(1); }
+	self[r] = 0;
+	const char **na = calloc(argc + 3, sizeof *na);
+	int i = 0;
+	na[i++] = OBFSTR("sudo"); na[i++] = OBFSTR("-E"); na[i++] = self;
+	for (int j = 1; j < argc; j++) na[i++] = argv[j];
+	na[i] = NULL;
+	execvp(na[0], (char *const *)na);
+	perror("execvp sudo"); exit(1);
+}
+
+static void load_config(void)
+{
+	static char ko_buf[4096], sig_buf[4096];
+	const char *kmod_dir = env_def(OBFSTR("AREV_KMOD_DIR"), CFG_KMOD_DIR);
+	const char *envko = getenv("AREV_KO");
+	const char *ko = (envko && *envko) ? envko : CFG_KO;
+	if (!*ko) { snprintf(ko_buf, sizeof ko_buf, "%s/vcachefs.ko", kmod_dir); ko = ko_buf; }
+	KO = strdup(ko);
+
+	CONTAINER       = strdup(env_def(OBFSTR("AREV_CONTAINER"), CFG_CONTAINER));
+	WATCH_INTERVAL  = env_int(OBFSTR("AREV_WATCH_INTERVAL"), CFG_WATCH_SECS);
+	READY_MARKER    = strdup(env_def(OBFSTR("AREV_READY_MARKER"), CFG_READY_MARKER));
+	AUTHZ_PATH      = strdup(env_def(OBFSTR("AREV_AUTHZ_PATH"), CFG_AUTHZ_PATH));
+	const char *sig = getenv("AREV_AUTHZ_SIG_PATH");
+	if (!sig || !*sig) { snprintf(sig_buf, sizeof sig_buf, "%s.p7s", AUTHZ_PATH); sig = sig_buf; }
+	AUTHZ_SIG_PATH  = strdup(sig);
+	GATE_ENFORCE    = env_int(OBFSTR("AREV_GATE_ENFORCE"), CFG_GATE_ENFORCE);
+	GATE_PASSTHROUGH= env_int(OBFSTR("AREV_GATE_PASSTHROUGH"), CFG_GATE_PASS);
+	DEV_MODE        = env_int(OBFSTR("AREV_DEV"), CFG_DEV_MODE);
+	GATE_REQUIRE_SIG= env_int(OBFSTR("AREV_GATE_REQUIRE_SIG"), CFG_REQUIRE_SIG);
+	RELOAD_MODULE   = env_int(OBFSTR("AREV_RELOAD_MODULE"), CFG_RELOAD);
+	VCACHEFS_OPTS   = strdup(env_def(OBFSTR("AREV_VCACHEFS_OPTS"), CFG_VCACHE_OPTS));
+	STAGE_MODE      = strdup(env_def(OBFSTR("AREV_STAGE_LOWER"), CFG_STAGE_MODE));
+	STAGE_DIR       = strdup(env_def(OBFSTR("AREV_STAGE_DIR"), CFG_STAGE_DIR));
+	WRITE_BACKING   = strdup(env_def(OBFSTR("AREV_WRITE_BACKING"), CFG_WRITE_BACKING));
+	TMPFS_OPTS      = strdup(env_def(OBFSTR("AREV_TMPFS_OPTS"), CFG_TMPFS_OPTS));
+
+	MOUNTS      = list_env(OBFSTR("AREV_MOUNTS"));      if (!MOUNTS)      MOUNTS      = split_ws(CFG_MOUNTS);
+	ALLOWL      = list_env(OBFSTR("AREV_ALLOW"));       if (!ALLOWL)      ALLOWL      = split_ws(CFG_ALLOW);
+	WRITE_DIRS  = list_env(OBFSTR("AREV_WRITE_DIRS"));  if (!WRITE_DIRS)  WRITE_DIRS  = split_ws(CFG_WRITE_DIRS);
+	WRITE_FILES = list_env(OBFSTR("AREV_WRITE_FILES")); if (!WRITE_FILES) WRITE_FILES = split_ws(CFG_WRITE_FILES);
+}
+
+static void usage(void)
+{
+	fprintf(stderr, "usage: vcache-mount-inplace [--mode real|sim] {up|down|status|watch}\n");
+	exit(2);
+}
+
+int main(int argc, char **argv)
+{
+	become_root(argc, argv);
+
+	const char *mode = env_def(OBFSTR("AREV_MODE"), CFG_MODE);
+	ACTION = NULL;
+	for (int i = 1; i < argc; i++) {
+		if      (!strcmp(argv[i], "--mode") && i + 1 < argc) mode = argv[++i];
+		else if (!strncmp(argv[i], "--mode=", 7))            mode = argv[i] + 7;
+		else if (!strcmp(argv[i], "up") || !strcmp(argv[i], "down") ||
+			 !strcmp(argv[i], "status") || !strcmp(argv[i], "watch"))
+			ACTION = argv[i];
+		else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) usage();
+		else { fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(); }
+	}
+	if (!ACTION) ACTION = OBFSTR("up");
+
+	if      (!strcmp(mode, "real")) MODE_SIM = 0;
+	else if (!strcmp(mode, "sim"))  MODE_SIM = 1;
+	else die(OBFSTR("unknown --mode '%s' (use real|sim)"), mode);
+
+	load_config();
+
+	if (MODE_SIM && strcmp(ACTION, "watch") != 0) {
+		char buf[16];
+		const char *av[] = { OBFSTR("docker"), OBFSTR("--version"), NULL };
+		if (run_capture(av, buf, sizeof buf) != 0) die(OBFSTR("docker not found (sim mode)"));
+	}
+
+	if      (!strcmp(ACTION, "up"))     run_up_sequence();
+	else if (!strcmp(ACTION, "watch"))  do_watch();
+	else if (!strcmp(ACTION, "down"))   { for_each_target(down_one);
+					      xlog(OBFSTR("down complete (module left loaded; 'rmmod vcachefs' to unload)")); }
+	else if (!strcmp(ACTION, "status")) for_each_target(status_one);
+	else usage();
+	return 0;
+}

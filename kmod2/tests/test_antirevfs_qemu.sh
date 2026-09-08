@@ -45,7 +45,6 @@ KMOD="$HERE/.."
 ROOT="$KMOD/.."
 MOD="$KMOD/module/vcachefs.ko"
 PROTECT="$ROOT/encryptor/protect.py"
-KEYCTL="$KMOD/tools/vcache-keyctl"
 ENF_PARAM=/sys/module/vcachefs/parameters/gate_enforce
 
 ACC=aarch64-linux-gnu-gcc
@@ -81,7 +80,6 @@ mkdir -p "$ENC" "$MP"
 cleanup() {
 	mountpoint -q "$MP" && umount "$MP"
 	rmmod vcachefs 2>/dev/null
-	"$KEYCTL" clear >/dev/null 2>&1
 	rm -rf "$WORK"
 }
 trap cleanup EXIT

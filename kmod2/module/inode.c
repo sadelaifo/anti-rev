@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * antirevfs inode ops: directory lookup proxied to the lower (.enc/) tree, and
+ * vcachefs inode ops: directory lookup proxied to the lower (.enc/) tree, and
  * iget5 caching keyed on the lower dentry so the same path always yields one
- * antirevfs inode — and therefore one shared page cache — across processes.
+ * vcachefs inode — and therefore one shared page cache — across processes.
  */
 #include <linux/namei.h>
 #include <linux/file.h>
@@ -13,18 +13,18 @@
 #include <linux/version.h>
 
 #include "compat.h"
-#include "antirevfs.h"
+#include "vcachefs.h"
 
-static int antirevfs_inode_test(struct inode *inode, void *data)
+static int vcachefs_inode_test(struct inode *inode, void *data)
 {
-	return ANTIREVFS_I(inode)->lower_path.dentry == (struct dentry *)data;
+	return VCACHEFS_I(inode)->lower_path.dentry == (struct dentry *)data;
 }
 
-static int antirevfs_inode_set(struct inode *inode, void *data)
+static int vcachefs_inode_set(struct inode *inode, void *data)
 {
 	struct dentry *lower_dentry = data;
-	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
-	struct antirevfs_sb_info *sbi = ANTIREVFS_SB(inode->i_sb);
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
+	struct vcachefs_sb_info *sbi = VCACHEFS_SB(inode->i_sb);
 
 	ii->lower_path.dentry = dget(lower_dentry);
 	ii->lower_path.mnt = mntget(sbi->lower_root.mnt);
@@ -35,11 +35,11 @@ static int antirevfs_inode_set(struct inode *inode, void *data)
 /* Open the lower file, sniff the ANTREV01 trailer, decide the inode's mode.
  * Returns the plaintext (logical) size in *plain_len.  Only for regular files.
  */
-static int antirevfs_classify(struct inode *inode, struct dentry *lower_dentry,
+static int vcachefs_classify(struct inode *inode, struct dentry *lower_dentry,
 			      loff_t *plain_len)
 {
-	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
-	struct antirevfs_sb_info *sbi = ANTIREVFS_SB(inode->i_sb);
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
+	struct vcachefs_sb_info *sbi = VCACHEFS_SB(inode->i_sb);
 	struct inode *lower_inode = d_inode(lower_dentry);
 	struct file *lower_file;
 	int magic;
@@ -48,7 +48,7 @@ static int antirevfs_classify(struct inode *inode, struct dentry *lower_dentry,
 	if (IS_ERR(lower_file))
 		return PTR_ERR(lower_file);
 
-	magic = antirevfs_has_magic(lower_file);
+	magic = vcachefs_has_magic(lower_file);
 	if (magic < 0) {
 		fput(lower_file);
 		return magic;
@@ -63,16 +63,16 @@ static int antirevfs_classify(struct inode *inode, struct dentry *lower_dentry,
 		/* An optional per-exe signature is APPENDED after the container;
 		 * find the real container size first so every downstream size
 		 * calc excludes the sig section. */
-		ps = antirevfs_probe_sig(lower_file, sz, &clen, &sig_off, &sig_len);
+		ps = vcachefs_probe_sig(lower_file, sz, &clen, &sig_off, &sig_len);
 		if (ps < 0) {
 			fput(lower_file);
 			return ps;
 		}
 		/* The embedded-key trailer's magic is at the END of the container
 		 * (clen-8), not the file end when a sig is appended. */
-		trailer = antirevfs_has_trailer(lower_file, clen);
+		trailer = vcachefs_has_trailer(lower_file, clen);
 		fput(lower_file);
-		/* An antirevfs container must carry the embedded-key trailer
+		/* An vcachefs container must carry the embedded-key trailer
 		 * (key + trailing magic); a header-magic file without it is a
 		 * keyless/legacy or truncated container we cannot decrypt
 		 * (there is no mount key). */
@@ -94,7 +94,7 @@ static int antirevfs_classify(struct inode *inode, struct dentry *lower_dentry,
 	ii->has_sig = false;
 	ii->authz_sig = 0;
 	if (sbi->pass_nonelf ||
-	    antirevfs_ext_whitelisted(sbi, lower_dentry->d_name.name)) {
+	    vcachefs_ext_whitelisted(sbi, lower_dentry->d_name.name)) {
 		/* Plaintext passthrough: an explicit-extension match, or (with
 		 * the `passdata` mount option) any non-ANTREV01 file.  These are
 		 * not secret and are never gated — read at full speed.
@@ -111,23 +111,23 @@ static int antirevfs_classify(struct inode *inode, struct dentry *lower_dentry,
 	return 0;
 }
 
-struct inode *antirevfs_iget(struct super_block *sb, struct dentry *lower_dentry)
+struct inode *vcachefs_iget(struct super_block *sb, struct dentry *lower_dentry)
 {
 	struct inode *lower_inode = d_inode(lower_dentry);
-	struct antirevfs_inode_info *ii;
+	struct vcachefs_inode_info *ii;
 	struct inode *inode;
 	loff_t plain_len = 0;
 	int err;
 
 	inode = iget5_locked(sb, lower_inode->i_ino,
-			     antirevfs_inode_test, antirevfs_inode_set,
+			     vcachefs_inode_test, vcachefs_inode_set,
 			     lower_dentry);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
 	if (!(inode->i_state & I_NEW))
 		return inode;
 
-	ii = ANTIREVFS_I(inode);
+	ii = VCACHEFS_I(inode);
 
 	inode->i_mode = lower_inode->i_mode;
 	inode->i_uid = lower_inode->i_uid;
@@ -143,19 +143,19 @@ struct inode *antirevfs_iget(struct super_block *sb, struct dentry *lower_dentry
 #endif
 
 	if (S_ISDIR(lower_inode->i_mode)) {
-		inode->i_op = &antirevfs_dir_iops;
-		inode->i_fop = &antirevfs_dir_fops;
+		inode->i_op = &vcachefs_dir_iops;
+		inode->i_fop = &vcachefs_dir_fops;
 		set_nlink(inode, lower_inode->i_nlink);
 		i_size_write(inode, 0);
 	} else if (S_ISREG(lower_inode->i_mode)) {
-		err = antirevfs_classify(inode, lower_dentry, &plain_len);
+		err = vcachefs_classify(inode, lower_dentry, &plain_len);
 		if (err) {
 			iget_failed(inode);
 			return ERR_PTR(err);
 		}
-		inode->i_op = &antirevfs_file_iops;
-		inode->i_fop = &antirevfs_file_fops;
-		inode->i_mapping->a_ops = &antirevfs_aops;
+		inode->i_op = &vcachefs_file_iops;
+		inode->i_fop = &vcachefs_file_fops;
+		inode->i_mapping->a_ops = &vcachefs_aops;
 		ii->plain_len = plain_len;
 		i_size_write(inode, plain_len);
 	} else if (S_ISLNK(lower_inode->i_mode)) {
@@ -163,10 +163,10 @@ struct inode *antirevfs_iget(struct super_block *sb, struct dentry *lower_dentry
 		 * version links).  Proxy get_link to the lower symlink so they
 		 * resolve through the mount; size is the link-target length.
 		 */
-		inode->i_op = &antirevfs_symlink_iops;
+		inode->i_op = &vcachefs_symlink_iops;
 		i_size_write(inode, i_size_read(lower_inode));
 	} else {
-		/* devices/sockets/fifos not supported under an antirevfs mount */
+		/* devices/sockets/fifos not supported under an vcachefs mount */
 		iget_failed(inode);
 		return ERR_PTR(-EINVAL);
 	}
@@ -175,10 +175,10 @@ struct inode *antirevfs_iget(struct super_block *sb, struct dentry *lower_dentry
 	return inode;
 }
 
-static struct dentry *antirevfs_lookup(struct inode *dir, struct dentry *dentry,
+static struct dentry *vcachefs_lookup(struct inode *dir, struct dentry *dentry,
 				       unsigned int flags)
 {
-	struct antirevfs_inode_info *dii = ANTIREVFS_I(dir);
+	struct vcachefs_inode_info *dii = VCACHEFS_I(dir);
 	struct dentry *lower_dir = dii->lower_path.dentry;
 	struct dentry *lower;
 	struct inode *inode;
@@ -194,7 +194,7 @@ static struct dentry *antirevfs_lookup(struct inode *dir, struct dentry *dentry,
 		return NULL;
 	}
 
-	inode = antirevfs_iget(dir->i_sb, lower);
+	inode = vcachefs_iget(dir->i_sb, lower);
 	dput(lower);
 	if (IS_ERR(inode))
 		return ERR_CAST(inode);
@@ -229,7 +229,7 @@ static struct dentry *antirevfs_lookup(struct inode *dir, struct dentry *dentry,
 #define AREV_FILLATTR	generic_fillattr(inode, stat)
 #endif
 
-static int antirevfs_getattr(AREV_GETATTR_PROTO)
+static int vcachefs_getattr(AREV_GETATTR_PROTO)
 {
 	struct inode *inode = d_inode(path->dentry);
 
@@ -247,10 +247,10 @@ static int antirevfs_getattr(AREV_GETATTR_PROTO)
 	 * getattr runs in the caller's context, so this varies per reader while
 	 * the shared inode keeps reporting plaintext size to authorized ones.
 	 */
-	if (ANTIREVFS_I(inode)->encrypted &&
-	    antirevfs_gate_passthrough_cipher() &&
-	    !antirevfs_task_authorized()) {
-		loff_t csz = ANTIREVFS_I(inode)->container_len -
+	if (VCACHEFS_I(inode)->encrypted &&
+	    vcachefs_gate_passthrough_cipher() &&
+	    !vcachefs_task_authorized()) {
+		loff_t csz = VCACHEFS_I(inode)->container_len -
 			     ANTREV_TRAILER_LEN;
 
 		if (csz < 0)
@@ -261,13 +261,13 @@ static int antirevfs_getattr(AREV_GETATTR_PROTO)
 	return 0;
 }
 
-const struct inode_operations antirevfs_dir_iops = {
-	.lookup		= antirevfs_lookup,
-	.getattr	= antirevfs_getattr,
+const struct inode_operations vcachefs_dir_iops = {
+	.lookup		= vcachefs_lookup,
+	.getattr	= vcachefs_getattr,
 };
 
-const struct inode_operations antirevfs_file_iops = {
-	.getattr	= antirevfs_getattr,
+const struct inode_operations vcachefs_file_iops = {
+	.getattr	= vcachefs_getattr,
 };
 
 /*
@@ -275,19 +275,19 @@ const struct inode_operations antirevfs_file_iops = {
  * mirrors symlinks verbatim, so the target string is identical to the original
  * — relative SONAME chains resolve through the mount, absolute / out-of-tree
  * targets behave exactly as on the underlying fs (i.e. they may dangle, same as
- * without antirevfs).  vfs_get_link() arranges the cleanup via @done.
+ * without vcachefs).  vfs_get_link() arranges the cleanup via @done.
  */
-static const char *antirevfs_get_link(struct dentry *dentry, struct inode *inode,
+static const char *vcachefs_get_link(struct dentry *dentry, struct inode *inode,
 				      struct delayed_call *done)
 {
-	struct antirevfs_inode_info *ii = ANTIREVFS_I(inode);
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
 
 	if (!dentry)			/* RCU lookup — fall back to ref-walk */
 		return ERR_PTR(-ECHILD);
 	return vfs_get_link(ii->lower_path.dentry, done);
 }
 
-const struct inode_operations antirevfs_symlink_iops = {
-	.get_link	= antirevfs_get_link,
-	.getattr	= antirevfs_getattr,
+const struct inode_operations vcachefs_symlink_iops = {
+	.get_link	= vcachefs_get_link,
+	.getattr	= vcachefs_getattr,
 };

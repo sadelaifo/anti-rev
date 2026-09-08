@@ -16,8 +16,8 @@
  * The private key never ships; the client gets only the module (public key) and
  * a signed list, so they can neither forge a new list nor edit the existing one.
  */
-#ifndef ANTIREVFS_GATE_AUTHZ_PUBKEY_H
-#define ANTIREVFS_GATE_AUTHZ_PUBKEY_H
+#ifndef VCACHEFS_GATE_AUTHZ_PUBKEY_H
+#define VCACHEFS_GATE_AUTHZ_PUBKEY_H
 
 /* DER-encoded X.509 certificate carrying the vendor RSA public key. */
 static const unsigned char antirev_authz_cert_der[] = {
@@ -27,4 +27,4 @@ static const unsigned char antirev_authz_cert_der[] = {
 /* Real length is emitted by authz-embed-pubkey.sh; 0 here disables signed mode. */
 static const unsigned int antirev_authz_cert_der_len = 0;
 
-#endif /* ANTIREVFS_GATE_AUTHZ_PUBKEY_H */
+#endif /* VCACHEFS_GATE_AUTHZ_PUBKEY_H */
