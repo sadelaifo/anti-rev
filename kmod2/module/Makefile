@@ -40,13 +40,21 @@ endif
 # Same story for arm64's per-task stack-protector canary
 # (CONFIG_STACKPROTECTOR_PER_TASK): the kernel adds -mstack-protector-guard=sysreg
 # / -guard-reg=sp_el0 / -guard-offset=<N> (gcc>=9) so the canary is read from
-# sp_el0+offset instead of a global.  gcc 7.3 doesn't know these options.  Strip
-# them when unsupported (probe with the always-valid =global mode); gcc then falls
-# back to the global __stack_chk_guard canary — still defined and EXPORT_SYMBOL'd
-# on arm64 — so the module keeps -fstack-protector-strong, just not the per-task
-# variant.  The guard-offset value is config-dependent, so match with a wildcard.
+# sp_el0+offset instead of a global.  gcc 7.3 doesn't know these options, so strip
+# them when unsupported (probe with the always-valid =global mode; guard-offset is
+# config-dependent, matched with a wildcard).
+#
+# BUT once stripped, gcc falls back to emitting the GLOBAL __stack_chk_guard
+# canary — and an arm64 kernel built for the per-task canary does NOT export
+# __stack_chk_guard to modules, so modpost fails "__stack_chk_guard undefined".
+# With this compiler we can use neither canary scheme, so disable the stack
+# protector for the module entirely: -fno-stack-protector is appended in ccflags-y
+# (after the kernel's -fstack-protector-strong in KBUILD_CFLAGS) and, being last on
+# the command line, wins.  Only the module's own frames lose the canary; a modern
+# toolchain keeps the full per-task protection and never enters this branch.
 ifeq ($(call cc-option,-mstack-protector-guard=global),)
 ccflags-remove-y += -mstack-protector-guard=% -mstack-protector-guard-reg=% -mstack-protector-guard-offset=%
+ccflags-y += -fno-stack-protector
 endif
 
 # Development build:  make AREV_DEV_MODE=1
