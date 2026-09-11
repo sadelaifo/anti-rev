@@ -86,6 +86,22 @@ size) uses `container_len`, not raw file size — same as kmod2.
   writable path outside the mount (same posture as kmod2 bare mount). An
   overlay-rw equivalent can be layered the same way if needed.
 
+## In-place mount (lower == mountpoint), like kmod2's layover
+
+`vcachefsd <dir> <dir>` is supported: the decrypted view can be mounted over the
+*same* directory that holds the ciphertext, so an app sees plaintext at the
+exact path the ciphertext lives at on disk (no sibling `.enc` path needed). The
+daemon **pins an fd to the lower root at startup** (`open(lower,
+O_DIRECTORY|O_CLOEXEC)`, before `fuse_main` mounts) and performs every lower
+access via `*at()` relative to that fd (`openat`/`fstatat`/`readlinkat`/
+`fdopendir`). So once the FUSE mount shadows the path, the pinned fd still
+reaches the real lower inodes — no re-resolution of the shadowed path, no
+recursion back into the daemon. (A naive path-based stacked daemon hangs here,
+because `open("$lower/x")` would resolve into the mount itself; the fd-pin is
+what kmod2 gets "for free" by holding the lower dentry in the kernel.) Verified
+by the in-place test (mount comes up, readdir + decrypt work, ciphertext
+reappears on unmount).
+
 ## The gate (decrypt-authorization)
 
 Only an *authorized* process reaches plaintext; `cp`/backup/file-manager get the

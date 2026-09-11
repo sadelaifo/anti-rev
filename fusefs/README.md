@@ -30,6 +30,11 @@ make static          # static binary for shipping in an image
 # readers get a keyless container instead of EACCES:
 ./vcachefsd <lower> <mnt> --passdata --gate --passthrough-cipher
 
+# IN-PLACE (lower == mountpoint), like kmod2's layover — the decrypted view
+# covers the same dir the ciphertext lives in (the daemon pins the lower fd at
+# startup, so this does not recurse/hang):
+./vcachefsd <dir> <dir> --passdata
+
 unmount:  fusermount3 -u <mnt>
 ```
 

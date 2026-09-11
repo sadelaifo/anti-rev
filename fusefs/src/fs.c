@@ -39,7 +39,8 @@
 
 /* ---- daemon-wide config ---------------------------------------------------- */
 static struct {
-	char *lower;			/* absolute ciphertext root */
+	char *lower;			/* absolute ciphertext root (for messages) */
+	int lower_fd;			/* pinned O_DIRECTORY fd to the lower root */
 	int passdata;
 	char *passthrough;		/* colon-separated extensions, or NULL */
 	int gate;
@@ -60,16 +61,17 @@ struct fh {
 };
 
 /* ---- helpers --------------------------------------------------------------- */
-static int lower_path(const char *path, char *out, size_t out_len)
+/* Map a FUSE absolute path to a path RELATIVE to the pinned lower dir fd
+ * (g.lower_fd).  "/" -> ".".  Every lower access goes through *at() on
+ * g.lower_fd rather than re-resolving the absolute lower path by name — which
+ * is exactly what makes an IN-PLACE mount (lower == mountpoint) safe: once the
+ * FUSE mount shadows that path, the pinned fd still reaches the real lower
+ * inodes, so there is no recursion back into the daemon. */
+static const char *rel_path(const char *path)
 {
-	int n;
 	if (path[0] == '/' && path[1] == '\0')
-		n = snprintf(out, out_len, "%s", g.lower);
-	else
-		n = snprintf(out, out_len, "%s%s", g.lower, path);
-	if (n < 0 || (size_t)n >= out_len)
-		return -ENAMETOOLONG;
-	return 0;
+		return ".";
+	return path + 1;		/* skip the leading '/' */
 }
 
 static bool ext_whitelisted(const char *name)
@@ -140,20 +142,18 @@ static void *fs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 static int fs_getattr(const char *path, struct stat *st,
 		      struct fuse_file_info *fi)
 {
-	char lp[PATH_MAX];
-	int fd, r, cls;
+	const char *rel = rel_path(path);
+	int fd, cls;
 	off_t clen = 0, plen = 0;
 	pid_t pid = fuse_get_context()->pid;
 
 	(void)fi;
-	if ((r = lower_path(path, lp, sizeof(lp))) < 0)
-		return r;
-	if (lstat(lp, st) < 0)
+	if (fstatat(g.lower_fd, rel, st, AT_SYMLINK_NOFOLLOW) < 0)
 		return -errno;
 	if (!S_ISREG(st->st_mode))
 		return 0;			/* dirs/symlinks: report as-is */
 
-	fd = open(lp, O_RDONLY | O_CLOEXEC);
+	fd = openat(g.lower_fd, rel, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		return 0;			/* unreadable: report raw stat */
 	cls = classify(fd, st->st_size, &clen, &plen);
@@ -173,13 +173,8 @@ static int fs_getattr(const char *path, struct stat *st,
 
 static int fs_readlink(const char *path, char *buf, size_t size)
 {
-	char lp[PATH_MAX];
-	ssize_t n;
-	int r;
+	ssize_t n = readlinkat(g.lower_fd, rel_path(path), buf, size - 1);
 
-	if ((r = lower_path(path, lp, sizeof(lp))) < 0)
-		return r;
-	n = readlink(lp, buf, size - 1);
 	if (n < 0)
 		return -errno;
 	buf[n] = '\0';
@@ -190,17 +185,19 @@ static int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		      off_t off, struct fuse_file_info *fi,
 		      enum fuse_readdir_flags flags)
 {
-	char lp[PATH_MAX];
 	DIR *d;
 	struct dirent *de;
-	int r;
+	int dfd;
 
 	(void)off; (void)fi; (void)flags;
-	if ((r = lower_path(path, lp, sizeof(lp))) < 0)
-		return r;
-	d = opendir(lp);
-	if (!d)
+	dfd = openat(g.lower_fd, rel_path(path), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dfd < 0)
 		return -errno;
+	d = fdopendir(dfd);		/* closedir() will close dfd */
+	if (!d) {
+		close(dfd);
+		return -errno;
+	}
 	while ((de = readdir(d))) {
 		struct stat st = { .st_ino = de->d_ino,
 				   .st_mode = DTTOIF(de->d_type) };
@@ -213,7 +210,6 @@ static int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
 static int fs_open(const char *path, struct fuse_file_info *fi)
 {
-	char lp[PATH_MAX];
 	struct fh *h;
 	int fd, cls, r;
 	off_t clen = 0, plen = 0;
@@ -221,9 +217,7 @@ static int fs_open(const char *path, struct fuse_file_info *fi)
 
 	if ((fi->flags & O_ACCMODE) != O_RDONLY)
 		return -EROFS;		/* read-only filesystem */
-	if ((r = lower_path(path, lp, sizeof(lp))) < 0)
-		return r;
-	fd = open(lp, O_RDONLY | O_CLOEXEC);
+	fd = openat(g.lower_fd, rel_path(path), O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		return -errno;
 
@@ -425,6 +419,17 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	/* Pin the lower root NOW, before fuse_main mounts.  All lower access is
+	 * via *at() on this fd, so an in-place mount (lower == mountpoint) works:
+	 * the overmount shadows the path but this fd keeps reaching the real
+	 * lower inodes. */
+	g.lower_fd = open(g.lower, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (g.lower_fd < 0) {
+		fprintf(stderr, "vcachefsd: cannot open lower dir '%s': %s\n",
+			g.lower, strerror(errno));
+		return 1;
+	}
+
 	cache_init((size_t)g.cache_mb * 1024 * 1024);
 	gc.enforce = g.gate;
 	gc.authz_path = g.authz;
@@ -432,6 +437,7 @@ int main(int argc, char *argv[])
 
 	ret = fuse_main(args.argc, args.argv, &fs_ops, NULL);
 	fuse_opt_free_args(&args);
+	close(g.lower_fd);
 	free(g.lower);
 	return ret;
 }
