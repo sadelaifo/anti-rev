@@ -1,0 +1,63 @@
+# Dockerfile.template — integrate fusefs into YOUR product image.
+# Variant: PREBUILT STATIC vcachefsd + WRITABLE overlay view.
+#
+# Build context must contain: your product tree, the antirev repo's `fusefs/`
+# (for the prebuilt binary + entrypoint), and the packer (`encryptor/` +
+# `kmod2/tools/vcache-pack.py`).  Replace <...> placeholders.
+#
+# The daemon ships as a prebuilt static binary (fusefs/prebuilt/vcachefsd-x86_64)
+# — no compiler/build stage in your pipeline.  If you change gate_whitelist.h or
+# the sources, rebuild it with `make -C fusefs static` and refresh prebuilt/.
+
+# ── stage 1: encrypt the product into a ciphertext lower tree ─────────────────
+ARG PACK_BASE=ubuntu:22.04
+FROM ${PACK_BASE} AS packer
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-cryptography patchelf \
+    && rm -rf /var/lib/apt/lists/*
+COPY encryptor/ /pack/encryptor/
+COPY kmod2/tools/vcache-pack.py /pack/vcache-pack.py
+COPY <your-product-dir>/ /pack/plain/            # <-- your plaintext product tree
+COPY <your-pack-config>.yaml /pack/pack.yaml     # <-- see kmod2/examples/proj-pack.yaml
+#   pack.yaml: install_dir=/pack/plain, output_dir=/pack/product.enc,
+#   mirror_plaintext=true, blacklist your third-party + preloaded libs.
+RUN cd /pack && python3 vcache-pack.py pack.yaml
+
+# ── final: your real product image ───────────────────────────────────────────
+FROM <your-base-image>
+# Runtime deps: fusermount3 (the setuid mount helper libfuse3 execs) + the kernel
+# 'fuse' module on the host + /dev/fuse (passed at run).  The STATIC vcachefsd
+# still needs fusermount3 present — it does not embed the mount helper.
+RUN apt-get update && apt-get install -y --no-install-recommends fuse3 \
+    && rm -rf /var/lib/apt/lists/*
+#   (Debian/Ubuntu: fuse3. RHEL/SLES: fuse3 / fuse. Alpine: fuse3 — and the
+#    static glibc binary needs a glibc base, not musl; rebuild against musl for
+#    Alpine, or use a glibc base image.)
+
+# prebuilt static daemon + the mount-then-exec entrypoint (writable overlay)
+COPY fusefs/prebuilt/vcachefsd-x86_64                   /usr/local/bin/vcachefsd
+COPY fusefs/docker/integration/fusefs-entrypoint.sh     /usr/local/bin/fusefs-entrypoint.sh
+RUN chmod +x /usr/local/bin/vcachefsd /usr/local/bin/fusefs-entrypoint.sh
+
+# ciphertext baked in; app reads/writes the decrypting+writable view at /opt/product
+COPY --from=packer /pack/product.enc /opt/product.enc
+
+ENV FUSEFS_LOWER=/opt/product.enc \
+    FUSEFS_MNT=/opt/product \
+    FUSEFS_WRITABLE=1 \
+    FUSEFS_OPTS="--passdata"
+    # production gate: FUSEFS_OPTS="--passdata --gate --passthrough-cipher"
+    #   + whitelist your launcher/interpreter BASENAMES in fusefs/src/gate_whitelist.h
+    #     and rebuild the static binary.  Never whitelist a shell/busybox.
+    # writes: runtime files written under /opt/product land in an overlay upper
+    #   on a tmpfs (wiped on container stop).  For persistence, bind a volume and
+    #   set FUSEFS_STATE=/that/path FUSEFS_STATE_TMPFS=0.
+
+ENTRYPOINT ["/usr/local/bin/fusefs-entrypoint.sh"]
+CMD        ["<your-original-entrypoint-or-cmd>"]   # e.g. /opt/product/bin/app
+
+# ── run (the only client-visible change) ──────────────────────────────────────
+#   docker run --device /dev/fuse --cap-add SYS_ADMIN \
+#     [--security-opt apparmor=unconfined]  <your-image>  [args]
+#   SYS_ADMIN covers the fuse mount AND the overlayfs/tmpfs mounts for the
+#   writable view.  Verified on kernel 6.6 (WSL2) Docker 29.1.3.

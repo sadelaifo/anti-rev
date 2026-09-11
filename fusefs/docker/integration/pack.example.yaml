@@ -1,0 +1,26 @@
+# pack.example.yaml — vcache-pack.py config for encrypting your product tree
+# into the ciphertext lower tree that fusefs (vcachefsd) mounts over.
+# Copy, edit the paths/blacklist, and point the Dockerfile packer stage at it.
+#
+#   python3 vcache-pack.py pack.example.yaml
+
+install_dir: /pack/plain          # plaintext product tree (as COPY'd into the packer stage)
+output_dir:  /pack/product.enc    # ciphertext lower tree (COPY --from=packer into the image)
+key:         product.key.hex      # hex keyfile, relative to THIS file; 0600, created if absent
+                                  # KEEP THIS OFF CLIENT IMAGES — it is the master key.
+
+# Complete mixed-content tree: every ELF encrypted; data files (.py/.sh/.json/…)
+# and blacklisted third-party ELFs mirrored verbatim (plaintext). Mount --passdata.
+mirror_plaintext: true
+
+# Left UNENCRYPTED. Trailing '/' = path-prefix subtree (relative to install_dir);
+# otherwise a basename glob. Third-party libs and anything on a global LD_PRELOAD
+# (plus its whole DT_NEEDED closure) MUST stay plaintext — see proj-pack.yaml.
+blacklist:
+  - lib/3rd/                      # <-- your third-party lib subtree(s)
+  # - libPreload.so               # <-- if you use a global LD_PRELOAD shim
+
+# Optional: per-exe signing so the gate authorizes executables by signature
+# instead of a basename whitelist. Keep the private key OFF client images.
+# sign_key:  product-sign.key.pem
+# sign_cert: product-sign.cert.pem
