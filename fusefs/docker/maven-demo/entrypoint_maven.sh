@@ -11,14 +11,18 @@ echo "== baseline: mvn test against the plaintext repo (offline) =="
 if ( cd /proj && mvn -o -B -q test ); then ok "baseline mvn test passes (plaintext repo)"; else bad "baseline failed"; echo; echo "$PASS passed, $((FAIL)) failed"; exit 1; fi
 
 echo
-echo "== protect: encrypt every .jar, mount decrypting view, rerun mvn test =="
+echo "== step 1: run the script (encrypt jars + mount + write .mvn/maven.config) =="
 /usr/local/bin/protect-maven-repo.sh \
 	--src "$HOME/.m2/repository" --enc /tmp/repo.enc --mnt /tmp/repo \
 	--fusefs /usr/local/bin/vcachefsd --pack /usr/local/bin/pack_jar.py \
-	--proj /proj --gate -- -o -B test
+	--proj /proj --gate --no-run
+[ -f /proj/.mvn/maven.config ] && ok "setup wrote /proj/.mvn/maven.config" || bad "maven.config not written"
+
+echo "== step 2: the exact user flow -> cd /proj && mvn test  (NO flags) =="
+( cd /proj && mvn -B test )
 rc=$?
-[ $rc -eq 0 ] && ok "mvn test PASSES reading encrypted jars through the mount (gate on: java)" \
-              || bad "mvn test failed over encrypted jars (rc=$rc)"
+[ $rc -eq 0 ] && ok "plain 'mvn test' PASSES over the encrypted repo (gate on: java)" \
+              || bad "plain mvn test failed over encrypted jars (rc=$rc)"
 
 echo
 echo "== proof the jars are ciphertext at rest =="
@@ -33,7 +37,8 @@ done < <(find /tmp/repo.enc -name '*.jar' -type f -print0)
 echo "  $ENCN of $TOTAL jars carry FS_MAGIC"
 [ "$ENCN" = "$TOTAL" ] && ok "ALL repo jars encrypted ($ENCN/$TOTAL)" || bad "some jars not encrypted ($ENCN/$TOTAL)"
 
-/usr/local/bin/protect-maven-repo.sh --down --mnt /tmp/repo --state /run/fusefs-repo 2>/dev/null || true
+/usr/local/bin/protect-maven-repo.sh --down --proj /proj --mnt /tmp/repo --state /run/fusefs-repo 2>/dev/null || true
+[ -f /proj/.mvn/maven.config ] && bad "--down left maven.config behind" || ok "--down cleaned up (mount + maven.config)"
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

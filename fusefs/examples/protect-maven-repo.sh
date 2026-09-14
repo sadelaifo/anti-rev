@@ -56,7 +56,30 @@ is_mounted() { grep -q " $1 " /proc/self/mountinfo; }
 umnt() { is_mounted "$1" && { fusermount3 -u "$1" 2>/dev/null || umount -l "$1" 2>/dev/null; } || true; }
 teardown() { umnt "$MNT"; umnt "$STATE/dec"; is_mounted "$STATE" && umount -l "$STATE" 2>/dev/null || true; }
 
-if [ "$DOWN" = 1 ]; then teardown; echo "[*] unmounted"; exit 0; fi
+# Drop a project .mvn/maven.config so plain `mvn test` in $PROJ uses the mounted
+# repo with no extra flag.  We only touch a config WE own (marker file), never
+# clobber the user's existing one.
+MVN_CFG="$PROJ/.mvn/maven.config"
+MVN_MARK="$PROJ/.mvn/.fusefs-owned"
+write_maven_config() {
+	[ -f "$PROJ/pom.xml" ] || return 0
+	if [ -f "$MVN_CFG" ] && [ ! -f "$MVN_MARK" ]; then
+		echo "[!] $MVN_CFG exists and isn't ours — run mvn with -Dmaven.repo.local=$MNT yourself"
+		return 0
+	fi
+	mkdir -p "$PROJ/.mvn"
+	printf -- '-Dmaven.repo.local=%s\n' "$MNT" > "$MVN_CFG"
+	: > "$MVN_MARK"
+	echo "[*] wrote $MVN_CFG  ->  plain 'mvn test' now reads the decrypted repo"
+}
+remove_maven_config() {
+	if [ -f "$MVN_MARK" ]; then
+		rm -f "$MVN_CFG" "$MVN_MARK"; rmdir "$PROJ/.mvn" 2>/dev/null || true
+		echo "[*] removed $MVN_CFG"
+	fi
+}
+
+if [ "$DOWN" = 1 ]; then remove_maven_config; teardown; echo "[*] unmounted"; exit 0; fi
 [ -x "$FUSEFS" ] || { echo "vcachefsd not executable at: $FUSEFS (--fusefs or build it)" >&2; exit 1; }
 [ -f "$PACK" ]   || { echo "pack_jar.py not found at: $PACK (--pack)" >&2; exit 1; }
 
@@ -94,7 +117,11 @@ fi
 i=0; until is_mounted "$MNT"; do i=$((i+1)); [ $i -gt 50 ] && { echo "mount failed" >&2; exit 1; }; sleep 0.1; done
 echo "[*] decrypting repo mounted at $MNT  (writable=$WRITABLE gate=$GATE)"
 
-[ "$RUN" = 0 ] && { echo "[*] --no-run: leaving it mounted; use  mvn -Dmaven.repo.local=$MNT"; exit 0; }
+if [ "$RUN" = 0 ]; then
+	write_maven_config
+	echo "[*] ready — now just:  cd $PROJ && mvn test        (tear down later: $0 --down)"
+	exit 0
+fi
 
 # 4) run Maven against the decrypted repo
 echo "[*] cd $PROJ && mvn ${MVN_ARGS[*]} -Dmaven.repo.local=$MNT"
