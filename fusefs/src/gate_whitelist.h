@@ -21,7 +21,20 @@
 #include <stddef.h>		/* NULL */
 
 static const char *const fusefs_whitelist[] = {
-	/* "python3", */
+	"java",			/* JVM: reads encrypted .jar */
+	/*
+	 * CPython.  The gate matches the basename that /proc/<pid>/exe RESOLVES to,
+	 * and distro `python`/`python3` are SYMLINKS to a concrete minor binary
+	 * (e.g. `python3.10`), which is the name exe_file reports.  So we must list
+	 * the real binary names, not just `python3`.  We enumerate the realistic
+	 * set explicitly (a security whitelist should be explicit, not a fuzzy
+	 * prefix match).  If your interpreter resolves to something not listed
+	 * (`readlink -f "$(command -v python3)"`), add it here and rebuild.
+	 */
+	"python", "python2", "python2.7",
+	"python3",
+	"python3.6", "python3.7", "python3.8", "python3.9",
+	"python3.10", "python3.11", "python3.12", "python3.13",
 	/* "qemu-aarch64-static", */
 	/* "your-launcher", */
 	NULL
