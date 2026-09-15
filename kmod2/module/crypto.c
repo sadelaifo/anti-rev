@@ -240,9 +240,15 @@ out_tfm:
  */
 int vcachefs_crypto_init(void)
 {
+	struct crypto_aead *tfm;
+
 	g_sw_gcm_ok = (vcf_sw_gcm_init() == 0);
 
-	if (crypto_has_aead("gcm(aes)", 0, 0)) {
+	/* Probe by actually allocating the transform (crypto_has_aead() is not
+	 * present on older kernels, e.g. 5.10).  Success => kernel path. */
+	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	if (!IS_ERR(tfm)) {
+		crypto_free_aead(tfm);
 		g_gcm_backend = GCM_BACKEND_KERNEL;
 		pr_info("vcachefs: AES-256-GCM via kernel gcm(aes); software fallback %s\n",
 			g_sw_gcm_ok ? "ready" : "UNAVAILABLE");
@@ -250,7 +256,8 @@ int vcachefs_crypto_init(void)
 	}
 	if (g_sw_gcm_ok) {
 		g_gcm_backend = GCM_BACKEND_SW;
-		pr_info("vcachefs: kernel gcm(aes) absent; using built-in software AES-256-GCM (self-test OK)\n");
+		pr_info("vcachefs: kernel gcm(aes) absent (%ld); using built-in software AES-256-GCM (self-test OK)\n",
+			PTR_ERR(tfm));
 		return 0;
 	}
 	pr_err("vcachefs: no gcm(aes) and software AES-GCM self-test failed; cannot decrypt\n");
