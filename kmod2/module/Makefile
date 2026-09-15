@@ -67,7 +67,12 @@ endif
 # allow-list door — authorization is ONLY per-exe signature + the compiled
 # whitelist (gate_whitelist.h).  A dev .ko warns at load and reports
 # `build: dev` in modinfo, so it is never mistaken for a shipped module.
-ccflags-y += $(if $(AREV_DEV_MODE),-DAREV_DEV_MODE)
+# Normalize the dev-mode flag: Make's $(if) treats the STRING "0" as true, so a
+# bare `$(if $(AREV_DEV_MODE),...)` would wrongly select the dev build for
+# AREV_DEV_MODE=0 (dev has the gate defaulting OFF -> looks like "the gate does
+# nothing").  Filter the off-ish spellings so only 1/y/yes/on/true enable dev.
+AREV_DEV := $(filter-out 0 n no N NO off OFF false FALSE,$(strip $(AREV_DEV_MODE)))
+ccflags-y += $(if $(AREV_DEV),-DAREV_DEV_MODE)
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
@@ -92,7 +97,7 @@ NM      ?= $(CROSS_COMPILE)nm
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) $(MAKE_ARGS) modules
-ifndef AREV_DEV_MODE
+ifeq ($(AREV_DEV),)
 	@# Rename every defined implementation symbol (vcachefs_*/vcf_* and their
 	@# __pfx_ CFI aliases) to an opaque token.  Relocations reference symbols by
 	@# table index, not by name, so renaming the name string is transparent to

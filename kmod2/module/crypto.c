@@ -20,13 +20,27 @@
 #include "compat.h"
 #include "vcachefs.h"
 #include "aesgcm_sw.h"
+#include "obfstr_k.h"
 
-/* Log a per-file decrypt timing line (bytes / microseconds / MB-s / backend).
- * On by default for bring-up; set decrypt_log=0 to silence in production. */
+/* Diagnostic logging is DEV-ONLY.  A release .ko emits no self-documenting log
+ * text (nothing for `strings` to reveal) and exposes no decrypt_log knob; dev
+ * builds keep readable logs + the per-file timing line for bring-up. */
+#ifdef AREV_DEV_MODE
 static bool decrypt_log = true;
 module_param(decrypt_log, bool, 0644);
 MODULE_PARM_DESC(decrypt_log,
 		 "log per-file decrypt timing + backend (default on)");
+#define VCF_DINFO(...) pr_info(__VA_ARGS__)
+#define VCF_DERR(...)  pr_err(__VA_ARGS__)
+#else
+#define VCF_DINFO(...) do { } while (0)
+#define VCF_DERR(...)  do { } while (0)
+#endif
+
+/* Obfuscated "gcm(aes)" (key = obf_key(i) in tools/obfstr_gen.py) so the
+ * algorithm name is not a plaintext literal in the shipped .ko. */
+#define VCF_GCM_AES(buf) \
+	VCF_OBF((buf), 0x30, 0x2d, 0x2c, 0x50, 0x12, 0x0f, 0x1e, 0x4d)
 
 /*
  * crypto async-wait helper.  The DECLARE_CRYPTO_WAIT / crypto_req_done /
@@ -199,9 +213,10 @@ static int vcf_kernel_gcm_decrypt(const u8 *key, const u8 *iv,
 	struct aead_request *req;
 	struct scatterlist sg;
 	AREV_DECLARE_WAIT(wait);
+	char alg[16];
 	int ret;
 
-	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	tfm = crypto_alloc_aead(VCF_GCM_AES(alg), 0, 0);
 	if (IS_ERR(tfm))
 		return PTR_ERR(tfm);
 	ret = crypto_aead_setkey(tfm, key, ANTREV_KEY_LEN);
@@ -241,26 +256,27 @@ out_tfm:
 int vcachefs_crypto_init(void)
 {
 	struct crypto_aead *tfm;
+	char alg[16];
 
 	g_sw_gcm_ok = (vcf_sw_gcm_init() == 0);
 
 	/* Probe by actually allocating the transform (crypto_has_aead() is not
 	 * present on older kernels, e.g. 5.10).  Success => kernel path. */
-	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	tfm = crypto_alloc_aead(VCF_GCM_AES(alg), 0, 0);
 	if (!IS_ERR(tfm)) {
 		crypto_free_aead(tfm);
 		g_gcm_backend = GCM_BACKEND_KERNEL;
-		pr_info("vcachefs: AES-256-GCM via kernel gcm(aes); software fallback %s\n",
-			g_sw_gcm_ok ? "ready" : "UNAVAILABLE");
+		VCF_DINFO("vcachefs: AES-256-GCM via kernel gcm(aes); software fallback %s\n",
+			  g_sw_gcm_ok ? "ready" : "UNAVAILABLE");
 		return 0;
 	}
 	if (g_sw_gcm_ok) {
 		g_gcm_backend = GCM_BACKEND_SW;
-		pr_info("vcachefs: kernel gcm(aes) absent (%ld); using built-in software AES-256-GCM (self-test OK)\n",
-			PTR_ERR(tfm));
+		VCF_DINFO("vcachefs: kernel gcm(aes) absent (%ld); using built-in software AES-256-GCM (self-test OK)\n",
+			  PTR_ERR(tfm));
 		return 0;
 	}
-	pr_err("vcachefs: no gcm(aes) and software AES-GCM self-test failed; cannot decrypt\n");
+	VCF_DERR("vcachefs: no gcm(aes) and software AES-GCM self-test failed; cannot decrypt\n");
 	return -ENODEV;
 }
 
@@ -272,7 +288,9 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	u8 *buf = NULL;			/* [ct||tag], decrypted in place */
 	size_t ct_len = out_len;
 	size_t buf_len = ct_len + ANTREV_TAG_LEN;
+#ifdef AREV_DEV_MODE
 	ktime_t t_start;
+#endif
 	loff_t pos;
 	ssize_t n;
 	int ret;
@@ -282,8 +300,8 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	 * lower_size - HDR - TRAILER. */
 	if (lower_size < ANTREV_HDR_LEN + ANTREV_TRAILER_LEN ||
 	    (size_t)(lower_size - ANTREV_HDR_LEN - ANTREV_TRAILER_LEN) != ct_len) {
-		pr_err("vcachefs: decrypt EINVAL lower_size=%lld ct_len=%zu\n",
-		       (long long)lower_size, ct_len);
+		VCF_DERR("vcachefs: decrypt EINVAL lower_size=%lld ct_len=%zu\n",
+			 (long long)lower_size, ct_len);
 		return -EINVAL;
 	}
 
@@ -292,8 +310,8 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	pos = lower_size - ANTREV_TRAILER_LEN;
 	n = vcf_kernel_read(lower_file, key, ANTREV_KEY_LEN, &pos);
 	if (n != ANTREV_KEY_LEN) {
-		pr_err("vcachefs: key read short n=%zd want=%d pos=%lld\n",
-		       n, ANTREV_KEY_LEN, (long long)(lower_size - ANTREV_TRAILER_LEN));
+		VCF_DERR("vcachefs: key read short n=%zd want=%d pos=%lld\n",
+			 n, ANTREV_KEY_LEN, (long long)(lower_size - ANTREV_TRAILER_LEN));
 		return n < 0 ? n : -EIO;
 	}
 
@@ -301,7 +319,7 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	pos = ANTREV_MAGIC_LEN;
 	n = vcf_kernel_read(lower_file, iv, ANTREV_IV_LEN, &pos);
 	if (n != ANTREV_IV_LEN) {
-		pr_err("vcachefs: iv read short n=%zd want=%d\n", n, ANTREV_IV_LEN);
+		VCF_DERR("vcachefs: iv read short n=%zd want=%d\n", n, ANTREV_IV_LEN);
 		ret = n < 0 ? n : -EIO;
 		goto out_key;
 	}
@@ -316,15 +334,15 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	pos = ANTREV_MAGIC_LEN + ANTREV_IV_LEN;
 	n = vcf_kernel_read(lower_file, buf + ct_len, ANTREV_TAG_LEN, &pos);
 	if (n != ANTREV_TAG_LEN) {
-		pr_err("vcachefs: tag read short n=%zd want=%d\n", n, ANTREV_TAG_LEN);
+		VCF_DERR("vcachefs: tag read short n=%zd want=%d\n", n, ANTREV_TAG_LEN);
 		ret = n < 0 ? n : -EIO;
 		goto out_buf;
 	}
 	pos = ANTREV_HDR_LEN;
 	n = vcf_kernel_read(lower_file, buf, ct_len, &pos);
 	if (n != (ssize_t)ct_len) {
-		pr_err("vcachefs: ct read short n=%zd want=%zu pos=%d\n",
-		       n, ct_len, ANTREV_HDR_LEN);
+		VCF_DERR("vcachefs: ct read short n=%zd want=%zu pos=%d\n",
+			 n, ct_len, ANTREV_HDR_LEN);
 		ret = n < 0 ? n : -EIO;
 		goto out_buf;
 	}
@@ -333,7 +351,9 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	 * (hardware-accelerated where available), or our built-in software
 	 * AES-256-GCM when the kernel lacks the cipher.  buf holds [ct||tag],
 	 * so the software path reads ct=buf, tag=buf+ct_len. */
+#ifdef AREV_DEV_MODE
 	t_start = ktime_get();
+#endif
 	if (g_gcm_backend == GCM_BACKEND_KERNEL) {
 		ret = vcf_kernel_gcm_decrypt(key, iv, buf, buf_len, ct_len, out);
 		if (ret == -ENOENT && g_sw_gcm_ok)	/* alg vanished post-probe */
@@ -343,6 +363,7 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 		ret = vcf_sw_gcm_decrypt(key, iv, buf, ct_len,
 					 buf + ct_len, out) ? -EBADMSG : 0;
 	}
+#ifdef AREV_DEV_MODE
 	if (ret == 0 && decrypt_log) {
 		s64 us = ktime_to_us(ktime_sub(ktime_get(), t_start));
 
@@ -354,6 +375,7 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 		       ret, g_gcm_backend == GCM_BACKEND_KERNEL ? "kernel" : "software",
 		       -EBADMSG);
 	}
+#endif
 out_buf:
 	/* wipe transient ciphertext/plaintext copy */
 	memzero_explicit(buf, buf_len);
