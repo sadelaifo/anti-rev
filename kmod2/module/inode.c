@@ -76,10 +76,23 @@ static int vcachefs_classify(struct inode *inode, struct dentry *lower_dentry,
 		 * (key + trailing magic); a header-magic file without it is a
 		 * keyless/legacy or truncated container we cannot decrypt
 		 * (there is no mount key). */
-		if (trailer < 0)
+		if (trailer < 0) {
+			pr_err("vcachefs: classify name=%s trailer_read_err=%d sz=%lld clen=%lld ps=%d\n",
+			       lower_dentry->d_name.name, trailer,
+			       (long long)sz, (long long)clen, ps);
 			return trailer;
-		if (!trailer || clen < ANTREV_HDR_LEN + ANTREV_TRAILER_LEN)
+		}
+		if (!trailer || clen < ANTREV_HDR_LEN + ANTREV_TRAILER_LEN) {
+			pr_err("vcachefs: classify EIO name=%s trailer=%d ps=%d sz=%lld clen=%lld sig_off=%lld sig_len=%u\n",
+			       lower_dentry->d_name.name, trailer, ps,
+			       (long long)sz, (long long)clen,
+			       (long long)sig_off, sig_len);
 			return -EIO;
+		}
+		pr_info("vcachefs: classify OK name=%s sz=%lld clen=%lld plain=%lld sig=%d sig_len=%u\n",
+			lower_dentry->d_name.name, (long long)sz, (long long)clen,
+			(long long)(clen - ANTREV_HDR_LEN - ANTREV_TRAILER_LEN),
+			ps, sig_len);
 		ii->encrypted = true;
 		ii->open_ok = true;
 		ii->container_len = clen;

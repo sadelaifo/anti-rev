@@ -192,21 +192,30 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	/* No mount key: the AES key lives in this file's trailer.  Layout is
 	 * [hdr:36][ct:ct_len][key:32][magic:8], so out_len (plaintext) ==
 	 * lower_size - HDR - TRAILER. */
+	pr_info("vcachefs: decrypt enter lower_size=%lld out_len=%zu ct_len=%zu\n",
+		(long long)lower_size, out_len, ct_len);
 	if (lower_size < ANTREV_HDR_LEN + ANTREV_TRAILER_LEN ||
-	    (size_t)(lower_size - ANTREV_HDR_LEN - ANTREV_TRAILER_LEN) != ct_len)
+	    (size_t)(lower_size - ANTREV_HDR_LEN - ANTREV_TRAILER_LEN) != ct_len) {
+		pr_err("vcachefs: decrypt EINVAL lower_size=%lld ct_len=%zu\n",
+		       (long long)lower_size, ct_len);
 		return -EINVAL;
+	}
 
 	/* Read the embedded key from the trailer (just before the trailing
 	 * magic).  Read it each decrypt; never cached in the inode/sb. */
 	pos = lower_size - ANTREV_TRAILER_LEN;
 	n = vcf_kernel_read(lower_file, key, ANTREV_KEY_LEN, &pos);
-	if (n != ANTREV_KEY_LEN)
+	if (n != ANTREV_KEY_LEN) {
+		pr_err("vcachefs: key read short n=%zd want=%d pos=%lld\n",
+		       n, ANTREV_KEY_LEN, (long long)(lower_size - ANTREV_TRAILER_LEN));
 		return n < 0 ? n : -EIO;
+	}
 
 	/* Read IV (after the magic). */
 	pos = ANTREV_MAGIC_LEN;
 	n = vcf_kernel_read(lower_file, iv, ANTREV_IV_LEN, &pos);
 	if (n != ANTREV_IV_LEN) {
+		pr_err("vcachefs: iv read short n=%zd want=%d\n", n, ANTREV_IV_LEN);
 		ret = n < 0 ? n : -EIO;
 		goto out_key;
 	}
@@ -221,12 +230,15 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	pos = ANTREV_MAGIC_LEN + ANTREV_IV_LEN;
 	n = vcf_kernel_read(lower_file, buf + ct_len, ANTREV_TAG_LEN, &pos);
 	if (n != ANTREV_TAG_LEN) {
+		pr_err("vcachefs: tag read short n=%zd want=%d\n", n, ANTREV_TAG_LEN);
 		ret = n < 0 ? n : -EIO;
 		goto out_buf;
 	}
 	pos = ANTREV_HDR_LEN;
 	n = vcf_kernel_read(lower_file, buf, ct_len, &pos);
 	if (n != (ssize_t)ct_len) {
+		pr_err("vcachefs: ct read short n=%zd want=%zu pos=%d\n",
+		       n, ct_len, ANTREV_HDR_LEN);
 		ret = n < 0 ? n : -EIO;
 		goto out_buf;
 	}
@@ -234,6 +246,7 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
 	if (IS_ERR(tfm)) {
 		ret = PTR_ERR(tfm);
+		pr_err("vcachefs: crypto_alloc_aead(gcm(aes)) failed ret=%d\n", ret);
 		goto out_buf;
 	}
 	ret = crypto_aead_setkey(tfm, key, ANTREV_KEY_LEN);
@@ -260,6 +273,9 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	aead_request_set_ad(req, 0);
 
 	ret = vcf_aead_wait(crypto_aead_decrypt(req), &wait);
+	if (ret)
+		pr_err("vcachefs: gcm decrypt failed ret=%d (EBADMSG=%d)\n",
+		       ret, -EBADMSG);
 	if (ret == 0)
 		memcpy(out, buf, ct_len);	/* tag verified */
 
