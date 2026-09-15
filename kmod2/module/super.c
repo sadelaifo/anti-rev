@@ -241,6 +241,13 @@ static int __init vcachefs_init(void)
 {
 	int err;
 
+	/* Choose the AES-GCM backend (kernel gcm(aes) if present, else our
+	 * built-in software AES-256-GCM).  Aborts load only if neither works,
+	 * since without a cipher the FS can decrypt nothing. */
+	err = vcachefs_crypto_init();
+	if (err)
+		return err;
+
 	vcachefs_inode_cachep = kmem_cache_create(
 		"vcachefs_inode_cache",
 		sizeof(struct vcachefs_inode_info), 0,

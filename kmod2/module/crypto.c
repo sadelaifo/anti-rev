@@ -13,10 +13,20 @@
 #include <linux/scatterlist.h>
 #include <linux/string.h>
 #include <linux/completion.h>
+#include <linux/ktime.h>
+#include <linux/moduleparam.h>
 #include <crypto/aead.h>
 
 #include "compat.h"
 #include "vcachefs.h"
+#include "aesgcm_sw.h"
+
+/* Log a per-file decrypt timing line (bytes / microseconds / MB-s / backend).
+ * On by default for bring-up; set decrypt_log=0 to silence in production. */
+static bool decrypt_log = true;
+module_param(decrypt_log, bool, 0644);
+MODULE_PARM_DESC(decrypt_log,
+		 "log per-file decrypt timing + backend (default on)");
 
 /*
  * crypto async-wait helper.  The DECLARE_CRYPTO_WAIT / crypto_req_done /
@@ -173,18 +183,89 @@ bool vcachefs_ext_whitelisted(struct vcachefs_sb_info *sbi, const char *name)
 	return false;
 }
 
-int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
-			   loff_t lower_size, void *out, size_t out_len)
+/* AES-GCM backend chosen once at module init (see vcachefs_crypto_init). */
+enum { GCM_BACKEND_KERNEL, GCM_BACKEND_SW };
+static int  g_gcm_backend = GCM_BACKEND_KERNEL;
+static bool g_sw_gcm_ok;
+
+/* Kernel gcm(aes) path (hardware-accelerated when the platform provides it).
+ * buf is [ct||tag] and is decrypted in place; on success ct_len plaintext
+ * bytes are copied to out.  Returns 0 or a negative errno. */
+static int vcf_kernel_gcm_decrypt(const u8 *key, const u8 *iv,
+				  u8 *buf, size_t buf_len, size_t ct_len,
+				  void *out)
 {
 	struct crypto_aead *tfm;
 	struct aead_request *req;
 	struct scatterlist sg;
 	AREV_DECLARE_WAIT(wait);
+	int ret;
+
+	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+	ret = crypto_aead_setkey(tfm, key, ANTREV_KEY_LEN);
+	if (ret)
+		goto out_tfm;
+	ret = crypto_aead_setauthsize(tfm, ANTREV_TAG_LEN);
+	if (ret)
+		goto out_tfm;
+	req = aead_request_alloc(tfm, GFP_KERNEL);
+	if (!req) {
+		ret = -ENOMEM;
+		goto out_tfm;
+	}
+	/* In-place: src/dst is the same [ct||tag] buffer; on success the first
+	 * ct_len bytes hold plaintext.  assoclen = 0 (no AAD). */
+	sg_init_one(&sg, buf, buf_len);
+	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
+				  CRYPTO_TFM_REQ_MAY_SLEEP, vcf_aead_done, &wait);
+	aead_request_set_crypt(req, &sg, &sg, buf_len, (u8 *)iv);
+	aead_request_set_ad(req, 0);
+	ret = vcf_aead_wait(crypto_aead_decrypt(req), &wait);
+	if (ret == 0)
+		memcpy(out, buf, ct_len);	/* tag verified */
+	aead_request_free(req);
+out_tfm:
+	crypto_free_aead(tfm);
+	return ret;
+}
+
+/*
+ * Decide the AES-GCM backend once at module load.  Prefer the kernel's
+ * gcm(aes) (picks up ARMv8 CE / AES-NI acceleration); fall back to our
+ * self-contained software implementation when the kernel was built without
+ * the GCM stack (common on locked-down / diskless targets).  Fails only if
+ * NEITHER is usable.  Called from vcachefs_init().
+ */
+int vcachefs_crypto_init(void)
+{
+	g_sw_gcm_ok = (vcf_sw_gcm_init() == 0);
+
+	if (crypto_has_aead("gcm(aes)", 0, 0)) {
+		g_gcm_backend = GCM_BACKEND_KERNEL;
+		pr_info("vcachefs: AES-256-GCM via kernel gcm(aes); software fallback %s\n",
+			g_sw_gcm_ok ? "ready" : "UNAVAILABLE");
+		return 0;
+	}
+	if (g_sw_gcm_ok) {
+		g_gcm_backend = GCM_BACKEND_SW;
+		pr_info("vcachefs: kernel gcm(aes) absent; using built-in software AES-256-GCM (self-test OK)\n");
+		return 0;
+	}
+	pr_err("vcachefs: no gcm(aes) and software AES-GCM self-test failed; cannot decrypt\n");
+	return -ENODEV;
+}
+
+int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
+			   loff_t lower_size, void *out, size_t out_len)
+{
 	u8 iv[ANTREV_IV_LEN];
 	u8 key[ANTREV_KEY_LEN];		/* read fresh from this file's trailer */
 	u8 *buf = NULL;			/* [ct||tag], decrypted in place */
 	size_t ct_len = out_len;
 	size_t buf_len = ct_len + ANTREV_TAG_LEN;
+	ktime_t t_start;
 	loff_t pos;
 	ssize_t n;
 	int ret;
@@ -192,8 +273,6 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	/* No mount key: the AES key lives in this file's trailer.  Layout is
 	 * [hdr:36][ct:ct_len][key:32][magic:8], so out_len (plaintext) ==
 	 * lower_size - HDR - TRAILER. */
-	pr_info("vcachefs: decrypt enter lower_size=%lld out_len=%zu ct_len=%zu\n",
-		(long long)lower_size, out_len, ct_len);
 	if (lower_size < ANTREV_HDR_LEN + ANTREV_TRAILER_LEN ||
 	    (size_t)(lower_size - ANTREV_HDR_LEN - ANTREV_TRAILER_LEN) != ct_len) {
 		pr_err("vcachefs: decrypt EINVAL lower_size=%lld ct_len=%zu\n",
@@ -243,45 +322,31 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 		goto out_buf;
 	}
 
-	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
-	if (IS_ERR(tfm)) {
-		ret = PTR_ERR(tfm);
-		pr_err("vcachefs: crypto_alloc_aead(gcm(aes)) failed ret=%d\n", ret);
-		goto out_buf;
+	/* Decrypt with the backend chosen at init: the kernel's gcm(aes)
+	 * (hardware-accelerated where available), or our built-in software
+	 * AES-256-GCM when the kernel lacks the cipher.  buf holds [ct||tag],
+	 * so the software path reads ct=buf, tag=buf+ct_len. */
+	t_start = ktime_get();
+	if (g_gcm_backend == GCM_BACKEND_KERNEL) {
+		ret = vcf_kernel_gcm_decrypt(key, iv, buf, buf_len, ct_len, out);
+		if (ret == -ENOENT && g_sw_gcm_ok)	/* alg vanished post-probe */
+			ret = vcf_sw_gcm_decrypt(key, iv, buf, ct_len,
+						 buf + ct_len, out) ? -EBADMSG : 0;
+	} else {
+		ret = vcf_sw_gcm_decrypt(key, iv, buf, ct_len,
+					 buf + ct_len, out) ? -EBADMSG : 0;
 	}
-	ret = crypto_aead_setkey(tfm, key, ANTREV_KEY_LEN);
-	if (ret)
-		goto out_tfm;
-	ret = crypto_aead_setauthsize(tfm, ANTREV_TAG_LEN);
-	if (ret)
-		goto out_tfm;
+	if (ret == 0 && decrypt_log) {
+		s64 us = ktime_to_us(ktime_sub(ktime_get(), t_start));
 
-	req = aead_request_alloc(tfm, GFP_KERNEL);
-	if (!req) {
-		ret = -ENOMEM;
-		goto out_tfm;
+		pr_info("vcachefs: decrypt %zu bytes in %lld us (~%lld MB/s, %s)\n",
+			ct_len, us, us > 0 ? (long long)ct_len / us : 0,
+			g_gcm_backend == GCM_BACKEND_KERNEL ? "kernel" : "software");
+	} else if (ret) {
+		pr_err("vcachefs: decrypt failed ret=%d (backend=%s, EBADMSG=%d)\n",
+		       ret, g_gcm_backend == GCM_BACKEND_KERNEL ? "kernel" : "software",
+		       -EBADMSG);
 	}
-
-	/* In-place: src/dst is the same [ct||tag] buffer; on success the first
-	 * ct_len bytes hold plaintext.  assoclen = 0 (no AAD).
-	 */
-	sg_init_one(&sg, buf, buf_len);
-	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
-				  CRYPTO_TFM_REQ_MAY_SLEEP,
-				  vcf_aead_done, &wait);
-	aead_request_set_crypt(req, &sg, &sg, buf_len, iv);
-	aead_request_set_ad(req, 0);
-
-	ret = vcf_aead_wait(crypto_aead_decrypt(req), &wait);
-	if (ret)
-		pr_err("vcachefs: gcm decrypt failed ret=%d (EBADMSG=%d)\n",
-		       ret, -EBADMSG);
-	if (ret == 0)
-		memcpy(out, buf, ct_len);	/* tag verified */
-
-	aead_request_free(req);
-out_tfm:
-	crypto_free_aead(tfm);
 out_buf:
 	/* wipe transient ciphertext/plaintext copy */
 	memzero_explicit(buf, buf_len);

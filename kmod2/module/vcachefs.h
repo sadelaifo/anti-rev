@@ -131,6 +131,7 @@ int  vcf_ctldev_init(void);
 void vcf_ctldev_exit(void);
 
 /* crypto.c */
+int vcachefs_crypto_init(void);	/* pick gcm(aes) backend; <0 if none usable */
 int vcachefs_has_magic(struct file *lower_file);	/* >0 yes, 0 no, <0 err */
 int vcachefs_has_trailer(struct file *lower_file, loff_t size);  /* >0/0/<0: trailing magic? */
 int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,

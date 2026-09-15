@@ -89,10 +89,6 @@ static int vcachefs_classify(struct inode *inode, struct dentry *lower_dentry,
 			       (long long)sig_off, sig_len);
 			return -EIO;
 		}
-		pr_info("vcachefs: classify OK name=%s sz=%lld clen=%lld plain=%lld sig=%d sig_len=%u\n",
-			lower_dentry->d_name.name, (long long)sz, (long long)clen,
-			(long long)(clen - ANTREV_HDR_LEN - ANTREV_TRAILER_LEN),
-			ps, sig_len);
 		ii->encrypted = true;
 		ii->open_ok = true;
 		ii->container_len = clen;
