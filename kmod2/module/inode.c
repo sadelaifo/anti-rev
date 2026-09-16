@@ -11,6 +11,7 @@
 #include <linux/dcache.h>
 #include <linux/mount.h>
 #include <linux/fs.h>
+#include <linux/slab.h>	/* kmalloc/kfree in the <4.2 symlink shim (not transitive on 3.10) */
 #include <linux/uaccess.h>	/* KERNEL_DS/get_fs/set_fs for the <4.5 symlink shim */
 #include <linux/version.h>
 

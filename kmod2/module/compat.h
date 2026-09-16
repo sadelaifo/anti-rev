@@ -72,8 +72,13 @@
 #define SLAB_ACCOUNT	0
 #endif
 
-/* memzero_explicit() (a memset the compiler may not elide) arrived in 3.18. */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 18, 0)
+/*
+ * memzero_explicit() (a memset the compiler may not elide) arrived in 3.18.
+ * RHEL/CentOS 7 backported it into its 3.10 kernel, so gate the shim out on
+ * RHEL (RHEL_RELEASE_CODE) to avoid a redefinition; only genuinely-old mainline
+ * kernels below 3.18 need it.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 18, 0) && !defined(RHEL_RELEASE_CODE)
 static inline void memzero_explicit(void *s, size_t count)
 {
 	memset(s, 0, count);
