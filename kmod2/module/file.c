@@ -11,6 +11,7 @@
  */
 #include <linux/fs.h>
 #include <linux/file.h>
+#include <linux/sched.h>	/* task_struct — current_cred() derefs current on 3.10 */
 #include <linux/cred.h>
 #include <linux/mount.h>
 #include <linux/namei.h>

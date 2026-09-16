@@ -67,7 +67,10 @@ typedef struct {
 	vcf_crypto_wait_t name = {					\
 		COMPLETION_INITIALIZER_ONSTACK((name).completion), 0	\
 	}
-static void vcf_aead_done(struct crypto_async_request *req, int err)
+/* __maybe_unused: on a pre-3.19 kernel the kernel gcm path is compiled out, so
+ * these have no caller (3.19..4.15 kernels do use them). */
+static __maybe_unused void vcf_aead_done(struct crypto_async_request *req,
+					 int err)
 {
 	vcf_crypto_wait_t *w = req->data;
 
@@ -76,7 +79,7 @@ static void vcf_aead_done(struct crypto_async_request *req, int err)
 	w->err = err;
 	complete(&w->completion);
 }
-static int vcf_aead_wait(int err, vcf_crypto_wait_t *w)
+static __maybe_unused int vcf_aead_wait(int err, vcf_crypto_wait_t *w)
 {
 	if (err == -EINPROGRESS || err == -EBUSY) {
 		wait_for_completion(&w->completion);
@@ -204,7 +207,12 @@ static bool g_sw_gcm_ok;
 
 /* Kernel gcm(aes) path (hardware-accelerated when the platform provides it).
  * buf is [ct||tag] and is decrypted in place; on success ct_len plaintext
- * bytes are copied to out.  Returns 0 or a negative errno. */
+ * bytes are copied to out.  Returns 0 or a negative errno.
+ *
+ * Requires the modern AEAD interface (aead_request_set_ad et al.), which
+ * arrived in 3.19.  On older kernels (e.g. RHEL/CentOS 7 3.10) this is a stub
+ * and the built-in software AES-GCM is used instead — see vcachefs_crypto_init. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
 static int vcf_kernel_gcm_decrypt(const u8 *key, const u8 *iv,
 				  u8 *buf, size_t buf_len, size_t ct_len,
 				  void *out)
@@ -245,6 +253,14 @@ out_tfm:
 	crypto_free_aead(tfm);
 	return ret;
 }
+#else	/* < 3.19: pre-modern-AEAD kernel — software backend only */
+static int vcf_kernel_gcm_decrypt(const u8 *key, const u8 *iv,
+				  u8 *buf, size_t buf_len, size_t ct_len,
+				  void *out)
+{
+	return -EOPNOTSUPP;	/* never reached: init pins GCM_BACKEND_SW */
+}
+#endif
 
 /*
  * Decide the AES-GCM backend once at module load.  Prefer the kernel's
@@ -255,29 +271,45 @@ out_tfm:
  */
 int vcachefs_crypto_init(void)
 {
-	struct crypto_aead *tfm;
-	char alg[16];
-
 	g_sw_gcm_ok = (vcf_sw_gcm_init() == 0);
 
-	/* Probe by actually allocating the transform (crypto_has_aead() is not
-	 * present on older kernels, e.g. 5.10).  Success => kernel path. */
-	tfm = crypto_alloc_aead(VCF_GCM_AES(alg), 0, 0);
-	if (!IS_ERR(tfm)) {
-		crypto_free_aead(tfm);
-		g_gcm_backend = GCM_BACKEND_KERNEL;
-		VCF_DINFO("vcachefs: AES-256-GCM via kernel gcm(aes); software fallback %s\n",
-			  g_sw_gcm_ok ? "ready" : "UNAVAILABLE");
-		return 0;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
+	{
+		struct crypto_aead *tfm;
+		char alg[16];
+
+		/* Probe by actually allocating the transform (crypto_has_aead()
+		 * is not present on older kernels, e.g. 5.10).  Success => kernel
+		 * path (picks up ARMv8 CE / AES-NI acceleration). */
+		tfm = crypto_alloc_aead(VCF_GCM_AES(alg), 0, 0);
+		if (!IS_ERR(tfm)) {
+			crypto_free_aead(tfm);
+			g_gcm_backend = GCM_BACKEND_KERNEL;
+			VCF_DINFO("vcachefs: AES-256-GCM via kernel gcm(aes); software fallback %s\n",
+				  g_sw_gcm_ok ? "ready" : "UNAVAILABLE");
+			return 0;
+		}
+		if (g_sw_gcm_ok) {
+			g_gcm_backend = GCM_BACKEND_SW;
+			VCF_DINFO("vcachefs: kernel gcm(aes) absent (%ld); using built-in software AES-256-GCM (self-test OK)\n",
+				  PTR_ERR(tfm));
+			return 0;
+		}
+		VCF_DERR("vcachefs: no gcm(aes) and software AES-GCM self-test failed; cannot decrypt\n");
+		return -ENODEV;
 	}
+#else
+	/* Pre-3.19 kernels predate the modern AEAD interface, so the kernel
+	 * gcm(aes) path is compiled out; use the self-contained software
+	 * AES-256-GCM unconditionally. */
 	if (g_sw_gcm_ok) {
 		g_gcm_backend = GCM_BACKEND_SW;
-		VCF_DINFO("vcachefs: kernel gcm(aes) absent (%ld); using built-in software AES-256-GCM (self-test OK)\n",
-			  PTR_ERR(tfm));
+		VCF_DINFO("vcachefs: pre-3.19 kernel; using built-in software AES-256-GCM (self-test OK)\n");
 		return 0;
 	}
-	VCF_DERR("vcachefs: no gcm(aes) and software AES-GCM self-test failed; cannot decrypt\n");
+	VCF_DERR("vcachefs: software AES-GCM self-test failed; cannot decrypt\n");
 	return -ENODEV;
+#endif
 }
 
 int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,

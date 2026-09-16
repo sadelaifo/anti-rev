@@ -29,6 +29,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/sched.h>	/* task_struct — current_cred() derefs current on 3.10 */
 #include <linux/cred.h>
 #include <linux/version.h>
 

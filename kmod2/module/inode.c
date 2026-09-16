@@ -6,6 +6,7 @@
  */
 #include <linux/namei.h>
 #include <linux/file.h>
+#include <linux/sched.h>	/* task_struct — current_cred() derefs current on 3.10 */
 #include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/mount.h>
