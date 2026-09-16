@@ -13,6 +13,8 @@
 #include <linux/path.h>
 #include <linux/mutex.h>
 
+#include "compat.h"	/* d_inode() shim for the accessor used below */
+
 #define VCACHEFS_NAME		"vcachefs"
 #define VCACHEFS_MAGIC		0x9E2B1147	/* non-descriptive sb magic */
 

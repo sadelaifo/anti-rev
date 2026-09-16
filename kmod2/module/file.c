@@ -19,6 +19,7 @@
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
 #include <linux/uio.h>
+#include <linux/uaccess.h>	/* copy_to_user for the <3.16 aio_read path */
 
 #include "compat.h"
 #include "vcachefs.h"
@@ -216,9 +217,11 @@ static int vcachefs_file_open(struct inode *inode, struct file *file)
  * mapping of the lower file would expose the trailer in its final page.
  */
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
 /* Bounce the lower (ciphertext) file into the reader's iter, page at a time,
  * but never past `limit`.  Built on vcf_kernel_read + copy_to_iter — the
- * lowest-common-denominator primitives present on both the 4.12 and 6.8 targets. */
+ * lowest-common-denominator primitives present on the 4.12 and 6.8 targets.
+ * (Pre-3.16 kernels lack iov_iter reads; see the aio_read variant below.) */
 static ssize_t vcachefs_passthrough_read(struct file *lower, loff_t limit,
 					  struct iov_iter *to, loff_t *ppos)
 {
@@ -277,6 +280,74 @@ static ssize_t vcachefs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	}
 	return generic_file_read_iter(iocb, to);
 }
+#else	/* LINUX_VERSION_CODE < 3.16: no iov_iter reads (RHEL/CentOS 7 3.10) */
+/*
+ * Classic .aio_read dispatcher.  read(2) reaches this via do_sync_read (which
+ * wraps a single-iovec kiocb), and readv(2)/preadv(2) call it directly — so
+ * BOTH funnel through here.  That is essential: routing only .read would let a
+ * readv() from an UNAUTHORIZED passthrough reader hit generic_file_aio_read and
+ * pull decrypted pages out of this inode's page cache.  When ->private_data is
+ * set (unauthorized, gate_passthrough_cipher) we serve the lower ciphertext
+ * capped at pd->limit via copy_to_user; otherwise we hand off to the page-cache
+ * decrypt path (generic_file_aio_read -> readpage -> whole-file decrypt).
+ */
+static ssize_t vcachefs_aio_read(struct kiocb *iocb, const struct iovec *iov,
+				 unsigned long nr_segs, loff_t pos)
+{
+	struct file *file = iocb->ki_filp;
+	struct vcachefs_passthrough *pd = file->private_data;
+	loff_t ppos = pos;
+	ssize_t total = 0;
+	unsigned long seg;
+	void *buf;
+
+	if (!pd)
+		return generic_file_aio_read(iocb, iov, nr_segs, pos);
+
+	buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	for (seg = 0; seg < nr_segs; seg++) {
+		char __user *ubuf = iov[seg].iov_base;
+		size_t count = iov[seg].iov_len;
+
+		while (count) {
+			size_t chunk;
+			loff_t rpos = ppos;
+			ssize_t n;
+
+			if (ppos >= pd->limit)		/* trailer-stripped EOF */
+				goto out;
+			chunk = min(count, (size_t)PAGE_SIZE);
+			if ((loff_t)chunk > pd->limit - ppos)
+				chunk = pd->limit - ppos;
+
+			n = vcf_kernel_read(pd->lower, buf, chunk, &rpos);
+			if (n <= 0) {
+				if (n < 0 && total == 0)
+					total = n;
+				goto out;
+			}
+			if (copy_to_user(ubuf, buf, n)) {
+				if (total == 0)
+					total = -EFAULT;
+				goto out;
+			}
+			ubuf += n;
+			ppos += n;
+			total += n;
+			count -= n;
+			if (n < (ssize_t)chunk)		/* lower EOF */
+				goto out;
+		}
+	}
+out:
+	kfree(buf);
+	iocb->ki_pos = ppos;		/* do_sync_read copies this back to *ppos */
+	return total;
+}
+#endif
 
 static int vcachefs_mmap(struct file *file, struct vm_area_struct *vma)
 {
@@ -396,7 +467,12 @@ const struct address_space_operations vcachefs_aops = {
 const struct file_operations vcachefs_file_fops = {
 	.open		= vcachefs_file_open,
 	.release	= vcachefs_file_release,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
 	.read_iter	= vcachefs_read_iter,
+#else
+	.read		= do_sync_read,		/* wraps a 1-iovec .aio_read call */
+	.aio_read	= vcachefs_aio_read,
+#endif
 	.mmap		= vcachefs_mmap,
 	.splice_read	= vcachefs_splice_read,
 	.llseek		= vcachefs_llseek,
@@ -405,7 +481,11 @@ const struct file_operations vcachefs_file_fops = {
 const struct file_operations vcachefs_dir_fops = {
 	.open		= vcachefs_dir_open,
 	.release	= vcachefs_dir_release,
-	.iterate_shared	= vcachefs_dir_iterate,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0)
+	.iterate_shared	= vcachefs_dir_iterate,	/* parallel readdir (4.7+) */
+#else
+	.iterate	= vcachefs_dir_iterate,	/* 3.11..4.6 single-cursor readdir */
+#endif
 	.read		= generic_read_dir,
 	.llseek		= generic_file_llseek,
 };

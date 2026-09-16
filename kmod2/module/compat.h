@@ -36,6 +36,52 @@
 #endif
 
 /*
+ * Pre-4.12 accessor shims (RHEL/CentOS 7 3.10.0-1160 and similar backported
+ * enterprise kernels).  Each is inert on kernels new enough to provide the
+ * real thing, so the 4.12+/6.8 builds are unaffected.
+ */
+
+/* d_inode()/d_really_is_positive() convenience accessors arrived in 3.19. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
+#ifndef d_inode
+#define d_inode(dentry)			((dentry)->d_inode)
+#endif
+#ifndef d_really_is_positive
+#define d_really_is_positive(dentry)	((dentry)->d_inode != NULL)
+#endif
+#endif
+
+/*
+ * lookup_one_len_unlocked() arrived in 4.6.  vcachefs only calls it from
+ * ->lookup, where the VFS already holds the parent inode lock, so the locked
+ * lookup_one_len() (identical 3-arg signature) is the correct equivalent.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
+#ifndef lookup_one_len_unlocked
+#define lookup_one_len_unlocked(name, base, len) \
+	lookup_one_len(name, base, len)
+#endif
+#endif
+
+/*
+ * SLAB_ACCOUNT (kmemcg accounting of the slab) arrived in 4.5.  It is a pure
+ * accounting hint, so on older kernels drop it to 0 — the inode cache works
+ * identically, just without per-cgroup memory accounting.
+ */
+#ifndef SLAB_ACCOUNT
+#define SLAB_ACCOUNT	0
+#endif
+
+/* memzero_explicit() (a memset the compiler may not elide) arrived in 3.18. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 18, 0)
+static inline void memzero_explicit(void *s, size_t count)
+{
+	memset(s, 0, count);
+	barrier();
+}
+#endif
+
+/*
  * kernel_read() gained the modern (file, buf, count, *pos) signature in 4.14;
  * before that it was int kernel_read(file, loff_t offset, char *addr, count)
  * and did not advance a position.  Define AREV_NEW_KERNEL_READ if your <4.14

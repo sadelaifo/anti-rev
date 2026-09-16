@@ -10,6 +10,7 @@
 #include <linux/dcache.h>
 #include <linux/mount.h>
 #include <linux/fs.h>
+#include <linux/uaccess.h>	/* KERNEL_DS/get_fs/set_fs for the <4.5 symlink shim */
 #include <linux/version.h>
 
 #include "compat.h"
@@ -286,6 +287,7 @@ const struct inode_operations vcachefs_file_iops = {
  * targets behave exactly as on the underlying fs (i.e. they may dangle, same as
  * without vcachefs).  vfs_get_link() arranges the cleanup via @done.
  */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)
 static const char *vcachefs_get_link(struct dentry *dentry, struct inode *inode,
 				      struct delayed_call *done)
 {
@@ -300,3 +302,61 @@ const struct inode_operations vcachefs_symlink_iops = {
 	.get_link	= vcachefs_get_link,
 	.getattr	= vcachefs_getattr,
 };
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(4, 2, 0)
+/*
+ * Pre-4.2 kernels (e.g. RHEL/CentOS 7 3.10) have neither get_link nor
+ * vfs_get_link/delayed_call — they use the older follow_link/put_link pair with
+ * a struct nameidata and an nd_set_link()/cookie handshake.  (Kernels 4.2..4.4
+ * use yet another form — a cookie-returning follow_link with no nameidata — but
+ * they are not a target; the #error below flags them rather than miscompiling.)
+ * Proxy the lower (.enc/) symlink's body by calling its own ->readlink under
+ * KERNEL_DS (the
+ * ecryptfs-on-3.10 idiom: the lower fs writes the target into our kernel buffer
+ * as if it were a userspace one), then hand that string to the resolver.  The
+ * buffer is the cookie put_link frees.
+ */
+static void *vcachefs_follow_link(struct dentry *dentry, struct nameidata *nd)
+{
+	struct vcachefs_inode_info *ii = VCACHEFS_I(dentry->d_inode);
+	struct dentry *lower = ii->lower_path.dentry;
+	struct inode *lower_inode = lower->d_inode;
+	mm_segment_t old_fs;
+	char *buf;
+	int rc;
+
+	if (!lower_inode->i_op || !lower_inode->i_op->readlink)
+		return ERR_PTR(-EINVAL);
+
+	buf = kmalloc(PATH_MAX + 1, GFP_KERNEL);
+	if (!buf)
+		return ERR_PTR(-ENOMEM);
+
+	old_fs = get_fs();
+	set_fs(KERNEL_DS);
+	rc = lower_inode->i_op->readlink(lower, (char __user *)buf, PATH_MAX);
+	set_fs(old_fs);
+
+	if (rc < 0) {
+		kfree(buf);
+		return ERR_PTR(rc);
+	}
+	buf[rc] = '\0';
+	nd_set_link(nd, buf);
+	return buf;			/* cookie -> put_link */
+}
+
+static void vcachefs_put_link(struct dentry *dentry, struct nameidata *nd,
+			      void *cookie)
+{
+	kfree(cookie);
+}
+
+const struct inode_operations vcachefs_symlink_iops = {
+	.readlink	= generic_readlink,
+	.follow_link	= vcachefs_follow_link,
+	.put_link	= vcachefs_put_link,
+	.getattr	= vcachefs_getattr,
+};
+#else
+#error "vcachefs symlink shim: kernels 4.2-4.4 use the cookie follow_link form; not a supported target"
+#endif

@@ -24,11 +24,15 @@
  * one-function swap.
  */
 #include <linux/module.h>
+#include <linux/version.h>	/* LINUX_VERSION_CODE / KERNEL_VERSION (used below) */
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/mm.h>
 #include <linux/sched.h>
-#include <linux/sched/mm.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+#include <linux/sched/mm.h>	/* split out of sched.h in 4.11; earlier the
+				 * mm helpers gate.c uses live in sched.h */
+#endif
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/dcache.h>
@@ -38,7 +42,12 @@
 #include <linux/cred.h>		/* current_cred(), GLOBAL_ROOT_UID/GID */
 #include <linux/ratelimit.h>	/* pr_warn_ratelimited (DEFINE_RATELIMIT_STATE) */
 #include <linux/key.h>
-#include <linux/verification.h>
+#if defined(CONFIG_SYSTEM_DATA_VERIFICATION)
+#include <linux/verification.h>	/* verify_pkcs7_signature(); header itself is
+				 * 4.7+.  All callers are already guarded on
+				 * this same config, so a kernel without it
+				 * (e.g. 3.10) never needs the header. */
+#endif
 #include <linux/spinlock.h>
 #include <crypto/hash.h>
 
