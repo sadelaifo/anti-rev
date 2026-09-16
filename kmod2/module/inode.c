@@ -217,7 +217,8 @@ static struct dentry *vcachefs_lookup(struct inode *dir, struct dentry *dentry,
 
 /*
  * getattr signature and generic_fillattr arity both shifted across releases:
- *   <5.12        getattr(path, ...)                  generic_fillattr(inode, stat)
+ *   <4.11        getattr(vfsmount*, dentry*, stat)   generic_fillattr(inode, stat)
+ *   4.11..5.11   getattr(path, ...)                  generic_fillattr(inode, stat)
  *   5.12..6.2    getattr(user_namespace*, path, ...) generic_fillattr(ns, inode, stat)
  *   6.3..6.5     getattr(mnt_idmap*, path, ...)      generic_fillattr(idmap, inode, stat)
  *   >=6.6        getattr(mnt_idmap*, path, ...)      generic_fillattr(idmap, mask, inode, stat)
@@ -235,15 +236,23 @@ static struct dentry *vcachefs_lookup(struct inode *dir, struct dentry *dentry,
 			   const struct path *path, struct kstat *stat, \
 			   u32 request_mask, unsigned int flags
 #define AREV_FILLATTR	generic_fillattr(mnt_userns, inode, stat)
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 #define AREV_GETATTR_PROTO const struct path *path, struct kstat *stat, \
 			   u32 request_mask, unsigned int flags
+#define AREV_FILLATTR	generic_fillattr(inode, stat)
+#else	/* < 4.11: getattr(vfsmount*, dentry*, stat) */
+#define AREV_GETATTR_PROTO struct vfsmount *mnt, struct dentry *dentry, \
+			   struct kstat *stat
 #define AREV_FILLATTR	generic_fillattr(inode, stat)
 #endif
 
 static int vcachefs_getattr(AREV_GETATTR_PROTO)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 	struct inode *inode = d_inode(path->dentry);
+#else
+	struct inode *inode = d_inode(dentry);	/* pre-4.11 getattr takes dentry */
+#endif
 
 	AREV_FILLATTR;
 	/* report the plaintext (logical) size, never the ciphertext length */

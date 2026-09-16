@@ -117,11 +117,17 @@ static inline ssize_t vcf_kernel_read(struct file *f, void *buf, size_t count,
  * mainline 4.14+, Ubuntu 6.8, AND SLES 12 SP5); define AREV_OLD_KERNEL_WRITE
  * only for a genuinely pre-4.14 kernel that did NOT backport it (symptom without
  * the flag there: "makes integer from pointer without a cast" on arg 4).
+ *
+ * FIELD FACT: RHEL/CentOS 7 (3.10) ships the OLD by-value-offset kernel_write
+ * and did NOT backport the modern one, so auto-select the old path there —
+ * keyed on RHEL_RELEASE_CODE so SLES 12 SP5 (also <4.14, but modern) is
+ * unaffected.  RHEL 8+ is >=4.14 and falls to the modern default.
  */
 static inline ssize_t vcf_kernel_write(struct file *f, const void *buf,
 					size_t count, loff_t *pos)
 {
-#if defined(AREV_OLD_KERNEL_WRITE)
+#if defined(AREV_OLD_KERNEL_WRITE) || \
+	(defined(RHEL_RELEASE_CODE) && LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0))
 	ssize_t n = kernel_write(f, (const char *)buf, count, *pos);
 
 	if (n > 0)
