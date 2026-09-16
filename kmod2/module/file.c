@@ -25,6 +25,11 @@
 #include "compat.h"
 #include "vcachefs.h"
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 16, 0)
+#include <linux/aio.h>	/* struct kiocb lived here before 3.16 (moved to fs.h);
+			 * needed by the <3.16 .aio_read path below */
+#endif
+
 /* Lazy, idempotent whole-file decrypt into ii->plain. */
 static int vcachefs_ensure_plain(struct inode *inode)
 {
