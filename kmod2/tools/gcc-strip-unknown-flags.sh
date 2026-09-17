@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# gcc wrapper: drop aarch64 hardening flags that an older gcc (e.g. the
-# company-pinned 7.3) can't parse, then exec the real gcc.
+# gcc wrapper: drop codegen flags that an older gcc can't parse, then exec the
+# real gcc.  Two cases seen in the field:
+#   - aarch64 hardening flags on a company-pinned gcc 7.3 (openEuler/EulerOS)
+#   - x86_64 -fmin-function-alignment (a gcc-14 flag) injected by SLE 15 SP7's
+#     6.4 kernel-devel, rejected by SLE 15's pinned gcc 7.5
+# All stripped flags are per-function codegen (alignment / PAC / patchable
+# entries / stack canary), NOT part of the module<->kernel ABI, so the .ko stays
+# loadable.
 #
 # WHY A WRAPPER AND NOT THE MODULE MAKEFILE:
 #   The openEuler/EulerOS kernel-devel was built with gcc 10, and its config
@@ -31,7 +37,7 @@ new=()
 strip_ssp=0
 for a in "$@"; do
 	case "$a" in
-	-mbranch-protection=*|-fpatchable-function-entry=*)
+	-mbranch-protection=*|-fpatchable-function-entry=*|-fmin-function-alignment=*)
 		continue ;;
 	-mstack-protector-guard=*|-mstack-protector-guard-reg=*|-mstack-protector-guard-offset=*)
 		strip_ssp=1
