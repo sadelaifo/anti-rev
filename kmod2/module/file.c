@@ -382,7 +382,16 @@ static ssize_t vcachefs_splice_read(struct file *in, loff_t *ppos,
 		return pd->lower->f_op->splice_read(pd->lower, ppos, pipe,
 						    len, flags);
 	}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+	/*
+	 * generic_file_splice_read() was removed in 6.5 (replaced by
+	 * filemap_splice_read()).  SLE 15 SP7 backported that removal into its
+	 * 6.4 kernel, so version code alone is wrong — key on CONFIG_SUSE_VERSION
+	 * too.  AREV_HAVE_FILEMAP_SPLICE_READ is a manual escape hatch for any
+	 * other enterprise kernel that backported it under a <6.5 version code.
+	 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0) || \
+	defined(AREV_HAVE_FILEMAP_SPLICE_READ) || \
+	(defined(CONFIG_SUSE_VERSION) && LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
 	return filemap_splice_read(in, ppos, pipe, len, flags);
 #else
 	return generic_file_splice_read(in, ppos, pipe, len, flags);
