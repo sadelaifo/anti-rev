@@ -11,7 +11,7 @@
 CC      ?= cc
 SRCDIR  := src
 SRCS    := $(SRCDIR)/fs.c $(SRCDIR)/container.c $(SRCDIR)/crypto.c \
-           $(SRCDIR)/gate.c $(SRCDIR)/cache.c
+           $(SRCDIR)/gate.c $(SRCDIR)/cache.c $(SRCDIR)/key_blob.c
 BIN     := vcachefsd
 
 PKG_CFLAGS := $(shell pkg-config --cflags fuse3 openssl 2>/dev/null)

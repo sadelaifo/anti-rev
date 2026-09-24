@@ -22,7 +22,11 @@
 #define AR_TAG_LEN     16
 #define AR_KEY_LEN     32                               /* AES-256 */
 #define AR_HDR_LEN     (AR_MAGIC_LEN + AR_IV_LEN + AR_TAG_LEN)   /* 36 */
-#define AR_TRAILER_LEN (AR_KEY_LEN + AR_MAGIC_LEN)              /* 40 */
+/* key-in-binary: containers no longer carry a per-file key trailer (the AES key
+ * is compiled into vcachefsd — see key_blob.c / crypto.c).  Kept 0 so size math
+ * (container_len - AR_TRAILER_LEN) stays valid; an unauthorized passthrough read
+ * now yields the whole keyless container, useless without this binary. */
+#define AR_TRAILER_LEN 0
 
 /* Appended per-exe signature section (FS_MAGIC/SIG_MAGIC = 3d6af0128c55b427). */
 #define AR_SIG_MAGIC      "\x3d\x6a\xf0\x12\x8c\x55\xb4\x27"

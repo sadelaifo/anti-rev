@@ -117,8 +117,8 @@ static int classify(int fd, off_t file_size, off_t *container_len,
 
 	if (ar_container_len(fd, file_size, &clen) < 0)
 		return -EIO;
-	if (ar_has_trailer(fd, clen) != 1)
-		return -EIO;			/* magic but no key trailer */
+	/* key-in-binary: no per-file key trailer — a header-magic file of at least
+	 * HDR bytes is a complete container (ar_plain_len rejects a short one). */
 	plen = ar_plain_len(clen);
 	if (plen < 0)
 		return -EIO;
