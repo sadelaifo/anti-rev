@@ -6,7 +6,7 @@
 #   make clean
 
 obj-m += vcachefs.o
-vcachefs-objs := super.o inode.o file.o crypto.o aesgcm_sw.o gate.o ctldev.o
+vcachefs-objs := super.o inode.o file.o crypto.o aesgcm_sw.o gate.o ctldev.o key_blob.o
 
 # GCC 9+ (-Wmissing-attributes) warns that the module_init/module_exit aliases
 # init_module/cleanup_module don't inherit the __cold that __init/__exit put on

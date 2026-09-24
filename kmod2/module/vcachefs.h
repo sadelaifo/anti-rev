@@ -36,9 +36,14 @@
 #define ANTREV_IV_LEN		12
 #define ANTREV_TAG_LEN		16
 #define ANTREV_HDR_LEN		(ANTREV_MAGIC_LEN + ANTREV_IV_LEN + ANTREV_TAG_LEN)
-#define ANTREV_KEY_LEN		32	/* AES-256 */
+#define ANTREV_KEY_LEN		32	/* AES-256 (the master key baked into the .ko) */
 /* Trailer = embedded key + a trailing magic (so the trailer is self-marking). */
-#define ANTREV_TRAILER_LEN	(ANTREV_KEY_LEN + ANTREV_MAGIC_LEN)
+/* key-in-.ko: containers no longer carry a per-file key trailer (the AES key is
+ * compiled into the module — see key_blob.c/crypto.c — not appended to each
+ * file).  Kept as 0 so existing size math (container_len - ANTREV_TRAILER_LEN)
+ * stays correct: an unauthorized passthrough read now yields the WHOLE keyless
+ * container, which is useless without this .ko. */
+#define ANTREV_TRAILER_LEN	0
 
 /*
  * OPTIONAL per-exe authorization signature, APPENDED after the container:

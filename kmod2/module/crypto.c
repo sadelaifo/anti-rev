@@ -312,11 +312,34 @@ int vcachefs_crypto_init(void)
 #endif
 }
 
+/*
+ * Master AES-256 key, compiled into the module (obfuscated) — see key_blob.c,
+ * regenerated from the project keyfile by shared/gen_key_blob.py.  The key no
+ * longer lives in each file's trailer, so a raw copy of the .enc/ lower tree is
+ * undecryptable without this .ko.  key_blob.c is a separate translation unit so
+ * a rebuild with a new keyfile recompiles only key_blob.o and relinks.
+ */
+extern const int vcf_master_key_present;
+extern const unsigned char vcf_master_key_obf[ANTREV_KEY_LEN];
+
+/* De-obfuscate the compiled-in key into out[32].  Per-position formula matches
+ * shared/gen_key_blob.py and obfstr_gen.py: obf_key(i) = 0x5a ^ ((i*7+13)&0xff). */
+static int vcf_get_master_key(u8 out[ANTREV_KEY_LEN])
+{
+	unsigned int i;
+
+	if (!vcf_master_key_present)
+		return -ENOKEY;		/* placeholder key_blob — not built with a keyfile */
+	for (i = 0; i < ANTREV_KEY_LEN; i++)
+		out[i] = vcf_master_key_obf[i] ^ (0x5a ^ (((i * 7) + 13) & 0xff));
+	return 0;
+}
+
 int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 			   loff_t lower_size, void *out, size_t out_len)
 {
 	u8 iv[ANTREV_IV_LEN];
-	u8 key[ANTREV_KEY_LEN];		/* read fresh from this file's trailer */
+	u8 key[ANTREV_KEY_LEN];		/* de-obfuscated master key (compiled in) */
 	u8 *buf = NULL;			/* [ct||tag], decrypted in place */
 	size_t ct_len = out_len;
 	size_t buf_len = ct_len + ANTREV_TAG_LEN;
@@ -327,9 +350,9 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 	ssize_t n;
 	int ret;
 
-	/* No mount key: the AES key lives in this file's trailer.  Layout is
-	 * [hdr:36][ct:ct_len][key:32][magic:8], so out_len (plaintext) ==
-	 * lower_size - HDR - TRAILER. */
+	/* key-in-.ko: the AES key is compiled into the module (not in the file).
+	 * Layout is [hdr:36][ct:ct_len], so out_len (plaintext) == lower_size - HDR
+	 * (ANTREV_TRAILER_LEN is 0). */
 	if (lower_size < ANTREV_HDR_LEN + ANTREV_TRAILER_LEN ||
 	    (size_t)(lower_size - ANTREV_HDR_LEN - ANTREV_TRAILER_LEN) != ct_len) {
 		VCF_DERR("vcachefs: decrypt EINVAL lower_size=%lld ct_len=%zu\n",
@@ -337,14 +360,12 @@ int vcachefs_decrypt_file(struct super_block *sb, struct file *lower_file,
 		return -EINVAL;
 	}
 
-	/* Read the embedded key from the trailer (just before the trailing
-	 * magic).  Read it each decrypt; never cached in the inode/sb. */
-	pos = lower_size - ANTREV_TRAILER_LEN;
-	n = vcf_kernel_read(lower_file, key, ANTREV_KEY_LEN, &pos);
-	if (n != ANTREV_KEY_LEN) {
-		VCF_DERR("vcachefs: key read short n=%zd want=%d pos=%lld\n",
-			 n, ANTREV_KEY_LEN, (long long)(lower_size - ANTREV_TRAILER_LEN));
-		return n < 0 ? n : -EIO;
+	/* Fetch the compiled-in master key (de-obfuscated onto the stack, wiped
+	 * at out_key).  Never cached in the inode/sb. */
+	ret = vcf_get_master_key(key);
+	if (ret) {
+		VCF_DERR("vcachefs: master key unavailable (%d) — key_blob not embedded?\n", ret);
+		return ret;
 	}
 
 	/* Read IV (after the magic). */

@@ -153,14 +153,16 @@ def encrypt_one(src: Path, dst: Path, key: bytes,
                 sign_key: Path = None, sign_cert: Path = None) -> int:
     """Encrypt src -> dst (ANTREV01 container with embedded-key trailer).
 
-    vcachefs has no mount-time key, so each file carries its own AES key in a
-    trailer (MAGIC + iv + tag + ct + key + MAGIC); the module reads it at
-    decrypt time.  When do_sign, append a per-exe signature section
-    ([sig][sig_len:4 LE][ANTRSIG1]) over the container bytes.  Returns plaintext
-    byte count.
+    key-in-.ko: the AES key is compiled into the module (see
+    shared/gen_key_blob.py), NOT appended to each file, so the container is a
+    keyless MAGIC + iv + tag + ct.  Encrypt with the SAME key that gets baked
+    into the .ko (KMOD2_KEYFILE == this `key`).  A raw copy of the output tree is
+    then undecryptable without the module.  When do_sign, append a per-exe
+    signature section ([sig][sig_len:4 LE][ANTRSIG1]) over the container bytes.
+    Returns plaintext byte count.
     """
     data = src.read_bytes()
-    container = make_container(data, key, embed_key=True, magic=FS_MAGIC)
+    container = make_container(data, key, embed_key=False, magic=FS_MAGIC)
     if do_sign:
         sig = sign_container(container, sign_key, sign_cert)
         container = container + sig + struct.pack("<I", len(sig)) + SIG_MAGIC

@@ -61,33 +61,25 @@ static int vcachefs_classify(struct inode *inode, struct dentry *lower_dentry,
 		loff_t sz = i_size_read(lower_inode);
 		loff_t clen, sig_off;
 		u32 sig_len;
-		int ps, trailer;
+		int ps;
 
 		/* An optional per-exe signature is APPENDED after the container;
 		 * find the real container size first so every downstream size
 		 * calc excludes the sig section. */
 		ps = vcachefs_probe_sig(lower_file, sz, &clen, &sig_off, &sig_len);
+		fput(lower_file);
 		if (ps < 0) {
-			fput(lower_file);
+			pr_err("vcachefs: classify name=%s probe_sig_err=%d sz=%lld\n",
+			       lower_dentry->d_name.name, ps, (long long)sz);
 			return ps;
 		}
-		/* The embedded-key trailer's magic is at the END of the container
-		 * (clen-8), not the file end when a sig is appended. */
-		trailer = vcachefs_has_trailer(lower_file, clen);
-		fput(lower_file);
-		/* An vcachefs container must carry the embedded-key trailer
-		 * (key + trailing magic); a header-magic file without it is a
-		 * keyless/legacy or truncated container we cannot decrypt
-		 * (there is no mount key). */
-		if (trailer < 0) {
-			pr_err("vcachefs: classify name=%s trailer_read_err=%d sz=%lld clen=%lld ps=%d\n",
-			       lower_dentry->d_name.name, trailer,
-			       (long long)sz, (long long)clen, ps);
-			return trailer;
-		}
-		if (!trailer || clen < ANTREV_HDR_LEN + ANTREV_TRAILER_LEN) {
-			pr_err("vcachefs: classify EIO name=%s trailer=%d ps=%d sz=%lld clen=%lld sig_off=%lld sig_len=%u\n",
-			       lower_dentry->d_name.name, trailer, ps,
+		/* key-in-.ko: the AES key is compiled into the module, NOT appended
+		 * to each file, so a container is just [magic][iv][tag][ct] with no
+		 * key trailer.  A header-magic file of at least HDR bytes is a
+		 * decryptable container; plain_len = container - HDR. */
+		if (clen < ANTREV_HDR_LEN) {
+			pr_err("vcachefs: classify EIO name=%s too-small ps=%d sz=%lld clen=%lld sig_off=%lld sig_len=%u\n",
+			       lower_dentry->d_name.name, ps,
 			       (long long)sz, (long long)clen,
 			       (long long)sig_off, sig_len);
 			return -EIO;
