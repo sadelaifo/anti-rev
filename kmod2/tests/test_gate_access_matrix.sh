@@ -46,7 +46,6 @@ ok()  { echo "  [PASS] $*"; PASS=$((PASS+1)); }
 bad() { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (insmod/mount)"; exit 1; }
-[[ -f "$MOD" ]] || { echo "module not built: $MOD (run: make -C $KMOD/module CC=gcc-12)"; exit 1; }
 
 WORK="$(mktemp -d /tmp/antirevfs_matrix.XXXXXX)"
 ENC="$WORK/.enc/lib"; MP="$WORK/lib"
@@ -83,7 +82,7 @@ gcc -o "$WORK/listed"   "$WORK/listed.c"
 gcc -o "$WORK/unlisted" "$WORK/unlisted.c"
 printf 'TOPSECRET42' > "$WORK/secret.dat"
 
-python3 "$PROTECT" encrypt-lib --embed-key --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
 	--libs "$WORK/listed" "$WORK/unlisted" "$WORK/secret.dat" \
 	--output-dir "$ENC" >/dev/null
 chmod +x "$ENC/listed" "$ENC/unlisted"          # mount mirrors the lower mode
@@ -96,6 +95,9 @@ sed 's/^/    /' "$AUTHZ"
 
 echo "== load module (gate_enforce=1, authz_path=$AUTHZ) + key + mount (ro) =="
 # NOTE: requires a dev-mode build (make AREV_DEV_MODE=1)
+# key-in-.ko: build the module with the SAME key we packed with, then load
+source "$KMOD/tests/keyhelper.sh"
+arev_build_with_key "$WORK/key.hex" "$KMOD/module"
 insmod "$MOD" gate_enforce=1 authz_path="$AUTHZ" || { echo "insmod failed"; exit 1; }
 mount -t vcachefs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
 mount | grep -q "$MP" && ok "mounted antirevfs (gating enforced, read-only)" || bad "mount missing"

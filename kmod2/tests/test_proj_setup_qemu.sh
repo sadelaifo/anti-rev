@@ -52,7 +52,6 @@ bad() { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 skip(){ echo "  [SKIP] $*"; }
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (insmod/mount)"; exit 1; }
-[[ -f "$MOD" ]] || { echo "module not built: $MOD (run: make -C $KMOD/module CC=gcc-12)"; exit 1; }
 
 miss=""
 [[ -n "$QEMU" ]]                             || miss+=" qemu-aarch64-static"
@@ -146,6 +145,8 @@ EOF
 python3 "$PACK" "$WORK/proj-pack.yaml" >/dev/null || { echo "pack failed"; exit 1; }
 
 # NOTE: requires a dev-mode build (make AREV_DEV_MODE=1)
+source "$KMOD/tests/keyhelper.sh"
+arev_build_with_key "$WORK/proj.key.hex" "$KMOD/module"
 insmod "$MOD" gate_enforce=0 gate_passthrough_cipher=1 authz_path="$AUTHZ" \
 	|| { echo "insmod failed"; exit 1; }
 "$MOUNTRW" --passdata --state "$SLIB" "$ENCROOT/lib" "$PROJ/lib" >/dev/null \
@@ -218,8 +219,8 @@ LEAK="$WORK/leak.so"; cp "$PROJ/lib/link/module_x/libxxx.so" "$LEAK" 2>/dev/null
 ENCSZ=$(stat -c%s "$ENCROOT/lib/link/module_x/libxxx.so"); LEAKSZ=$(stat -c%s "$LEAK" 2>/dev/null || echo -1)
 if cmp -s "$LEAK" "$WORK/libxxx.plain.so"; then
 	bad "6. host cp exfiltrated the plaintext ARM64 lib"
-elif [ "$(head -c8 "$LEAK" 2>/dev/null | xxd -p)" = "a74c2e91d63b085f" ] && [[ "$LEAKSZ" -eq $((ENCSZ-40)) ]]; then
-	ok "6. host cp got a trailer-stripped keyless container ($LEAKSZ == enc-40); no plaintext escapes"
+elif [ "$(head -c8 "$LEAK" 2>/dev/null | xxd -p)" = "a74c2e91d63b085f" ] && [[ "$LEAKSZ" -eq "$ENCSZ" ]]; then
+	ok "6. host cp got a keyless container ($LEAKSZ == enc; key is in the .ko, not the file); no plaintext escapes"
 else
 	bad "6. unexpected cp result (size=$LEAKSZ enc=$ENCSZ)"
 fi

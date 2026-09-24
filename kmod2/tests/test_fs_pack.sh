@@ -72,22 +72,22 @@ done
 echo "== 2. ciphertext differs, decrypts byte-identically =="
 cmp -s "$ENC/lib/libtest.so.1.0" "$PROJ/lib/libtest.so.1.0" \
 	&& bad "ciphertext == plaintext!" || ok "ciphertext differs from plaintext"
-# round-trip: decrypt with the same key via a tiny python check.
-# antirevfs container carries an embedded-key trailer: MAGIC|iv|tag|ct|key|MAGIC,
-# so the ciphertext body is blob[36:-40] and the trailer holds the key + magic.
+# round-trip: decrypt with the master key via a tiny python check.
+# key-in-.ko: the container is KEYLESS (MAGIC|iv|tag|ct, no trailer) — the key
+# lives in the .ko, not the file — so we decrypt with the packer key directly.
 python3 - "$ENC/bin/app" "$PROJ/bin/app" "$WORK/key.hex" <<'PY'
 import sys
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 enc, plain, keyf = sys.argv[1:4]
 key = bytes.fromhex(open(keyf).read().strip())
 blob = open(enc, "rb").read()
-assert blob[:8] == bytes.fromhex("a74c2e91d63b085f") and blob[-8:] == bytes.fromhex("a74c2e91d63b085f"), "missing header/trailer magic"
-assert blob[-40:-8] == key, "embedded trailer key != packer key"
-iv, tag, ct = blob[8:20], blob[20:36], blob[36:-40]
+assert blob[:8] == bytes.fromhex("a74c2e91d63b085f"), "missing header magic"
+assert len(blob) == 36 + len(open(plain, "rb").read()), "container should be keyless (hdr+ct, no key trailer)"
+iv, tag, ct = blob[8:20], blob[20:36], blob[36:]
 dec = AESGCM(key).decrypt(iv, ct + tag, None)
 sys.exit(0 if dec == open(plain, "rb").read() else 1)
 PY
-[[ $? -eq 0 ]] && ok "decrypt round-trips via embedded trailer key" || bad "decrypt mismatch"
+[[ $? -eq 0 ]] && ok "decrypt round-trips (keyless container, key from .ko)" || bad "decrypt mismatch"
 
 echo "== 3. non-ELF data files mirrored VERBATIM (plaintext, in tree) =="
 for f in lib/data.json bin/run.py lib/notes.txt; do

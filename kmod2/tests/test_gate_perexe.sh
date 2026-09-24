@@ -33,6 +33,9 @@ cp -r "$KMOD/module" "$W/module"
 bash "$TOOLS/authz-embed-pubkey.sh" "$W/keys/authz_cert.der" > "$W/module/gate_authz_pubkey.h"
 # add a test whitelist entry
 sed -i 's/^\tNULL$/\t"wlloader",\n\tNULL/' "$W/module/gate_whitelist.h"
+# key-in-.ko: create the master key and bake it into the throwaway module
+python3 -c 'import os,sys;open(sys.argv[1],"w").write(os.urandom(32).hex())' "$W/key.hex"
+python3 "$ROOT/shared/gen_key_blob.py" "$W/key.hex" "$W/module/key_blob.c" >/dev/null
 make -C "$W/module" CC="$CC" AREV_DEV_MODE=1 >"$W/build.log" 2>&1 || { echo "build failed:"; tail -20 "$W/build.log"; exit 1; }
 MOD="$W/module/vcachefs.ko"
 
@@ -60,7 +63,7 @@ EOF
 python3 "$PACK" "$W/cfg.yaml" >/dev/null 2>&1 || { echo pack failed; exit 1; }
 # make uloader UNSIGNED: re-encrypt it without a sig (strip the appended section
 # by re-packing just it via protect.py encrypt-lib, which never appends a sig)
-python3 "$ROOT/shared/protect.py" encrypt-lib --embed-key --key "$W/uk.hex" \
+python3 "$ROOT/shared/protect.py" encrypt-lib --key "$W/key.hex" \
         --libs "$W/install/bin/uloader" --output-dir "$ENC/bin" >/dev/null 2>&1
 # ...but that uses a different key; simpler: truncate the sig off uloader so it
 # ends in ANTREV01 (no ANTRSIG1) -> unsigned, still decrypts.

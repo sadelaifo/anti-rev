@@ -37,7 +37,6 @@ ok()  { echo "  [PASS] $*"; PASS=$((PASS+1)); }
 bad() { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (insmod/mount)"; exit 1; }
-[[ -f "$MOD" ]] || { echo "module not built: $MOD (run: make -C $KMOD/module CC=gcc-12)"; exit 1; }
 
 WORK="$(mktemp -d /tmp/antirevfs_gate.XXXXXX)"
 ENC="$WORK/.enc/lib"; MP="$WORK/lib"; AUTHZ="$WORK/authorized_apps.txt"
@@ -57,7 +56,7 @@ EOF
 gcc -shared -fPIC -o "$WORK/libtest.so" "$WORK/libtest.c"
 cp "$WORK/libtest.so" "$WORK/libtest.plain.so"   # reference plaintext
 
-python3 "$PROTECT" encrypt-lib --embed-key --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
 	--libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
 
 # An authorized loader (dlopen+dlsym+call) and a byte-identical unlisted twin.
@@ -102,6 +101,9 @@ chmod 0644 "$AUTHZ"
 
 echo "== load module (gate_enforce=1) + key + mount =="
 # NOTE: requires a dev-mode build (make AREV_DEV_MODE=1)
+# key-in-.ko: build the module with the SAME key we packed with, then load
+source "$KMOD/tests/keyhelper.sh"
+arev_build_with_key "$WORK/key.hex" "$KMOD/module"
 insmod "$MOD" gate_enforce=1 authz_path="$AUTHZ" || { echo "insmod failed"; exit 1; }
 mount -t vcachefs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
 mount | grep -q "$MP" && ok "mounted antirevfs (gating enforced)" || bad "mount missing"
@@ -150,7 +152,7 @@ cat > "$WORK/Foo.c" <<'EOF'
 int main(void) { printf("FOO_RAN_OK\n"); return 0; }
 EOF
 gcc -o "$WORK/Foo" "$WORK/Foo.c"
-python3 "$PROTECT" encrypt-lib --embed-key --key "$WORK/key.hex" --libs "$WORK/Foo" --output-dir "$ENC" >/dev/null
+python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" --libs "$WORK/Foo" --output-dir "$ENC" >/dev/null
 chmod +x "$ENC/Foo"                        # mount mirrors the lower mode; exe needs +x
 echo "$MP/Foo" >> "$AUTHZ"                  # authorize the exe by its mounted path
 OUT="$("$MP/Foo" 2>&1)"; RC=$?

@@ -23,6 +23,8 @@ MOUNTED=""
 
 cleanup() {
 	[ -n "$MOUNTED" ] && fusermount3 -u "$MNT" 2>/dev/null
+	# restore the checked-in placeholder key_blob.c (never leave a real key)
+	[ -f "$WORK/key_blob.orig" ] && cp "$WORK/key_blob.orig" "$ROOT/src/key_blob.c"
 	rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -33,24 +35,32 @@ skip() { echo "SKIP: $1"; exit 0; }
 
 command -v fusermount3 >/dev/null 2>&1 || skip "fusermount3 not found"
 [ -e /dev/fuse ] || skip "/dev/fuse not present"
-[ -x "$BIN" ] || skip "vcachefsd not built — run 'make' in $ROOT first"
 python3 -c 'import cryptography' 2>/dev/null || skip "python3 cryptography missing"
 
 mkdir -p "$LOWER" "$MNT"
 
+# key-in-binary: bake a fresh master key into vcachefsd, pack with the SAME key.
+KEYFILE="$WORK/master.hex"
+python3 -c 'import os,sys;open(sys.argv[1],"w").write(os.urandom(32).hex())' "$KEYFILE"
+cp "$ROOT/src/key_blob.c" "$WORK/key_blob.orig"
+python3 "$ROOT/../shared/gen_key_blob.py" "$KEYFILE" "$ROOT/src/key_blob.c" >/dev/null
+make -C "$ROOT" >/dev/null 2>&1 || skip "vcachefsd build failed (need libfuse3-dev/openssl)"
+[ -x "$BIN" ] || skip "vcachefsd not built"
+
 # ---- build a ciphertext lower tree exactly like the packer ------------------
-# FS_MAGIC = a74c2e91d63b085f ; embedded-key form: MAGIC+iv+tag+ct+key+MAGIC
+# FS_MAGIC = a74c2e91d63b085f ; key-in-binary keyless form: MAGIC+iv+tag+ct
 export PYTHONWARNINGS=ignore
-python3 - "$LOWER" <<'PY'
+python3 - "$LOWER" "$KEYFILE" <<'PY'
 import os, sys
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 FS_MAGIC = bytes.fromhex("a74c2e91d63b085f")
 lower = sys.argv[1]
+KEY = bytes.fromhex(open(sys.argv[2]).read().strip())
 def container(data):
-    key = os.urandom(32); iv = os.urandom(12)
-    ct_tag = AESGCM(key).encrypt(iv, data, None)
+    iv = os.urandom(12)
+    ct_tag = AESGCM(KEY).encrypt(iv, data, None)
     ct, tag = ct_tag[:-16], ct_tag[-16:]
-    return FS_MAGIC + iv + tag + ct + key + FS_MAGIC
+    return FS_MAGIC + iv + tag + ct           # keyless: key is in the binary
 # an "encrypted lib": recognizable plaintext payload
 plain = b"FUSEFS-PLAINTEXT-PAYLOAD-" + b"\x7fELF" + os.urandom(4096) + b"-END"
 open(os.path.join(lower, "secret.so"), "wb").write(container(plain))
@@ -131,11 +141,11 @@ echo "== gate + passthrough-cipher: keyless container, no plaintext/key leak =="
 if mount_fs --passdata --gate --authz "$WORK/authz.txt" --passthrough-cipher; then
 	MOUNTED=1
 	ENC_SIZE=$(stat -c %s "$LOWER/secret.so")
-	EXPECT=$((ENC_SIZE - 40))          # container minus 32-byte key + 8-byte magic
+	EXPECT=$ENC_SIZE                    # key-in-binary: no trailer -> whole container
 	OUT="$WORK/copied.bin"; cat "$MNT/secret.so" > "$OUT" 2>/dev/null
 	GOT=$(stat -c %s "$OUT")
 	if [ "$GOT" = "$EXPECT" ]; then
-		ok "unauthorized read yields container-minus-40 bytes ($GOT)"
+		ok "unauthorized read yields the whole keyless container ($GOT == enc; key is in the binary)"
 	else
 		bad "passthrough size wrong: got $GOT expected $EXPECT"
 	fi
@@ -149,13 +159,12 @@ if mount_fs --passdata --gate --authz "$WORK/authz.txt" --passthrough-cipher; th
 	else
 		ok "keyless copy is not plaintext"
 	fi
-	# the embedded key (last 40 bytes of the lower file) must be absent
-	tail -c 40 "$LOWER/secret.so" > "$WORK/keytrailer.bin"
-	if grep -qF -f /dev/null "$OUT" 2>/dev/null; then :; fi
-	if cmp -s <(tail -c 40 "$OUT") "$WORK/keytrailer.bin"; then
-		bad "keyless copy still contains the key trailer"
+	# key-in-binary: the on-disk container is ALREADY keyless (no trailer), and
+	# the copy must equal it byte-for-byte (useless without the binary's key).
+	if cmp -s "$OUT" "$LOWER/secret.so"; then
+		ok "unauthorized copy == the keyless on-disk container (no key anywhere in it)"
 	else
-		ok "key trailer absent from unauthorized copy"
+		bad "unauthorized copy differs from the on-disk container"
 	fi
 else
 	bad "mount (gate+passthrough-cipher) failed"

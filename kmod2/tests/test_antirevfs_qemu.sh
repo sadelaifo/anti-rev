@@ -58,7 +58,6 @@ bad() { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 skip(){ echo "  [SKIP] $*"; }
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (insmod/mount)"; exit 1; }
-[[ -f "$MOD" ]] || { echo "module not built: $MOD (run: make -C $KMOD/module CC=gcc-12)"; exit 1; }
 
 # ---- prerequisite gate: skip cleanly if the cross/emulation stack is absent --
 miss=""
@@ -119,9 +118,9 @@ EOF
 "$ACC" -o "$WORK/armapp" "$WORK/armapp.c"
 
 # encrypt both the ARM .so and the ARM exe (encryption is arch-agnostic)
-python3 "$PROTECT" encrypt-lib --embed-key --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
 	--libs "$WORK/libtest_arm.so" --output-dir "$ENC" >/dev/null
-python3 "$PROTECT" encrypt-lib --embed-key --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
 	--libs "$WORK/armapp" --output-dir "$ENC" >/dev/null
 chmod +x "$ENC/armapp"      # mount mirrors lower mode; exec needs +x
 
@@ -130,6 +129,9 @@ echo "    emulator basename to whitelist: $QBASE"
 
 echo "== load module + key + mount (gate off first: validate pure emulation) =="
 # NOTE: requires a dev-mode build (make AREV_DEV_MODE=1)
+# key-in-.ko: build the module with the SAME key we packed with, then load
+source "$KMOD/tests/keyhelper.sh"
+arev_build_with_key "$WORK/key.hex" "$KMOD/module"
 insmod "$MOD" gate_enforce=0 authz_path="$AUTHZ" || { echo "insmod failed"; exit 1; }
 mount -t vcachefs -o ro,passdata "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
 mount | grep -q "$MP" && ok "mounted antirevfs (passdata)" || bad "mount missing"

@@ -50,7 +50,6 @@ ok()  { echo "  [PASS] $*"; PASS=$((PASS+1)); }
 bad() { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (insmod/mount)"; exit 1; }
-[[ -f "$MOD" ]] || { echo "module not built: $MOD (run: make -C $KMOD/module CC=gcc-12)"; exit 1; }
 
 WORK="$(mktemp -d /tmp/antirevfs_proj.XXXXXX)"
 INSTALL="$WORK/install"          # plaintext source tree (the unprotected ~/proj)
@@ -196,6 +195,8 @@ hdr "$ENCROOT/lib/link/module_x/libxxx.so" && ! hdr "$ENCROOT/lib/link/sw/libPre
 
 echo "== load module (gate_enforce=1, passthrough-cipher=1) + mount rw views =="
 # NOTE: requires a dev-mode build (make AREV_DEV_MODE=1)
+source "$KMOD/tests/keyhelper.sh"
+arev_build_with_key "$WORK/proj.key.hex" "$KMOD/module"
 insmod "$MOD" gate_enforce=1 gate_passthrough_cipher=1 authz_path="$AUTHZ" \
 	|| { echo "insmod failed"; exit 1; }
 "$MOUNTRW" --passdata --state "$SLIB" "$ENCROOT/lib" "$PROJ/lib" >/dev/null \
@@ -260,8 +261,8 @@ ENCSZ=$(stat -c%s "$ENCROOT/lib/link/module_x/libxxx.so")
 LEAKSZ=$(stat -c%s "$LEAK" 2>/dev/null || echo -1)
 if cmp -s "$LEAK" "$WORK/libxxx.plain.so"; then
 	bad "6. cp exfiltrated PLAINTEXT through the mount"
-elif [ "$(head -c8 "$LEAK" 2>/dev/null | xxd -p)" = "a74c2e91d63b085f" ] && [[ "$LEAKSZ" -eq $((ENCSZ-40)) ]]; then
-	ok "6. cp got a trailer-stripped keyless container ($LEAKSZ == enc-40); no plaintext, no key"
+elif [ "$(head -c8 "$LEAK" 2>/dev/null | xxd -p)" = "a74c2e91d63b085f" ] && [[ "$LEAKSZ" -eq "$ENCSZ" ]]; then
+	ok "6. cp got a keyless container ($LEAKSZ == enc; key is in the .ko, not the file); no plaintext, no key"
 else
 	bad "6. unexpected cp result (size=$LEAKSZ enc=$ENCSZ)"
 fi

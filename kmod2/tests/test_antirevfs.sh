@@ -45,7 +45,6 @@ ok()   { echo "  [PASS] $*"; PASS=$((PASS+1)); }
 bad()  { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (insmod/mount)"; exit 1; }
-[[ -f "$MOD" ]] || { echo "module not built: $MOD (run: make -C $KMOD/module CC=gcc-12)"; exit 1; }
 
 WORK="$(mktemp -d /tmp/antirevfs_test.XXXXXX)"
 ENC="$WORK/.enc/lib"; MP="$WORK/lib"; MP2="$WORK/lib_pd"
@@ -68,7 +67,7 @@ gcc -shared -fPIC -o "$WORK/libtest.so" "$WORK/libtest.c"
 cp "$WORK/libtest.so" "$WORK/libtest.plain.so"   # reference plaintext
 
 # Encrypt into the lower tree; protect.py creates the keyfile.
-python3 "$PROTECT" encrypt-lib --embed-key --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
 	--libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
 # Mixed content: a plaintext .so (strict-mode reject) and a whitelisted .json.
 echo "not encrypted" > "$ENC/plain.so"
@@ -85,6 +84,9 @@ ln -s data.json    "$ENC/data_link.json"  # symlink -> passthrough data file
 ln -s nonexistent  "$ENC/broken_link"     # genuinely dangling target
 
 echo "== load module + key + mount =="
+# key-in-.ko: build the module with the SAME key we packed with, then load
+source "$KMOD/tests/keyhelper.sh"
+arev_build_with_key "$WORK/key.hex" "$KMOD/module"
 insmod "$MOD" || { echo "insmod failed"; exit 1; }
 mount -t vcachefs -o "ro,passthrough=json" "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
 mount | grep -q "$MP" && ok "mounted antirevfs at $MP" || bad "mount missing"

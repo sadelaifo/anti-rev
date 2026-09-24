@@ -37,7 +37,6 @@ ok()  { echo "  [PASS] $*"; PASS=$((PASS+1)); }
 bad() { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (insmod/mount)"; exit 1; }
-[[ -f "$MOD" ]] || { echo "module not built: $MOD (run: make -C $KMOD/module CC=gcc-12)"; exit 1; }
 
 WORK="$(mktemp -d /tmp/antirevfs_passthru.XXXXXX)"
 ENC="$WORK/.enc/lib"; MP="$WORK/lib"; AUTHZ="$WORK/authorized_apps.txt"
@@ -57,7 +56,7 @@ EOF
 gcc -shared -fPIC -o "$WORK/libtest.so" "$WORK/libtest.c"
 cp "$WORK/libtest.so" "$WORK/libtest.plain.so"   # reference plaintext
 
-python3 "$PROTECT" encrypt-lib --embed-key --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
 	--libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
 
 # An authorized loader (dlopen+dlsym+call).
@@ -83,6 +82,9 @@ chmod 0644 "$AUTHZ"
 
 echo "== load module (gate_enforce=1, gate_passthrough_cipher=1) + key + mount =="
 # NOTE: requires a dev-mode build (make AREV_DEV_MODE=1)
+# key-in-.ko: build the module with the SAME key we packed with, then load
+source "$KMOD/tests/keyhelper.sh"
+arev_build_with_key "$WORK/key.hex" "$KMOD/module"
 insmod "$MOD" gate_enforce=1 gate_passthrough_cipher=1 authz_path="$AUTHZ" \
 	|| { echo "insmod failed"; exit 1; }
 mount -t vcachefs -o ro "$ENC" "$MP" || { echo "mount failed"; dmesg | tail -5; exit 1; }
@@ -100,16 +102,16 @@ if cp "$MP/libtest.so" "$WORK/out_cp" 2>"$WORK/cp.err"; then
 	OUTSZ="$(stat -c%s "$WORK/out_cp")"
 	if cmp -s "$WORK/out_cp" "$WORK/libtest.plain.so"; then
 		bad "cp yielded PLAINTEXT (passthrough leaked decrypted content!)"
-	elif [[ "$OUTSZ" -eq "$((ENCSZ - 40))" ]]; then
-		ok "cp output is the .enc container minus the 40-byte key trailer ($OUTSZ = $ENCSZ-40)"
+	elif [[ "$OUTSZ" -eq "$ENCSZ" ]]; then
+		ok "cp output is the whole keyless .enc container ($OUTSZ = $ENCSZ; key is in the .ko)"
 	else
-		bad "cp output size $OUTSZ != enc-40 ($((ENCSZ - 40)))"
+		bad "cp output size $OUTSZ != enc ($ENCSZ)"
 	fi
 	# the embedded AES key (key.hex) must NOT appear anywhere in the stripped copy
 	if python3 -c "import sys; d=open('$WORK/out_cp','rb').read(); k=bytes.fromhex(open('$WORK/key.hex').read().strip()); sys.exit(0 if k in d else 1)"; then
 		bad "the embedded key LEAKED into the cp output"
 	else
-		ok "embedded key absent from the cp output (trailer withheld)"
+		ok "no key in the cp output (key lives in the .ko, never in the container)"
 	fi
 else
 	bad "cp was denied (expected success with stripped ciphertext): $(cat "$WORK/cp.err")"

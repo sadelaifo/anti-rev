@@ -33,6 +33,9 @@ bash "$TOOLS/authz-keygen.sh" "$W/keys" >/dev/null 2>&1 || { echo keygen failed;
 cp -r "$KMOD/module" "$W/module"
 bash "$TOOLS/authz-embed-pubkey.sh" "$W/keys/authz_cert.der" "$W/module/gate_authz_pubkey.h" >/dev/null
 sed -i 's/^\tNULL$/\t"arevctl",\n\tNULL/' "$W/module/gate_whitelist.h"
+# key-in-.ko: create the master key and bake it into the throwaway module
+python3 -c 'import os,sys;open(sys.argv[1],"w").write(os.urandom(32).hex())' "$W/key.hex"
+python3 "$ROOT/shared/gen_key_blob.py" "$W/key.hex" "$W/module/key_blob.c" >/dev/null
 make -C "$W/module" CC="$CC" >"$W/build.log" 2>&1 || { echo "MODULE BUILD FAILED:"; tail -30 "$W/build.log"; exit 1; }
 MOD="$W/module/vcachefs.ko"
 ok "module (with ctldev.o) built"

@@ -162,6 +162,9 @@ abort() {
 # ── build encrypted corpus of varied sizes ─────────────────────────────
 hdr "build encrypted corpus ($NFILES files, up to ${FILE_MB}MB)"
 KEY="$WORK/key.hex"
+# key-in-.ko: create the key, embed it, build the module with it
+source "$KMOD/tests/keyhelper.sh"
+arev_build_with_key "$KEY" "$KMOD/module"
 declare -a NAMES SHAS
 mk_file() {
 	local idx="$1" bytes="$2" src="$WORK/src_$idx.bin"
@@ -169,7 +172,7 @@ mk_file() {
 	head -c "$bytes" /dev/urandom > "$src"
 	SHAS[$idx]="$(sha256sum "$src" | awk '{print $1}')"
 	NAMES[$idx]="enc_$idx.bin"
-	python3 "$PROTECT" encrypt-lib --embed-key --key "$KEY" \
+	python3 "$PROTECT" encrypt-lib --key "$KEY" \
 		--libs "$src" --output-dir "$ENC" >/dev/null 2>&1 \
 		|| abort "packing enc_$idx failed"
 	mv "$ENC/$(basename "$src")" "$ENC/${NAMES[$idx]}"
