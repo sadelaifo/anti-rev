@@ -29,7 +29,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
 MOD="$KMOD/module/vcachefs.ko"
-PROTECT="$ROOT/encryptor/protect.py"
+PROTECT="$ROOT/shared/protect.py"
 PARAM=/sys/module/vcachefs/parameters/gate_enforce
 
 PASS=0; FAIL=0

@@ -37,7 +37,7 @@ MODULE_PARM_DESC(decrypt_log,
 #define VCF_DERR(...)  do { } while (0)
 #endif
 
-/* Obfuscated "gcm(aes)" (key = obf_key(i) in tools/obfstr_gen.py) so the
+/* Obfuscated "gcm(aes)" (key = obf_key(i) in shared/obfstr_gen.py) so the
  * algorithm name is not a plaintext literal in the shipped .ko. */
 #define VCF_GCM_AES(buf) \
 	VCF_OBF((buf), 0x30, 0x2d, 0x2c, 0x50, 0x12, 0x0f, 0x1e, 0x4d)

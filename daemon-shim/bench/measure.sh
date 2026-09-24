@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR/project"
-ENCRYPTOR="$SCRIPT_DIR/../encryptor/protect.py"
+ENCRYPTOR="$SCRIPT_DIR/../../shared/protect.py"
 STUB="$SCRIPT_DIR/../build/stub"
 
 cd "$PROJECT_DIR"

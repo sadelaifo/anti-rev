@@ -12,7 +12,7 @@ STUB="$1"
 MYLIB="$2"
 LIBLINKEDMATH="$3"
 SRC_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-PROTECT="$SRC_DIR/encryptor/protect.py"
+PROTECT="$SRC_DIR/../shared/protect.py"
 TD="$(dirname "$STUB")/python_client_daemon_test"
 
 rm -rf "$TD"

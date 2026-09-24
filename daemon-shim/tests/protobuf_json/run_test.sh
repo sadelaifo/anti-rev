@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 BUILD_DIR="${1:-../../build}"
 STUB="$BUILD_DIR/stub"
 KEY="$BUILD_DIR/test.key"
-PROTECT="../../encryptor/protect.py"
+PROTECT="../../../shared/protect.py"
 
 if [ ! -x "$STUB" ]; then echo "FAIL: stub not found at $STUB" >&2; exit 1; fi
 if [ ! -f "$KEY"  ]; then echo "FAIL: key not found at $KEY"  >&2; exit 1; fi

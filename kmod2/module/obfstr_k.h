@@ -10,7 +10,7 @@
  * literal).  So this provides only what a module needs: decode an obfuscated
  * byte array into a caller-provided buffer, valid for that function's lifetime.
  *
- * The XOR key formula is IDENTICAL to obf_key() in tools/obfstr_gen.py, so byte
+ * The XOR key formula is IDENTICAL to obf_key() in shared/obfstr_gen.py, so byte
  * arrays produced by that tool (or the formula below) decode cleanly here.
  * Encode with, e.g.:
  *     python - <<'PY'
@@ -28,7 +28,7 @@
 
 #include <linux/types.h>
 
-/* Per-position key — KEEP IN SYNC with obf_key() in tools/obfstr_gen.py. */
+/* Per-position key — KEEP IN SYNC with obf_key() in shared/obfstr_gen.py. */
 #define _VCF_OBF_K(i) ((u8)(0x5a ^ (((((unsigned)(i)) * 7u) + 13u) & 0xffu)))
 
 static inline const char *vcf_deobf(char *dst, const volatile u8 *e, unsigned n)

@@ -18,7 +18,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
-PROTECT="$ROOT/encryptor/protect.py"
+PROTECT="$ROOT/shared/protect.py"
 TOOLS="$KMOD/tools"
 CC="${CC:-$(command -v gcc-12 || command -v gcc-4.8 || command -v gcc)}"
 

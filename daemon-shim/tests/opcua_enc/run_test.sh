@@ -14,7 +14,7 @@ BUILD_DIR="${1:-$REPO/build}"
 WORK="$DIR/_workdir"
 
 STUB="$BUILD_DIR/stub"
-PROTECT="$REPO/encryptor/protect.py"
+PROTECT="$REPO/../shared/protect.py"
 
 # Sanity checks
 if [ ! -x "$STUB" ]; then

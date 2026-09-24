@@ -14,7 +14,7 @@ DLOPEN_MAIN="$2"
 LINKED_MAIN="$3"
 MYLIB="$4"
 LIBLINKEDMATH="$5"
-PROTECT="$(dirname "$0")/../../encryptor/protect.py"
+PROTECT="$(dirname "$0")/../../../shared/protect.py"
 TD="$(dirname "$STUB")/daemon_test"
 
 rm -rf "$TD"

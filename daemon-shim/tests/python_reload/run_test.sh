@@ -15,7 +15,7 @@ set -e
 STUB="$1"
 LIBRELOAD="$2"
 SRC_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-PROTECT="$SRC_DIR/encryptor/protect.py"
+PROTECT="$SRC_DIR/../shared/protect.py"
 TD="$(dirname "$STUB")/python_reload_test"
 LOG="$TD/reload.log"
 

@@ -33,7 +33,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
 MOD="$KMOD/module/vcachefs.ko"
-PROTECT="$ROOT/encryptor/protect.py"
+PROTECT="$ROOT/shared/protect.py"
 MOUNTRW="$KMOD/tools/vcache-mount-rw"
 
 PASS=0; FAIL=0

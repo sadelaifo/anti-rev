@@ -21,9 +21,9 @@ gcc -O2 -o "$RUN/worker"   "$HERE/worker.c"
 echo "BUILD_OK"
 
 echo "=== 2. antirev pack (daemon mode) ==="
-python3 "$ROOT/encryptor/protect.py" encrypt-lib    --key "$KEY" --libs "$RUN/libplugin.so" "$RUN/libcore.so" "$RUN/libmockanti.so" "$RUN/pg.elf" --output-dir "$RUN"
-python3 "$ROOT/encryptor/protect.py" protect-daemon --stub "$STUB" --key "$KEY" --output "$RUN/lrxd"
-python3 "$ROOT/encryptor/protect.py" protect-exe    --stub "$STUB" --main "$RUN/launcher" --key "$KEY" --daemon-libs --output "$RUN/launcher.protected"
+python3 "$ROOT/shared/protect.py" encrypt-lib    --key "$KEY" --libs "$RUN/libplugin.so" "$RUN/libcore.so" "$RUN/libmockanti.so" "$RUN/pg.elf" --output-dir "$RUN"
+python3 "$ROOT/shared/protect.py" protect-daemon --stub "$STUB" --key "$KEY" --output "$RUN/lrxd"
+python3 "$ROOT/shared/protect.py" protect-exe    --stub "$STUB" --main "$RUN/launcher" --key "$KEY" --daemon-libs --output "$RUN/launcher.protected"
 echo "PACK_OK"
 
 cd "$RUN"

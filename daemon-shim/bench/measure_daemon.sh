@@ -12,7 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT="$SCRIPT_DIR/daemon_project"
-PROTECT="$ROOT_DIR/encryptor/protect.py"
+PROTECT="$ROOT_DIR/../shared/protect.py"
 STUB="$ROOT_DIR/build/stub"
 
 LIBS_DIR="$PROJECT/libs"
@@ -165,7 +165,7 @@ else
     python3 -c "
 import os, sys
 from pathlib import Path
-sys.path.insert(0, '$ROOT_DIR/encryptor')
+sys.path.insert(0, '$ROOT_DIR/../shared')
 from protect import load_or_create_key, encrypt_data, MAGIC
 from concurrent.futures import ProcessPoolExecutor, as_completed
 

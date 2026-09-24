@@ -10,7 +10,7 @@ Binary protection system that encrypts executables and shared libraries, then ru
     - `stub/daemon_client.c` — shared daemon-protocol client owning the socket fd (`__r_LS`), the eager fd map (`__r_FM`), and the encrypted-name set (`__r_EL`). Both `dlopen_shim` and `aarch64_extend_shim` talk to the daemon through `daemon_client_send` / `daemon_client_recv` and check encryption / eager-lookup state through accessors instead of carrying private copies. Init is idempotent — each shim's constructor calls `daemon_client_init()` and only the first call reads env vars.
 
     Each source file keeps its own concern (identity, dlopen, ARM-only, daemon transport) with disjoint symbol exports and independent file-scope state where it makes sense to stay isolated (per-shim caches, mutexes, log files).
-- **encryptor** (`protect.py`, `antirev-pack.py`): Python tools that encrypt and bundle binaries with AES-256-GCM
+- **encryptor** (`daemon-shim/encryptor/antirev-pack.py` + `shared/protect.py`): Python tools that encrypt and bundle binaries with AES-256-GCM. `protect.py` (the `make_container` AES-256-GCM format) lives in `shared/` because kmod2's `vcache-pack.py` and fusefs read the same container format.
 - **daemon mode** (`lrxd`): a lightweight lib-server process that scans `$HOME/SA` (the suite's install tree; falls back to its own directory when `$HOME/SA` is absent) for encrypted `.so` / `.elf` files, decrypts them into memfds, and serves the fds to client processes via SCM_RIGHTS.  Pinning the scan root to `$HOME/SA` lets the daemon live in a subdir (e.g. `$HOME/SA/bin`) while still serving libs from the whole tree (e.g. `$HOME/SA/lib`).  (Filename was `.antirev-libd` historically, then `.lrxd`; the leading dot was dropped because a hidden *executable* is itself a red flag, and dotfiles get skipped by glob/rsync copies — plain `lrxd` blends in with ordinary binaries and copies cleanly. Multi-arch deploys get `lrxd-x86_64` / `lrxd-aarch64`.)
 - **antirev_client.py**: Python client that connects to the daemon, receives decrypted lib memfds via SCM_RIGHTS, and patches `import` + `ctypes.CDLL` to transparently load encrypted libs. Handles dependency ordering via `_ensure_loaded()` which recursively preloads transitive DT_NEEDED deps with `RTLD_GLOBAL`.
 - **build.py**: compiles/obfuscates Python source files via Cython, Nuitka, or PyArmor
@@ -24,21 +24,44 @@ This project protects a business software suite consisting of:
 
 The business software also uses third-party libraries (e.g. `libdopra.so`, `libprotobuf.so`, open62541, Boost) which are NOT encrypted but coexist in the same processes.
 
+## Repository layout
+
+The three designs each live in their own folder with their own `CMakeLists.txt`; cross-design code lives in `shared/`:
+
+| Folder | Design / role | Build |
+|--------|---------------|-------|
+| `daemon-shim/` | **Design 1** (shipping): stub + LD_PRELOAD shim + daemon (`lrxd`) + `antirev_client.py`. Holds `stub/`, `encryptor/`, `tools/`, `tests/`, `bench/`, `cmake/`, `CMakeLists.txt`. | native C via CMake |
+| `kmod2/` | **Design 2**: `vcachefs` kernel module + tools. | `CMakeLists.txt` wraps `make` (kbuild) |
+| `fusefs/` | **Design 3**: userspace FUSE decrypt daemon `vcachefsd`. | `CMakeLists.txt` wraps `make` |
+| `shared/` | Cross-design code used by ≥2 designs: `protect.py` (AES-256-GCM container format), `obfstr_gen.py` (string-obfuscation codegen). No build of its own. | — |
+
+**Path note:** paths named below without a folder prefix are relative to their design. Design-1 references like `stub/…`, `encryptor/…` (except `protect.py`), `tools/…` (except `obfstr_gen.py`), `tests/…` now live under `daemon-shim/`; `protect.py` and `obfstr_gen.py` are under `shared/`; kmod2/fusefs paths are unchanged.
+
 ## Build
 
+The root `CMakeLists.txt` is an umbrella that builds design 1 by default; kmod2 and fusefs are opt-in (they need kernel-devel / libfuse3 respectively). Each design also builds standalone from inside its own folder.
+
 ```bash
+# whole repo (design 1 only, by default):
 mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake .. -DCMAKE_BUILD_TYPE=Release          # add -DBUILD_KMOD2=ON / -DBUILD_FUSEFS=ON to include the others
 make
+
+# or a single design standalone:
+cmake -S daemon-shim -B build/daemon-shim -DCMAKE_BUILD_TYPE=Release && cmake --build build/daemon-shim
+cmake -S kmod2       -B build/kmod2 -DKMOD2_CC=gcc-12 [-DKMOD2_DEV=ON] && cmake --build build/kmod2
+cmake -S fusefs      -B build/fusefs && cmake --build build/fusefs
 ```
 
 ## Testing
 
-Always run the full test suite after adding features or making changes:
+Always run the full test suite after adding features or making changes (design-1 suite; run from `daemon-shim/`):
 
 ```bash
-cmake -DBUILD_DIR=build -DSRC_DIR=. -P cmake/run_all_tests.cmake
+cmake -DBUILD_DIR=build -DSRC_DIR=. -P daemon-shim/cmake/run_all_tests.cmake
 ```
+
+kmod2 and fusefs keep their own standalone tests under `kmod2/tests/` and `fusefs/tests/` (not part of `run_all_tests.cmake`).
 
 New features must include a corresponding test case that verifies correctness and demonstrates the failure mode without the fix.
 

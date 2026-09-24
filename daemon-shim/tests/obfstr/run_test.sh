@@ -1,5 +1,5 @@
 #!/bin/bash
-# tests/obfstr — smoke test for tools/obfstr_gen.py + stub/obfstr.h.
+# tests/obfstr — smoke test for shared/obfstr_gen.py + stub/obfstr.h.
 #
 # Two things need to hold for the protection to work:
 #

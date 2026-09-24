@@ -60,7 +60,7 @@ EOF
 python3 "$PACK" "$W/cfg.yaml" >/dev/null 2>&1 || { echo pack failed; exit 1; }
 # make uloader UNSIGNED: re-encrypt it without a sig (strip the appended section
 # by re-packing just it via protect.py encrypt-lib, which never appends a sig)
-python3 "$ROOT/encryptor/protect.py" encrypt-lib --embed-key --key "$W/uk.hex" \
+python3 "$ROOT/shared/protect.py" encrypt-lib --embed-key --key "$W/uk.hex" \
         --libs "$W/install/bin/uloader" --output-dir "$ENC/bin" >/dev/null 2>&1
 # ...but that uses a different key; simpler: truncate the sig off uloader so it
 # ends in ANTREV01 (no ANTRSIG1) -> unsigned, still decrypts.

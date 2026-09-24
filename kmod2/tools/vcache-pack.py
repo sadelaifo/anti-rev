@@ -75,12 +75,12 @@ SIG_MAGIC = bytes.fromhex("3d6af0128c55b427")
 # with what the kernel module's read_folio decrypts.
 _HERE = Path(__file__).resolve()
 _REPO = _HERE.parents[2]
-sys.path.insert(0, str(_REPO / "encryptor"))
+sys.path.insert(0, str(_REPO / "shared"))
 try:
     from protect import make_container, load_or_create_key  # noqa: E402
 except ImportError as e:
-    sys.exit(f"[error] cannot import encryptor/protect.py ({e}); "
-             f"expected at {_REPO / 'encryptor' / 'protect.py'}")
+    sys.exit(f"[error] cannot import shared/protect.py ({e}); "
+             f"expected at {_REPO / 'shared' / 'protect.py'}")
 
 try:
     import yaml
