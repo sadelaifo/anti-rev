@@ -1,9 +1,9 @@
 # Dockerfile.template — integrate fusefs into YOUR product image.
 # Variant: PREBUILT STATIC vcachefsd + WRITABLE overlay view.
 #
-# Build context must contain: your product tree, the antirev repo's `fusefs/`
+# Build context must contain: your product tree, the antirev repo (fusefs/ + shared/)
 # (for the prebuilt binary + entrypoint), and the packer (`encryptor/` +
-# `kmod2/tools/vcache-pack.py`).  Replace <...> placeholders.
+# `shared/vcache-pack.py`).  Replace <...> placeholders.
 #
 # The daemon ships as a prebuilt static binary (fusefs/prebuilt/vcachefsd-x86_64)
 # — no compiler/build stage in your pipeline.  If you change gate_whitelist.h or
@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-cryptography patchelf \
     && rm -rf /var/lib/apt/lists/*
 COPY encryptor/ /pack/encryptor/
-COPY kmod2/tools/vcache-pack.py /pack/vcache-pack.py
+COPY shared/vcache-pack.py /pack/vcache-pack.py
 COPY <your-product-dir>/ /pack/plain/            # <-- your plaintext product tree
 COPY <your-pack-config>.yaml /pack/pack.yaml     # <-- see kmod2/examples/proj-pack.yaml
 #   pack.yaml: install_dir=/pack/plain, output_dir=/pack/product.enc,

@@ -15,7 +15,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KMOD="$HERE/.."
 ROOT="$KMOD/.."
-PACK="$KMOD/tools/vcache-pack.py"
+PACK="$ROOT/shared/vcache-pack.py"
 PROTECT="$ROOT/shared/protect.py"
 
 PASS=0; FAIL=0

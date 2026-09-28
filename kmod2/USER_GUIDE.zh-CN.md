@@ -111,8 +111,8 @@ cat /sys/module/antirevfs/refcnt          # 每个存活挂载 +1
 ## 6. 打包：`vcache-pack.py`
 
 ```bash
-python3 kmod2/tools/vcache-pack.py config.yaml            # 产出密文下层树
-python3 kmod2/tools/vcache-pack.py config.yaml --dry-run  # 只分类不写盘
+python3 shared/vcache-pack.py config.yaml            # 产出密文下层树
+python3 shared/vcache-pack.py config.yaml --dry-run  # 只分类不写盘
 ```
 
 它按 **ELF 魔数**（不是扩展名）加密**每个 ELF**（库和可执行都加密），产出镜像化的
@@ -318,7 +318,7 @@ make -C kmod2/module CC=<内核的gcc>
 sudo insmod kmod2/module/antirevfs.ko gate_enforce=0
 
 # 打包
-python3 kmod2/tools/vcache-pack.py config.yaml        # [--dry-run]
+python3 shared/vcache-pack.py config.yaml        # [--dry-run]
 
 # 挂载（三选一）
 sudo kmod2/tools/vcache-mount-ro    --passdata <密文树> <挂载点>          # 只读

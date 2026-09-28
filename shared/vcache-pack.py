@@ -74,7 +74,7 @@ SIG_MAGIC = bytes.fromhex("3d6af0128c55b427")
 # Reuse protect.py's exact crypto so the container format stays in lockstep
 # with what the kernel module's read_folio decrypts.
 _HERE = Path(__file__).resolve()
-_REPO = _HERE.parents[2]
+_REPO = _HERE.parents[1]   # shared/vcache-pack.py -> repo root
 sys.path.insert(0, str(_REPO / "shared"))
 try:
     from protect import make_container, load_or_create_key  # noqa: E402
