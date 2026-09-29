@@ -1,0 +1,54 @@
+# deploy-vcachefs.yml — push the vcachefs module + mount unit to every compute
+# node, NFS-mount the ciphertext from storage, and enable the decrypting mount.
+# Run:  ansible-playbook deploy-vcachefs.yml
+#
+# Prereq: put your built module at files/vcachefs.ko (built with -DKMOD2_KEYFILE
+# for THIS cluster's kernel; vermagic must match `uname -r` on the nodes).
+- name: Deploy vcachefs decrypt mount to the compute cluster
+  hosts: compute
+  become: true
+  tasks:
+    - name: local dir for the module
+      file:
+        path: "{{ ko_dest | dirname }}"
+        state: directory
+        mode: "0700"
+
+    - name: copy vcachefs.ko (AES key is baked inside — keep it 0600)
+      copy:
+        src: files/vcachefs.ko
+        dest: "{{ ko_dest }}"
+        mode: "0600"
+
+    - name: NFS-mount the ciphertext, read-only (also persists in /etc/fstab)
+      ansible.posix.mount:
+        path: "{{ enc_mnt }}"
+        src: "{{ enc_src }}"
+        fstype: nfs
+        opts: "ro,vers=4,_netdev,nofail"
+        state: mounted
+
+    - name: ensure the vcachefs mountpoint exists
+      file:
+        path: "{{ app_mnt }}"
+        state: directory
+
+    - name: install the systemd mount unit (from the template)
+      template:
+        src: vcachefs-mount.service.j2
+        dest: /etc/systemd/system/vcachefs-mount.service
+        mode: "0644"
+
+    - name: enable + start the vcachefs decrypt mount
+      systemd:
+        name: vcachefs-mount
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: verify a file decrypts through the mount (spot check)
+      shell: "head -c4 {{ app_mnt }}/$(ls {{ app_mnt }} | head -1) | od -An -tx1"
+      register: _chk
+      changed_when: false
+      failed_when: false
+    - debug: { var: _chk.stdout }

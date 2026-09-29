@@ -1,0 +1,2 @@
+# never commit the key-bearing module; supply it at deploy time
+*.ko

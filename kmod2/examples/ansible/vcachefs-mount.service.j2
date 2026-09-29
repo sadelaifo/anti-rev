@@ -1,0 +1,18 @@
+[Unit]
+Description=vcachefs decrypt mount over {{ enc_mnt }}
+# ensure the NFS ciphertext mount is up first (Ansible added it to fstab)
+RequiresMountsFor={{ enc_mnt }}
+After=remote-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# load the module (key baked in) only if not already loaded, then mount the
+# decrypting view in place-of the ciphertext at {{ app_mnt }}.
+ExecStart=/bin/sh -c 'lsmod | grep -q "^vcachefs " || /sbin/insmod {{ ko_dest }}'
+ExecStart=/bin/mount -t vcachefs -o ro,passdata {{ enc_mnt }} {{ app_mnt }}
+ExecStop=/bin/umount {{ app_mnt }}
+ExecStop=/bin/sh -c '/sbin/rmmod vcachefs 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
