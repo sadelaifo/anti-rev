@@ -17,6 +17,7 @@
 
 #include "compat.h"
 #include "vcachefs.h"
+#include "obfstr_k.h"
 
 static int vcachefs_inode_test(struct inode *inode, void *data)
 {
@@ -62,6 +63,7 @@ static int vcachefs_classify(struct inode *inode, struct dentry *lower_dentry,
 		loff_t clen, sig_off;
 		u32 sig_len;
 		int ps;
+		char obf[32];	/* VCF_OBF scratch for the diagnostics below */
 
 		/* An optional per-exe signature is APPENDED after the container;
 		 * find the real container size first so every downstream size
@@ -69,7 +71,13 @@ static int vcachefs_classify(struct inode *inode, struct dentry *lower_dentry,
 		ps = vcachefs_probe_sig(lower_file, sz, &clen, &sig_off, &sig_len);
 		fput(lower_file);
 		if (ps < 0) {
-			pr_err("vcachefs: classify name=%s probe_sig_err=%d sz=%lld\n",
+			/* "vcachefs: classify" — obfuscated so `strings` on the
+			 * release .ko shows no self-documenting diagnostic text. */
+			pr_err("%s name=%s err=%d sz=%lld\n",
+			       VCF_OBF(obf,
+				0x21, 0x2d, 0x20, 0x1b, 0x1b, 0x0f, 0x0b, 0x17,
+				0x25, 0x36, 0x6a, 0x6c, 0x5a, 0x41, 0x46, 0x45,
+				0x41, 0xa7),
 			       lower_dentry->d_name.name, ps, (long long)sz);
 			return ps;
 		}
@@ -78,7 +86,14 @@ static int vcachefs_classify(struct inode *inode, struct dentry *lower_dentry,
 		 * key trailer.  A header-magic file of at least HDR bytes is a
 		 * decryptable container; plain_len = container - HDR. */
 		if (clen < ANTREV_HDR_LEN) {
-			pr_err("vcachefs: classify EIO name=%s too-small ps=%d sz=%lld clen=%lld sig_off=%lld sig_len=%u\n",
+			/* "vcachefs: classify too-small" — obfuscated; generic
+			 * field labels below reveal nothing about the format. */
+			pr_err("%s name=%s err=%d sz=%lld c=%lld o=%lld n=%u\n",
+			       VCF_OBF(obf,
+				0x21, 0x2d, 0x20, 0x1b, 0x1b, 0x0f, 0x0b, 0x17,
+				0x25, 0x36, 0x6a, 0x6c, 0x5a, 0x41, 0x46, 0x45,
+				0x41, 0xa7, 0xf1, 0xbc, 0xac, 0x95, 0xd0, 0x87,
+				0x82, 0x87, 0xf5, 0xfc),
 			       lower_dentry->d_name.name, ps,
 			       (long long)sz, (long long)clen,
 			       (long long)sig_off, sig_len);
