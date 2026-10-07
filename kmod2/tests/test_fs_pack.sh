@@ -180,7 +180,8 @@ echo "== 9. --install-dir / --output-dir override the config (CLI wins) =="
 PROJ2="$WORK/proj2"; ENC2="$WORK/enc2"
 mkdir -p "$PROJ2/bin"
 gcc -o "$PROJ2/bin/app2" "$WORK/m.c"        # an ELF that exists ONLY in proj2
-python3 "$PACK" "$WORK/config.yaml" \
+# also exercises the --config flag form (earlier cases use the positional arg)
+python3 "$PACK" --config "$WORK/config.yaml" \
 	--install-dir "$PROJ2" --output-dir "$ENC2" >/dev/null 2>&1
 if [[ -f "$ENC2/bin/app2" ]] \
    && [ "$(head -c8 "$ENC2/bin/app2" | xxd -p)" = "a74c2e91d63b085f" ]; then

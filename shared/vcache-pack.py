@@ -9,7 +9,8 @@
 # ([magic ANTREV01][iv:12][tag:16][ct...]), and leaves everything else alone.
 #
 # Usage:
-#   vcache-pack.py <config.yaml> [--install-dir DIR] [--output-dir DIR] [-j N] [--dry-run]
+#   vcache-pack.py --config <config.yaml> [--install-dir DIR] [--output-dir DIR] [-j N] [--dry-run]
+#   (the config may also be given positionally: vcache-pack.py <config.yaml> ...)
 #
 # --install-dir / --output-dir override the config values (CLI wins); handy for
 # reusing one config across trees, or driving the packer from a build system.
@@ -200,7 +201,10 @@ def copy_verbatim(src: Path, dst: Path) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="vcachefs (kmod2) config-driven ciphertext-tree packer")
-    ap.add_argument("config", help="YAML config file")
+    ap.add_argument("-c", "--config", dest="config_flag", metavar="FILE",
+                    default=None, help="YAML config file")
+    ap.add_argument("config_pos", nargs="?", metavar="config", default=None,
+                    help="YAML config file (positional; same as --config)")
     ap.add_argument("-j", "--jobs", type=int, default=0,
                     help="parallel workers (default: CPU count)")
     ap.add_argument("--install-dir", metavar="DIR", default=None,
@@ -211,7 +215,12 @@ def main() -> int:
                     help="classify and report, but write nothing")
     args = ap.parse_args()
 
-    cfg_path = Path(args.config)
+    # Accept the config either as --config/-c or as the positional arg (the
+    # positional is kept for backward compatibility).  Exactly one is required.
+    config = args.config_flag if args.config_flag is not None else args.config_pos
+    if not config:
+        ap.error("config file required: pass --config FILE (or as a positional argument)")
+    cfg_path = Path(config)
     if not cfg_path.exists():
         sys.exit(f"[error] config not found: {cfg_path}")
     with open(cfg_path) as f:
