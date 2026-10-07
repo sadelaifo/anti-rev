@@ -173,5 +173,49 @@ assert not (need & pt), f"wrongly in plaintext: {need & pt}"
 PY
 then ok "manifest lists .a/.pyc/.elf as encrypted"; else bad "encrypt_ext manifest wrong"; fi
 
+echo
+echo "== 9. --install-dir / --output-dir override the config (CLI wins) =="
+# A separate tree + output location; the config still points at PROJ/$ENC, so a
+# correct override must encrypt proj2's ELF into enc2 and leave $ENC untouched.
+PROJ2="$WORK/proj2"; ENC2="$WORK/enc2"
+mkdir -p "$PROJ2/bin"
+gcc -o "$PROJ2/bin/app2" "$WORK/m.c"        # an ELF that exists ONLY in proj2
+python3 "$PACK" "$WORK/config.yaml" \
+	--install-dir "$PROJ2" --output-dir "$ENC2" >/dev/null 2>&1
+if [[ -f "$ENC2/bin/app2" ]] \
+   && [ "$(head -c8 "$ENC2/bin/app2" | xxd -p)" = "a74c2e91d63b085f" ]; then
+	ok "override: proj2 ELF encrypted into the --output-dir tree"
+else
+	bad "override: expected encrypted $ENC2/bin/app2"
+fi
+# the override must NOT have pulled proj2's file into the config's output_dir
+if [[ ! -e "$ENC/bin/app2" ]]; then
+	ok "override: config output_dir ($ENC) untouched by the overridden run"
+else
+	bad "override: config output_dir leaked the overridden file"
+fi
+# and the config's own install_dir ELF must be absent from the override output
+if [[ ! -e "$ENC2/lib/libtest.so.1.0" ]]; then
+	ok "override: config install_dir was not scanned"
+else
+	bad "override: config install_dir was scanned despite --install-dir"
+fi
+
+echo "== 10. missing both config fields AND flags -> clear error =="
+printf 'key: key.hex\n' > "$WORK/nodirs.yaml"
+err="$(python3 "$PACK" "$WORK/nodirs.yaml" --dry-run 2>&1 || true)"
+if grep -q "missing required 'install_dir'" <<<"$err"; then
+	ok "missing install_dir reported with the --install-dir hint"
+else
+	bad "expected a missing-install_dir error, got: $err"
+fi
+# supplying both via flags only (config has neither) must succeed
+if python3 "$PACK" "$WORK/nodirs.yaml" \
+	--install-dir "$PROJ2" --output-dir "$WORK/enc3" --dry-run >/dev/null 2>&1; then
+	ok "CLI-only install_dir/output_dir (config omits both) works"
+else
+	bad "CLI-only dirs should satisfy the requirement"
+fi
+
 echo "== RESULT: $PASS passed, $FAIL failed =="
 [[ $FAIL -eq 0 ]]

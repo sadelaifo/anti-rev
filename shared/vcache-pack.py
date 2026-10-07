@@ -9,11 +9,14 @@
 # ([magic ANTREV01][iv:12][tag:16][ct...]), and leaves everything else alone.
 #
 # Usage:
-#   vcache-pack.py <config.yaml> [-j N] [--dry-run]
+#   vcache-pack.py <config.yaml> [--install-dir DIR] [--output-dir DIR] [-j N] [--dry-run]
+#
+# --install-dir / --output-dir override the config values (CLI wins); handy for
+# reusing one config across trees, or driving the packer from a build system.
 #
 # Config (YAML):
-#   install_dir: /root/proj          # tree to scan (required)
-#   output_dir:  /root/proj/.enc     # mirrored ciphertext tree (required)
+#   install_dir: /root/proj          # tree to scan (required; --install-dir overrides)
+#   output_dir:  /root/proj/.enc     # ciphertext tree (required; --output-dir overrides)
 #   key:         proj.key.hex        # hex keyfile, relative to the config file;
 #                                    #   created (0600) on first run if absent
 #   blacklist:                       # optional — ELFs to leave UNencrypted
@@ -200,6 +203,10 @@ def main() -> int:
     ap.add_argument("config", help="YAML config file")
     ap.add_argument("-j", "--jobs", type=int, default=0,
                     help="parallel workers (default: CPU count)")
+    ap.add_argument("--install-dir", metavar="DIR", default=None,
+                    help="tree to scan; overrides install_dir in the config")
+    ap.add_argument("--output-dir", metavar="DIR", default=None,
+                    help="ciphertext output tree; overrides output_dir in the config")
     ap.add_argument("--dry-run", action="store_true",
                     help="classify and report, but write nothing")
     args = ap.parse_args()
@@ -210,15 +217,22 @@ def main() -> int:
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f) or {}
 
-    for field in ("install_dir", "output_dir"):
-        if field not in cfg:
-            sys.exit(f"[error] missing required field '{field}' in config")
-
     def _expand(p: str) -> str:
         return os.path.expanduser(os.path.expandvars(p))
 
-    install_dir = Path(_expand(cfg["install_dir"])).resolve()
-    output_dir = Path(_expand(cfg["output_dir"])).resolve()
+    # install_dir / output_dir: a CLI flag overrides the config value (CLI wins).
+    # Each is required from exactly one source; error only if neither the flag
+    # nor the config supplies it.  A relative CLI path resolves against the
+    # current working directory, matching how a config value is resolved.
+    install_src = args.install_dir if args.install_dir is not None else cfg.get("install_dir")
+    output_src = args.output_dir if args.output_dir is not None else cfg.get("output_dir")
+    for field, val in (("install_dir", install_src), ("output_dir", output_src)):
+        if not val:
+            sys.exit(f"[error] missing required '{field}': set it in "
+                     f"{cfg_path.name} or pass --{field.replace('_', '-')}")
+
+    install_dir = Path(_expand(install_src)).resolve()
+    output_dir = Path(_expand(output_src)).resolve()
     key_path = (cfg_path.parent / _expand(cfg.get("key", "vcache.key"))).resolve()
     patterns = [p.replace("\\", "/") for p in (cfg.get("blacklist") or [])]
     # encrypt_ext (optional): extra file extensions to encrypt even when they are
