@@ -59,4 +59,43 @@ struct arev_cipher_arg {
 };
 #define AREV_IOC_OPEN_CIPHER	_IOWR(AREV_IOC_MAGIC, 2, struct arev_cipher_arg)
 
+/*
+ * AREV_IOC_INSTALL_CIPHER: write a CIPHERTEXT blob into the lower (.enc) store
+ * of a vcachefs mount, so it is thereafter served DECRYPTED through the mount.
+ * This is the "drop a hot-patch at runtime" primitive for the in-place layover
+ * deployment (lower == mountpoint), where the real lower directory is shadowed
+ * by the mount and so is unreachable from userspace — only the kernel, which
+ * pinned the lower dir dentry at mount time, can write there.
+ *
+ *   in : path      = userspace ptr to a NUL-terminated absolute DESTINATION
+ *                    path whose PARENT directory is under a vcachefs mount
+ *                    (e.g. "/root/project/lib/patch_v3"); the leaf must not
+ *                    already exist (installs never overwrite — a stale inode
+ *                    classification would otherwise mask the new bytes).
+ *        path_len  = strlen(path)+1 (sanity cap AREV_PATH_MAX)
+ *        mode      = file mode for the new lower file (e.g. 0644; masked 0777)
+ *        data      = userspace ptr to the ciphertext (a keyless FS_MAGIC
+ *                    container, encrypted with the project key baked into the
+ *                    .ko; the kernel verifies the leading magic and rejects
+ *                    anything else, so this cannot plant arbitrary files)
+ *        data_len  = ciphertext length (>= header, <= AREV_INSTALL_MAX)
+ *   ret = 0 on success; <0 on error (-EACCES unauthorized caller, -EEXIST leaf
+ *         present, -EINVAL not under a vcachefs mount / bad magic, -EROFS lower
+ *         read-only, ...).  On any failure after create the partial file is
+ *         unlinked.
+ *
+ * Gated (like the other ioctls) on vcf_ctl_caller_ok() — ship the installer as
+ * a pinned/signed binary.  The installer still never holds the AES key: it
+ * supplies ciphertext produced off-box with the project key.
+ */
+#define AREV_INSTALL_MAX	(64u * 1024 * 1024)	/* sanity cap on one blob */
+struct arev_install_arg {
+	__u64	path;		/* __u64 so the struct is 32/64-bit identical */
+	__u32	path_len;
+	__u32	mode;		/* new-file mode bits (masked to 0777) */
+	__u64	data;		/* ciphertext bytes */
+	__u64	data_len;
+};
+#define AREV_IOC_INSTALL_CIPHER	_IOW(AREV_IOC_MAGIC, 3, struct arev_install_arg)
+
 #endif /* AREV_UAPI_H */

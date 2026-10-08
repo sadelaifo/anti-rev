@@ -11,14 +11,24 @@
  *   AREV_IOC_OPEN_CIPHER(path): return the KEYLESS ciphertext of a vcachefs
  *       mount file as a fresh read-only fd, for the unauthorized-guest branch
  *       (authorized guests just read the mount and share the decrypted cache).
+ *   AREV_IOC_INSTALL_CIPHER(path,data): write a ciphertext blob into the lower
+ *       (.enc) store of a vcachefs mount so it is thereafter served DECRYPTED
+ *       through the mount — the "drop a hot-patch at runtime" primitive for the
+ *       in-place layover deployment, where the real lower dir is shadowed by
+ *       the mount and only the kernel (which pinned the lower dentry) can write
+ *       there.  Validates the FS_MAGIC header, never overwrites, unlinks a
+ *       partial file on error.  Still keyless: the caller supplies ciphertext
+ *       produced off-box with the project key; the AES key never leaves the .ko.
  *
- * Both ioctls are gated on the caller being the genuine emulator
- * (vcf_ctl_caller_ok(): whitelisted basename or a signed exe).  Opening the
- * device is unrestricted (mode 0666); all enforcement is per-ioctl.
+ * All ioctls are gated on the caller being the genuine emulator / a trusted
+ * installer (vcf_ctl_caller_ok(): whitelisted basename or a signed exe).
+ * Opening the device is unrestricted (mode 0666); all enforcement is per-ioctl.
  *
  * NOTE: not yet built/tested on a real kernel.  The kernel-version-sensitive
- * spots are shmem_file_setup(), fdget/fd_install, and kernel_write (via the
- * compat.h wrapper) — confirm on SLES 4.12 / mainline.
+ * spots are shmem_file_setup(), fdget/fd_install, kernel_write (via the compat.h
+ * wrapper), and — for INSTALL_CIPHER — vfs_create()/vfs_unlink() (the leading
+ * idmap/userns arg via compat.h VCF_IDMAP_ARG) + mnt_want_write(); confirm on
+ * SLES 4.12 / mainline.
  */
 #include <linux/module.h>
 #include <linux/fs.h>
@@ -29,6 +39,9 @@
 #include <linux/shmem_fs.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/mount.h>	/* mnt_want_write / mnt_drop_write */
+#include <linux/dcache.h>	/* d_hash_and_lookup / d_drop (negative-dentry flush) */
+#include <linux/string.h>	/* strrchr / memcmp */
 #include <linux/sched.h>	/* task_struct — current_cred() derefs current on 3.10 */
 #include <linux/cred.h>
 #include <linux/version.h>
@@ -197,16 +210,204 @@ put_path:
 	return ret;
 }
 
+/*
+ * AREV_IOC_INSTALL_CIPHER: write a ciphertext blob into the LOWER (.enc) store
+ * of a vcachefs mount.  See arev_uapi.h.  The destination path's PARENT must be
+ * a vcachefs directory; the leaf is created in the pinned lower directory
+ * (dii->lower_path) and the ciphertext streamed in, so the mount then serves it
+ * decrypted.  Fails closed: validates the FS_MAGIC header, refuses to overwrite,
+ * and unlinks the partial file on any error.
+ */
+static long do_install_cipher(unsigned long arg)
+{
+	struct arev_install_arg iarg;
+	char *pathbuf = NULL, *base, *slash;
+	const char *dir;
+	const char __user *src;
+	struct path dpath, np;
+	struct inode *dinode, *ldir_inode;
+	struct vcachefs_inode_info *dii;
+	struct dentry *ld, *nd = NULL, *cached;
+	struct vfsmount *lmnt;
+	struct file *wf = NULL;
+	void *buf = NULL;
+	struct qstr q;
+	u64 remaining;
+	loff_t wpos = 0;
+	bool created = false, got_write = false, magic_checked = false;
+	umode_t mode;
+	long ret;
+
+	if (copy_from_user(&iarg, (void __user *)arg, sizeof(iarg)))
+		return -EFAULT;
+	if (iarg.path_len == 0 || iarg.path_len > AREV_PATH_MAX)
+		return -EINVAL;
+	if (iarg.data_len < ANTREV_HDR_LEN || iarg.data_len > AREV_INSTALL_MAX)
+		return -EINVAL;
+	mode = (umode_t)(iarg.mode & 0777);
+	if (!mode)
+		mode = 0644;
+
+	pathbuf = kmalloc(iarg.path_len, GFP_KERNEL);
+	if (!pathbuf)
+		return -ENOMEM;
+	if (copy_from_user(pathbuf, (void __user *)(uintptr_t)iarg.path,
+			   iarg.path_len)) {
+		ret = -EFAULT;
+		goto out;
+	}
+	pathbuf[iarg.path_len - 1] = '\0';
+
+	/* split "<dir>/<leaf>" — the leaf must not already exist (no overwrite) */
+	slash = strrchr(pathbuf, '/');
+	if (!slash || slash[1] == '\0') {	/* need a non-empty leaf */
+		ret = -EINVAL;
+		goto out;
+	}
+	*slash = '\0';
+	base = slash + 1;
+	dir = pathbuf[0] ? pathbuf : "/";
+	if (!strcmp(base, ".") || !strcmp(base, "..")) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	ret = kern_path(dir, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &dpath);
+	if (ret)
+		goto out;
+	dinode = d_inode(dpath.dentry);
+	if (dinode->i_sb->s_magic != VCACHEFS_MAGIC) {
+		ret = -EINVAL;			/* parent is not a vcachefs dir */
+		goto put_dpath;
+	}
+	dii = VCACHEFS_I(dinode);
+	if (!dii->lower_path.dentry) {
+		ret = -EINVAL;
+		goto put_dpath;
+	}
+	ld = dii->lower_path.dentry;
+	lmnt = dii->lower_path.mnt;
+	ldir_inode = d_inode(ld);
+
+	ret = mnt_want_write(lmnt);		/* -EROFS if the lower is read-only */
+	if (ret)
+		goto put_dpath;
+	got_write = true;
+
+	/* create the leaf in the pinned lower directory */
+	inode_lock(ldir_inode);
+	nd = lookup_one_len(base, ld, strlen(base));
+	if (IS_ERR(nd)) {
+		ret = PTR_ERR(nd);
+		nd = NULL;
+		inode_unlock(ldir_inode);
+		goto drop_write;
+	}
+	if (d_really_is_positive(nd)) {
+		ret = -EEXIST;			/* never overwrite (stale-cache hazard) */
+		inode_unlock(ldir_inode);
+		goto drop_write;
+	}
+	ret = vfs_create(VCF_IDMAP_ARG ldir_inode, nd, mode, true);
+	inode_unlock(ldir_inode);
+	if (ret)
+		goto drop_write;
+	created = true;
+
+	/* open the new lower file for writing (through the lower mnt) */
+	np.mnt = lmnt;
+	np.dentry = nd;
+	wf = dentry_open(&np, O_WRONLY | O_LARGEFILE, current_cred());
+	if (IS_ERR(wf)) {
+		ret = PTR_ERR(wf);
+		wf = NULL;
+		goto unlink;
+	}
+
+	buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!buf) {
+		ret = -ENOMEM;
+		goto unlink;
+	}
+
+	src = (const char __user *)(uintptr_t)iarg.data;
+	remaining = iarg.data_len;
+	while (remaining > 0) {
+		size_t chunk = remaining < PAGE_SIZE ? (size_t)remaining : PAGE_SIZE;
+		ssize_t wn;
+
+		if (copy_from_user(buf, src, chunk)) {
+			ret = -EFAULT;
+			goto unlink;
+		}
+		if (!magic_checked) {		/* first bytes must be the container magic */
+			if (chunk < ANTREV_MAGIC_LEN ||
+			    memcmp(buf, ANTREV_MAGIC, ANTREV_MAGIC_LEN)) {
+				ret = -EINVAL;
+				goto unlink;
+			}
+			magic_checked = true;
+		}
+		wn = vcf_kernel_write(wf, buf, chunk, &wpos);
+		if (wn != (ssize_t)chunk) {
+			ret = wn < 0 ? wn : -EIO;
+			goto unlink;
+		}
+		src += chunk;
+		remaining -= chunk;
+	}
+
+	/* Flush any cached NEGATIVE vcachefs dentry for this leaf so the next
+	 * lookup through the mount sees the file we just created (vcachefs has no
+	 * d_revalidate, so a stale negative dentry would otherwise mask it). */
+	q.name = (const unsigned char *)base;
+	q.len = strlen(base);
+	cached = d_hash_and_lookup(dpath.dentry, &q);
+	if (!IS_ERR_OR_NULL(cached)) {
+		if (!d_really_is_positive(cached))
+			d_drop(cached);
+		dput(cached);
+	}
+
+	ret = 0;
+	kfree(buf);
+	fput(wf);
+	wf = NULL;
+	goto drop_write;			/* success: skip the unlink block */
+
+unlink:
+	kfree(buf);
+	if (wf)
+		fput(wf);
+	if (created) {
+		inode_lock(ldir_inode);
+		vfs_unlink(VCF_IDMAP_ARG ldir_inode, nd, NULL);
+		inode_unlock(ldir_inode);
+	}
+drop_write:
+	if (got_write)
+		mnt_drop_write(lmnt);
+	if (nd)
+		dput(nd);
+put_dpath:
+	path_put(&dpath);
+out:
+	kfree(pathbuf);
+	return ret;
+}
+
 static long vcf_ctl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	if (!vcf_ctl_caller_ok())
-		return -EACCES;		/* only the genuine emulator */
+		return -EACCES;		/* only the genuine emulator / trusted installer */
 
 	switch (cmd) {
 	case AREV_IOC_AUTHORIZE_FD:
 		return do_authorize_fd(arg);
 	case AREV_IOC_OPEN_CIPHER:
 		return do_open_cipher(arg);
+	case AREV_IOC_INSTALL_CIPHER:
+		return do_install_cipher(arg);
 	default:
 		return -ENOTTY;
 	}

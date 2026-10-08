@@ -181,4 +181,23 @@ static inline bool vcf_is_exec_open(struct file *file)
 	return (file->f_mode & FMODE_EXEC) || (file->f_flags & __FMODE_EXEC);
 }
 
+/*
+ * Leading idmap/user-namespace argument for the write-side VFS helpers
+ * (vfs_create / vfs_unlink / ...).  It did not exist before 5.12, was added as
+ * `struct user_namespace *` in 5.12, and became `struct mnt_idmap *` in 6.3.
+ * VCF_IDMAP_ARG expands to the right leading argument (with its trailing comma)
+ * or to nothing on <5.12, so a call site reads uniformly:
+ *     vfs_create(VCF_IDMAP_ARG dir, dentry, mode, true);
+ * Only ctldev.c's INSTALL_CIPHER uses these — vcachefs is otherwise read-only.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#include <linux/mnt_idmap.h>
+#define VCF_IDMAP_ARG	&nop_mnt_idmap,
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+#include <linux/user_namespace.h>
+#define VCF_IDMAP_ARG	&init_user_ns,
+#else
+#define VCF_IDMAP_ARG
+#endif
+
 #endif /* _VCACHEFS_COMPAT_H */
