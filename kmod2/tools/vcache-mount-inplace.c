@@ -67,11 +67,16 @@
 
 /* Lists — ONE whitespace-separated string (no commas).  Wrap the whole string
  * in OBFSTR(...) to obfuscate it; "" = empty list.  WRITE_* entries are
- * "<mount-root>|<relative-path>", space-separated. */
-#define CFG_MOUNTS        OBFSTR("/root/proj/bin /root/proj/lib")
+ * "<mount-root>|<relative-path>", space-separated.
+ *
+ * Mount roots (and WRITE_* roots) may be RELATIVE: a relative entry is rebased
+ * onto $SOFTWARE_PATH at runtime (default /root/proj), so "bin lib" becomes
+ * "$SOFTWARE_PATH/bin $SOFTWARE_PATH/lib".  An entry that already starts with
+ * '/' is treated as absolute and left unchanged. */
+#define CFG_MOUNTS        OBFSTR("bin lib")  /* relative to $SOFTWARE_PATH */
 #define CFG_ALLOW         ""                 /* legacy model only; prefer per-exe sigs */
-#define CFG_WRITE_DIRS    ""                 /* e.g. OBFSTR("/root/proj/bin|logs") */
-#define CFG_WRITE_FILES   ""                 /* e.g. OBFSTR("/root/proj/bin|QtApplication.pid") */
+#define CFG_WRITE_DIRS    ""                 /* e.g. OBFSTR("bin|logs") */
+#define CFG_WRITE_FILES   ""                 /* e.g. OBFSTR("bin|QtApplication.pid") */
 /* ======================= end EDIT ME ====================================== */
 
 /* ------------------------------------------------------------------ config */
@@ -154,6 +159,34 @@ static char **list_env(const char *k)
 { const char *v = getenv(k); return (v && *v) ? split_ws(v) : NULL; }
 
 static int list_len(char **a) { int n = 0; while (a && a[n]) n++; return n; }
+
+/* Rebase every RELATIVE entry of a NULL-terminated list onto <base>, in place:
+ *   "bin"        -> "<base>/bin"
+ *   "bin|logs"   -> "<base>/bin|logs"   (WRITE_* "root|rel": only root rebased)
+ * Entries that already start with '/' are absolute and left untouched, so an
+ * env override carrying absolute paths still works.  No-op if base is empty. */
+static void rebase_list(char **a, const char *base)
+{
+	if (!a || !base || !*base)
+		return;
+	size_t blen = strlen(base);
+	while (blen && base[blen - 1] == '/')   /* trim trailing '/' on base */
+		blen--;
+	for (int i = 0; a[i]; i++) {
+		if (a[i][0] == '/')             /* already absolute */
+			continue;
+		const char *bar = strchr(a[i], '|');   /* WRITE_* "root|rel" */
+		size_t rootlen = bar ? (size_t)(bar - a[i]) : strlen(a[i]);
+		const char *tail = bar ? bar : "";     /* "|rel" kept verbatim */
+		char *out = malloc(blen + 1 + rootlen + strlen(tail) + 1);
+		if (!out)
+			die("out of memory rebasing mount list");
+		sprintf(out, "%.*s/%.*s%s", (int)blen, base,
+			(int)rootlen, a[i], tail);
+		free(a[i]);
+		a[i] = out;
+	}
+}
 
 /* ------------------------------------------------------------- subprocesses */
 
@@ -822,6 +855,15 @@ static void load_config(void)
 	ALLOWL      = list_env(OBFSTR("AREV_ALLOW"));       if (!ALLOWL)      ALLOWL      = split_ws(CFG_ALLOW);
 	WRITE_DIRS  = list_env(OBFSTR("AREV_WRITE_DIRS"));  if (!WRITE_DIRS)  WRITE_DIRS  = split_ws(CFG_WRITE_DIRS);
 	WRITE_FILES = list_env(OBFSTR("AREV_WRITE_FILES")); if (!WRITE_FILES) WRITE_FILES = split_ws(CFG_WRITE_FILES);
+
+	/* Rebase relative mount/write roots onto $SOFTWARE_PATH (default
+	 * /root/proj).  Absolute entries are left as-is.  The WRITE_* roots must
+	 * stay byte-identical to their MOUNTS entry (they are matched by strcmp),
+	 * so all three lists are rebased with the same base. */
+	const char *base = env_def(OBFSTR("SOFTWARE_PATH"), OBFSTR("/root/proj"));
+	rebase_list(MOUNTS,      base);
+	rebase_list(WRITE_DIRS,  base);
+	rebase_list(WRITE_FILES, base);
 }
 
 static void usage(void)
