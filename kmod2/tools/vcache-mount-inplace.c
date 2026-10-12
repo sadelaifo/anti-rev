@@ -70,10 +70,16 @@
  * "<mount-root>|<relative-path>", space-separated.
  *
  * Mount roots (and WRITE_* roots) may be RELATIVE: a relative entry is rebased
- * onto $SOFTWARE_PATH at runtime (default /root/proj), so "bin lib" becomes
- * "$SOFTWARE_PATH/bin $SOFTWARE_PATH/lib".  An entry that already starts with
- * '/' is treated as absolute and left unchanged. */
-#define CFG_MOUNTS        OBFSTR("bin lib")  /* relative to $SOFTWARE_PATH */
+ * onto the install root at runtime, so "bin lib" becomes
+ * "<install-root>/bin <install-root>/lib".  An entry that already starts with
+ * '/' is treated as absolute and left unchanged.
+ *
+ * The install root is taken from the $CFG_SWPATH_ENV environment variable, or
+ * CFG_SWPATH_DEFAULT when that env var is unset/empty.  Edit either below to
+ * change the env-var name or the fallback path. */
+#define CFG_SWPATH_ENV    OBFSTR("SOFTWARE_PATH")  /* env var naming the install root */
+#define CFG_SWPATH_DEFAULT OBFSTR("/root/proj")    /* install root when env unset */
+#define CFG_MOUNTS        OBFSTR("bin lib")  /* relative to the install root */
 #define CFG_ALLOW         ""                 /* legacy model only; prefer per-exe sigs */
 #define CFG_WRITE_DIRS    ""                 /* e.g. OBFSTR("bin|logs") */
 #define CFG_WRITE_FILES   ""                 /* e.g. OBFSTR("bin|QtApplication.pid") */
@@ -856,11 +862,11 @@ static void load_config(void)
 	WRITE_DIRS  = list_env(OBFSTR("AREV_WRITE_DIRS"));  if (!WRITE_DIRS)  WRITE_DIRS  = split_ws(CFG_WRITE_DIRS);
 	WRITE_FILES = list_env(OBFSTR("AREV_WRITE_FILES")); if (!WRITE_FILES) WRITE_FILES = split_ws(CFG_WRITE_FILES);
 
-	/* Rebase relative mount/write roots onto $SOFTWARE_PATH (default
-	 * /root/proj).  Absolute entries are left as-is.  The WRITE_* roots must
-	 * stay byte-identical to their MOUNTS entry (they are matched by strcmp),
-	 * so all three lists are rebased with the same base. */
-	const char *base = env_def(OBFSTR("SOFTWARE_PATH"), OBFSTR("/root/proj"));
+	/* Rebase relative mount/write roots onto the install root ($CFG_SWPATH_ENV,
+	 * default CFG_SWPATH_DEFAULT).  Absolute entries are left as-is.  The WRITE_*
+	 * roots must stay byte-identical to their MOUNTS entry (they are matched by
+	 * strcmp), so all three lists are rebased with the same base. */
+	const char *base = env_def(CFG_SWPATH_ENV, CFG_SWPATH_DEFAULT);
 	rebase_list(MOUNTS,      base);
 	rebase_list(WRITE_DIRS,  base);
 	rebase_list(WRITE_FILES, base);
