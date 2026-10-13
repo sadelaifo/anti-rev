@@ -10,6 +10,7 @@
  */
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
+#include <linux/mm.h>		/* vmalloc_to_page() */
 #include <linux/scatterlist.h>
 #include <linux/string.h>
 #include <linux/completion.h>
@@ -219,7 +220,10 @@ static int vcf_kernel_gcm_decrypt(const u8 *key, const u8 *iv,
 {
 	struct crypto_aead *tfm;
 	struct aead_request *req;
-	struct scatterlist sg;
+	struct scatterlist *sg = NULL;
+	unsigned int npages, i;
+	unsigned long addr;
+	size_t rem;
 	AREV_DECLARE_WAIT(wait);
 	char alg[16];
 	int ret;
@@ -238,16 +242,47 @@ static int vcf_kernel_gcm_decrypt(const u8 *key, const u8 *iv,
 		ret = -ENOMEM;
 		goto out_tfm;
 	}
+
+	/* buf is vmalloc()'d (whole-file plaintext can exceed the contiguous
+	 * kmalloc limit), so its pages are NOT in the kernel linear map and
+	 * sg_init_one()'s virt_to_page() would build a bogus scatterlist and
+	 * crash the AEAD backend when it walks it.  Map the real vmalloc pages
+	 * with vmalloc_to_page() into a per-page scatterlist instead. */
+	npages = DIV_ROUND_UP(offset_in_page(buf) + buf_len, PAGE_SIZE);
+	sg = kmalloc_array(npages, sizeof(*sg), GFP_KERNEL);
+	if (!sg) {
+		ret = -ENOMEM;
+		goto out_req;
+	}
+	sg_init_table(sg, npages);
+	addr = (unsigned long)buf;
+	rem = buf_len;
+	for (i = 0; i < npages; i++) {
+		unsigned int off = offset_in_page(addr);
+		unsigned int len = min_t(size_t, PAGE_SIZE - off, rem);
+		struct page *pg = vmalloc_to_page((void *)addr);
+
+		if (!pg) {
+			ret = -EFAULT;
+			goto out_sg;
+		}
+		sg_set_page(&sg[i], pg, len, off);
+		addr += len;
+		rem -= len;
+	}
+
 	/* In-place: src/dst is the same [ct||tag] buffer; on success the first
 	 * ct_len bytes hold plaintext.  assoclen = 0 (no AAD). */
-	sg_init_one(&sg, buf, buf_len);
 	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
 				  CRYPTO_TFM_REQ_MAY_SLEEP, vcf_aead_done, &wait);
-	aead_request_set_crypt(req, &sg, &sg, buf_len, (u8 *)iv);
+	aead_request_set_crypt(req, sg, sg, buf_len, (u8 *)iv);
 	aead_request_set_ad(req, 0);
 	ret = vcf_aead_wait(crypto_aead_decrypt(req), &wait);
 	if (ret == 0)
 		memcpy(out, buf, ct_len);	/* tag verified */
+out_sg:
+	kfree(sg);
+out_req:
 	aead_request_free(req);
 out_tfm:
 	crypto_free_aead(tfm);
