@@ -84,11 +84,95 @@ from pathlib import Path
 try:
     import yaml
 except ImportError:
-    sys.exit("Missing dependency: pip install pyyaml")
+    yaml = None   # optional: a built-in subset parser (_load_config) is used instead
 
-sys.path.insert(0, str(Path(__file__).parent))
+_here = Path(__file__).resolve().parent
+sys.path.insert(0, str(_here))                              # encryptor/ (local modules)
+sys.path.insert(0, str(_here.parent.parent / "shared"))    # shared/ (protect.py moved here)
 from protect import (load_or_create_key, encrypt_data, MAGIC,
                      BFLAG_HAS_MAIN, BFLAG_DAEMON_LIBS)
+
+
+# ── Config loading (PyYAML optional) ─────────────────────────────────
+def _parse_simple_yaml(text: str) -> dict:
+    """Minimal YAML-subset parser so pack configs load without PyYAML.
+
+    Supports exactly what these configs use:
+      key: value                     # scalar (optionally "quoted"/'quoted')
+      key:                           # block follows:
+        - item                       #   a list of scalars, or
+        subkey: value                #   a one-level nested mapping (e.g. stubs:)
+      # comments (whole-line or trailing, honoring quotes)
+    Not a general YAML parser (no flow syntax, multi-line scalars, anchors, or
+    nested lists).  If anything richer is needed, install PyYAML and it's used
+    automatically.
+    """
+    def strip_comment(s: str) -> str:
+        out, q, i = [], None, 0
+        while i < len(s):
+            c = s[i]
+            if q:
+                out.append(c)
+                if c == q:
+                    q = None
+            elif c in ('"', "'"):
+                q = c; out.append(c)
+            elif c == '#':
+                break
+            else:
+                out.append(c)
+            i += 1
+        return ''.join(out)
+
+    def unquote(v: str):
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+            return v[1:-1]
+        if v in ('null', '~', ''):
+            return None
+        return v
+
+    root: dict = {}
+    cur_key = None            # top-level key whose block we're filling
+    cur_container = None      # the list/dict being populated under cur_key
+    for raw in text.splitlines():
+        line = strip_comment(raw).rstrip()
+        if not line.strip():
+            continue
+        stripped = line.strip()
+        if stripped.startswith('- '):                      # list item
+            if not isinstance(cur_container, list):
+                cur_container = []
+                root[cur_key] = cur_container
+            cur_container.append(unquote(stripped[2:]))
+            continue
+        if ':' not in stripped:                            # malformed — skip
+            continue
+        k, _, v = stripped.partition(':')
+        k, v = k.strip(), v.strip()
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            if v == '':
+                cur_key, cur_container = k, None           # block follows
+                root.setdefault(k, None)
+            else:
+                root[k] = unquote(v)
+                cur_key, cur_container = None, None
+        else:                                              # nested mapping value
+            if not isinstance(cur_container, dict):
+                cur_container = {}
+                root[cur_key] = cur_container
+            cur_container[k] = unquote(v)
+    return root
+
+
+def _load_config(path: Path) -> dict:
+    """Load a pack config.  Uses PyYAML when available, else the built-in
+    subset parser — so antirev-pack has no hard PyYAML dependency."""
+    text = Path(path).read_text()
+    if yaml is not None:
+        return yaml.safe_load(text) or {}
+    return _parse_simple_yaml(text)
 
 def _resolve_field(cli_val, cfg, key, default=None):
     """Merge a single config field with CLI override precedence.
@@ -620,8 +704,8 @@ def main():
     if not config_path.exists():
         sys.exit(f"[error] config not found: {config_path}")
 
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f) or {}   # empty YAML -> {} so CLI-only runs work
+    cfg = _load_config(config_path)   # PyYAML if present, else built-in parser
+    cfg = cfg or {}                   # empty config -> {} so CLI-only runs work
 
     def _expand(p: str) -> str:
         return os.path.expanduser(os.path.expandvars(p))
