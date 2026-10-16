@@ -1579,23 +1579,28 @@ static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
      * under the tree (e.g. <root>/bin) and still serve every encrypted
      * lib in it (e.g. <root>/lib):
      *
-     *   1. <base>/<VCACHE_SUBDIR>, where <base> is $VCACHE_HOME if set,
-     *      else $HOME, and <VCACHE_SUBDIR> defaults to "SW" (build-time
-     *      -DVCACHE_SUBDIR="..." overrides it).  $VCACHE_HOME is the
-     *      editable knob: a deployment whose install tree is not under
-     *      the login $HOME just exports VCACHE_HOME (it plays the exact
-     *      role of HOME).  Both the daemon and the protected exes must
-     *      see the same value — export it in the systemd unit / start
-     *      script so every node agrees on the root.
-     *   2. the lrxd's own directory (tests/demos not installed under a
+     *   1. $VCACHE_HOME, used VERBATIM as the scan root when set and a
+     *      directory (no subtree appended).  This is the editable knob:
+     *      a deployment points it straight at its install tree, e.g.
+     *      VCACHE_HOME=/root/SW  ->  scan /root/SW.  Both the daemon and
+     *      the protected exes must see the same value — export it in the
+     *      systemd unit / start script so every node agrees on the root.
+     *   2. $HOME/<VCACHE_SUBDIR> (subtree defaults to "SW"; build-time
+     *      -DVCACHE_SUBDIR="..." overrides it) — the default when
+     *      VCACHE_HOME is unset.
+     *   3. the lrxd's own directory (tests/demos not installed under a
      *      dedicated tree).
      */
     char sa_root[4096];
-    const char *base = getenv("VCACHE_HOME");
-    if (!base || !base[0]) base = getenv("HOME");
+    const char *root_env = getenv("VCACHE_HOME");
+    const char *home = getenv("HOME");
     struct stat sa_st;
-    if (base && base[0]
-        && (size_t) snprintf(sa_root, sizeof(sa_root), "%s/%s", base,
+    if (root_env && root_env[0]
+        && stat(root_env, &sa_st) == 0 && S_ISDIR(sa_st.st_mode)) {
+        snprintf(dir, sizeof(dir), "%s", root_env);
+        LOG_INFO("[antirev] scan root (VCACHE_HOME): %s\n", dir);
+    } else if (home && home[0]
+        && (size_t) snprintf(sa_root, sizeof(sa_root), "%s/%s", home,
                              VCACHE_SUBDIR) < sizeof(sa_root)
         && stat(sa_root, &sa_st) == 0 && S_ISDIR(sa_st.st_mode)) {
         snprintf(dir, sizeof(dir), "%s", sa_root);

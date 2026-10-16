@@ -5,7 +5,8 @@
 #
 # Proves scan_encrypted_libs() root selection (stub.c):
 #   A. default   : $HOME set, VCACHE_HOME unset -> scan root $HOME/SW
-#   B. override  : $HOME has no SW, VCACHE_HOME set -> scan root $VCACHE_HOME/SW
+#   B. override  : $HOME has no SW, VCACHE_HOME=<root>/SW (verbatim, no subtree
+#                  appended) -> scan root is exactly $VCACHE_HOME
 #   C. control   : neither valid -> exe-dir fallback (<root>/SW/bin, which holds
 #                  no lib) -> the job MUST fail, proving the root is load-bearing
 #
@@ -72,8 +73,8 @@ echo "=== test_scan_root: configurable daemon scan root ==="
 FAILS=0
 ( export HOME="$ROOT"; unset VCACHE_HOME LD_PRELOAD LD_LIBRARY_PATH __r_LS __r_FM __r_EL __r_SD; \
   run_phase "A default \$HOME/SW" ok ); FAILS=$((FAILS + $?))
-( export HOME="$EMPTY" VCACHE_HOME="$ROOT"; unset LD_PRELOAD LD_LIBRARY_PATH __r_LS __r_FM __r_EL __r_SD; \
-  run_phase "B VCACHE_HOME overrides HOME" ok ); FAILS=$((FAILS + $?))
+( export HOME="$EMPTY" VCACHE_HOME="$ROOT/SW"; unset LD_PRELOAD LD_LIBRARY_PATH __r_LS __r_FM __r_EL __r_SD; \
+  run_phase "B VCACHE_HOME verbatim root" ok ); FAILS=$((FAILS + $?))
 ( export HOME="$EMPTY"; unset VCACHE_HOME LD_PRELOAD LD_LIBRARY_PATH __r_LS __r_FM __r_EL __r_SD; \
   run_phase "C control (no valid root)" fail ); FAILS=$((FAILS + $?))
 
