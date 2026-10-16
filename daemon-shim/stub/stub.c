@@ -1562,24 +1562,44 @@ static void collect_enc_paths(const char *dir, dec_job_t *jobs, int *njobs,
     closedir(dp);
 }
 
+/* Install subtree appended to the base dir ($VCACHE_HOME or $HOME).
+ * Override at build time with -DVCACHE_SUBDIR="myapp" to bake a
+ * different default tree name. */
+#ifndef VCACHE_SUBDIR
+#define VCACHE_SUBDIR "SW"
+#endif
+
 /* Scan directory, decrypt all encrypted libs in parallel using pthreads */
 static int scan_encrypted_libs(const char *exe_path, const uint8_t *key,
                                int *lib_fds, char (*lib_names)[MAX_NAME + 1],
                                int *nlibs)
 {
     char dir[4096];
-    /* Lib-scan root is pinned to $HOME/SA — the install tree of the
-     * protected suite — so the daemon (lrxd) can live anywhere under it
-     * (e.g. $HOME/SA/bin) and still serve every encrypted lib in the
-     * tree (e.g. $HOME/SA/lib).  Falls back to the lrxd's own directory
-     * when $HOME/SA is absent (tests/demos not installed under it). */
+    /* Lib-scan root selection — so the daemon (lrxd) can live anywhere
+     * under the tree (e.g. <root>/bin) and still serve every encrypted
+     * lib in it (e.g. <root>/lib):
+     *
+     *   1. <base>/<VCACHE_SUBDIR>, where <base> is $VCACHE_HOME if set,
+     *      else $HOME, and <VCACHE_SUBDIR> defaults to "SW" (build-time
+     *      -DVCACHE_SUBDIR="..." overrides it).  $VCACHE_HOME is the
+     *      editable knob: a deployment whose install tree is not under
+     *      the login $HOME just exports VCACHE_HOME (it plays the exact
+     *      role of HOME).  Both the daemon and the protected exes must
+     *      see the same value — export it in the systemd unit / start
+     *      script so every node agrees on the root.
+     *   2. the lrxd's own directory (tests/demos not installed under a
+     *      dedicated tree).
+     */
     char sa_root[4096];
-    const char *home = getenv("HOME");
+    const char *base = getenv("VCACHE_HOME");
+    if (!base || !base[0]) base = getenv("HOME");
     struct stat sa_st;
-    if (home && home[0]
-        && (size_t) snprintf(sa_root, sizeof(sa_root), "%s/SA", home) < sizeof(sa_root)
+    if (base && base[0]
+        && (size_t) snprintf(sa_root, sizeof(sa_root), "%s/%s", base,
+                             VCACHE_SUBDIR) < sizeof(sa_root)
         && stat(sa_root, &sa_st) == 0 && S_ISDIR(sa_st.st_mode)) {
         snprintf(dir, sizeof(dir), "%s", sa_root);
+        LOG_INFO("[antirev] scan root: %s\n", dir);
     } else {
         const char *slash = strrchr(exe_path, '/');
         if (slash) {

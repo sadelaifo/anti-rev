@@ -1544,6 +1544,20 @@ add_custom_target(test_lib_daemon
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_scan_root — configurable daemon scan root ($VCACHE_HOME / <base>/SW)
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_target(test_scan_root
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_scan_root ==="
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/scan_root/run_test.sh"
+            "${CMAKE_BINARY_DIR}/stub"
+    DEPENDS stub antirev_shim
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "configurable daemon scan root (VCACHE_HOME / <base>/SW)"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_python_client_daemon — antirev_client.py speaks daemon protocol v2
 # ═══════════════════════════════════════════════════════════════════════
 
