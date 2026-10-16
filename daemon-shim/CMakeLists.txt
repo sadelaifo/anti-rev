@@ -1544,6 +1544,20 @@ add_custom_target(test_lib_daemon
 )
 
 # ═══════════════════════════════════════════════════════════════════════
+#  test_pack_symlinks — antirev-pack.py keeps symlinks resolvable in output
+# ═══════════════════════════════════════════════════════════════════════
+
+add_custom_target(test_pack_symlinks
+    COMMAND ${CMAKE_COMMAND} -E echo "=== test_pack_symlinks ==="
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/pack_symlinks/run_test.sh"
+            "${CMAKE_BINARY_DIR}/stub"
+    DEPENDS stub
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "antirev-pack.py symlink resolution (auto-copy target, abs->rel)"
+    USES_TERMINAL
+)
+
+# ═══════════════════════════════════════════════════════════════════════
 #  test_scan_root — configurable daemon scan root ($VCACHE_HOME / <base>/SW)
 # ═══════════════════════════════════════════════════════════════════════
 

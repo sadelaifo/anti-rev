@@ -871,6 +871,64 @@ def main():
                 # No filter: encrypt all libs
                 lib_files.append(src)
 
+    # ── Resolve symlink targets so the packed tree stays self-contained ─
+    # A recreated symlink only resolves if its target exists in the OUTPUT
+    # tree.  Without this pass, links whose target got filtered out (a
+    # non-ELF not in `copy:`) dangle silently, and absolute links point
+    # back at the plaintext origin (which isn't shipped, and leaks that
+    # path).  Three fix-ups:
+    #   * an ABSOLUTE target that resolves INSIDE install_dir is rewritten
+    #     to a path relative to the link's own directory, so it points
+    #     within the shipped tree.  Relative links are left verbatim so
+    #     SONAME chains (libfoo.so -> .so.1 -> .so.1.2.3) are preserved
+    #     exactly — the daemon's symlink dir and ld.so resolve by soname.
+    #   * a target that is a regular file inside install_dir but was
+    #     otherwise filtered out is AUTO-COPIED (plaintext) so the link
+    #     isn't left dangling — unless it is explicitly blacklisted.
+    #   * anything still unresolved (blacklisted / outside the tree /
+    #     already dangling in the source) is reported as a WARNING.
+    emitted = set()
+    for rel, _a, _s in exe_files:        emitted.add(rel)
+    for s in lib_files:                  emitted.add(str(s.relative_to(install_dir)))
+    for s in plain_libs:                 emitted.add(str(s.relative_to(install_dir)))
+    for s in copy_files:                 emitted.add(str(s.relative_to(install_dir)))
+    for rel, _a, _s in unsupported_arch: emitted.add(rel)
+
+    resolved_symlinks = []   # (src, final_target_text)
+    sym_autocopied   = []    # rel paths pulled in to satisfy a link
+    sym_dangling     = []    # (link_rel, reason)
+    for src, target in symlinks:
+        link_rel = str(src.relative_to(install_dir))
+        real = Path(os.path.realpath(src))
+        try:
+            target_rel = str(real.relative_to(install_dir))
+            inside = True
+        except ValueError:
+            target_rel, inside = None, False
+
+        final_target = target
+        if os.path.isabs(target) and inside:
+            final_target = os.path.relpath(real, start=src.parent)
+
+        if not src.exists():
+            sym_dangling.append((link_rel, f"target missing in source ({target})"))
+        elif inside and real.is_file():
+            if target_rel not in emitted:
+                if is_blacklisted(target_rel, blacklist):
+                    sym_dangling.append((link_rel, f"target is blacklisted: {target_rel}"))
+                else:
+                    copy_files.append(real)       # auto-copy to satisfy the link
+                    emitted.add(target_rel)
+                    sym_autocopied.append(target_rel)
+        elif inside and real.is_dir():
+            if not any(e == target_rel or e.startswith(target_rel + "/") for e in emitted):
+                sym_dangling.append((link_rel, f"target dir has no packed contents: {target_rel}"))
+        elif not inside:
+            sym_dangling.append((link_rel, f"target outside install tree: {target}"))
+
+        resolved_symlinks.append((src, final_target))
+    symlinks = resolved_symlinks
+
     # ── Report scan results ───────────────────────────────────────────
     print(f"[pack] Scanned {install_dir}")
     print(f"[pack]   Executables:    {len(exe_files)}")
@@ -880,6 +938,10 @@ def main():
     print(f"[pack]   Copy:           {len(copy_files)}")
     if symlinks:
         print(f"[pack]   Symlinks:       {len(symlinks)}")
+    if sym_autocopied:
+        print(f"[pack]   Symlink targets auto-copied (not in copy list): {len(sym_autocopied)}")
+        for rel in sym_autocopied:
+            print(f"[pack]     +copy (symlink target): {rel}")
     print(f"[pack]   Ignored:        {ignored}")
     print(f"[pack]   Workers:        {workers}")
     if skipped:
@@ -898,6 +960,12 @@ def main():
                   f"copying as plaintext")
             for rel in rels:
                 print(f"[pack]     plain (arch={arch}): {rel}")
+    if sym_dangling:
+        print(f"[pack]   WARNING: {len(sym_dangling)} symlink(s) will DANGLE in the "
+              f"output tree (target not packed):")
+        for link_rel, reason in sym_dangling:
+            print(f"[pack]     dangling: {link_rel}  ({reason})")
+        print(f"[pack]   -> add the target to `copy:` (or un-blacklist it) to fix.")
     print()
 
     # ── Lib handling mode ────────────────────────────────────────────────

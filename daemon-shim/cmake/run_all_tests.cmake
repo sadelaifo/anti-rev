@@ -28,6 +28,7 @@ set(TESTS
     test_script_multi_bin # script invokes A and B with shared + unique libs
     test_lib_daemon       # centralized lib daemon serves libs to client exes
     test_scan_root        # configurable daemon scan root (VCACHE_HOME / <base>/SW)
+    test_pack_symlinks    # antirev-pack.py keeps symlinks resolvable in output
     test_python_client_daemon  # antirev_client.py speaks daemon v2 protocol
     test_python_reload    # antirev_client ctypes reload re-runs ctor
     test_fd_reduction     # exe_shim ctor closes DT_NEEDED memfds
