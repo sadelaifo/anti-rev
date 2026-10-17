@@ -17,8 +17,8 @@ __pycache__/
 *.pyc
 
 # Test scratch dirs
-tests/**/_workdir/
-tests/**/out_*/
+**/tests/**/_workdir/
+**/tests/**/out_*/
 
 # Local Claude Code settings (per-machine)
 .claude/settings.local.json
