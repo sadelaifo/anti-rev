@@ -214,6 +214,24 @@ if(TARGET_ARCH STREQUAL "aarch64")
         "-Wl,--dynamic-linker=/lib64/ld-linux-aarch64.so.1")
 endif()
 
+# crypto.c (x86-64) includes <wmmintrin.h>/<smmintrin.h> for its AES-NI +
+# PCLMULQDQ fast path.  Newer gcc lets the per-function
+# __attribute__((target("aes,sse4.1"))) in crypto.c satisfy those headers'
+# ISA guards, so no global ISA flag is needed and the binary stays baseline
+# (runs on any x86-64).  gcc < 5, however, hard-#errors in <wmmintrin.h>
+# unless the ISAs are enabled on the command line:
+#   wmmintrin.h: error: #error "AES/PCLMUL instructions not enabled"
+# Enable them for just crypto.c on that old toolchain.  crypto.c still does
+# runtime CPUID detection (_detect_hw) and a portable-C fallback, so this
+# only permits the AES-NI code to COMPILE; it is never executed unless the
+# CPU advertises AES-NI/PCLMULQDQ.
+if(NOT TARGET_ARCH STREQUAL "aarch64"
+   AND CMAKE_C_COMPILER_ID STREQUAL "GNU"
+   AND CMAKE_C_COMPILER_VERSION VERSION_LESS 5.0)
+    set_source_files_properties("${CMAKE_BINARY_DIR}/obf/crypto.c" PROPERTIES
+        COMPILE_OPTIONS "-maes;-mpclmul;-mssse3;-msse4.1")
+endif()
+
 # stub.c #includes the generated blob headers — the object file can't
 # compile until they exist.  Declare both as OBJECT_DEPENDS and wire a
 # phony target dependency so parallel builds stay correct.  After the
