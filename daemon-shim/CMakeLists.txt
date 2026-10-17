@@ -4,6 +4,17 @@ project(antirev C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Belt-and-suspenders for old toolchains: on some gcc/CMake combinations
+# (notably gcc 4.8 on CentOS 7) CMAKE_C_STANDARD above is silently ignored
+# and the compiler falls back to its gnu90 default, which rejects the C99
+# declarations used throughout the stub ("error: 'for' loop initial
+# declarations are only allowed in C99 mode").  Force the flag explicitly
+# for GNU compilers — this matches the C_STANDARD intent above and is a
+# no-op on toolchains that already apply it.
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:-std=gnu11>)
+endif()
+
 # Emit compile_commands.json so CLion (and other clangd-based IDEs) can
 # index every translation unit with the real compile flags + include
 # paths.  Previously stub.c / exe_shim.c / dlopen_shim.c / crypto.c were

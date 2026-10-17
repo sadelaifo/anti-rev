@@ -209,7 +209,8 @@
         size_t _antirev_obf_n = sizeof(_antirev_obf_e);                   \
         char *_antirev_obf_buf =                                          \
             (char *)__builtin_alloca(_antirev_obf_n + 1);                 \
-        for (size_t _antirev_obf_i = 0;                                   \
+        size_t _antirev_obf_i;                                            \
+        for (_antirev_obf_i = 0;                                          \
              _antirev_obf_i < _antirev_obf_n; _antirev_obf_i++)           \
             _antirev_obf_buf[_antirev_obf_i] =                            \
                 (char)(_antirev_obf_e[_antirev_obf_i]                     \
