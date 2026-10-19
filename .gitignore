@@ -45,3 +45,20 @@ compile_commands.json
 .wsl_build.log
 glib-*.tar.xz
 /qemu-aarch64-static
+
+# In-source CMake build artifacts (proper build is out-of-source in build/).
+# These names are ONLY ever CMake-generated, so ignore them at any depth:
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+# Generated Makefiles live only at the repo root and in daemon-shim/ (both are
+# pure CMake projects). Anchored so the hand-written fusefs/ and kmod2/ Makefiles
+# are NOT ignored:
+/Makefile
+/daemon-shim/Makefile
+# daemon-shim codegen outputs when CMAKE_BINARY_DIR is the source root:
+/antirev_shim_blob.h
+/antirev_shim_blob_aarch64.h
+/runtime_paths.c
+/obf/
