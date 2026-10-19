@@ -31,6 +31,7 @@
 #include <linux/mm.h>
 #include <linux/sched.h>	/* task_struct — current_cred() derefs current on 3.10 */
 #include <linux/cred.h>
+#include <linux/dcache.h>	/* d_invalidate (via vcf_d_invalidate) for REFRESH_PATH */
 #include <linux/version.h>
 
 #include "compat.h"
@@ -197,16 +198,165 @@ put_path:
 	return ret;
 }
 
+/*
+ * AREV_IOC_LOWER_DIRFD: resolve a vcachefs DIRECTORY and hand back a fresh fd to
+ * its LOWER (real, on-disk) directory.  Needed for the live per-file upgrade of
+ * an IN-PLACE mount: once vcachefs is mounted over /root/proj/bin the real
+ * ciphertext dir is shadowed (and the mount is read-only), so the upgrade tool
+ * cannot reach it by path.  The module still holds it pinned in the inode's
+ * lower_path, so we return an fd to it; the tool then writes a temp file and
+ * atomically renameat()s it over the target (CIPHERTEXT only — no plaintext,
+ * no key crosses this interface).  Mirrors do_open_cipher's path handling.
+ */
+static long do_lower_dirfd(unsigned long arg)
+{
+	struct arev_cipher_arg carg;
+	char *pathbuf;
+	struct path p;
+	struct inode *inode;
+	struct vcachefs_inode_info *ii;
+	struct file *lf;
+	int nfd;
+	long ret;
+
+	if (copy_from_user(&carg, (void __user *)arg, sizeof(carg)))
+		return -EFAULT;
+	if (carg.path_len == 0 || carg.path_len > AREV_PATH_MAX)
+		return -EINVAL;
+
+	pathbuf = kmalloc(carg.path_len, GFP_KERNEL);
+	if (!pathbuf)
+		return -ENOMEM;
+	if (copy_from_user(pathbuf, (void __user *)(uintptr_t)carg.path,
+			   carg.path_len)) {
+		kfree(pathbuf);
+		return -EFAULT;
+	}
+	pathbuf[carg.path_len - 1] = '\0';
+
+	ret = kern_path(pathbuf, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &p);
+	kfree(pathbuf);
+	if (ret)
+		return ret;
+
+	inode = d_inode(p.dentry);
+	if (inode->i_sb->s_magic != VCACHEFS_MAGIC) {
+		ret = -EINVAL;			/* not a vcachefs path */
+		goto put_path;
+	}
+	if (!S_ISDIR(inode->i_mode)) {
+		ret = -ENOTDIR;
+		goto put_path;
+	}
+	ii = VCACHEFS_I(inode);
+	if (!ii->lower_path.dentry) {
+		ret = -EINVAL;
+		goto put_path;
+	}
+
+	/* O_RDONLY|O_DIRECTORY is enough: the fd only anchors the caller's
+	 * openat()/renameat(), whose create/rename permission is checked against
+	 * the LOWER directory's own mode (writable real fs, caller is root). */
+	lf = dentry_open(&ii->lower_path, O_RDONLY | O_DIRECTORY, current_cred());
+	if (IS_ERR(lf)) {
+		ret = PTR_ERR(lf);
+		goto put_path;
+	}
+
+	nfd = get_unused_fd_flags(O_CLOEXEC);
+	if (nfd < 0) {
+		ret = nfd;
+		goto put_lf;
+	}
+	carg.out_fd = nfd;
+	if (copy_to_user((void __user *)arg, &carg, sizeof(carg))) {
+		put_unused_fd(nfd);
+		ret = -EFAULT;
+		goto put_lf;
+	}
+
+	fd_install(nfd, lf);		/* transfers the 'lf' reference */
+	path_put(&p);
+	return 0;
+
+put_lf:
+	fput(lf);
+put_path:
+	path_put(&p);
+	return ret;
+}
+
+/*
+ * AREV_IOC_REFRESH_PATH: after an atomic rename replaced the lower file, drop
+ * the cached vcachefs dentry for that one path so the next access re-runs
+ * ->lookup against the lower dir.  The rename gave the lower a NEW inode, so the
+ * fresh lookup's iget5 (keyed on the lower dentry) misses the stale vcachefs
+ * inode and builds a new one — fresh classify, fresh gate verdict, fresh
+ * decrypt on first fault.  The stale inode is orphaned and freed at eviction
+ * (which also wipes + frees its decrypted ii->plain buffer); we deliberately do
+ * NOT free ii->plain here, as a concurrent reader may still be copying from it.
+ * Every other file's inode/pages/mmaps are untouched — no remount, no rmmod.
+ */
+static long do_refresh_path(unsigned long arg)
+{
+	struct arev_cipher_arg carg;
+	char *pathbuf;
+	struct path p;
+	struct inode *inode;
+	long ret;
+
+	if (copy_from_user(&carg, (void __user *)arg, sizeof(carg)))
+		return -EFAULT;
+	if (carg.path_len == 0 || carg.path_len > AREV_PATH_MAX)
+		return -EINVAL;
+
+	pathbuf = kmalloc(carg.path_len, GFP_KERNEL);
+	if (!pathbuf)
+		return -ENOMEM;
+	if (copy_from_user(pathbuf, (void __user *)(uintptr_t)carg.path,
+			   carg.path_len)) {
+		kfree(pathbuf);
+		return -EFAULT;
+	}
+	pathbuf[carg.path_len - 1] = '\0';
+
+	ret = kern_path(pathbuf, LOOKUP_FOLLOW, &p);
+	kfree(pathbuf);
+	if (ret)
+		return ret;
+
+	inode = d_inode(p.dentry);
+	if (inode->i_sb->s_magic != VCACHEFS_MAGIC) {
+		ret = -EINVAL;			/* not a vcachefs path */
+		goto put_path;
+	}
+	if (!S_ISREG(inode->i_mode)) {
+		ret = -EINVAL;			/* only regular files are refreshed */
+		goto put_path;
+	}
+
+	vcf_d_invalidate(p.dentry);
+	ret = 0;
+
+put_path:
+	path_put(&p);
+	return ret;
+}
+
 static long vcf_ctl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	if (!vcf_ctl_caller_ok())
-		return -EACCES;		/* only the genuine emulator */
+		return -EACCES;		/* only the genuine emulator / signed tool */
 
 	switch (cmd) {
 	case AREV_IOC_AUTHORIZE_FD:
 		return do_authorize_fd(arg);
 	case AREV_IOC_OPEN_CIPHER:
 		return do_open_cipher(arg);
+	case AREV_IOC_LOWER_DIRFD:
+		return do_lower_dirfd(arg);
+	case AREV_IOC_REFRESH_PATH:
+		return do_refresh_path(arg);
 	default:
 		return -ENOTTY;
 	}

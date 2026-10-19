@@ -14,6 +14,7 @@
 #include <linux/version.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
+#include <linux/dcache.h>
 
 /* hex2bin() moved from linux/kernel.h to linux/hex.h in 5.18. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
@@ -180,5 +181,26 @@ static inline bool vcf_is_exec_open(struct file *file)
 {
 	return (file->f_mode & FMODE_EXEC) || (file->f_flags & __FMODE_EXEC);
 }
+
+/*
+ * d_invalidate() unhashes a dentry and shrinks away its (unused) subtree, so a
+ * later lookup re-resolves it against the lower fs.  The prototype changed in
+ * 3.18 (commit 5542aa2fa743): before, it returned int and could fail with
+ * -EBUSY when the dentry still had busy children/mounts; from 3.18 it returns
+ * void and always succeeds (busy children are handled by the shrink).  vcachefs
+ * only calls it on a regular-file dentry (no children), so the pre-3.18 return
+ * is always 0 here; wrap both forms in a void helper.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 18, 0)
+static inline void vcf_d_invalidate(struct dentry *dentry)
+{
+	(void)d_invalidate(dentry);
+}
+#else
+static inline void vcf_d_invalidate(struct dentry *dentry)
+{
+	d_invalidate(dentry);
+}
+#endif
 
 #endif /* _VCACHEFS_COMPAT_H */

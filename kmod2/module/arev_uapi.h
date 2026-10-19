@@ -59,4 +59,31 @@ struct arev_cipher_arg {
 };
 #define AREV_IOC_OPEN_CIPHER	_IOWR(AREV_IOC_MAGIC, 2, struct arev_cipher_arg)
 
+/*
+ * AREV_IOC_LOWER_DIRFD: return a fresh fd for the LOWER (real, on-disk)
+ * directory that backs a vcachefs DIRECTORY `path`.  With an in-place mount the
+ * lower dir is shadowed by the read-only vcachefs mount and is unreachable by
+ * path, so an authorized upgrade tool asks the kernel for a handle to it, then
+ * creates a temp file + atomically renameat()s it over the target basename.
+ * Only CIPHERTEXT is written through this fd — no plaintext and no key ever
+ * cross the interface.  Reuses struct arev_cipher_arg:
+ *   in : path/path_len = a vcachefs DIRECTORY (e.g. /root/proj/bin)
+ *   out: out_fd        = O_DIRECTORY fd on the lower dir (caller owns/closes)
+ *   ret = 0 on success; <0 on error.
+ */
+#define AREV_IOC_LOWER_DIRFD	_IOWR(AREV_IOC_MAGIC, 3, struct arev_cipher_arg)
+
+/*
+ * AREV_IOC_REFRESH_PATH: drop the cached vcachefs dentry for ONE regular file
+ * `path` so the next access re-resolves the lower dentry and rebuilds a fresh
+ * inode (classification + decrypt + gate verdict) from the just-replaced lower
+ * file.  Lets a LIVE mount pick up new ciphertext for one file without a
+ * remount — every other file/subsystem is untouched.  The replacement MUST be
+ * an atomic rename in the lower dir (giving a NEW lower inode); an in-place
+ * overwrite is not picked up (the cached inode would be reused).  out_fd unused.
+ *   in : path/path_len = a vcachefs regular file (e.g. /root/proj/bin/FOO)
+ *   ret = 0 on success; <0 on error.
+ */
+#define AREV_IOC_REFRESH_PATH	_IOW(AREV_IOC_MAGIC, 4, struct arev_cipher_arg)
+
 #endif /* AREV_UAPI_H */

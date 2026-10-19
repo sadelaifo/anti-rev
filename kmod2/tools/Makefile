@@ -19,11 +19,18 @@ OBFGEN  := ../../tools/obfstr_gen.py
 OBFDIR  := obf
 PY      ?= python3
 
-all: vcache-mount vcache-mount-inplace
+all: vcache-mount vcache-mount-inplace vcache-replace
 
 # Minimal single-tree ro/rw helper (explicit args) — not obfuscated.
 vcache-mount: vcache-mount.c
 	$(CC) $(CFLAGS) $(SECFLAGS) $(LDFLAGS) -o $@ $<
+
+# Live per-file upgrade helper for in-place mounts.  Drives /dev/vcachefs
+# (AREV_IOC_LOWER_DIRFD + REFRESH_PATH), so it needs the shared UAPI header on
+# the include path.  Not obfuscated for v1 (it opens "/dev/vcachefs" and calls
+# mount-free ioctls — `strings` leaks no more than vcache-mount already does).
+vcache-replace: vcache-replace.c ../module/arev_uapi.h
+	$(CC) $(CFLAGS) $(SECFLAGS) -I../module $(LDFLAGS) -o $@ $<
 
 # Compiled twin of vcache-mount.sh.  Its string literals are XOR-obfuscated:
 # obfstr_gen.py rewrites this source into $(OBFDIR)/ with encrypted bytes, then
@@ -46,6 +53,6 @@ vcache-mount-inplace: $(OBFDIR)/vcache-mount-inplace.c
 	$(CC) $(CFLAGS) $(SECFLAGS) -I$(STUB) $(LDFLAGS) -o $@ $<
 
 clean:
-	rm -f vcache-mount vcache-mount-inplace
+	rm -f vcache-mount vcache-mount-inplace vcache-replace
 	rm -rf $(OBFDIR)
 .PHONY: all clean

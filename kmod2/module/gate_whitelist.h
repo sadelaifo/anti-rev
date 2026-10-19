@@ -25,6 +25,22 @@ static const char *const antirev_whitelist[] = {
 	 */
 	/* "python3", */
 	/* "your-launcher", */
+
+	/*
+	 * vcache-replace: the live per-file upgrade tool.  It drives the
+	 * /dev/vcachefs control device (AREV_IOC_LOWER_DIRFD + REFRESH_PATH) to
+	 * swap one encrypted executable in an in-place mount without a remount.
+	 * NOTE: this whitelist is shared with the data-read gate, so listing a
+	 * basename here also lets a process so named read DECRYPTED content
+	 * through the mount.  vcache-replace never does (it only writes
+	 * ciphertext into the lower dir), but a different binary renamed to
+	 * "vcache-replace" would inherit that trust — acceptable under the
+	 * rookie/competitor threat model (needs root at the box).  HARDENING:
+	 * drop this entry and instead per-exe-sign vcache-replace (passes via
+	 * the signature branch) or pin it by name+SHA-256 in
+	 * gate_trusted_hashes.h, exactly as qemu-aarch64-static is.
+	 */
+	"vcache-replace",
 	NULL
 };
 
