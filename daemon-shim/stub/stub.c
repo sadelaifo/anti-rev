@@ -57,6 +57,21 @@
 #include <signal.h>
 #include "crypto.h"
 
+/* explicit_bzero() is glibc 2.25+ (musl 1.1.5+).  Enterprise targets such
+ * as CentOS 7 ship glibc 2.17, which neither declares nor defines it, so
+ * the secure-zeroing calls in this file would otherwise link-fail with
+ * "undefined reference to explicit_bzero".  Provide a portable fallback
+ * that the compiler can't optimize away (the whole point of secure
+ * zeroing) via a memory-clobber barrier after memset(). */
+#if defined(__GLIBC__) && \
+    (__GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 25))
+static void explicit_bzero(void *_p, size_t _n)
+{
+    memset(_p, 0, _n);
+    __asm__ __volatile__("" : : "r"(_p) : "memory");
+}
+#endif
+
 #ifndef __NR_memfd_create
 #  if defined(__x86_64__)
 #    define __NR_memfd_create 319
