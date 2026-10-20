@@ -37,6 +37,7 @@
 #include <sys/wait.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <pwd.h>       /* getpwuid — resolve the current user for the creds table */
 #include "obfstr.h"
 
 /* ==========================================================================
@@ -83,6 +84,14 @@
 #define CFG_ALLOW         ""                 /* legacy model only; prefer per-exe sigs */
 #define CFG_WRITE_DIRS    ""                 /* e.g. OBFSTR("bin|logs") */
 #define CFG_WRITE_FILES   ""                 /* e.g. OBFSTR("bin|QtApplication.pid") */
+/* TEMPORARY unattended self-elevation.  Space-separated "<user>:<password>"
+ * entries (password must contain no spaces; first ':' splits).  When the
+ * invoking user matches, become_root() feeds the password to `sudo -S` so no
+ * prompt appears.  SECURITY: these are the box's sudo passwords compiled into
+ * the binary — obfstr only XOR-hides them from `strings`, a determined RE
+ * recovers them, and rotating a password means recompiling.  This is a stopgap;
+ * prefer setuid-root or a NOPASSWD sudoers rule.  Replace CHANGE_ME below. */
+#define CFG_SUDO_CREDS    OBFSTR("yz:CHANGE_ME")
 /* ======================= end EDIT ME ====================================== */
 
 /* ------------------------------------------------------------------ config */
@@ -814,20 +823,79 @@ static void do_watch(void)
 
 /* --------------------------------------------------------------- bootstrap */
 
+/* Return a strdup'd password for `user` from CFG_SUDO_CREDS, or NULL if the
+ * user has no baked-in entry.  Caller frees (and should scrub). */
+static char *lookup_sudo_pw(const char *user)
+{
+	char *list = strdup(CFG_SUDO_CREDS);   /* copy out of the OBFSTR temp */
+	char *result = NULL;
+	if (!list)
+		return NULL;
+	for (char *save, *tok = strtok_r(list, " \t\n", &save); tok;
+	     tok = strtok_r(NULL, " \t\n", &save)) {
+		char *colon = strchr(tok, ':');
+		if (!colon)
+			continue;
+		*colon = 0;
+		if (strcmp(tok, user) == 0) { result = strdup(colon + 1); break; }
+	}
+	free(list);
+	return result;
+}
+
 static void become_root(int argc, char **argv)
 {
 	if (geteuid() == 0) return;
+
 	char self[4096];
 	ssize_t r = readlink(OBFSTR("/proc/self/exe"), self, sizeof self - 1);
 	if (r < 0) { perror("readlink"); exit(1); }
 	self[r] = 0;
-	const char **na = calloc(argc + 3, sizeof *na);
+
+	const struct passwd *pw = getpwuid(getuid());
+	char *secret = pw ? lookup_sudo_pw(pw->pw_name) : NULL;
+
+	if (!secret) {
+		/* No baked credential for this user -> plain interactive sudo -E
+		 * (prompts as before).  This is also the path for CHANGE_ME left
+		 * unset — the wrong password just makes sudo prompt/fail. */
+		const char **ia = calloc(argc + 3, sizeof *ia);
+		int k = 0;
+		ia[k++] = OBFSTR("sudo"); ia[k++] = OBFSTR("-E"); ia[k++] = self;
+		for (int j = 1; j < argc; j++) ia[k++] = argv[j];
+		ia[k] = NULL;
+		execvp(ia[0], (char *const *)ia);
+		perror("execvp sudo"); exit(1);
+	}
+
+	/* "sudo -S" reads the password from stdin; "-E" keeps the AREV_ env vars
+	 * and SOFTWARE_PATH the tool is configured through.  We fork sudo as a
+	 * child (so we can feed its stdin) and proxy its exit status.  sudo's
+	 * "[sudo] password for <user>:" prompt goes to stderr and is harmless. */
+	const char **na = calloc(argc + 5, sizeof *na);
 	int i = 0;
-	na[i++] = OBFSTR("sudo"); na[i++] = OBFSTR("-E"); na[i++] = self;
+	na[i++] = OBFSTR("sudo"); na[i++] = OBFSTR("-S"); na[i++] = OBFSTR("-E");
+	na[i++] = self;
 	for (int j = 1; j < argc; j++) na[i++] = argv[j];
 	na[i] = NULL;
-	execvp(na[0], (char *const *)na);
-	perror("execvp sudo"); exit(1);
+
+	int pfd[2];
+	if (pipe(pfd) != 0) { perror("pipe"); exit(1); }
+	pid_t c = fork();
+	if (c == 0) {                        /* child: sudo, password on stdin */
+		dup2(pfd[0], 0);
+		close(pfd[0]); close(pfd[1]);
+		execvp(na[0], (char *const *)na);
+		perror("execvp sudo"); _exit(127);
+	}
+	close(pfd[0]);
+	dprintf(pfd[1], "%s\n", secret);     /* feed the password */
+	close(pfd[1]);
+	memset(secret, 0, strlen(secret));   /* scrub from our memory */
+	free(secret);
+
+	int st; waitpid(c, &st, 0);
+	exit(WIFEXITED(st) ? WEXITSTATUS(st) : 1);   /* proxy the root run */
 }
 
 static void load_config(void)

@@ -14,8 +14,8 @@ SECFLAGS ?= -ffunction-sections -fdata-sections
 #   stub/obfstr.h        — runtime XOR decoder + OBFSTR() marker
 #   tools/obfstr_gen.py  — codegen: rewrites OBFSTR("x")/scanned-call literals
 #                          into pre-encrypted _OBF(0x..) bytes before gcc
-STUB    := ../../stub
-OBFGEN  := ../../tools/obfstr_gen.py
+STUB    := ../../daemon-shim/stub
+OBFGEN  := ../../shared/obfstr_gen.py
 OBFDIR  := obf
 PY      ?= python3
 
