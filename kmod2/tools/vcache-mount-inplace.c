@@ -546,6 +546,15 @@ static int do_up(void)
 		xlog(OBFSTR("tmpfs %s"), mp);
 		if (mount(OBFSTR("tmpfs"), mp, OBFSTR("tmpfs"), fl, data[0] ? data : NULL) != 0)
 			die(OBFSTR("tmpfs %s: %s"), mp, strerror(errno));
+		/* Same ownership fix as WRITE_FILES below: the tmpfs is mounted by
+		 * root (become_root), so its root inode is root:root per TMPFS_OPTS
+		 * (mode=0755) and a non-root business process cannot create runtime
+		 * files inside it.  Hand the dir to the invoking user via $SUDO_UID. */
+		{
+			const char *su = getenv("SUDO_UID"), *sg = getenv("SUDO_GID");
+			if (su) { if (chown(mp, (uid_t)atoi(su),
+			                     (gid_t)(sg ? atoi(sg) : -1))) {/*ignore*/} }
+		}
 	}
 
 	if (WRITE_FILES[0]) {
