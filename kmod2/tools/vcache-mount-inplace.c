@@ -563,7 +563,19 @@ static int do_up(void)
 			snprintf(tag, sizeof tag, "%s/%s", root + (root[0] == '/'), rel);
 			for (char *p = tag; *p; p++) if (*p == '/') *p = '_';
 			snprintf(srcp, sizeof srcp, "%s/%s", WRITE_BACKING, tag);
-			int fd = open(srcp, O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd);
+			/* The mounter runs under sudo (become_root), so the backing file
+			 * is created as root.  Hand it to the invoking (non-root) user via
+			 * $SUDO_UID/$SUDO_GID so a non-root business process can WRITE its
+			 * runtime file (e.g. QtApplication.pid); otherwise root:root 0644
+			 * makes every non-owner open(O_WRONLY) fail with EACCES.  Under a
+			 * real root login SUDO_UID is unset -> file stays root-owned. */
+			int fd = open(srcp, O_CREAT | O_WRONLY, 0644);
+			if (fd >= 0) {
+				const char *su = getenv("SUDO_UID"), *sg = getenv("SUDO_GID");
+				if (su) { if (fchown(fd, (uid_t)atoi(su),
+				                      (gid_t)(sg ? atoi(sg) : -1))) {/*ignore*/} }
+				close(fd);
+			}
 			snprintf(dst, sizeof dst, "%s/%s", root, rel);
 			xlog(OBFSTR("bind %s -> %s"), srcp, dst);
 			if (mount(srcp, dst, NULL, MS_BIND, NULL) != 0)
