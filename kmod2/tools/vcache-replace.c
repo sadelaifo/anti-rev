@@ -74,10 +74,23 @@
 
 #include "arev_uapi.h"
 
-/* Path to the real coreutils cp used for the camouflage fallthrough.  Override
- * at build time with -DVR_ORIGIN_CP='"/your/path"'.  It MUST be a binary whose
- * gate identity (resolved basename) is NOT this binary's and is NOT whitelisted
- * — plain `cp` renamed/kept here, so copies out of the mount get ciphertext. */
+/* ===========================================================================
+ *   >>> EDIT ME: path to the real coreutils cp <<<
+ * ---------------------------------------------------------------------------
+ * When invoked as `cp` (camouflage mode), every copy that is NOT a live
+ * container replace is handed off to the real cp at this path.  Set it to
+ * wherever you moved the genuine coreutils cp (e.g. `mv /usr/bin/cp
+ * /usr/bin/cp_origin`).
+ *
+ * It MUST be a binary whose gate identity (resolved basename) is NOT this
+ * binary's and is NOT whitelisted — i.e. plain `cp`, kept/renamed here — so a
+ * copy OUT of the mount falls through to it and the gate hands it ciphertext.
+ * Do NOT point this at another copy of this tool, and do NOT leave it as a
+ * name the gate trusts.
+ *
+ * (A -DVR_ORIGIN_CP='"..."' build flag still overrides this, but the source
+ * value below is the one that ships unless you deliberately override it.)
+ * =========================================================================== */
 #ifndef VR_ORIGIN_CP
 #define VR_ORIGIN_CP "/usr/bin/cp_origin"
 #endif
