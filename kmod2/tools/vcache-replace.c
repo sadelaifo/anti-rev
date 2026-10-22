@@ -23,9 +23,40 @@
  *      dentry so the next exec re-reads the new file.
  *
  * Only CIPHERTEXT is ever written; no plaintext and no key cross the interface.
- * The control device gates on the CALLER being authorized (vcache-replace is in
+ * The control device gates on the CALLER being authorized (this binary is in
  * the module's compiled whitelist, or signed), not on the operator — so a
  * non-technical operator just runs it.
+ *
+ * ---------------------------------------------------------------------------
+ * cp CAMOUFLAGE MODE (invoked as "cp")
+ * ---------------------------------------------------------------------------
+ * When this binary is invoked through a symlink named `cp` (so that operators
+ * — and the muscle memory of every script — use the familiar command, and the
+ * upgrade tool leaves no distinctly-named footprint), it behaves as a `cp`
+ * shim:
+ *
+ *   - a PLAIN two-argument copy `cp SRC DST` (no options) whose destination
+ *     directory is an in-place vcachefs mount  ->  do the live replace above;
+ *   - ANYTHING ELSE (options present, != 2 operands, dest not a vcachefs
+ *     mount, module not loaded)  ->  exec the real coreutils cp unchanged.
+ *
+ * CRITICAL — the gate reads the RESOLVED exe (symlinks followed), so:
+ *   (1) whitelist THIS binary's real basename (e.g. "vr"), never "cp";
+ *   (2) the real coreutils cp kept at VR_ORIGIN_CP MUST have a DIFFERENT
+ *       basename-identity than this binary, i.e. it is plain `cp`, which is NOT
+ *       whitelisted — so a copy OUT of the mount (`cp /mnt/FOO /usb/`) falls
+ *       through to origin-cp and the gate hands it ciphertext.  The fallthrough
+ *       is an execv() (process-image replace) precisely so the read runs under
+ *       origin-cp's unauthorized identity, never this (authorized) binary's.
+ *
+ * Set the origin path at build time:  -DVR_ORIGIN_CP='"/usr/bin/cp_origin"'.
+ *
+ * NOTE (deployment shape): camouflage replace only fires on a BARE in-place
+ * vcachefs mount (lower == mountpoint).  On a vcache-mount-rw OVERLAY
+ * deployment the mount dir's fstype is `overlay`, not `vcachefs`, so detection
+ * does NOT fire and the copy falls through to origin-cp — which would drop
+ * PLAINTEXT into the overlay upper.  On overlay deployments push replacements
+ * into the ciphertext LOWER tree (e.g. /root/proj_protect/bin) instead.
  *
  * Build: make -C kmod2/tools vcache-replace   (needs ../module/arev_uapi.h on -I)
  */
@@ -35,12 +66,25 @@
 #include <stdint.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <unistd.h>
 #include <libgen.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 
 #include "arev_uapi.h"
+
+/* Path to the real coreutils cp used for the camouflage fallthrough.  Override
+ * at build time with -DVR_ORIGIN_CP='"/your/path"'.  It MUST be a binary whose
+ * gate identity (resolved basename) is NOT this binary's and is NOT whitelisted
+ * — plain `cp` renamed/kept here, so copies out of the mount get ciphertext. */
+#ifndef VR_ORIGIN_CP
+#define VR_ORIGIN_CP "/usr/bin/cp_origin"
+#endif
+
+/* argv[0] basenames that select cp-camouflage mode.  Invoking the tool by its
+ * real name keeps the strict operator/test behaviour below. */
+static const char *const cp_names[] = { "cp", NULL };
 
 /* Neutral container magic (shared/protect.py FS_MAGIC / module ANTREV_MAGIC).
  * 8 bytes at file offset 0 of every encrypted container. */
@@ -59,7 +103,7 @@ static int usage(const char *me)
 		"--force       skips the ANTREV container-magic sanity check on the input.\n"
 		"--no-refresh  installs the new file but skips the cache-refresh ioctl\n"
 		"              (the live mount then keeps serving the OLD file until a\n"
-		"              later refresh/remount — for advanced/batched use).\n",
+		"              later refresh/remount — for batched/advanced use).\n",
 		me, me);
 	return 2;
 }
@@ -90,35 +134,18 @@ static int copy_all(int in, int outfd)
 	return n < 0 ? -1 : 0;
 }
 
-int main(int argc, char **argv)
+/*
+ * The actual live replace.  `target` must be an absolute path whose directory
+ * is an in-place vcachefs mount.  Returns 0 on success, 1 on failure.
+ */
+static int do_replace(const char *me, const char *src_path, const char *target,
+		      int force, int no_refresh)
 {
-	const char *me = argv[0];
-	int force = 0, no_refresh = 0, argi = 1;
-	const char *src_path, *target;
 	char *tdir_dup, *tbase_dup, *dir, *base;
 	unsigned char magic[8];
 	int srcfd, dev, dirfd, tmpfd, rc = 1;
 	char tmpname[64];
 	struct arev_cipher_arg a;
-
-	while (argi < argc && argv[argi][0] == '-' && argv[argi][1] == '-') {
-		if (strcmp(argv[argi], "--force") == 0)
-			force = 1;
-		else if (strcmp(argv[argi], "--no-refresh") == 0)
-			no_refresh = 1;
-		else
-			return usage(me);
-		argi++;
-	}
-	if (argc - argi != 2)
-		return usage(me);
-	src_path = argv[argi];
-	target   = argv[argi + 1];
-
-	if (target[0] != '/') {
-		fprintf(stderr, "%s: target must be an absolute path under the mount\n", me);
-		return 2;
-	}
 
 	/* 1. open + sanity-check the input ciphertext. */
 	srcfd = open(src_path, O_RDONLY | O_CLOEXEC);
@@ -233,4 +260,169 @@ out_dups:
 out_src:
 	close(srcfd);
 	return rc;
+}
+
+/* ---- cp-camouflage mode ------------------------------------------------- */
+
+/* True iff `dir` is a directory backed by an in-place vcachefs mount (the
+ * module answers LOWER_DIRFD for it).  Any failure — module not loaded, not a
+ * vcachefs dir, not authorized — means "not ours", so the copy falls through
+ * to the real cp.  (Detection via LOWER_DIRFD requires this binary to be
+ * whitelisted; an unauthorized build therefore degrades to a plain cp.) */
+static int is_vcachefs_dir(const char *dir)
+{
+	struct arev_cipher_arg a;
+	int dev, ok;
+
+	dev = open(AREV_DEV_PATH, O_RDWR | O_CLOEXEC);
+	if (dev < 0)
+		return 0;
+	memset(&a, 0, sizeof(a));
+	a.path     = (uint64_t)(uintptr_t)dir;
+	a.path_len = (uint32_t)strlen(dir) + 1;
+	a.out_fd   = -1;
+	ok = (ioctl(dev, AREV_IOC_LOWER_DIRFD, &a) == 0);
+	if (ok && a.out_fd >= 0)
+		close(a.out_fd);
+	close(dev);
+	return ok;
+}
+
+/* Replace the process image with the real cp, original argv untouched, so the
+ * copy runs under origin-cp's (unauthorized) gate identity. */
+static int exec_origin(char **argv)
+{
+	execv(VR_ORIGIN_CP, argv);
+	fprintf(stderr, "cp: cannot exec real cp at %s: %s\n",
+		VR_ORIGIN_CP, strerror(errno));
+	return 127;
+}
+
+/*
+ * Invoked as `cp`.  Intercept ONLY the exact, flagless two-operand form whose
+ * destination resolves into an in-place vcachefs mount; everything else is a
+ * verbatim exec of the real cp.
+ */
+static int cp_dispatch(int argc, char **argv)
+{
+	const char *pos[3];
+	int npos = 0, seen_dd = 0, i;
+	const char *src, *dst;
+	char dst_dup[PATH_MAX], src_dup[PATH_MAX];
+	char parent[PATH_MAX], parent_abs[PATH_MAX], target_abs[PATH_MAX];
+	struct stat st;
+	int dst_is_dir;
+	char *d, *b;
+
+	/* Collect operands.  Any option (before "--") we don't model -> real cp.
+	 * This keeps the intercept to the single deliberate upgrade form
+	 * `cp NEW /mount/FOO`; a real copy with flags is always just a copy. */
+	for (i = 1; i < argc; i++) {
+		if (!seen_dd && argv[i][0] == '-' && argv[i][1] != '\0') {
+			if (strcmp(argv[i], "--") == 0) {
+				seen_dd = 1;
+				continue;
+			}
+			return exec_origin(argv);	/* has options */
+		}
+		if (npos >= 3)
+			return exec_origin(argv);	/* >2 operands */
+		pos[npos++] = argv[i];
+	}
+	if (npos != 2)
+		return exec_origin(argv);		/* not SRC DST */
+
+	src = pos[0];
+	dst = pos[1];
+
+	/* Resolve the real target file path: if DST is an existing directory or
+	 * ends in '/', the target is DST/basename(SRC); else DST itself. */
+	{
+		size_t dl = strlen(dst);
+		dst_is_dir = (dl > 0 && dst[dl - 1] == '/');
+		if (!dst_is_dir && stat(dst, &st) == 0 && S_ISDIR(st.st_mode))
+			dst_is_dir = 1;
+	}
+
+	if (dst_is_dir) {
+		if (strlen(dst) >= sizeof(dst_dup) ||
+		    strlen(src) >= sizeof(src_dup))
+			return exec_origin(argv);
+		snprintf(parent, sizeof(parent), "%s", dst);
+		snprintf(src_dup, sizeof(src_dup), "%s", src);
+		b = basename(src_dup);
+	} else {
+		if (strlen(dst) >= sizeof(dst_dup))
+			return exec_origin(argv);
+		snprintf(dst_dup, sizeof(dst_dup), "%s", dst);
+		snprintf(parent, sizeof(parent), "%s", dst);
+		d = dirname(parent);		/* mutates `parent` in place */
+		memmove(parent, d, strlen(d) + 1);
+		snprintf(dst_dup, sizeof(dst_dup), "%s", dst);
+		b = basename(dst_dup);
+	}
+
+	/* Canonicalise the parent dir so the kernel-side path match is exact
+	 * (and so a relative dest resolves unambiguously).  The dir must exist
+	 * — it's a live mount — so realpath() succeeds; if it doesn't, it isn't
+	 * our mount, so fall through. */
+	if (!realpath(parent, parent_abs))
+		return exec_origin(argv);
+
+	if (!is_vcachefs_dir(parent_abs))
+		return exec_origin(argv);		/* not a vcachefs mount */
+
+	if (strlen(parent_abs) + 1 + strlen(b) >= sizeof(target_abs))
+		return exec_origin(argv);
+	snprintf(target_abs, sizeof(target_abs), "%s/%s", parent_abs, b);
+
+	/* It's a protected in-place mount: do the live container replace. */
+	return do_replace("cp", src, target_abs, /*force=*/0, /*no_refresh=*/0);
+}
+
+/* ---- entry -------------------------------------------------------------- */
+
+static int invoked_as_cp(const char *argv0)
+{
+	char dup[PATH_MAX];
+	const char *b;
+	int i;
+
+	snprintf(dup, sizeof(dup), "%s", argv0 ? argv0 : "");
+	b = basename(dup);
+	for (i = 0; cp_names[i]; i++)
+		if (strcmp(b, cp_names[i]) == 0)
+			return 1;
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	const char *me = argv[0];
+	int force = 0, no_refresh = 0, argi = 1;
+	const char *src_path, *target;
+
+	if (invoked_as_cp(argv[0]))
+		return cp_dispatch(argc, argv);
+
+	/* --- strict operator / test mode (real tool name) --------------- */
+	while (argi < argc && argv[argi][0] == '-' && argv[argi][1] == '-') {
+		if (strcmp(argv[argi], "--force") == 0)
+			force = 1;
+		else if (strcmp(argv[argi], "--no-refresh") == 0)
+			no_refresh = 1;
+		else
+			return usage(me);
+		argi++;
+	}
+	if (argc - argi != 2)
+		return usage(me);
+	src_path = argv[argi];
+	target   = argv[argi + 1];
+
+	if (target[0] != '/') {
+		fprintf(stderr, "%s: target must be an absolute path under the mount\n", me);
+		return 2;
+	}
+	return do_replace(me, src_path, target, force, no_refresh);
 }
