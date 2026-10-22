@@ -24,41 +24,41 @@
  *
  * Only CIPHERTEXT is ever written; no plaintext and no key cross the interface.
  * The control device gates on the CALLER being authorized (this binary is in
- * the module's compiled whitelist, or signed), not on the operator — so a
- * non-technical operator just runs it.
+ * the module's compiled whitelist, or pinned by SHA-256), not on the operator.
  *
  * ---------------------------------------------------------------------------
  * cp CAMOUFLAGE MODE (invoked as "cp")
  * ---------------------------------------------------------------------------
- * When this binary is invoked through a symlink named `cp` (so that operators
- * — and the muscle memory of every script — use the familiar command, and the
- * upgrade tool leaves no distinctly-named footprint), it behaves as a `cp`
- * shim:
- *
+ * When invoked through a symlink named `cp`, this behaves as a `cp` shim:
  *   - a PLAIN two-argument copy `cp SRC DST` (no options) whose destination
  *     directory is an in-place vcachefs mount  ->  do the live replace above;
- *   - ANYTHING ELSE (options present, != 2 operands, dest not a vcachefs
- *     mount, module not loaded)  ->  exec the real coreutils cp unchanged.
+ *   - ANYTHING ELSE  ->  exec the real coreutils cp (VR_ORIGIN_CP) unchanged.
  *
  * CRITICAL — the gate reads the RESOLVED exe (symlinks followed), so:
- *   (1) whitelist THIS binary's real basename (e.g. "vr"), never "cp";
- *   (2) the real coreutils cp kept at VR_ORIGIN_CP MUST have a DIFFERENT
- *       basename-identity than this binary, i.e. it is plain `cp`, which is NOT
- *       whitelisted — so a copy OUT of the mount (`cp /mnt/FOO /usb/`) falls
- *       through to origin-cp and the gate hands it ciphertext.  The fallthrough
- *       is an execv() (process-image replace) precisely so the read runs under
- *       origin-cp's unauthorized identity, never this (authorized) binary's.
+ *   (1) authorize THIS binary's real basename (e.g. "vr"), never "cp";
+ *   (2) VR_ORIGIN_CP MUST be the plain coreutils cp (basename `cp`, NOT
+ *       trusted by the gate) — the fallthrough is an execv() so a copy OUT of
+ *       the mount runs under origin-cp's unauthorized identity and gets
+ *       ciphertext, never this (authorized) binary's.
  *
- * Set the origin path at build time:  -DVR_ORIGIN_CP='"/usr/bin/cp_origin"'.
+ * ---------------------------------------------------------------------------
+ * STRING OBFUSCATION
+ * ---------------------------------------------------------------------------
+ * This source is built through shared/obfstr_gen.py (see kmod2/tools/Makefile),
+ * which rewrites every OBFSTR("...") literal into XOR-encrypted bytes before
+ * gcc, so `strings` on the shipped binary reveals none of the vcachefs design
+ * tokens — important because the camouflage binary is named `cp`.  Rules when
+ * editing: keep OBFSTR() strings ASCII-only (the codegen crashes on multibyte
+ * — use "--" not a real dash), and never assign an OBFSTR() result to a
+ * variable for later use (its decoded buffer dies when the function returns) —
+ * consume it inline in the same call.
  *
- * NOTE (deployment shape): camouflage replace only fires on a BARE in-place
- * vcachefs mount (lower == mountpoint).  On a vcache-mount-rw OVERLAY
- * deployment the mount dir's fstype is `overlay`, not `vcachefs`, so detection
- * does NOT fire and the copy falls through to origin-cp — which would drop
- * PLAINTEXT into the overlay upper.  On overlay deployments push replacements
- * into the ciphertext LOWER tree (e.g. /root/proj_protect/bin) instead.
+ * Residuals NOT hidden (accepted): VR_ORIGIN_CP's path (it is a deliberately
+ * editable #define used verbatim in execv), and the "cp"/"vr" basenames.  Pick
+ * a bland VR_ORIGIN_CP path if even that matters.
  *
- * Build: make -C kmod2/tools vcache-replace   (needs ../module/arev_uapi.h on -I)
+ * Build: make -C kmod2/tools vcache-replace
+ *   (needs ../module/arev_uapi.h and the obfstr header on the include path)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,6 +73,7 @@
 #include <sys/ioctl.h>
 
 #include "arev_uapi.h"
+#include "obfstr.h"	/* OBFSTR() — rewritten by shared/obfstr_gen.py */
 
 /* ===========================================================================
  *   >>> EDIT ME: path to the real coreutils cp <<<
@@ -83,20 +84,23 @@
  * /usr/bin/cp_origin`).
  *
  * It MUST be a binary whose gate identity (resolved basename) is NOT this
- * binary's and is NOT whitelisted — i.e. plain `cp`, kept/renamed here — so a
- * copy OUT of the mount falls through to it and the gate hands it ciphertext.
- * Do NOT point this at another copy of this tool, and do NOT leave it as a
- * name the gate trusts.
+ * binary's and is NOT trusted by the gate — i.e. plain `cp`, kept/renamed
+ * here — so a copy OUT of the mount falls through to it and the gate hands it
+ * ciphertext.  Do NOT point this at another copy of this tool, and do NOT
+ * leave it as a name the gate trusts.
  *
- * (A -DVR_ORIGIN_CP='"..."' build flag still overrides this, but the source
- * value below is the one that ships unless you deliberately override it.)
+ * NOTE: this literal is not string-obfuscated (it is a #define used verbatim
+ * in execv), so it is visible in `strings`.  Choose a bland path if that is a
+ * concern.  A -DVR_ORIGIN_CP='"..."' build flag still overrides this, but the
+ * source value below is the one that ships unless you deliberately override it.
  * =========================================================================== */
 #ifndef VR_ORIGIN_CP
 #define VR_ORIGIN_CP "/usr/bin/cp_origin"
 #endif
 
 /* argv[0] basenames that select cp-camouflage mode.  Invoking the tool by its
- * real name keeps the strict operator/test behaviour below. */
+ * real name keeps the strict operator/test behaviour below.  (Innocuous names;
+ * left un-obfuscated.) */
 static const char *const cp_names[] = { "cp", NULL };
 
 /* Neutral container magic (shared/protect.py FS_MAGIC / module ANTREV_MAGIC).
@@ -108,7 +112,7 @@ static const unsigned char ANTREV_MAGIC[8] = {
 static int usage(const char *me)
 {
 	fprintf(stderr,
-		"usage: %s [--force] [--no-refresh] <new-ciphertext-file> <target-path-in-mount>\n"
+		OBFSTR("usage: %s [--force] [--no-refresh] <new-ciphertext-file> <target-path-in-mount>\n"
 		"   e.g. %s /media/usb/FOO.new /root/proj/bin/FOO\n"
 		"\n"
 		"Replaces one encrypted file on a live in-place vcachefs mount and\n"
@@ -116,7 +120,7 @@ static int usage(const char *me)
 		"--force       skips the ANTREV container-magic sanity check on the input.\n"
 		"--no-refresh  installs the new file but skips the cache-refresh ioctl\n"
 		"              (the live mount then keeps serving the OLD file until a\n"
-		"              later refresh/remount — for batched/advanced use).\n",
+		"              later refresh/remount -- for batched/advanced use).\n"),
 		me, me);
 	return 2;
 }
@@ -163,15 +167,15 @@ static int do_replace(const char *me, const char *src_path, const char *target,
 	/* 1. open + sanity-check the input ciphertext. */
 	srcfd = open(src_path, O_RDONLY | O_CLOEXEC);
 	if (srcfd < 0) {
-		fprintf(stderr, "%s: open %s: %s\n", me, src_path, strerror(errno));
+		fprintf(stderr, OBFSTR("%s: open %s: %s\n"), me, src_path, strerror(errno));
 		return 1;
 	}
 	if (!force) {
 		if (read(srcfd, magic, sizeof(magic)) != (ssize_t)sizeof(magic) ||
 		    memcmp(magic, ANTREV_MAGIC, sizeof(magic)) != 0) {
 			fprintf(stderr,
-				"%s: %s is not an encrypted vcachefs container "
-				"(bad magic); refusing.  Use --force to override.\n",
+				OBFSTR("%s: %s is not an encrypted container "
+				"(bad magic); refusing.  Use --force to override.\n"),
 				me, src_path);
 			close(srcfd);
 			return 1;
@@ -182,17 +186,19 @@ static int do_replace(const char *me, const char *src_path, const char *target,
 	tdir_dup  = strdup(target);
 	tbase_dup = strdup(target);
 	if (!tdir_dup || !tbase_dup) {
-		fprintf(stderr, "%s: out of memory\n", me);
+		fprintf(stderr, OBFSTR("%s: out of memory\n"), me);
 		goto out_src;
 	}
 	dir  = dirname(tdir_dup);
 	base = basename(tbase_dup);
 
-	/* 2. get an fd to the shadowed lower directory from the module. */
-	dev = open(AREV_DEV_PATH, O_RDWR | O_CLOEXEC);
+	/* 2. get an fd to the shadowed lower directory from the module.
+	 *    OBFSTR("/dev/vcachefs") KEEP IN SYNC with AREV_DEV_PATH (arev_uapi.h);
+	 *    inlined (not the macro) so the device name is XOR-hidden in strings. */
+	dev = open(OBFSTR("/dev/vcachefs"), O_RDWR | O_CLOEXEC);
 	if (dev < 0) {
-		fprintf(stderr, "%s: open %s: %s (is the module loaded?)\n",
-			me, AREV_DEV_PATH, strerror(errno));
+		fprintf(stderr, OBFSTR("%s: cannot open control device: %s (is the module loaded?)\n"),
+			me, strerror(errno));
 		goto out_dups;
 	}
 	memset(&a, 0, sizeof(a));
@@ -200,47 +206,48 @@ static int do_replace(const char *me, const char *src_path, const char *target,
 	a.path_len = (uint32_t)strlen(dir) + 1;
 	a.out_fd   = -1;
 	if (ioctl(dev, AREV_IOC_LOWER_DIRFD, &a) != 0) {
-		fprintf(stderr, "%s: LOWER_DIRFD %s: %s%s\n", me, dir, strerror(errno),
-			errno == EACCES ? " (tool not authorized by the module)" :
-			errno == EINVAL ? " (not a vcachefs directory)" : "");
+		fprintf(stderr, OBFSTR("%s: cannot resolve %s: %s%s\n"), me, dir, strerror(errno),
+			errno == EACCES ? OBFSTR(" (not authorized)") :
+			errno == EINVAL ? OBFSTR(" (not a managed directory)") : "");
 		goto out_dev;
 	}
 	dirfd = a.out_fd;
 
 	/* 3. write the new ciphertext to a temp in the lower dir, fsync, then
-	 *    atomically rename it over the target basename (new lower inode). */
-	snprintf(tmpname, sizeof(tmpname), ".vcache-replace.%ld.tmp",
+	 *    atomically rename it over the target basename (new lower inode).
+	 *    Bland dotfile temp name so an `ls` during the window reveals nothing. */
+	snprintf(tmpname, sizeof(tmpname), OBFSTR(".cp.%ld.tmp"),
 		 (long)getpid());
 	tmpfd = openat(dirfd, tmpname,
 		       O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
 	if (tmpfd < 0) {
-		fprintf(stderr, "%s: create temp in lower dir: %s\n",
+		fprintf(stderr, OBFSTR("%s: create temp in lower dir: %s\n"),
 			me, strerror(errno));
 		goto out_dirfd;
 	}
 	if (copy_all(srcfd, tmpfd) != 0) {
-		fprintf(stderr, "%s: writing new ciphertext: %s\n",
+		fprintf(stderr, OBFSTR("%s: writing new ciphertext: %s\n"),
 			me, strerror(errno));
 		close(tmpfd);
 		unlinkat(dirfd, tmpname, 0);
 		goto out_dirfd;
 	}
 	if (fsync(tmpfd) != 0) {
-		fprintf(stderr, "%s: fsync: %s\n", me, strerror(errno));
+		fprintf(stderr, OBFSTR("%s: fsync: %s\n"), me, strerror(errno));
 		close(tmpfd);
 		unlinkat(dirfd, tmpname, 0);
 		goto out_dirfd;
 	}
 	close(tmpfd);
 	if (renameat(dirfd, tmpname, dirfd, base) != 0) {
-		fprintf(stderr, "%s: rename over %s: %s\n", me, base, strerror(errno));
+		fprintf(stderr, OBFSTR("%s: rename over %s: %s\n"), me, base, strerror(errno));
 		unlinkat(dirfd, tmpname, 0);
 		goto out_dirfd;
 	}
 
 	/* 4. drop the target's cached dentry so the next exec re-reads it. */
 	if (no_refresh) {
-		printf("%s: installed %s (no refresh — live mount still serves the old file)\n",
+		printf(OBFSTR("%s: installed %s (no refresh -- live mount still serves the old file)\n"),
 		       me, target);
 		rc = 0;
 		goto out_dirfd;
@@ -253,14 +260,14 @@ static int do_replace(const char *me, const char *src_path, const char *target,
 		/* The file IS replaced, but the live cache is stale.  Tell the
 		 * operator rather than silently leaving the old binary running. */
 		fprintf(stderr,
-			"%s: WARNING: %s was replaced but REFRESH failed: %s\n"
+			OBFSTR("%s: WARNING: %s was replaced but refresh failed: %s\n"
 			"   the new file is in place; re-run `%s --force %s %s`\n"
-			"   or remount to pick it up.\n",
+			"   or remount to pick it up.\n"),
 			me, target, strerror(errno), me, src_path, target);
 		goto out_dirfd;
 	}
 
-	printf("%s: replaced %s (live, no remount)\n", me, target);
+	printf(OBFSTR("%s: replaced %s (live, no remount)\n"), me, target);
 	rc = 0;
 
 out_dirfd:
@@ -281,13 +288,13 @@ out_src:
  * module answers LOWER_DIRFD for it).  Any failure — module not loaded, not a
  * vcachefs dir, not authorized — means "not ours", so the copy falls through
  * to the real cp.  (Detection via LOWER_DIRFD requires this binary to be
- * whitelisted; an unauthorized build therefore degrades to a plain cp.) */
+ * authorized; an unauthorized build therefore degrades to a plain cp.) */
 static int is_vcachefs_dir(const char *dir)
 {
 	struct arev_cipher_arg a;
 	int dev, ok;
 
-	dev = open(AREV_DEV_PATH, O_RDWR | O_CLOEXEC);
+	dev = open(OBFSTR("/dev/vcachefs"), O_RDWR | O_CLOEXEC);
 	if (dev < 0)
 		return 0;
 	memset(&a, 0, sizeof(a));
@@ -306,7 +313,7 @@ static int is_vcachefs_dir(const char *dir)
 static int exec_origin(char **argv)
 {
 	execv(VR_ORIGIN_CP, argv);
-	fprintf(stderr, "cp: cannot exec real cp at %s: %s\n",
+	fprintf(stderr, OBFSTR("cp: cannot execute %s: %s\n"),
 		VR_ORIGIN_CP, strerror(errno));
 	return 127;
 }
@@ -358,7 +365,7 @@ static int cp_dispatch(int argc, char **argv)
 	}
 
 	if (dst_is_dir) {
-		if (strlen(dst) >= sizeof(dst_dup) ||
+		if (strlen(dst) >= sizeof(parent) ||
 		    strlen(src) >= sizeof(src_dup))
 			return exec_origin(argv);
 		snprintf(parent, sizeof(parent), "%s", dst);
@@ -367,7 +374,6 @@ static int cp_dispatch(int argc, char **argv)
 	} else {
 		if (strlen(dst) >= sizeof(dst_dup))
 			return exec_origin(argv);
-		snprintf(dst_dup, sizeof(dst_dup), "%s", dst);
 		snprintf(parent, sizeof(parent), "%s", dst);
 		d = dirname(parent);		/* mutates `parent` in place */
 		memmove(parent, d, strlen(d) + 1);
@@ -434,7 +440,7 @@ int main(int argc, char **argv)
 	target   = argv[argi + 1];
 
 	if (target[0] != '/') {
-		fprintf(stderr, "%s: target must be an absolute path under the mount\n", me);
+		fprintf(stderr, OBFSTR("%s: target must be an absolute path under the mount\n"), me);
 		return 2;
 	}
 	return do_replace(me, src_path, target, force, no_refresh);

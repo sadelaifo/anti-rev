@@ -26,11 +26,27 @@ vcache-mount: vcache-mount.c
 	$(CC) $(CFLAGS) $(SECFLAGS) $(LDFLAGS) -o $@ $<
 
 # Live per-file upgrade helper for in-place mounts.  Drives /dev/vcachefs
-# (AREV_IOC_LOWER_DIRFD + REFRESH_PATH), so it needs the shared UAPI header on
-# the include path.  Not obfuscated for v1 (it opens "/dev/vcachefs" and calls
-# mount-free ioctls — `strings` leaks no more than vcache-mount already does).
-vcache-replace: vcache-replace.c ../module/arev_uapi.h
-	$(CC) $(CFLAGS) $(SECFLAGS) -I../module $(LDFLAGS) -o $@ $<
+# (AREV_IOC_LOWER_DIRFD + REFRESH_PATH), so it needs the shared UAPI header
+# (-I../module).  Its string literals ARE obfuscated: it ships camouflaged as
+# `cp` (symlink cp -> vr), so `strings` must not leak vcachefs/design tokens.
+# obfstr_gen.py rewrites OBFSTR("...") in this source into encrypted bytes
+# (same codegen as vcache-mount-inplace below), then gcc compiles THAT against
+# stub/obfstr.h (-I$(STUB)).  Verify:
+#   strings vcache-replace | grep -iE 'vcachefs|container|refresh|ciphertext' \
+#       || echo clean    # (VR_ORIGIN_CP path + "cp"/"vr" basenames remain)
+# If python3 is missing the raw source still compiles (OBFSTR is passthrough)
+# but literals are NOT hidden — the codegen recipe prints a loud warning.
+$(OBFDIR)/vcache-replace.c: vcache-replace.c $(OBFGEN)
+	@if command -v $(PY) >/dev/null 2>&1; then \
+	   echo "obfstr-codegen vcache-replace.c"; \
+	   $(PY) $(OBFGEN) --out-dir $(OBFDIR) $< ; \
+	 else \
+	   echo "WARNING: $(PY) not found -> building vcache-replace WITHOUT string obfuscation (strings WILL leak)"; \
+	   mkdir -p $(OBFDIR) && cp $< $(OBFDIR)/ ; \
+	 fi
+
+vcache-replace: $(OBFDIR)/vcache-replace.c ../module/arev_uapi.h
+	$(CC) $(CFLAGS) $(SECFLAGS) -I$(STUB) -I../module $(LDFLAGS) -o $@ $<
 
 # Compiled twin of vcache-mount.sh.  Its string literals are XOR-obfuscated:
 # obfstr_gen.py rewrites this source into $(OBFDIR)/ with encrypted bytes, then
