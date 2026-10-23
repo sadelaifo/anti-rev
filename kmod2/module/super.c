@@ -100,6 +100,8 @@ static int vcachefs_show_options(struct seq_file *m, struct dentry *root)
 		seq_printf(m, ",passthrough=%s", sbi->passthrough);
 	if (sbi->pass_nonelf)
 		seq_printf(m, ",passdata");
+	if (sbi->writable)
+		seq_printf(m, ",writable");
 	return 0;
 }
 
@@ -144,6 +146,16 @@ static int vcachefs_parse_opts(struct vcachefs_sb_info *sbi, char *opts)
 			 * (ANTREV01) files are still decrypted + gated as usual.
 			 */
 			sbi->pass_nonelf = true;
+		} else if (!strcmp(p, "writable")) {
+			/* Gated plaintext write passthrough (see vcachefs.h).
+			 * Only available on the mnt_idmap ABI (>= 6.3); reject on
+			 * older kernels so the fs can never silently stay RO while
+			 * claiming to be writable. */
+#ifdef VCACHEFS_WRITE
+			sbi->writable = true;
+#else
+			return -EINVAL;
+#endif
 		}
 		/* unknown options (ro, relatime, ...) ignored */
 	}
@@ -190,7 +202,12 @@ static int vcachefs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_blocksize = PAGE_SIZE;
 	sb->s_blocksize_bits = PAGE_SHIFT;
 	sb->s_time_gran = 1;
-	sb->s_flags |= SB_RDONLY | SB_NOSUID | SB_NODEV;
+	/* SB_NOSUID|SB_NODEV always; SB_RDONLY unless the gated writable
+	 * passthrough was requested (then writes reach our inode/file ops,
+	 * which enforce the gate + the "encrypted files are immutable" rule). */
+	sb->s_flags |= SB_NOSUID | SB_NODEV;
+	if (!sbi->writable)
+		sb->s_flags |= SB_RDONLY;
 
 	root_inode = vcachefs_iget(sb, sbi->lower_root.dentry);
 	if (IS_ERR(root_inode))

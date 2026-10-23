@@ -112,11 +112,12 @@ static int vcachefs_classify(struct inode *inode, struct dentry *lower_dentry,
 	ii->container_len = i_size_read(lower_inode);	/* no sig on non-ANTREV01 */
 	ii->has_sig = false;
 	ii->authz_sig = 0;
-	if (sbi->pass_nonelf ||
+	if (sbi->pass_nonelf || sbi->writable ||
 	    vcachefs_ext_whitelisted(sbi, lower_dentry->d_name.name)) {
-		/* Plaintext passthrough: an explicit-extension match, or (with
-		 * the `passdata` mount option) any non-ANTREV01 file.  These are
-		 * not secret and are never gated — read at full speed.
+		/* Plaintext passthrough: an explicit-extension match, (with the
+		 * `passdata` mount option) any non-ANTREV01 file, or any non-magic
+		 * file on a `writable` mount (the app's own plaintext scratch must
+		 * be readable back).  These are not secret and are never gated.
 		 */
 		ii->encrypted = false;
 		ii->open_ok = true;
@@ -162,7 +163,12 @@ struct inode *vcachefs_iget(struct super_block *sb, struct dentry *lower_dentry)
 #endif
 
 	if (S_ISDIR(lower_inode->i_mode)) {
+#ifdef VCACHEFS_WRITE
+		inode->i_op = VCACHEFS_SB(sb)->writable ?
+			      &vcachefs_dir_iops_rw : &vcachefs_dir_iops;
+#else
 		inode->i_op = &vcachefs_dir_iops;
+#endif
 		inode->i_fop = &vcachefs_dir_fops;
 		set_nlink(inode, lower_inode->i_nlink);
 		i_size_write(inode, 0);
@@ -172,7 +178,12 @@ struct inode *vcachefs_iget(struct super_block *sb, struct dentry *lower_dentry)
 			iget_failed(inode);
 			return ERR_PTR(err);
 		}
+#ifdef VCACHEFS_WRITE
+		inode->i_op = VCACHEFS_SB(sb)->writable ?
+			      &vcachefs_file_iops_rw : &vcachefs_file_iops;
+#else
 		inode->i_op = &vcachefs_file_iops;
+#endif
 		inode->i_fop = &vcachefs_file_fops;
 		inode->i_mapping->a_ops = &vcachefs_aops;
 		ii->plain_len = plain_len;
@@ -266,6 +277,23 @@ static int vcachefs_getattr(AREV_GETATTR_PROTO)
 	stat->size = i_size_read(inode);
 	stat->blocks = (stat->size + 511) >> 9;
 
+#ifdef VCACHEFS_WRITE
+	/*
+	 * On a writable mount a plaintext file is served directly from the lower
+	 * file (no vcachefs-side cache), so its size changes live as the app
+	 * writes.  Report the lower inode's current size so stat() stays accurate
+	 * without round-tripping through our (unused) cached i_size.
+	 */
+	if (VCACHEFS_SB(inode->i_sb)->writable &&
+	    !VCACHEFS_I(inode)->encrypted) {
+		loff_t sz = i_size_read(vcachefs_lower_inode(inode));
+
+		stat->size = sz;
+		stat->blocks = (sz + 511) >> 9;
+		return 0;
+	}
+#endif
+
 	/*
 	 * Under gate_passthrough_cipher an unauthorized caller is served the
 	 * lower .enc/ ciphertext with the key TRAILER stripped — i.e. the first
@@ -297,6 +325,366 @@ const struct inode_operations vcachefs_dir_iops = {
 const struct inode_operations vcachefs_file_iops = {
 	.getattr	= vcachefs_getattr,
 };
+
+#ifdef VCACHEFS_WRITE
+/*
+ * ------------------------------------------------------------------------
+ * Writable passthrough inode ops (mount option `writable`, mnt_idmap ABI).
+ *
+ * All of these forward the mutation verbatim to the LOWER (.enc/) tree, which
+ * is the single source of truth — there is NO encrypt-on-write.  Two invariants
+ * are enforced on every op:
+ *   (1) the mount is `writable` AND the calling process is gate-authorized
+ *       (vcachefs_may_write), else -EROFS / -EACCES;
+ *   (2) an ENCRYPTED (ANTREV01) file is immutable — it can be read (decrypted)
+ *       but never written, unlinked, renamed-over, or resized, so the shipped
+ *       ciphertext payload can never be altered or deleted through the mount.
+ *
+ * The lower directory dentry is pinned by the parent vcachefs inode's
+ * ->lower_path, so these ops reach the (possibly overmounted/in-place-shadowed)
+ * lower directly in-kernel — no path walk, works on a bare in-place mount.
+ * ------------------------------------------------------------------------
+ */
+
+/* Refresh a vcachefs inode's cached attrs from its lower inode after a change. */
+static void vcachefs_copy_attr(struct inode *inode, struct inode *lower)
+{
+	inode->i_mode = lower->i_mode;
+	inode->i_uid  = lower->i_uid;
+	inode->i_gid  = lower->i_gid;
+	set_nlink(inode, lower->i_nlink);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+	inode_set_atime_to_ts(inode, inode_get_atime(lower));
+	inode_set_mtime_to_ts(inode, inode_get_mtime(lower));
+	inode_set_ctime_to_ts(inode, inode_get_ctime(lower));
+#else
+	inode->i_atime = lower->i_atime;
+	inode->i_mtime = lower->i_mtime;
+	inode->i_ctime = lower->i_ctime;
+#endif
+	if (S_ISREG(lower->i_mode)) {
+		loff_t sz = i_size_read(lower);
+
+		i_size_write(inode, sz);
+		VCACHEFS_I(inode)->plain_len = sz;
+		VCACHEFS_I(inode)->container_len = sz;
+	}
+}
+
+/* Gate a mutation on a directory: writable mount + authorized caller. */
+static int vcachefs_may_write(struct inode *dir)
+{
+	if (!VCACHEFS_SB(dir->i_sb)->writable)
+		return -EROFS;
+	if (!vcachefs_task_authorized())
+		return -EACCES;
+	return 0;
+}
+
+static int vcachefs_create(struct mnt_idmap *idmap, struct inode *dir,
+			    struct dentry *dentry, umode_t mode, bool excl)
+{
+	struct dentry *ldir = VCACHEFS_I(dir)->lower_path.dentry;
+	struct inode *ldir_inode = d_inode(ldir);
+	struct mnt_idmap *lidmap = vcachefs_lower_idmap(dir);
+	struct dentry *lchild;
+	struct inode *inode;
+	int err;
+
+	err = vcachefs_may_write(dir);
+	if (err)
+		return err;
+
+	inode_lock_nested(ldir_inode, I_MUTEX_PARENT);
+	lchild = lookup_one_len(dentry->d_name.name, ldir, dentry->d_name.len);
+	if (IS_ERR(lchild)) {
+		inode_unlock(ldir_inode);
+		return PTR_ERR(lchild);
+	}
+	err = vfs_create(lidmap, ldir_inode, lchild, mode, excl);
+	inode_unlock(ldir_inode);
+	if (err) {
+		dput(lchild);
+		return err;
+	}
+
+	inode = vcachefs_iget(dir->i_sb, lchild);
+	dput(lchild);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	d_instantiate(dentry, inode);
+	vcachefs_copy_attr(dir, ldir_inode);		/* dir times bumped */
+	return 0;
+}
+
+static int vcachefs_unlink(struct inode *dir, struct dentry *dentry)
+{
+	struct dentry *ldir = VCACHEFS_I(dir)->lower_path.dentry;
+	struct inode *ldir_inode = d_inode(ldir);
+	struct mnt_idmap *lidmap = vcachefs_lower_idmap(dir);
+	struct inode *victim = d_inode(dentry);
+	struct dentry *lchild;
+	int err;
+
+	err = vcachefs_may_write(dir);
+	if (err)
+		return err;
+	if (victim && VCACHEFS_I(victim)->encrypted)
+		return -EPERM;		/* shipped ciphertext is immutable */
+
+	inode_lock_nested(ldir_inode, I_MUTEX_PARENT);
+	lchild = lookup_one_len(dentry->d_name.name, ldir, dentry->d_name.len);
+	if (IS_ERR(lchild)) {
+		inode_unlock(ldir_inode);
+		return PTR_ERR(lchild);
+	}
+	err = vfs_unlink(lidmap, ldir_inode, lchild, NULL);
+	dput(lchild);
+	inode_unlock(ldir_inode);
+	if (!err && victim) {
+		struct inode *lvictim = d_inode(VCACHEFS_I(victim)->lower_path.dentry);
+
+		set_nlink(victim, lvictim->i_nlink);
+		vcachefs_copy_attr(dir, ldir_inode);
+	}
+	return err;
+}
+
+static int vcachefs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+			   struct dentry *dentry, umode_t mode)
+{
+	struct dentry *ldir = VCACHEFS_I(dir)->lower_path.dentry;
+	struct inode *ldir_inode = d_inode(ldir);
+	struct mnt_idmap *lidmap = vcachefs_lower_idmap(dir);
+	struct dentry *lchild;
+	struct inode *inode;
+	int err;
+
+	err = vcachefs_may_write(dir);
+	if (err)
+		return err;
+
+	inode_lock_nested(ldir_inode, I_MUTEX_PARENT);
+	lchild = lookup_one_len(dentry->d_name.name, ldir, dentry->d_name.len);
+	if (IS_ERR(lchild)) {
+		inode_unlock(ldir_inode);
+		return PTR_ERR(lchild);
+	}
+	err = vfs_mkdir(lidmap, ldir_inode, lchild, mode);
+	if (err) {
+		inode_unlock(ldir_inode);
+		dput(lchild);
+		return err;
+	}
+	/* some filesystems leave the dentry negative after a successful mkdir */
+	if (!d_really_is_positive(lchild)) {
+		dput(lchild);
+		lchild = lookup_one_len(dentry->d_name.name, ldir,
+					dentry->d_name.len);
+		if (IS_ERR(lchild)) {
+			inode_unlock(ldir_inode);
+			return PTR_ERR(lchild);
+		}
+	}
+	inode_unlock(ldir_inode);
+
+	inode = vcachefs_iget(dir->i_sb, lchild);
+	dput(lchild);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	d_instantiate(dentry, inode);
+	set_nlink(dir, ldir_inode->i_nlink);
+	return 0;
+}
+
+static int vcachefs_rmdir(struct inode *dir, struct dentry *dentry)
+{
+	struct dentry *ldir = VCACHEFS_I(dir)->lower_path.dentry;
+	struct inode *ldir_inode = d_inode(ldir);
+	struct mnt_idmap *lidmap = vcachefs_lower_idmap(dir);
+	struct inode *victim = d_inode(dentry);
+	struct dentry *lchild;
+	int err;
+
+	err = vcachefs_may_write(dir);
+	if (err)
+		return err;
+
+	inode_lock_nested(ldir_inode, I_MUTEX_PARENT);
+	lchild = lookup_one_len(dentry->d_name.name, ldir, dentry->d_name.len);
+	if (IS_ERR(lchild)) {
+		inode_unlock(ldir_inode);
+		return PTR_ERR(lchild);
+	}
+	err = vfs_rmdir(lidmap, ldir_inode, lchild);
+	dput(lchild);
+	inode_unlock(ldir_inode);
+	if (!err) {
+		if (victim)
+			clear_nlink(victim);
+		set_nlink(dir, ldir_inode->i_nlink);
+	}
+	return err;
+}
+
+static int vcachefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+			     struct dentry *dentry, const char *symname)
+{
+	struct dentry *ldir = VCACHEFS_I(dir)->lower_path.dentry;
+	struct inode *ldir_inode = d_inode(ldir);
+	struct mnt_idmap *lidmap = vcachefs_lower_idmap(dir);
+	struct dentry *lchild;
+	struct inode *inode;
+	int err;
+
+	err = vcachefs_may_write(dir);
+	if (err)
+		return err;
+
+	inode_lock_nested(ldir_inode, I_MUTEX_PARENT);
+	lchild = lookup_one_len(dentry->d_name.name, ldir, dentry->d_name.len);
+	if (IS_ERR(lchild)) {
+		inode_unlock(ldir_inode);
+		return PTR_ERR(lchild);
+	}
+	err = vfs_symlink(lidmap, ldir_inode, lchild, symname);
+	inode_unlock(ldir_inode);
+	if (err) {
+		dput(lchild);
+		return err;
+	}
+	inode = vcachefs_iget(dir->i_sb, lchild);
+	dput(lchild);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+static int vcachefs_rename(struct mnt_idmap *idmap,
+			    struct inode *old_dir, struct dentry *old_dentry,
+			    struct inode *new_dir, struct dentry *new_dentry,
+			    unsigned int flags)
+{
+	struct dentry *lold_dir = VCACHEFS_I(old_dir)->lower_path.dentry;
+	struct dentry *lnew_dir = VCACHEFS_I(new_dir)->lower_path.dentry;
+	struct mnt_idmap *lidmap = vcachefs_lower_idmap(old_dir);
+	struct inode *old_victim = d_inode(old_dentry);
+	struct inode *new_victim = d_inode(new_dentry);
+	struct dentry *lold = NULL, *lnew = NULL, *trap;
+	struct renamedata rd;
+	int err;
+
+	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
+		return -EINVAL;
+	err = vcachefs_may_write(old_dir);
+	if (err)
+		return err;
+	err = vcachefs_may_write(new_dir);
+	if (err)
+		return err;
+	/* never move, nor overwrite-away, shipped ciphertext */
+	if (old_victim && VCACHEFS_I(old_victim)->encrypted)
+		return -EPERM;
+	if (new_victim && VCACHEFS_I(new_victim)->encrypted)
+		return -EPERM;
+
+	trap = lock_rename(lnew_dir, lold_dir);
+
+	lold = lookup_one_len(old_dentry->d_name.name, lold_dir,
+			      old_dentry->d_name.len);
+	if (IS_ERR(lold)) {
+		err = PTR_ERR(lold);
+		lold = NULL;
+		goto unlock;
+	}
+	lnew = lookup_one_len(new_dentry->d_name.name, lnew_dir,
+			      new_dentry->d_name.len);
+	if (IS_ERR(lnew)) {
+		err = PTR_ERR(lnew);
+		lnew = NULL;
+		goto unlock;
+	}
+	if (!d_really_is_positive(lold)) {	/* source vanished */
+		err = -ENOENT;
+		goto unlock;
+	}
+	if (trap == lold) {			/* lower dir is an ancestor of src */
+		err = -EINVAL;
+		goto unlock;
+	}
+	if (trap == lnew) {			/* lower dir is an ancestor of dst */
+		err = -ENOTEMPTY;
+		goto unlock;
+	}
+
+	memset(&rd, 0, sizeof(rd));
+	rd.old_mnt_idmap = lidmap;
+	rd.old_dir	 = d_inode(lold_dir);
+	rd.old_dentry	 = lold;
+	rd.new_mnt_idmap = lidmap;
+	rd.new_dir	 = d_inode(lnew_dir);
+	rd.new_dentry	 = lnew;
+	rd.flags	 = flags;
+	err = vfs_rename(&rd);		/* VFS d_move()s our upper dentries on success */
+unlock:
+	dput(lold);
+	dput(lnew);
+	unlock_rename(lnew_dir, lold_dir);
+	return err;
+}
+
+static int vcachefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+			     struct iattr *ia)
+{
+	struct inode *inode = d_inode(dentry);
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
+	struct dentry *lower = ii->lower_path.dentry;
+	struct inode *lower_inode = d_inode(lower);
+	struct mnt_idmap *lidmap = vcachefs_lower_idmap(inode);
+	struct iattr lia;
+	int err;
+
+	if (!VCACHEFS_SB(inode->i_sb)->writable)
+		return -EROFS;
+	if (!vcachefs_task_authorized())
+		return -EACCES;
+	if (ii->encrypted)
+		return -EPERM;		/* can't resize/chmod ciphertext */
+
+	err = setattr_prepare(idmap, dentry, ia);
+	if (err)
+		return err;
+
+	lia = *ia;
+	/* ATTR_FILE pins the UPPER struct file; the lower op must not deref it */
+	lia.ia_valid &= ~ATTR_FILE;
+
+	inode_lock(lower_inode);
+	err = notify_change(lidmap, lower, &lia, NULL);
+	inode_unlock(lower_inode);
+	if (!err)
+		vcachefs_copy_attr(inode, lower_inode);
+	return err;
+}
+
+const struct inode_operations vcachefs_dir_iops_rw = {
+	.lookup		= vcachefs_lookup,
+	.getattr	= vcachefs_getattr,
+	.create		= vcachefs_create,
+	.unlink		= vcachefs_unlink,
+	.mkdir		= vcachefs_mkdir,
+	.rmdir		= vcachefs_rmdir,
+	.symlink	= vcachefs_symlink,
+	.rename		= vcachefs_rename,
+	.setattr	= vcachefs_setattr,
+};
+
+const struct inode_operations vcachefs_file_iops_rw = {
+	.getattr	= vcachefs_getattr,
+	.setattr	= vcachefs_setattr,
+};
+#endif /* VCACHEFS_WRITE */
 
 /*
  * Follow a symlink by proxying to the lower (.enc/) symlink's body.  The packer

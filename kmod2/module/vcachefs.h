@@ -12,11 +12,28 @@
 #include <linux/fs.h>
 #include <linux/path.h>
 #include <linux/mutex.h>
+#include <linux/mount.h>	/* mnt_idmap() for the lower-idmap helper below */
 
 #include "compat.h"	/* d_inode() shim for the accessor used below */
 
 #define VCACHEFS_NAME		"vcachefs"
 #define VCACHEFS_MAGIC		0x9E2B1147	/* non-descriptive sb magic */
+
+/*
+ * Writable passthrough ("-o writable"): an OPT-IN mode in which an *authorized*
+ * process (the per-exe-signed/whitelisted gate, same identity as a data read)
+ * may create/modify/delete *plaintext* files through the mount.  Writes are
+ * forwarded verbatim to the lower tree — there is NO encrypt-on-write: encrypted
+ * (ANTREV01) files stay read-only (a write open returns -EROFS) and can never be
+ * removed/renamed/truncated, so the shipped ciphertext payload is immutable.
+ * Only the app's own plaintext scratch (lock/pid/log files) is mutable.
+ *
+ * Implemented only for the mnt_idmap inode-op ABI (>= 6.3; the 6.8 field
+ * target).  On older kernels the option is rejected at mount and the fs is RO.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#define VCACHEFS_WRITE 1
+#endif
 
 /* On-disk container format (antirev-fs-pack.py / protect.py --embed-key):
  *   [magic:8][iv:12][tag:16][ciphertext...][key:32][magic:8]
@@ -69,6 +86,7 @@ struct vcachefs_sb_info {
 	struct path	lower_root;		/* the .enc/ subtree */
 	char		*passthrough;		/* comma list of extensions, or NULL */
 	bool		pass_nonelf;		/* passdata: serve ANY non-magic file plaintext */
+	bool		writable;		/* -o writable: gated plaintext write passthrough */
 };
 
 /* Per-inode state.  One vcachefs inode per lower inode (iget5 cached) so the
@@ -108,6 +126,15 @@ static inline struct inode *vcachefs_lower_inode(struct inode *inode)
 	return d_inode(VCACHEFS_I(inode)->lower_path.dentry);
 }
 
+#ifdef VCACHEFS_WRITE
+/* The idmap of the LOWER mount — what vfs_create/unlink/rename/notify_change on
+ * the lower inodes expect (NOT the vcachefs mount's idmap passed to our ops). */
+static inline struct mnt_idmap *vcachefs_lower_idmap(struct inode *inode)
+{
+	return mnt_idmap(VCACHEFS_I(inode)->lower_path.mnt);
+}
+#endif
+
 /* super.c */
 extern struct kmem_cache *vcachefs_inode_cachep;
 extern const struct super_operations vcachefs_sops;
@@ -116,7 +143,26 @@ extern const struct super_operations vcachefs_sops;
 extern const struct inode_operations vcachefs_dir_iops;
 extern const struct inode_operations vcachefs_file_iops;
 extern const struct inode_operations vcachefs_symlink_iops;
+#ifdef VCACHEFS_WRITE
+/* Writable-mount variants: add the create/unlink/rename/setattr seam. */
+extern const struct inode_operations vcachefs_dir_iops_rw;
+extern const struct inode_operations vcachefs_file_iops_rw;
+#endif
 struct inode *vcachefs_iget(struct super_block *sb, struct dentry *lower_dentry);
+
+/* True iff @inode is a vcachefs REGULAR-file inode (either the read-only or the
+ * writable-mount iops).  The gate uses this to decide a file is vcachefs-resident
+ * and may carry a per-exe signature, so it must match BOTH variants. */
+static inline bool vcachefs_is_reg_inode(const struct inode *inode)
+{
+	if (inode->i_op == &vcachefs_file_iops)
+		return true;
+#ifdef VCACHEFS_WRITE
+	if (inode->i_op == &vcachefs_file_iops_rw)
+		return true;
+#endif
+	return false;
+}
 
 /* file.c */
 extern const struct file_operations vcachefs_dir_fops;

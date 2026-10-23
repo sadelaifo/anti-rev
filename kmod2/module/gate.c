@@ -659,7 +659,7 @@ static bool authz_ok(struct file *exe)
 		return false;		/* pinned name, wrong build -> deny */
 	if (authz_whitelisted(name))
 		return true;
-	if (inode && inode->i_op == &vcachefs_file_iops &&
+	if (inode && vcachefs_is_reg_inode(inode) &&
 	    az_s(inode))
 		return true;
 	return false;
@@ -742,7 +742,7 @@ bool vcf_verify_authorize_fd(struct file *f)
 	if (!f)
 		return false;
 	inode = file_inode(f);
-	if (inode && inode->i_op == &vcachefs_file_iops)
+	if (inode && vcachefs_is_reg_inode(inode))
 		return az_s(inode);
 	return vcf_verify_file_sig(f);
 }

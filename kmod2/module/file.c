@@ -144,15 +144,67 @@ static int vcachefs_readpage(struct file *file, struct page *page)
  */
 struct vcachefs_passthrough {
 	struct file	*lower;
-	loff_t		limit;		/* lower_size - ANTREV_TRAILER_LEN */
+	loff_t		limit;		/* lower_size - ANTREV_TRAILER_LEN (cipher-RO) */
+	bool		direct;		/* true: forward ALL ops to lower (writable plaintext) */
 };
 
 static int vcachefs_file_open(struct inode *inode, struct file *file)
 {
 	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
+#ifdef VCACHEFS_WRITE
+	struct vcachefs_sb_info *sbi = VCACHEFS_SB(inode->i_sb);
+#endif
 
 	if (!ii->open_ok)
 		return -EIO;	/* strict mode: unencrypted, non-whitelisted */
+
+#ifdef VCACHEFS_WRITE
+	/*
+	 * Writable mount (`-o writable`), NON-encrypted (plaintext) file:
+	 * forward EVERY data op (read/write/mmap/splice/seek/fsync) straight to a
+	 * per-open lower file, so the lower fs's own page cache is the single
+	 * coherent source for concurrent readers and writers — the overlayfs
+	 * idiom, with no vcachefs-side plaintext copy to go stale.  Writes require
+	 * gate authorization (only the app may mutate its scratch; `cp` into the
+	 * mount is denied); plain reads of non-secret plaintext stay ungated.
+	 *
+	 * Encrypted files are never writable here (no encrypt-on-write) and keep
+	 * the decrypt + shared-page-cache read path below; a write-intent open of
+	 * one is refused so the shipped ciphertext payload stays immutable.
+	 */
+	if (sbi->writable && !ii->encrypted) {
+		struct vcachefs_passthrough *pd;
+		struct file *lower;
+		int lflags;
+
+		if (file->f_mode & FMODE_WRITE) {
+			if (!vcachefs_task_authorized())
+				return -EACCES;
+			/* mirror access mode + append; O_CREAT/O_TRUNC were
+			 * already applied to the upper open (O_TRUNC via our
+			 * ->setattr), so don't replay them against the lower. */
+			lflags = file->f_flags &
+				 (O_ACCMODE | O_APPEND | O_LARGEFILE);
+		} else {
+			lflags = O_RDONLY | (file->f_flags & O_LARGEFILE);
+		}
+		pd = kmalloc(sizeof(*pd), GFP_KERNEL);
+		if (!pd)
+			return -ENOMEM;
+		lower = dentry_open(&ii->lower_path, lflags, current_cred());
+		if (IS_ERR(lower)) {
+			kfree(pd);
+			return PTR_ERR(lower);
+		}
+		pd->lower = lower;
+		pd->limit = 0;
+		pd->direct = true;
+		file->private_data = pd;
+		return 0;
+	}
+	if (sbi->writable && ii->encrypted && (file->f_mode & FMODE_WRITE))
+		return -EROFS;		/* shipped ciphertext is immutable */
+#endif /* VCACHEFS_WRITE */
 
 	/*
 	 * Decrypt-authorization gate.  Gating at open — before any read/mmap/
@@ -204,6 +256,7 @@ static int vcachefs_file_open(struct inode *inode, struct file *file)
 			pd->lower = lower;
 			pd->limit = lsz > ANTREV_TRAILER_LEN ?
 				    lsz - ANTREV_TRAILER_LEN : 0;
+			pd->direct = false;		/* cipher-RO passthrough */
 			file->private_data = pd;
 		}
 	}
@@ -278,14 +331,48 @@ static ssize_t vcachefs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 	if (pd) {
 		loff_t pos = iocb->ki_pos;
-		ssize_t ret = vcachefs_passthrough_read(pd->lower, pd->limit,
-							 to, &pos);
+		ssize_t ret;
 
+#ifdef VCACHEFS_WRITE
+		if (pd->direct)
+			/* writable-mount plaintext: read straight from the lower
+			 * file so this fd sees its own (and others') writes. */
+			ret = vfs_iter_read(pd->lower, to, &pos, 0);
+		else
+#endif
+			ret = vcachefs_passthrough_read(pd->lower, pd->limit,
+							to, &pos);
 		iocb->ki_pos = pos;
 		return ret;
 	}
 	return generic_file_read_iter(iocb, to);
 }
+
+#ifdef VCACHEFS_WRITE
+static ssize_t vcachefs_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+	struct vcachefs_passthrough *pd = iocb->ki_filp->private_data;
+	loff_t pos;
+	ssize_t ret;
+
+	if (!pd || !pd->direct)
+		return -EROFS;			/* not a writable-plaintext fd */
+	pos = iocb->ki_pos;
+	ret = vfs_iter_write(pd->lower, from, &pos, 0);
+	iocb->ki_pos = pos;
+	return ret;
+}
+
+static int vcachefs_fsync(struct file *file, loff_t start, loff_t end,
+			   int datasync)
+{
+	struct vcachefs_passthrough *pd = file->private_data;
+
+	if (pd && pd->direct)
+		return vfs_fsync_range(pd->lower, start, end, datasync);
+	return 0;	/* read-only fd: nothing of ours to flush */
+}
+#endif /* VCACHEFS_WRITE */
 #else	/* LINUX_VERSION_CODE < 3.16: no iov_iter reads (RHEL/CentOS 7 3.10) */
 /*
  * Classic .aio_read dispatcher.  read(2) reaches this via do_sync_read (which
@@ -357,11 +444,35 @@ out:
 
 static int vcachefs_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	/* Unauthorized passthrough: refuse mmap.  A file-backed mapping of the
-	 * lower file would surface the key trailer in the final page (it can't
-	 * be capped the way read/splice are).  Readers fall back to read(). */
-	if (file->private_data)
+	struct vcachefs_passthrough *pd = file->private_data;
+
+	if (pd) {
+#ifdef VCACHEFS_WRITE
+		if (pd->direct) {
+			/* writable-mount plaintext: back the mapping with the
+			 * LOWER file's address space (overlayfs idiom), so mmap
+			 * /exec of plaintext works and shares the lower page
+			 * cache across processes.  Retarget the vma's file, then
+			 * call the lower mmap; restore on failure to keep refs
+			 * balanced. */
+			struct file *realfile = pd->lower;
+			int ret;
+
+			if (!realfile->f_op->mmap)
+				return -ENODEV;
+			vma_set_file(vma, realfile);
+			ret = call_mmap(vma->vm_file, vma);
+			if (ret)
+				vma_set_file(vma, file);
+			return ret;
+		}
+#endif
+		/* cipher-RO passthrough: refuse mmap.  A file-backed mapping of
+		 * the lower file would surface the key trailer in the final page
+		 * (it can't be capped the way read/splice are); fall back to
+		 * read(). */
 		return -ENODEV;
+	}
 	return generic_file_mmap(file, vma);
 }
 
@@ -374,7 +485,14 @@ static ssize_t vcachefs_splice_read(struct file *in, loff_t *ppos,
 	if (pd) {
 		if (!pd->lower->f_op->splice_read)
 			return -EINVAL;
-		/* never let splice/sendfile read into the key trailer */
+#ifdef VCACHEFS_WRITE
+		/* writable-mount plaintext: splice the whole lower file (not
+		 * secret, no key trailer to withhold). */
+		if (pd->direct)
+			return pd->lower->f_op->splice_read(pd->lower, ppos,
+							    pipe, len, flags);
+#endif
+		/* cipher-RO: never let splice/sendfile read into the key trailer */
 		if (*ppos >= pd->limit)
 			return 0;
 		if ((loff_t)len > pd->limit - *ppos)
@@ -402,11 +520,18 @@ static loff_t vcachefs_llseek(struct file *file, loff_t offset, int whence)
 {
 	struct vcachefs_passthrough *pd = file->private_data;
 
-	/* Seek against the exposed (trailer-stripped) length so SEEK_END lands
-	 * at the limit, not the real ciphertext end. */
-	if (pd)
+	if (pd) {
+#ifdef VCACHEFS_WRITE
+		/* writable-mount plaintext: seek against the LIVE lower size so
+		 * SEEK_END follows the file as the app grows it. */
+		if (pd->direct)
+			return vfs_llseek(pd->lower, offset, whence);
+#endif
+		/* cipher-RO: seek against the exposed (trailer-stripped) length
+		 * so SEEK_END lands at the limit, not the real ciphertext end. */
 		return generic_file_llseek_size(file, offset, whence,
 						MAX_LFS_FILESIZE, pd->limit);
+	}
 	return generic_file_llseek(file, offset, whence);
 }
 
@@ -487,6 +612,12 @@ const struct file_operations vcachefs_file_fops = {
 #else
 	.read		= do_sync_read,		/* wraps a 1-iovec .aio_read call */
 	.aio_read	= vcachefs_aio_read,
+#endif
+#ifdef VCACHEFS_WRITE
+	/* Present unconditionally; inert on a RO mount (write opens never create
+	 * a write-through pd, so write_iter returns -EROFS and fsync is a no-op). */
+	.write_iter	= vcachefs_write_iter,
+	.fsync		= vcachefs_fsync,
 #endif
 	.mmap		= vcachefs_mmap,
 	.splice_read	= vcachefs_splice_read,

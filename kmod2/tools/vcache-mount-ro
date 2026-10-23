@@ -2,11 +2,17 @@
 # vcache-mount-ro — mount an encrypted .enc/ subtree as a decrypted vcachefs view.
 #
 # Usage:
-#   vcache-mount-ro [--passdata] <lowerdir> <mountpoint> [passthrough-exts]
+#   vcache-mount-ro [--passdata] [--writable] <lowerdir> <mountpoint> [passthrough-exts]
 #
 #   --passdata        serve ANY non-ANTREV01 file as plaintext passthrough — for
 #                     complete mixed-content read-only trees (vcache-pack.py
 #                     with mirror_plaintext).  Supersedes [passthrough-exts].
+#   --writable        gated plaintext write passthrough (6.8+ only): an
+#                     authorized process may create/write/delete PLAINTEXT files
+#                     in-place; encrypted files stay immutable (read-only).  No
+#                     overlay needed.  Drops the mount's SB_RDONLY.  See CLAUDE.md
+#                     "Native writable passthrough".  Usually paired with
+#                     --passdata so the app's scratch reads back.
 #   <lowerdir>        ciphertext tree (e.g. /root/proj/.enc/lib)
 #   <mountpoint>      where the plaintext view appears (e.g. /root/proj/lib)
 #   passthrough-exts  optional colon-separated extensions served verbatim
@@ -21,15 +27,25 @@ set -euo pipefail
 die() { echo "vcache-mount-ro: $*" >&2; exit 1; }
 
 passdata=0
-if [[ "${1:-}" == "--passdata" ]]; then passdata=1; shift; fi
+writable=0
+while [[ "${1:-}" == --* ]]; do
+	case "$1" in
+		--passdata) passdata=1; shift;;
+		--writable) writable=1; shift;;
+		*) die "unknown option: $1";;
+	esac
+done
 
-[[ $# -ge 2 ]] || die "usage: vcache-mount-ro [--passdata] <lowerdir> <mountpoint> [passthrough-exts]"
+[[ $# -ge 2 ]] || die "usage: vcache-mount-ro [--passdata] [--writable] <lowerdir> <mountpoint> [passthrough-exts]"
 lower="$1"; mp="$2"; pass="${3:-}"
 
 [[ -d "$lower" ]] || die "lowerdir not a directory: $lower"
 [[ -d "$mp" ]]    || die "mountpoint not a directory: $mp"
 
-opts="ro"
+# A writable mount must NOT carry 'ro' (the module drops SB_RDONLY only when the
+# 'writable' option is present; a conflicting 'ro' would re-assert it via the VFS).
+opts=""
+if [[ "$writable" -eq 1 ]]; then opts="writable"; else opts="ro"; fi
 [[ "$passdata" -eq 1 ]] && opts="$opts,passdata"
 [[ -n "$pass" ]] && opts="$opts,passthrough=$pass"
 [[ -n "${VCACHE_MOUNT_OPTS:-}" ]] && opts="$opts,$VCACHE_MOUNT_OPTS"
