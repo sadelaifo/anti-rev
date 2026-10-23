@@ -1,5 +1,5 @@
 #!/bin/sh
-# build-gdb-static.sh — build a fully-static, multiarch "my_gdb" for debugging
+# build-gdb-static.sh — build a fully-static, multiarch "vcache-coredbg" for debugging
 # coredumps of protected (encrypted-binary) processes at a client site.
 #
 # WHY: a client's stock gdb is denied by the vcachefs gate when it tries to read
@@ -11,25 +11,41 @@
 #
 # WHAT this produces: ONE statically-linked gdb (x86_64 host) with ALL targets
 # enabled (--enable-targets=all), so it reads BOTH x86_64 and aarch64 cores and
-# binaries.  Fully static (-static) so it runs on any client box regardless of
-# its glibc.  (For a technician who must run gdb natively ON an arm64 box, build
+# binaries.  Fully static (-all-static -no-pie) so it runs on any client box
+# regardless of its glibc.  Two flags are REQUIRED and non-obvious:
+#   * -all-static (NOT plain -static): gdb links its final executable through
+#     LIBTOOL, which SWALLOWS a plain -static (it means "static only against
+#     libtool archives") and still emits a dynamic binary needing the client's
+#     ld.so/libc.  -all-static is libtool's "fully static, no dynamic linking"
+#     flag and is what actually produces a static ELF here.
+#   * -no-pie / -fno-PIE: distros that default gcc to -pie (Ubuntu/Debian)
+#     otherwise emit a PIE that ignores static linking.
+# ALWAYS verify the result with `ldd` / `file`: it must say "statically linked"
+# / "not a dynamic executable", NOT "interpreter /lib64/ld-linux...".  The
+# system static libs this needs — libc.a libm.a libstdc++.a libz.a libexpat.a
+# libzstd.a — come from gcc/g++ + zlib1g-dev libexpat1-dev libzstd-dev.
+# (For a technician who must run gdb natively ON an arm64 box, build
 # an aarch64 host gdb on an arm64 machine, or cross — see the notes at the end.)
 #
-# UNIQUE HASH: a random build marker is baked into the version string via gdb's
-# official --with-pkgversion, so this binary's SHA-256 differs from any public
-# gdb and `gdb --version` identifies it (e.g. "vcachefs-coredbg a1b2...").  Do
-# NOT pad trailing garbage — the vendor signature footer (sign-exe.sh) lives at
-# the END of the file and the gate reads it from there; a marker in .rodata is
-# the clean way to make the build unique.
+# UNIQUE HASH (the "magic number"): a random 128-bit build marker is baked into
+# the version string via gdb's official --with-pkgversion, so this binary's
+# SHA-256 CANNOT match any public gdb — no upstream/distro build carries the
+# "vcachefs-coredbg" pkgversion prefix, and the 16 random bytes make a collision
+# with any other build astronomically improbable.  `gdb --version` prints it
+# (e.g. "vcachefs-coredbg a1b2c3d4...") so a technician can identify the binary.
+# Pin a specific magic with BUILD_ID=<hex>; the default is fresh randomness per
+# build.  Do NOT pad trailing garbage to force uniqueness — the vendor signature
+# footer (sign-exe.sh) lives at the END of the file and the gate reads it from
+# there; a marker in .rodata is the ONLY clean way to make the build unique.
 #
 # NO sudo / root: gmp, mpfr and ncurses are built from source into a local
 # prefix (modern gdb REQUIRES gmp+mpfr; readline/TUI need a curses/termcap lib).
 #
 # AFTER building: sign it with your vendor key so the gate trusts it —
-#     kmod2/tools/sign-exe.sh <vendor.key> <vendor.crt> my_gdb
+#     kmod2/tools/sign-exe.sh <vendor.key> <vendor.crt> vcache-coredbg
 #   and make sure the matching vendor cert is embedded in the module
 #   (gate_authz_pubkey.h) and the .ko rebuilt.  The technician runs the SIGNED
-#   my_gdb on the client box against the (plaintext) core, with the encrypted
+#   vcache-coredbg on the client box against the (plaintext) core, with the encrypted
 #   binary tree mounted so symbols resolve through the gated mount.
 #
 # Usage:  build-gdb-static.sh [OUTPUT_BINARY]
@@ -45,9 +61,9 @@ GMP_VER=${GMP_VER:-6.3.0}
 MPFR_VER=${MPFR_VER:-4.2.1}
 NCURSES_VER=${NCURSES_VER:-6.4}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
-BUILD_ID=${BUILD_ID:-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')}
+BUILD_ID=${BUILD_ID:-$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')}
 WORK=${WORK:-$(pwd)/gdb-static-work}
-OUT=${1:-$(pwd)/my_gdb}
+OUT=${1:-$(pwd)/vcache-coredbg}
 PKGVERSION="vcachefs-coredbg ${BUILD_ID}"
 
 PREFIX="$WORK/prefix"
@@ -112,7 +128,9 @@ d=$(unpack "$(fetch "$GNU/gdb/gdb-$GDB_VER.tar.xz")")
 		--with-gmp="$PREFIX" --with-mpfr="$PREFIX" \
 		--with-expat --with-system-zlib \
 		CPPFLAGS="-I$PREFIX/include" \
-		LDFLAGS="-static -L$PREFIX/lib" \
+		CFLAGS="-O2 -no-pie -fno-PIE" \
+		CXXFLAGS="-O2 -no-pie -fno-PIE" \
+		LDFLAGS="-all-static -no-pie -L$PREFIX/lib" \
 		>/dev/null
 	# MAKEINFO=true: skip doc generation (texinfo not required to build gdb).
 	make -j"$JOBS" MAKEINFO=true all-gdb

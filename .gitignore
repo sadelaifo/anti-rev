@@ -62,3 +62,6 @@ CTestTestfile.cmake
 /antirev_shim_blob_aarch64.h
 /runtime_paths.c
 /obf/
+# gdb-static builder work tree + log (never commit the 1.3G source/build dir)
+/gdb-static-work/
+/gdb-static-work-build.log
