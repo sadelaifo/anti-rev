@@ -21,6 +21,7 @@
 #include <linux/slab.h>
 #include <linux/uio.h>
 #include <linux/uaccess.h>	/* copy_to_user for the <3.16 aio_read path */
+#include <linux/compat.h>	/* compat_ptr() for the 32-on-64 chattr ioctls */
 
 #include "compat.h"
 #include "vcachefs.h"
@@ -670,6 +671,93 @@ static int vcachefs_dir_iterate(struct file *file, struct dir_context *ctx)
 	return ret;
 }
 
+/*
+ * chattr/lsattr passthrough (PRE-5.13 half).  vcachefs keeps no inode flags of
+ * its own, so we forward the attribute ioctls to a LOWER file and mirror the
+ * resulting VFS flag bits (S_IMMUTABLE / S_APPEND / S_NOATIME) onto our inode.
+ * Reaching the lower through the pinned ->lower_path is what makes this work on
+ * an IN-PLACE mount, where the lower tree is shadowed by the overmount and
+ * unreachable by path: `chattr +i /root/proj/bin/FOO` sets the immutable bit on
+ * the real backing inode, so writes vcachefs forwards there are rejected with
+ * -EPERM — a live, per-file read-only lock with no unmount.
+ *
+ * This ioctl path is for kernels BEFORE 5.13, where filesystems still implement
+ * FS_IOC_{GET,SET}FLAGS / FS_IOC_FS{GET,SET}XATTR in their ->unlocked_ioctl.
+ * From 5.13 the in-tree filesystems moved those to the fileattr inode ops and no
+ * longer answer them via unlocked_ioctl, so forwarding there would -ENOTTY;
+ * >= 5.13 is handled by vcachefs_fileattr_get/set in inode.c instead.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 13, 0)
+static long vcachefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct inode *inode = file_inode(file);
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
+	struct file *lower;
+	bool is_set;
+	long ret;
+
+	switch (cmd) {
+	case FS_IOC_GETFLAGS:
+	case FS_IOC_SETFLAGS:
+	case FS_IOC_FSGETXATTR:
+	case FS_IOC_FSSETXATTR:
+		break;
+	default:
+		return -ENOTTY;
+	}
+
+	is_set = (cmd == FS_IOC_SETFLAGS || cmd == FS_IOC_FSSETXATTR);
+	/* Honour the vcachefs mount's own read-only state for mutating cmds: the
+	 * lower mount is always writable, so without this a SETFLAGS could slip
+	 * through a read-only vcachefs mount. */
+	if (is_set) {
+		ret = mnt_want_write_file(file);
+		if (ret)
+			return ret;
+	}
+
+	lower = dentry_open(&ii->lower_path, O_RDONLY, current_cred());
+	if (IS_ERR(lower)) {
+		ret = PTR_ERR(lower);
+		goto out;
+	}
+	if (!lower->f_op->unlocked_ioctl) {
+		fput(lower);
+		ret = -ENOTTY;
+		goto out;
+	}
+	ret = lower->f_op->unlocked_ioctl(lower, cmd, arg);
+	fput(lower);
+
+	if (!ret && is_set) {
+		/* keep VFS-level IS_IMMUTABLE/IS_APPEND checks on our inode in sync
+		 * with the lower (lsattr still reads through GETFLAGS above). */
+		struct inode *li = d_inode(ii->lower_path.dentry);
+
+		inode->i_flags = (inode->i_flags &
+				  ~(S_IMMUTABLE | S_APPEND | S_NOATIME)) |
+				 (li->i_flags &
+				  (S_IMMUTABLE | S_APPEND | S_NOATIME));
+	}
+out:
+	if (is_set)
+		mnt_drop_write_file(file);
+	return ret;
+}
+
+#ifdef CONFIG_COMPAT
+static long vcachefs_compat_ioctl(struct file *file, unsigned int cmd,
+				   unsigned long arg)
+{
+	switch (cmd) {
+	case FS_IOC32_GETFLAGS:   cmd = FS_IOC_GETFLAGS;   break;
+	case FS_IOC32_SETFLAGS:   cmd = FS_IOC_SETFLAGS;   break;
+	}
+	return vcachefs_ioctl(file, cmd, (unsigned long)compat_ptr(arg));
+}
+#endif
+#endif /* LINUX_VERSION_CODE < 5.13 */
+
 const struct address_space_operations vcachefs_aops = {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
 	.read_folio	= vcachefs_read_folio,
@@ -693,6 +781,12 @@ const struct file_operations vcachefs_file_fops = {
 	.write_iter	= vcachefs_write_iter,
 	.fsync		= vcachefs_fsync,
 #endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 13, 0)
+	.unlocked_ioctl	= vcachefs_ioctl,	/* chattr/lsattr -> lower (>=5.13: fileattr ops) */
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= vcachefs_compat_ioctl,
+#endif
+#endif
 	.mmap		= vcachefs_mmap,
 	.splice_read	= vcachefs_splice_read,
 	.llseek		= vcachefs_llseek,
@@ -707,5 +801,11 @@ const struct file_operations vcachefs_dir_fops = {
 	.iterate	= vcachefs_dir_iterate,	/* 3.11..4.6 single-cursor readdir */
 #endif
 	.read		= generic_read_dir,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 13, 0)
+	.unlocked_ioctl	= vcachefs_ioctl,	/* chattr/lsattr on a dir -> lower */
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= vcachefs_compat_ioctl,
+#endif
+#endif
 	.llseek		= generic_file_llseek,
 };

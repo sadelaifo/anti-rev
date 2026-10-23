@@ -22,6 +22,10 @@
 #      vcache-replace; it can also be unlinked (even unauthorized)         (live-swap)
 #   8. control: with gate_enforce=0 the unauthorized READER decrypts -> proves the
 #      gate is the READ enforcer                                           (control)
+#   9. chattr +i through the mount forwards to the lower inode and locks the file
+#      read-only live (writes -> -EPERM); chattr -i restores it; lsattr reads the
+#      flag through the mount.  Best-effort (SKIPs if the lower fs lacks flag
+#      support, e.g. tmpfs on an older kernel)                             (chattr)
 #
 # Requires root + a kernel >= 4.9 (the write-op inode ABI the module shims span
 # mnt_idmap >= 6.3, user_namespace 5.12-6.2, and none < 5.12 down to 4.9).  On an
@@ -254,6 +258,27 @@ else
 	bad "control gate_enforce=0 read: $out"
 fi
 echo 1 > "$GPARAM" 2>/dev/null || true
+
+echo "== 9. chattr +i through the mount locks a file read-only (live) =="
+# Forwarded to the lower inode (via fileattr ops on >=5.13, unlocked_ioctl below
+# that).  Best-effort: SKIP if the lower fs can't store the flag (the test's
+# lower is tmpfs, which supports chattr flags only on newer kernels; a real ext4
+# lower always does).
+if command -v chattr >/dev/null && command -v lsattr >/dev/null; then
+	run create "$MP/locked.txt" "v1" >/dev/null
+	if chattr +i "$MP/locked.txt" 2>"$WORK/chattr.err"; then
+		out=$(run write "$MP/locked.txt" "v2")
+		[[ "$out" == ERR* ]] && ok "write to a chattr +i file is denied ($out)" || bad "write succeeded despite +i: $out"
+		lsattr "$MP/locked.txt" 2>/dev/null | grep -q 'i' && ok "lsattr shows the immutable flag through the mount" || bad "lsattr missing the i flag"
+		chattr -i "$MP/locked.txt" 2>/dev/null
+		out=$(run write "$MP/locked.txt" "v3")
+		[[ "$out" == "OK" ]] && ok "chattr -i restores writability" || bad "still locked after -i: $out"
+	else
+		skip "lower fs ($(stat -f -c %T "$ENC" 2>/dev/null)) has no chattr-flag support: $(cat "$WORK/chattr.err")"
+	fi
+else
+	skip "chattr/lsattr not installed"
+fi
 
 echo
 echo "==== write-mode: $PASS passed, $FAIL failed, $SKIP skipped ===="

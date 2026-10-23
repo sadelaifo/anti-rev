@@ -14,6 +14,9 @@
 #include <linux/slab.h>	/* kmalloc/kfree in the <4.2 symlink shim (not transitive on 3.10) */
 #include <linux/uaccess.h>	/* KERNEL_DS/get_fs/set_fs for the <4.5 symlink shim */
 #include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0)
+#include <linux/fileattr.h>	/* struct fileattr + vfs_fileattr_{get,set} (chattr) */
+#endif
 
 #include "compat.h"
 #include "vcachefs.h"
@@ -334,13 +337,66 @@ static int vcachefs_getattr(AREV_GETATTR_PROTO)
 	return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0)
+/*
+ * chattr/lsattr passthrough (5.13+ half).  From 5.13 the in-tree filesystems
+ * answer FS_IOC_{GET,SET}FLAGS / FS_IOC_FS{GET,SET}XATTR through the fileattr
+ * inode ops (not ->unlocked_ioctl), so a stacking fs forwards via
+ * vfs_fileattr_get/set on the LOWER dentry — the overlayfs idiom.  Reaching the
+ * lower through the pinned ->lower_path is what makes `chattr +i` on an IN-PLACE
+ * mount set the immutable bit on the real backing inode (the lower is otherwise
+ * shadowed/unreachable by path), giving a live per-file read-only lock.  The
+ * leading idmap/userns arg of ->fileattr_set is absorbed by VCF_IOP_IDMAP_PARAM
+ * (see compat.h); pre-5.13 kernels use the ->unlocked_ioctl path in file.c.
+ */
+static int vcachefs_fileattr_get(struct dentry *dentry, struct fileattr *fa)
+{
+	return vfs_fileattr_get(VCACHEFS_I(d_inode(dentry))->lower_path.dentry, fa);
+}
+
+static int vcachefs_fileattr_set(VCF_IOP_IDMAP_PARAM struct dentry *dentry,
+				  struct fileattr *fa)
+{
+	struct inode *inode = d_inode(dentry);
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
+	struct dentry *lower = ii->lower_path.dentry;
+	int err;
+
+	/* The VFS holds a write ref on OUR mount; take one on the lower mount too
+	 * (that is where the flag actually lands) around the forward. */
+	err = mnt_want_write(ii->lower_path.mnt);
+	if (err)
+		return err;
+	err = vfs_fileattr_set(vcachefs_lower_idmap(inode), lower, fa);
+	mnt_drop_write(ii->lower_path.mnt);
+	if (!err) {
+		struct inode *li = d_inode(lower);
+
+		/* mirror the flag bits so VFS IS_IMMUTABLE/IS_APPEND on our inode
+		 * agrees with the lower. */
+		inode->i_flags = (inode->i_flags &
+				  ~(S_IMMUTABLE | S_APPEND | S_NOATIME)) |
+				 (li->i_flags &
+				  (S_IMMUTABLE | S_APPEND | S_NOATIME));
+	}
+	return err;
+}
+#define VCACHEFS_FILEATTR_OPS \
+	.fileattr_get	= vcachefs_fileattr_get, \
+	.fileattr_set	= vcachefs_fileattr_set,
+#else
+#define VCACHEFS_FILEATTR_OPS
+#endif
+
 const struct inode_operations vcachefs_dir_iops = {
 	.lookup		= vcachefs_lookup,
 	.getattr	= vcachefs_getattr,
+	VCACHEFS_FILEATTR_OPS
 };
 
 const struct inode_operations vcachefs_file_iops = {
 	.getattr	= vcachefs_getattr,
+	VCACHEFS_FILEATTR_OPS
 };
 
 #ifdef VCACHEFS_WRITE
@@ -690,11 +746,13 @@ const struct inode_operations vcachefs_dir_iops_rw = {
 	.symlink	= vcachefs_symlink,
 	.rename		= vcachefs_rename,
 	.setattr	= vcachefs_setattr,
+	VCACHEFS_FILEATTR_OPS
 };
 
 const struct inode_operations vcachefs_file_iops_rw = {
 	.getattr	= vcachefs_getattr,
 	.setattr	= vcachefs_setattr,
+	VCACHEFS_FILEATTR_OPS
 };
 #endif /* VCACHEFS_WRITE */
 
