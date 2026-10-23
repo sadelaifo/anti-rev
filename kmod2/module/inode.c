@@ -131,6 +131,23 @@ static int vcachefs_classify(struct inode *inode, struct dentry *lower_dentry,
 	return 0;
 }
 
+#ifdef VCACHEFS_WRITE
+/*
+ * Re-run classification against the CURRENT lower content.  Used by the writable
+ * mount's refresh-on-write-close (vcachefs_refresh_after_write in file.c) so a
+ * file replaced through the mount — e.g. `cp newver.enc bin/FOO` — is re-sniffed
+ * (encrypted vs plaintext, new size / container_len / signature) and picked up
+ * live without a remount or vcache-replace.  The caller holds ii->plain_lock and
+ * has already dropped the stale decrypt buffer, so re-setting ii->encrypted etc.
+ * here cannot race a reader.
+ */
+int vcachefs_reclassify(struct inode *inode, loff_t *plain_len)
+{
+	return vcachefs_classify(inode, VCACHEFS_I(inode)->lower_path.dentry,
+				 plain_len);
+}
+#endif
+
 struct inode *vcachefs_iget(struct super_block *sb, struct dentry *lower_dentry)
 {
 	struct inode *lower_inode = d_inode(lower_dentry);
@@ -333,13 +350,17 @@ const struct inode_operations vcachefs_file_iops = {
  * the leading idmap/userns arg absorbed by the compat.h shims across bands).
  *
  * All of these forward the mutation verbatim to the LOWER (.enc/) tree, which
- * is the single source of truth — there is NO encrypt-on-write.  Two invariants
- * are enforced on every op:
- *   (1) the mount is `writable` AND the calling process is gate-authorized
- *       (vcachefs_may_write), else -EROFS / -EACCES;
- *   (2) an ENCRYPTED (ANTREV01) file is immutable — it can be read (decrypted)
- *       but never written, unlinked, renamed-over, or resized, so the shipped
- *       ciphertext payload can never be altered or deleted through the mount.
+ * is the single source of truth — there is NO encrypt-on-write.  Writes are
+ * UNGATED: the only precondition is that the mount is `writable` (else -EROFS,
+ * via vcachefs_may_write).  Any caller — the app, an operator's cp/scp/touch, a
+ * file-manager drag — may create, overwrite, rename, truncate or delete ANY
+ * file, ENCRYPTED ones included, so a stopped subsystem's binary (or a lib it
+ * links to) can be swapped for another container.  This does NOT weaken secrecy:
+ * the sole gate is on *reading decrypted content* (the encrypted-read path in
+ * file.c), and these ops only move RAW bytes (no decrypt, no key).  A file
+ * replaced through the mount is picked up live: on close of the write fd the
+ * inode is re-classified and its stale decrypt cache dropped (file.c's
+ * vcachefs_refresh_after_write via vcachefs_reclassify).
  *
  * The lower directory dentry is pinned by the parent vcachefs inode's
  * ->lower_path, so these ops reach the (possibly overmounted/in-place-shadowed)
@@ -372,13 +393,20 @@ static void vcachefs_copy_attr(struct inode *inode, struct inode *lower)
 	}
 }
 
-/* Gate a mutation on a directory: writable mount + authorized caller. */
+/*
+ * Gate a mutation on a directory.  Writes are UNGATED on a writable mount: any
+ * process (an operator's cp/scp/touch, a file-manager drag) may create/replace/
+ * delete files in bin/lib — including encrypted ones, so a stopped subsystem's
+ * binary or a lib it links to can be swapped for another container.  This does
+ * NOT weaken secrecy: the ONLY gate is on *reading decrypted content* (the
+ * encrypted-read path in file.c), and every write forwards RAW bytes to the
+ * lower (no decrypt, no key).  A plaintext file written here is served verbatim;
+ * an unsigned binary dropped in simply won't run — the writer's problem.
+ */
 static int vcachefs_may_write(struct inode *dir)
 {
 	if (!VCACHEFS_SB(dir->i_sb)->writable)
 		return -EROFS;
-	if (!vcachefs_task_authorized())
-		return -EACCES;
 	return 0;
 }
 
@@ -430,8 +458,6 @@ static int vcachefs_unlink(struct inode *dir, struct dentry *dentry)
 	err = vcachefs_may_write(dir);
 	if (err)
 		return err;
-	if (victim && VCACHEFS_I(victim)->encrypted)
-		return -EPERM;		/* shipped ciphertext is immutable */
 
 	inode_lock_nested(ldir_inode, I_MUTEX_PARENT);
 	lchild = lookup_one_len(dentry->d_name.name, ldir, dentry->d_name.len);
@@ -570,8 +596,6 @@ static int vcachefs_rename(VCF_IOP_IDMAP_PARAM
 	struct dentry *lold_dir = VCACHEFS_I(old_dir)->lower_path.dentry;
 	struct dentry *lnew_dir = VCACHEFS_I(new_dir)->lower_path.dentry;
 	vcf_idmap_t lidmap __maybe_unused = vcachefs_lower_idmap(old_dir);
-	struct inode *old_victim = d_inode(old_dentry);
-	struct inode *new_victim = d_inode(new_dentry);
 	struct dentry *lold = NULL, *lnew = NULL, *trap;
 	int err;
 
@@ -583,11 +607,6 @@ static int vcachefs_rename(VCF_IOP_IDMAP_PARAM
 	err = vcachefs_may_write(new_dir);
 	if (err)
 		return err;
-	/* never move, nor overwrite-away, shipped ciphertext */
-	if (old_victim && VCACHEFS_I(old_victim)->encrypted)
-		return -EPERM;
-	if (new_victim && VCACHEFS_I(new_victim)->encrypted)
-		return -EPERM;
 
 	trap = lock_rename(lnew_dir, lold_dir);
 
@@ -642,10 +661,8 @@ static int vcachefs_setattr(VCF_IOP_IDMAP_PARAM struct dentry *dentry,
 
 	if (!VCACHEFS_SB(inode->i_sb)->writable)
 		return -EROFS;
-	if (!vcachefs_task_authorized())
-		return -EACCES;
-	if (ii->encrypted)
-		return -EPERM;		/* can't resize/chmod ciphertext */
+	/* writes ungated: truncate/chmod allowed for any caller, encrypted files
+	 * included (replacing a shipped binary implies truncating/overwriting it). */
 
 	err = vcf_setattr_prepare(idmap, dentry, ia);
 	if (err)

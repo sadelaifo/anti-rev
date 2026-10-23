@@ -1,22 +1,27 @@
 #!/bin/bash
 # test_write_mode.sh — native writable passthrough (`-o writable`) for vcachefs.
 #
-# Proves the single-mount writable alternative to the overlay (kernel >= 4.9):
-#   1. an AUTHORIZED process creates/writes/reads-back a PLAINTEXT file in-place
-#      through the mount; the bytes land in the lower tree as plaintext    (write)
-#   2. mkdir / append / rename(atomic replace) / truncate / unlink by the
-#      authorized process all succeed                                     (ops)
-#   3. an UNAUTHORIZED process (not in the allow-list) is DENIED -EACCES on
-#      create AND on unlink — `cp` into the mount cannot land content      (gate)
-#   4. an ENCRYPTED (ANTREV01) file is IMMUTABLE: a write open -> -EROFS, an
-#      unlink -> -EPERM, a rename -> -EPERM, even for the authorized process
-#      -> the shipped ciphertext payload can never be altered/removed      (immutable)
-#   5. decrypt still works through the writable mount: the authorized reader sees
+# Proves the single-mount writable alternative to the overlay (kernel >= 4.9).
+# WRITES ARE UNGATED — the gate is ONLY on reading decrypted content — so an
+# operator can stop a subsystem, replace its binary (or a lib it links to) with
+# another container, and restart, all while the rest of the system runs:
+#   1. a process creates/writes/reads-back a PLAINTEXT file in-place through the
+#      mount; the bytes land in the lower tree as plaintext                (write)
+#   2. mkdir / append / rename(atomic replace) / truncate / unlink succeed  (ops)
+#   3. an UNAUTHORIZED process can ALSO write — create AND unlink succeed, the
+#      file lands in the tree (writes are ungated; cp/scp/drag all work)   (ungated)
+#   4. decrypt still works through the writable mount: the authorized reader sees
 #      the encrypted lib's plaintext ELF; the lower file stays ciphertext  (decrypt)
-#   6. plaintext scratch is NOT gated on read (the documented tradeoff: it is
-#      served to anyone, and sits plaintext in the lower tree)             (plaintext)
-#   7. control: with gate_enforce=0 the unauthorized writer succeeds -> proves the
-#      gate is what denies in (3), not some unrelated failure              (control)
+#   5. the READ gate still holds — an UNAUTHORIZED reader NEVER gets decrypted
+#      content (EACCES or the keyless container, never plaintext ELF)      (readgate)
+#   6. plaintext scratch is NOT gated on read (it is served to anyone, and sits
+#      plaintext in the lower tree)                                        (plaintext)
+#   7. an ENCRYPTED file replaced through the mount (cp a NEW container over it)
+#      is picked up LIVE — ->release re-classifies + drops the stale decrypt, so
+#      the next read decrypts the NEW bytes (size tracks the new container), no
+#      vcache-replace; it can also be unlinked (even unauthorized)         (live-swap)
+#   8. control: with gate_enforce=0 the unauthorized READER decrypts -> proves the
+#      gate is the READ enforcer                                           (control)
 #
 # Requires root + a kernel >= 4.9 (the write-op inode ABI the module shims span
 # mnt_idmap >= 6.3, user_namespace 5.12-6.2, and none < 5.12 down to 4.9).  On an
@@ -61,6 +66,17 @@ EOF
 gcc -shared -fPIC -o "$WORK/libtest.so" "$WORK/libtest.c"
 python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
 	--libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
+
+# A SECOND, clearly bigger encrypted lib, used as a replacement container to
+# prove live refresh-on-write-close (its decrypted size differs from libtest.so).
+cat > "$WORK/libbig.c" <<'EOF'
+char vcf_marker[65536] = "BIGVERSION";
+int vcachefs_answer(void) { return 99; }
+EOF
+gcc -shared -fPIC -o "$WORK/libbig.so" "$WORK/libbig.c"
+python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+	--libs "$WORK/libbig.so" --output-dir "$ENC" >/dev/null
+BIG_PLAIN_SZ=$(stat -c%s "$WORK/libbig.so")
 
 # fsop: a precise single-identity filesystem op tool.  Prints "OK[ <data>]" on
 # success or "ERR <errno> <name>" and exits nonzero on failure, so the gate's
@@ -177,43 +193,65 @@ out=$(run trunc "$MP/app.lock" 0)
 out=$(run unlink "$MP/logs/a.log")
 [[ "$out" == "OK" && ! -e "$ENC/logs/a.log" ]] && ok "unlink scratch" || bad "unlink: $out"
 
-echo "== 3. unauthorized writer is denied (the gate) =="
-out=$(evil create "$MP/evil" "x")
-[[ "$out" == ERR*EACCES* || "$out" == *"Permission denied"* ]] && ok "unauthorized create -> EACCES" || bad "evil create: $out"
-[[ ! -e "$ENC/evil" ]] && ok "no evil file landed in the tree" || bad "evil file appeared!"
-out=$(evil unlink "$MP/app.lock")
-[[ "$out" == ERR*EACCES* || "$out" == *"Permission denied"* ]] && ok "unauthorized unlink -> EACCES" || bad "evil unlink: $out"
-[[ -e "$ENC/app.lock" ]] && ok "app.lock survived the unauthorized unlink" || bad "app.lock was removed!"
+echo "== 3. ALL writes are ungated — the unauthorized writer also succeeds =="
+out=$(evil create "$MP/dropped" "x")
+[[ "$out" == "OK" ]] && ok "unauthorized create -> OK (writes ungated)" || bad "evil create: $out"
+[[ -f "$ENC/dropped" && "$(cat "$ENC/dropped")" == "x" ]] && ok "dropped file landed plaintext in the tree" || bad "dropped file missing/not plaintext"
+out=$(evil unlink "$MP/dropped")
+[[ "$out" == "OK" && ! -e "$ENC/dropped" ]] && ok "unauthorized unlink -> OK" || bad "evil unlink: $out"
 
-echo "== 4. encrypted file is immutable (no encrypt-on-write) =="
-out=$(run write "$MP/libtest.so" "x")
-[[ "$out" == ERR*EROFS* || "$out" == *"Read-only"* ]] && ok "write encrypted -> EROFS" || bad "enc write: $out"
-out=$(run unlink "$MP/libtest.so")
-[[ "$out" == ERR*EPERM* || "$out" == *"Operation not permitted"* ]] && ok "unlink encrypted -> EPERM" || bad "enc unlink: $out"
-run create "$MP/t.tmp" "y" >/dev/null
-out=$(run rename "$MP/libtest.so" "$MP/elsewhere.so")
-[[ "$out" == ERR*EPERM* || "$out" == *"Operation not permitted"* ]] && ok "rename encrypted -> EPERM" || bad "enc rename: $out"
-run unlink "$MP/t.tmp" >/dev/null 2>&1
-
-echo "== 5. decrypt still works through the writable mount =="
+echo "== 4. decrypt still works through the writable mount (read path intact) =="
 out=$(run readelf "$MP/libtest.so")
 [[ "$out" == "OK 7f454c46" ]] && ok "authorized reader sees decrypted ELF" || bad "decrypt read: $out"
 # lower stays ciphertext (container magic a74c2e91d63b085f)
 lmag=$(head -c8 "$ENC/libtest.so" | xxd -p 2>/dev/null)
 [[ "$lmag" == "a74c2e91d63b085f" ]] && ok "lower lib stays ciphertext at rest" || bad "lower magic: $lmag"
 
+echo "== 5. the READ gate still protects decrypted content (the ONLY gate) =="
+out=$(evil readelf "$MP/libtest.so")
+# An unauthorized reader must NEVER see the decrypted ELF (7f454c46): depending
+# on gate_passthrough_cipher it gets either EACCES or the keyless container's
+# magic (a74c...), but never plaintext.
+if [[ "$out" == "OK 7f454c46" ]]; then
+	bad "unauthorized reader DECRYPTED the lib — read gate broken! ($out)"
+else
+	ok "unauthorized reader does NOT get decrypted content ($out)"
+fi
+
 echo "== 6. plaintext scratch read is NOT gated (documented tradeoff) =="
 run create "$MP/public.txt" "HELLO" >/dev/null
 out=$(evil read "$MP/public.txt")
 [[ "$out" == "OK HELLO" ]] && ok "unauthorized reader CAN read plaintext scratch" || bad "evil read plaintext: $out"
 
-echo "== 7. control: gate_enforce=0 lets the unauthorized writer through =="
-echo 0 > "$GPARAM" 2>/dev/null || true
-out=$(evil create "$MP/ctrl" "z")
-if [[ "$out" == "OK" ]]; then
-	ok "gate_enforce=0 -> unauthorized write succeeds (gate was the enforcer)"
+echo "== 7. replace an encrypted file through the mount -> picked up LIVE =="
+# libvictim starts as the small encrypted libtest.so (classifies encrypted on
+# first lookup, ciphertext already in place).
+cp "$ENC/libtest.so" "$ENC/libvictim.so"
+out=$(run readelf "$MP/libvictim.so")
+[[ "$out" == "OK 7f454c46" ]] && ok "fresh encrypted copy decrypts" || bad "victim decrypt: $out"
+sz0=$(stat -c%s "$MP/libvictim.so")
+# Operator drops a NEW (bigger) container over it, straight through the mount —
+# no vcache-replace.  On close, ->release re-classifies + drops the stale decrypt.
+cp "$ENC/libbig.so" "$MP/libvictim.so"
+out=$(run readelf "$MP/libvictim.so")
+[[ "$out" == "OK 7f454c46" ]] && ok "after replace: still a valid decrypted ELF (not raw ciphertext)" || bad "post-replace readelf: $out"
+sz1=$(stat -c%s "$MP/libvictim.so")
+if [[ "$sz1" == "$BIG_PLAIN_SZ" && "$sz1" != "$sz0" ]]; then
+	ok "decrypted size tracks the NEW container ($sz0 -> $sz1) — refresh-on-close worked"
 else
-	bad "control gate_enforce=0: $out"
+	bad "size not refreshed: $sz0 -> $sz1 (want $BIG_PLAIN_SZ)"
+fi
+# and an encrypted file can be removed (even by the unauthorized identity)
+out=$(evil unlink "$MP/libvictim.so")
+[[ "$out" == "OK" && ! -e "$ENC/libvictim.so" ]] && ok "unlink an encrypted file -> OK (even unauthorized)" || bad "enc unlink: $out"
+
+echo "== 8. control: gate_enforce=0 lets the unauthorized reader decrypt =="
+echo 0 > "$GPARAM" 2>/dev/null || true
+out=$(evil readelf "$MP/libtest.so")
+if [[ "$out" == "OK 7f454c46" ]]; then
+	ok "gate_enforce=0 -> unauthorized reader decrypts (the gate is the READ enforcer)"
+else
+	bad "control gate_enforce=0 read: $out"
 fi
 echo 1 > "$GPARAM" 2>/dev/null || true
 

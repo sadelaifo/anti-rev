@@ -30,32 +30,31 @@
 			 * needed by the <3.16 .aio_read path below */
 #endif
 
-/* Lazy, idempotent whole-file decrypt into ii->plain. */
-static int vcachefs_ensure_plain(struct inode *inode)
+/*
+ * Lazy, idempotent whole-file decrypt into ii->plain.  The caller MUST hold
+ * ii->plain_lock, and must keep holding it across the copy out of ii->plain
+ * (see vcachefs_fill_page): there is NO lockless reader of ii->plain, so a
+ * concurrent writer's refresh (vcachefs_refresh_after_write) can swap it to NULL
+ * and free the old buffer under the same lock without racing a page fault.
+ */
+static int vcachefs_ensure_plain_locked(struct inode *inode)
 {
 	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
 	struct file *lower_file;
 	void *buf;
 	int ret = 0;
 
-	if (smp_load_acquire(&ii->plain))
+	if (ii->plain)
 		return 0;
 
-	mutex_lock(&ii->plain_lock);
-	if (ii->plain)
-		goto out;
-
 	buf = vmalloc(ii->plain_len ? ii->plain_len : 1);
-	if (!buf) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	if (!buf)
+		return -ENOMEM;
 
 	lower_file = dentry_open(&ii->lower_path, O_RDONLY, current_cred());
 	if (IS_ERR(lower_file)) {
-		ret = PTR_ERR(lower_file);
 		vfree(buf);
-		goto out;
+		return PTR_ERR(lower_file);
 	}
 
 	if (ii->encrypted) {
@@ -74,12 +73,10 @@ static int vcachefs_ensure_plain(struct inode *inode)
 
 	if (ret) {
 		vfree(buf);
-		goto out;
+		return ret;
 	}
-	smp_store_release(&ii->plain, buf);
-out:
-	mutex_unlock(&ii->plain_lock);
-	return ret;
+	ii->plain = buf;
+	return 0;
 }
 
 /*
@@ -95,9 +92,16 @@ static int vcachefs_fill_page(struct inode *inode, struct page *page)
 	void *kaddr;
 	int ret;
 
-	ret = vcachefs_ensure_plain(inode);
-	if (ret)
+	/* Hold plain_lock across BOTH the decrypt and the copy: this is the only
+	 * reader of ii->plain, so the writable-mount refresh can swap/free it
+	 * safely (no lockless fast path).  read_folio is called only on a page
+	 * cache miss (cold fault), so the mutex is off the steady-state path. */
+	mutex_lock(&ii->plain_lock);
+	ret = vcachefs_ensure_plain_locked(inode);
+	if (ret) {
+		mutex_unlock(&ii->plain_lock);
 		return ret;
+	}
 
 	if (off < (loff_t)ii->plain_len)
 		copy = min_t(size_t, PAGE_SIZE, ii->plain_len - off);
@@ -108,6 +112,7 @@ static int vcachefs_fill_page(struct inode *inode, struct page *page)
 	if (copy < PAGE_SIZE)
 		memset(kaddr + copy, 0, PAGE_SIZE - copy);
 	kunmap(page);
+	mutex_unlock(&ii->plain_lock);
 
 	flush_dcache_page(page);
 	return 0;
@@ -160,34 +165,26 @@ static int vcachefs_file_open(struct inode *inode, struct file *file)
 
 #ifdef VCACHEFS_WRITE
 	/*
-	 * Writable mount (`-o writable`), NON-encrypted (plaintext) file:
-	 * forward EVERY data op (read/write/mmap/splice/seek/fsync) straight to a
-	 * per-open lower file, so the lower fs's own page cache is the single
-	 * coherent source for concurrent readers and writers — the overlayfs
-	 * idiom, with no vcachefs-side plaintext copy to go stale.  Writes require
-	 * gate authorization (only the app may mutate its scratch; `cp` into the
-	 * mount is denied); plain reads of non-secret plaintext stay ungated.
-	 *
-	 * Encrypted files are never writable here (no encrypt-on-write) and keep
-	 * the decrypt + shared-page-cache read path below; a write-intent open of
-	 * one is refused so the shipped ciphertext payload stays immutable.
+	 * Writable mount (`-o writable`): writes are UNGATED so an operator (cp/
+	 * scp/touch/a file-manager drag) can replace a stopped subsystem's binary
+	 * or a lib it links to.  ANY open carrying FMODE_WRITE forwards straight to
+	 * a per-open lower file and moves RAW bytes — plaintext written verbatim,
+	 * an encrypted file replaced by whatever container the writer supplies.
+	 * There is NO encrypt-on-write and NO decrypt on this path, so no key or
+	 * plaintext is ever involved; opening writes up therefore does NOT weaken
+	 * the read gate below (decrypted content is still served only to authorized
+	 * readers).  A replacement written through the mount is picked up LIVE:
+	 * ->release re-classifies the inode and drops its stale decrypt cache
+	 * (vcachefs_refresh_after_write), so the next exec decrypts the new bytes
+	 * with no remount or vcache-replace.
 	 */
-	if (sbi->writable && !ii->encrypted) {
+	if (sbi->writable && (file->f_mode & FMODE_WRITE)) {
 		struct vcachefs_passthrough *pd;
 		struct file *lower;
-		int lflags;
+		/* mirror access mode + append; O_CREAT/O_TRUNC were already applied
+		 * to the upper open (O_TRUNC via our ->setattr), don't replay them. */
+		int lflags = file->f_flags & (O_ACCMODE | O_APPEND | O_LARGEFILE);
 
-		if (file->f_mode & FMODE_WRITE) {
-			if (!vcachefs_task_authorized())
-				return -EACCES;
-			/* mirror access mode + append; O_CREAT/O_TRUNC were
-			 * already applied to the upper open (O_TRUNC via our
-			 * ->setattr), so don't replay them against the lower. */
-			lflags = file->f_flags &
-				 (O_ACCMODE | O_APPEND | O_LARGEFILE);
-		} else {
-			lflags = O_RDONLY | (file->f_flags & O_LARGEFILE);
-		}
 		pd = kmalloc(sizeof(*pd), GFP_KERNEL);
 		if (!pd)
 			return -ENOMEM;
@@ -202,8 +199,31 @@ static int vcachefs_file_open(struct inode *inode, struct file *file)
 		file->private_data = pd;
 		return 0;
 	}
-	if (sbi->writable && ii->encrypted && (file->f_mode & FMODE_WRITE))
-		return -EROFS;		/* shipped ciphertext is immutable */
+	/*
+	 * Non-encrypted (plaintext) READ on a writable mount: serve straight from a
+	 * per-open lower file (the overlayfs idiom), so this fd sees its own and
+	 * others' live writes and mmap/exec of plaintext third-party libs works.
+	 * Plaintext isn't secret, so this read is ungated.
+	 */
+	if (sbi->writable && !ii->encrypted) {
+		struct vcachefs_passthrough *pd;
+		struct file *lower;
+		int lflags = O_RDONLY | (file->f_flags & O_LARGEFILE);
+
+		pd = kmalloc(sizeof(*pd), GFP_KERNEL);
+		if (!pd)
+			return -ENOMEM;
+		lower = dentry_open(&ii->lower_path, lflags, current_cred());
+		if (IS_ERR(lower)) {
+			kfree(pd);
+			return PTR_ERR(lower);
+		}
+		pd->lower = lower;
+		pd->limit = 0;
+		pd->direct = true;
+		file->private_data = pd;
+		return 0;
+	}
 #endif /* VCACHEFS_WRITE */
 
 	/*
@@ -535,15 +555,69 @@ static loff_t vcachefs_llseek(struct file *file, loff_t offset, int whence)
 	return generic_file_llseek(file, offset, whence);
 }
 
+#ifdef VCACHEFS_WRITE
+/*
+ * Refresh an inode after it was written through a writable mount, so a file
+ * replaced via a plain write (cp/scp/drag of a new container, in place OR via a
+ * fresh file) is picked up LIVE — no remount, no vcache-replace.  Re-sniffs the
+ * current lower content (encrypted vs plaintext, new size / container_len /
+ * signature) and drops the cached whole-file decrypt plus any cached pages, so
+ * the next read/exec re-decrypts the new bytes.
+ *
+ * Safe against concurrent readers: ii->plain is touched ONLY under plain_lock
+ * (vcachefs_fill_page holds it across the copy — there is no lockless reader),
+ * so swapping it to NULL here and freeing the old buffer after the lock cannot
+ * race a fault.  Cached pages are dropped with invalidate_mapping_pages, which
+ * only evicts clean, UNMAPPED pages — the intended case is a quiescent file
+ * (e.g. a subsystem the operator stopped before swapping its binary); a page
+ * still mapped by a live reader is left alone, exactly as overwriting an in-use
+ * file behaves on any filesystem.
+ */
+static void vcachefs_refresh_after_write(struct inode *inode)
+{
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
+	loff_t plain_len = 0;
+	void *old;
+	int err;
+
+	mutex_lock(&ii->plain_lock);
+	old = ii->plain;
+	ii->plain = NULL;			/* force re-decrypt on next fault */
+	err = vcachefs_reclassify(inode, &plain_len);
+	if (!err) {
+		ii->plain_len = plain_len;
+		i_size_write(inode, plain_len);
+	} else {
+		ii->open_ok = false;		/* fail-closed if the re-sniff failed */
+	}
+	mutex_unlock(&ii->plain_lock);
+
+	if (old)
+		vfree(old);
+	invalidate_mapping_pages(inode->i_mapping, 0, -1);
+}
+#endif /* VCACHEFS_WRITE */
+
 static int vcachefs_file_release(struct inode *inode, struct file *file)
 {
 	struct vcachefs_passthrough *pd = file->private_data;
+#ifdef VCACHEFS_WRITE
+	/* A write through a writable mount may have replaced the file's content;
+	 * re-classify + drop the stale decrypt cache so the new bytes are served
+	 * on the next open (the "cp a new container and it just runs" path). */
+	bool refresh = (file->f_mode & FMODE_WRITE) &&
+		       VCACHEFS_SB(inode->i_sb)->writable;
+#endif
 
 	if (pd) {
 		file->private_data = NULL;
-		fput(pd->lower);
+		fput(pd->lower);		/* flush/close the lower write fd first */
 		kfree(pd);
 	}
+#ifdef VCACHEFS_WRITE
+	if (refresh)
+		vcachefs_refresh_after_write(inode);
+#endif
 	return 0;
 }
 

@@ -16,13 +16,21 @@
 #include <linux/version.h>	/* LINUX_VERSION_CODE for the VCACHEFS_WRITE gate */
 
 /*
- * Writable passthrough ("-o writable"): an OPT-IN mode in which an *authorized*
- * process (the per-exe-signed/whitelisted gate, same identity as a data read)
- * may create/modify/delete *plaintext* files through the mount.  Writes are
- * forwarded verbatim to the lower tree — there is NO encrypt-on-write: encrypted
- * (ANTREV01) files stay read-only (a write open returns -EROFS) and can never be
- * removed/renamed/truncated, so the shipped ciphertext payload is immutable.
- * Only the app's own plaintext scratch (lock/pid/log files) is mutable.
+ * Writable passthrough ("-o writable"): an OPT-IN mode in which writes are
+ * UNGATED — ANY process (the app, an operator's cp/scp/touch, a file-manager
+ * drag) may create/modify/rename/delete files through the mount, forwarded
+ * verbatim to the lower tree.  ENCRYPTED (ANTREV01) files are mutable too, so a
+ * stopped subsystem's binary (or a lib it links to) can be swapped for another
+ * container while the rest of the system runs.  There is NO encrypt-on-write
+ * (raw bytes only), and the SOLE gate is on *reading decrypted content* (the
+ * encrypted-read path in file.c), so opening writes up never exposes plaintext
+ * or the key.  Dropping in an unsigned/plaintext binary just means it won't run
+ * — the writer's problem.  A file replaced through the mount (cp/scp/drag of a
+ * new container) is picked up LIVE: on close of the write fd the inode is
+ * re-sniffed and its stale decrypt cache dropped (vcachefs_refresh_after_write),
+ * so the next exec decrypts the new bytes with no remount.  (vcache-replace is
+ * still the tool for writing straight into the lower tree, e.g. on an in-place
+ * mount whose lower is shadowed, where you can't reach it through the mount.)
  *
  * Compiled for kernels >= 4.9, where the two VFS APIs the write ops rely on both
  * exist: setattr_prepare() and the flags-carrying ->rename inode op.  The
@@ -157,6 +165,8 @@ extern const struct inode_operations vcachefs_symlink_iops;
 /* Writable-mount variants: add the create/unlink/rename/setattr seam. */
 extern const struct inode_operations vcachefs_dir_iops_rw;
 extern const struct inode_operations vcachefs_file_iops_rw;
+/* Re-sniff the lower after a write, for refresh-on-write-close (file.c). */
+int vcachefs_reclassify(struct inode *inode, loff_t *plain_len);
 #endif
 struct inode *vcachefs_iget(struct super_block *sb, struct dentry *lower_dentry);
 
