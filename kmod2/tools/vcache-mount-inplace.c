@@ -10,8 +10,10 @@
 // snprintf/strcmp/syscall/getenv/execvp/... — are auto-encrypted; the rest are
 // hand-wrapped OBFSTR("...") below).
 //
-// In-place vcachefs mounts + tmpfs write layers; real = host only, sim = host +
-// (via docker inspect + setns into the container's mount ns) the sim container.
+// In-place vcachefs mounts, WRITABLE by default (the module's -o writable verb:
+// gated plaintext writes forwarded to the lower tree); real = host only, sim =
+// host + (via docker inspect + setns into the container's mount ns) the sim
+// container.
 //
 // Build:  make -C kmod2/tools vcache-mount-inplace   (runs the obfstr codegen,
 //         then a static build).  Run as root (re-execs with sudo -E).
@@ -51,11 +53,10 @@
 #define CFG_CONTAINER     OBFSTR("slave")       /* sim: business `docker run --name` */
 #define CFG_READY_MARKER  ""            /* installer's last-touched marker; "" => dir-nonempty */
 #define CFG_AUTHZ_PATH    OBFSTR("/etc/authorized_apps.txt")
-#define CFG_VCACHE_OPTS   OBFSTR("ro,passdata")
+#define CFG_WRITABLE      1             /* 1 = mount bin/lib WRITABLE in-place via the module's -o writable (gated plaintext writes; needs a .ko with that verb, kernel >= 6.3); 0 = read-only */
+#define CFG_VCACHE_OPTS   OBFSTR("passdata")    /* passthrough mode only; 'ro'/'writable' is prepended from CFG_WRITABLE, so do NOT put either here */
 #define CFG_STAGE_MODE    OBFSTR("auto")        /* auto | always | never */
 #define CFG_STAGE_DIR     OBFSTR("/dev/shm/arev")
-#define CFG_WRITE_BACKING OBFSTR("/run/vcache-write")
-#define CFG_TMPFS_OPTS    OBFSTR("mode=0755,nosuid,nodev")
 #define CFG_MODE          OBFSTR("real")        /* default --mode */
 
 #define CFG_WATCH_SECS    5             /* watch poll period (s) */
@@ -66,13 +67,12 @@
 #define CFG_RELOAD        0             /* 1 = rmmod+insmod on 'up' */
 
 /* Lists — ONE whitespace-separated string (no commas).  Wrap the whole string
- * in OBFSTR(...) to obfuscate it; "" = empty list.  WRITE_* entries are
- * "<mount-root>|<relative-path>", space-separated.
+ * in OBFSTR(...) to obfuscate it; "" = empty list.
  *
- * Mount roots (and WRITE_* roots) may be RELATIVE: a relative entry is rebased
- * onto the install root at runtime, so "bin lib" becomes
- * "<install-root>/bin <install-root>/lib".  An entry that already starts with
- * '/' is treated as absolute and left unchanged.
+ * Mount roots may be RELATIVE: a relative entry is rebased onto the install
+ * root at runtime, so "bin lib" becomes "<install-root>/bin
+ * <install-root>/lib".  An entry that already starts with '/' is treated as
+ * absolute and left unchanged.
  *
  * The install root is taken from the $CFG_SWPATH_ENV environment variable, or
  * CFG_SWPATH_DEFAULT when that env var is unset/empty.  Edit either below to
@@ -81,8 +81,6 @@
 #define CFG_SWPATH_DEFAULT OBFSTR("/root/proj")    /* install root when env unset */
 #define CFG_MOUNTS        OBFSTR("bin lib")  /* relative to the install root */
 #define CFG_ALLOW         ""                 /* legacy model only; prefer per-exe sigs */
-#define CFG_WRITE_DIRS    ""                 /* e.g. OBFSTR("bin|logs") */
-#define CFG_WRITE_FILES   ""                 /* e.g. OBFSTR("bin|QtApplication.pid") */
 /* Self-elevation is plain interactive `sudo -E` (become_root()).  There is NO
  * compiled-in password: a baked sudo credential — even obfstr-XOR-hidden — is
  * recoverable by any RE of the binary and forces a recompile to rotate, so it
@@ -101,15 +99,12 @@ static const char *AUTHZ_SIG_PATH;
 static int         GATE_ENFORCE, GATE_PASSTHROUGH, DEV_MODE, GATE_REQUIRE_SIG;
 static int         RELOAD_MODULE;
 static const char *VCACHEFS_OPTS;
+static int         WRITABLE;
 static const char *STAGE_MODE;
 static const char *STAGE_DIR;
-static const char *WRITE_BACKING;
-static const char *TMPFS_OPTS;
 
 static char      **MOUNTS;
 static char      **ALLOWL;
-static char      **WRITE_DIRS;
-static char      **WRITE_FILES;
 
 static int         MODE_SIM;
 static const char *ACTION;
@@ -459,19 +454,6 @@ static void rm_rf(const char *path)
 
 /* --------------------------------------------------- per-target operations */
 
-static const char *spec_root(const char *spec, char *buf, size_t n)
-{
-	const char *bar = strchr(spec, '|');
-	size_t l = bar ? (size_t)(bar - spec) : strlen(spec);
-	if (l >= n) l = n - 1;
-	memcpy(buf, spec, l);
-	buf[l] = 0;
-	return buf;
-}
-
-static const char *spec_rel(const char *spec)
-{ const char *bar = strchr(spec, '|'); return bar ? bar + 1 : ""; }
-
 static int do_up(void)
 {
 	int n = list_len(MOUNTS);
@@ -506,87 +488,36 @@ static int do_up(void)
 		}
 	}
 
-	for (int i = 0; WRITE_DIRS[i]; i++) {
-		char root[4096]; spec_root(WRITE_DIRS[i], root, sizeof root);
-		for (int j = 0; j < n; j++) if (!strcmp(MOUNTS[j], root)) {
-			char p[4096];
-			snprintf(p, sizeof p, "%s/%s", lowers[j], spec_rel(WRITE_DIRS[i]));
-			mkdir_p(p);
-		}
-	}
-	for (int i = 0; WRITE_FILES[i]; i++) {
-		char root[4096]; spec_root(WRITE_FILES[i], root, sizeof root);
-		for (int j = 0; j < n; j++) if (!strcmp(MOUNTS[j], root)) {
-			char p[4096], d[4096];
-			snprintf(p, sizeof p, "%s/%s", lowers[j], spec_rel(WRITE_FILES[i]));
-			snprintf(d, sizeof d, "%s", p);
-			char *sl = strrchr(d, '/'); if (sl) { *sl = 0; mkdir_p(d); }
-			if (access(p, F_OK) != 0) { int fd = open(p, O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd); }
-		}
-	}
-
 	for (int i = 0; i < n; i++) {
-		char data[128];
-		unsigned long fl = opts_split(VCACHEFS_OPTS, data, sizeof data);
-		xlog(OBFSTR("vcachefs %s -> %s (%s)"), lowers[i], MOUNTS[i], VCACHEFS_OPTS);
+		char optbuf[192], data[128];
+		/* The module drops SB_RDONLY only when 'writable' is present AND 'ro'
+		 * is absent, so prepend exactly one of them from WRITABLE.  A writable
+		 * mount makes the WHOLE bin/lib view accept gated plaintext writes
+		 * in-place (create/write/unlink/mkdir/rename/truncate, forwarded to the
+		 * lower tree); encrypted ANTREV01 files stay immutable regardless.  No
+		 * separate tmpfs scratch layer is needed — hence WRITE_DIRS/WRITE_FILES
+		 * are gone.  'writable' needs a .ko carrying the -o writable verb
+		 * (kernel >= 6.3); on an older kernel the VFS rejects it with EINVAL and
+		 * we fall back to a read-only mount so decrypt-on-read still works. */
+		snprintf(optbuf, sizeof optbuf, "%s,%s",
+			 WRITABLE ? OBFSTR("writable") : OBFSTR("ro"), VCACHEFS_OPTS);
+		unsigned long fl = opts_split(optbuf, data, sizeof data);
+		xlog(OBFSTR("vcachefs %s -> %s (%s)"), lowers[i], MOUNTS[i], optbuf);
 		if (mount(lowers[i], MOUNTS[i], OBFSTR("vcachefs"), fl,
-			  data[0] ? data : NULL) != 0)
-			die(OBFSTR("mount vcachefs %s: %s"), MOUNTS[i], strerror(errno));
-	}
-
-	for (int i = 0; WRITE_DIRS[i]; i++) {
-		char root[4096]; spec_root(WRITE_DIRS[i], root, sizeof root);
-		char mp[4096], data[128];
-		snprintf(mp, sizeof mp, "%s/%s", root, spec_rel(WRITE_DIRS[i]));
-		unsigned long fl = opts_split(TMPFS_OPTS, data, sizeof data);
-		xlog(OBFSTR("tmpfs %s"), mp);
-		if (mount(OBFSTR("tmpfs"), mp, OBFSTR("tmpfs"), fl, data[0] ? data : NULL) != 0)
-			die(OBFSTR("tmpfs %s: %s"), mp, strerror(errno));
-		/* Same ownership fix as WRITE_FILES below: the tmpfs is mounted by
-		 * root (become_root), so its root inode is root:root per TMPFS_OPTS
-		 * (mode=0755) and a non-root business process cannot create runtime
-		 * files inside it.  Hand the dir to the invoking user via $SUDO_UID. */
-		{
-			const char *su = getenv("SUDO_UID"), *sg = getenv("SUDO_GID");
-			if (su) { if (chown(mp, (uid_t)atoi(su),
-			                     (gid_t)(sg ? atoi(sg) : -1))) {/*ignore*/} }
-		}
-	}
-
-	if (WRITE_FILES[0]) {
-		char data[128];
-		unsigned long fl = opts_split(TMPFS_OPTS, data, sizeof data);
-		mkdir_p(WRITE_BACKING);
-		if (!is_mountpoint(WRITE_BACKING) &&
-		    mount(OBFSTR("tmpfs"), WRITE_BACKING, OBFSTR("tmpfs"), fl,
-			  data[0] ? data : NULL) != 0)
-			die(OBFSTR("tmpfs %s: %s"), WRITE_BACKING, strerror(errno));
-		for (int i = 0; WRITE_FILES[i]; i++) {
-			char root[4096]; spec_root(WRITE_FILES[i], root, sizeof root);
-			const char *rel = spec_rel(WRITE_FILES[i]);
-			char tag[4096], srcp[4096], dst[4096];
-			snprintf(tag, sizeof tag, "%s/%s", root + (root[0] == '/'), rel);
-			for (char *p = tag; *p; p++) if (*p == '/') *p = '_';
-			snprintf(srcp, sizeof srcp, "%s/%s", WRITE_BACKING, tag);
-			/* The mounter runs under sudo (become_root), so the backing file
-			 * is created as root.  Hand it to the invoking (non-root) user via
-			 * $SUDO_UID/$SUDO_GID so a non-root business process can WRITE its
-			 * runtime file (e.g. QtApplication.pid); otherwise root:root 0644
-			 * makes every non-owner open(O_WRONLY) fail with EACCES.  Under a
-			 * real root login SUDO_UID is unset -> file stays root-owned. */
-			int fd = open(srcp, O_CREAT | O_WRONLY, 0644);
-			if (fd >= 0) {
-				const char *su = getenv("SUDO_UID"), *sg = getenv("SUDO_GID");
-				if (su) { if (fchown(fd, (uid_t)atoi(su),
-				                      (gid_t)(sg ? atoi(sg) : -1))) {/*ignore*/} }
-				close(fd);
+			  data[0] ? data : NULL) != 0) {
+			if (WRITABLE && errno == EINVAL) {
+				xlog(OBFSTR("writable rejected (kernel lacks the -o writable ABI, needs >= 6.3) -> mounting read-only"));
+				snprintf(optbuf, sizeof optbuf, "%s,%s", OBFSTR("ro"), VCACHEFS_OPTS);
+				fl = opts_split(optbuf, data, sizeof data);
+				if (mount(lowers[i], MOUNTS[i], OBFSTR("vcachefs"), fl,
+					  data[0] ? data : NULL) != 0)
+					die(OBFSTR("mount vcachefs %s: %s"), MOUNTS[i], strerror(errno));
+			} else {
+				die(OBFSTR("mount vcachefs %s: %s"), MOUNTS[i], strerror(errno));
 			}
-			snprintf(dst, sizeof dst, "%s/%s", root, rel);
-			xlog(OBFSTR("bind %s -> %s"), srcp, dst);
-			if (mount(srcp, dst, NULL, MS_BIND, NULL) != 0)
-				die(OBFSTR("bind %s: %s"), dst, strerror(errno));
 		}
 	}
+
 	xlog(OBFSTR("up complete"));
 	return 0;
 }
@@ -612,8 +543,6 @@ static int do_down(void)
 			free(subs);
 		}
 	}
-	while (is_mountpoint(WRITE_BACKING))
-		if (umount2(WRITE_BACKING, 0) != 0 && umount2(WRITE_BACKING, MNT_DETACH) != 0) break;
 	if (STAGE_DIR && *STAGE_DIR) rm_rf(STAGE_DIR);
 	xlog(OBFSTR("down complete"));
 	return 0;
@@ -802,7 +731,7 @@ static void run_up_sequence(void)
 	for_each_target(down_pre);
 	IN_CONTAINER = 0; ensure_module(); read_ctl_mm();
 	for_each_target(up_one);
-	xlog(OBFSTR("up complete. Watch for EROFS -> add paths to WRITE_DIRS/WRITE_FILES and re-run 'up'."));
+	xlog(OBFSTR("up complete. bin/lib are writable in-place (gated plaintext writes); encrypted files stay immutable."));
 }
 
 static void do_watch(void)
@@ -884,24 +813,17 @@ static void load_config(void)
 	GATE_REQUIRE_SIG= env_int(OBFSTR("AREV_GATE_REQUIRE_SIG"), CFG_REQUIRE_SIG);
 	RELOAD_MODULE   = env_int(OBFSTR("AREV_RELOAD_MODULE"), CFG_RELOAD);
 	VCACHEFS_OPTS   = strdup(env_def(OBFSTR("AREV_VCACHEFS_OPTS"), CFG_VCACHE_OPTS));
+	WRITABLE        = env_int(OBFSTR("AREV_WRITABLE"), CFG_WRITABLE);
 	STAGE_MODE      = strdup(env_def(OBFSTR("AREV_STAGE_LOWER"), CFG_STAGE_MODE));
 	STAGE_DIR       = strdup(env_def(OBFSTR("AREV_STAGE_DIR"), CFG_STAGE_DIR));
-	WRITE_BACKING   = strdup(env_def(OBFSTR("AREV_WRITE_BACKING"), CFG_WRITE_BACKING));
-	TMPFS_OPTS      = strdup(env_def(OBFSTR("AREV_TMPFS_OPTS"), CFG_TMPFS_OPTS));
 
 	MOUNTS      = list_env(OBFSTR("AREV_MOUNTS"));      if (!MOUNTS)      MOUNTS      = split_ws(CFG_MOUNTS);
 	ALLOWL      = list_env(OBFSTR("AREV_ALLOW"));       if (!ALLOWL)      ALLOWL      = split_ws(CFG_ALLOW);
-	WRITE_DIRS  = list_env(OBFSTR("AREV_WRITE_DIRS"));  if (!WRITE_DIRS)  WRITE_DIRS  = split_ws(CFG_WRITE_DIRS);
-	WRITE_FILES = list_env(OBFSTR("AREV_WRITE_FILES")); if (!WRITE_FILES) WRITE_FILES = split_ws(CFG_WRITE_FILES);
 
-	/* Rebase relative mount/write roots onto the install root ($CFG_SWPATH_ENV,
-	 * default CFG_SWPATH_DEFAULT).  Absolute entries are left as-is.  The WRITE_*
-	 * roots must stay byte-identical to their MOUNTS entry (they are matched by
-	 * strcmp), so all three lists are rebased with the same base. */
+	/* Rebase relative mount roots onto the install root ($CFG_SWPATH_ENV,
+	 * default CFG_SWPATH_DEFAULT).  Absolute entries are left as-is. */
 	const char *base = env_def(CFG_SWPATH_ENV, CFG_SWPATH_DEFAULT);
 	rebase_list(MOUNTS,      base);
-	rebase_list(WRITE_DIRS,  base);
-	rebase_list(WRITE_FILES, base);
 }
 
 static void usage(void)
