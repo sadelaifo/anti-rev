@@ -53,7 +53,7 @@
 #define CFG_CONTAINER     OBFSTR("slave")       /* sim: business `docker run --name` */
 #define CFG_READY_MARKER  ""            /* installer's last-touched marker; "" => dir-nonempty */
 #define CFG_AUTHZ_PATH    OBFSTR("/etc/authorized_apps.txt")
-#define CFG_WRITABLE      1             /* 1 = mount bin/lib WRITABLE in-place via the module's -o writable (gated plaintext writes; needs a .ko with that verb, kernel >= 6.3); 0 = read-only */
+#define CFG_WRITABLE      1             /* 1 = mount bin/lib WRITABLE in-place via the module's -o writable (gated plaintext writes; needs a .ko with that verb, kernel >= 4.9); 0 = read-only */
 #define CFG_VCACHE_OPTS   OBFSTR("passdata")    /* passthrough mode only; 'ro'/'writable' is prepended from CFG_WRITABLE, so do NOT put either here */
 #define CFG_STAGE_MODE    OBFSTR("auto")        /* auto | always | never */
 #define CFG_STAGE_DIR     OBFSTR("/dev/shm/arev")
@@ -506,7 +506,7 @@ static int do_up(void)
 		if (mount(lowers[i], MOUNTS[i], OBFSTR("vcachefs"), fl,
 			  data[0] ? data : NULL) != 0) {
 			if (WRITABLE && errno == EINVAL) {
-				xlog(OBFSTR("writable rejected (kernel lacks the -o writable ABI, needs >= 6.3) -> mounting read-only"));
+				xlog(OBFSTR("writable rejected (kernel lacks the -o writable ABI, needs >= 4.9) -> mounting read-only"));
 				snprintf(optbuf, sizeof optbuf, "%s,%s", OBFSTR("ro"), VCACHEFS_OPTS);
 				fl = opts_split(optbuf, data, sizeof data);
 				if (mount(lowers[i], MOUNTS[i], OBFSTR("vcachefs"), fl,

@@ -1,7 +1,7 @@
 #!/bin/bash
 # test_write_mode.sh — native writable passthrough (`-o writable`) for vcachefs.
 #
-# Proves the single-mount writable alternative to the overlay (6.8+ only):
+# Proves the single-mount writable alternative to the overlay (kernel >= 4.9):
 #   1. an AUTHORIZED process creates/writes/reads-back a PLAINTEXT file in-place
 #      through the mount; the bytes land in the lower tree as plaintext    (write)
 #   2. mkdir / append / rename(atomic replace) / truncate / unlink by the
@@ -18,9 +18,10 @@
 #   7. control: with gate_enforce=0 the unauthorized writer succeeds -> proves the
 #      gate is what denies in (3), not some unrelated failure              (control)
 #
-# Requires root + a kernel with the mnt_idmap inode-op ABI (>= 6.3; the field
-# target is 6.8).  On an older kernel `-o writable` is rejected and the test
-# SKIPS.  Run:  sudo bash test_write_mode.sh
+# Requires root + a kernel >= 4.9 (the write-op inode ABI the module shims span
+# mnt_idmap >= 6.3, user_namespace 5.12-6.2, and none < 5.12 down to 4.9).  On an
+# older kernel `-o writable` is rejected and the test SKIPS.  Field targets: 6.8
+# mainline, SLES 12 SP5 4.12, BiSheng 5.10.  Run:  sudo bash test_write_mode.sh
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -137,9 +138,9 @@ insmod "$MOD" gate_enforce=1 authz_path="$AUTHZ" || { echo "insmod failed"; exit
 # decrypts + is gated).
 if ! "$MOUNT_RO" --writable --passdata "$ENC" "$MP" 2>"$WORK/mnt.err"; then
 	if grep -qi "invalid argument" "$WORK/mnt.err"; then
-		skip "kernel lacks mnt_idmap write ABI (<6.3): -o writable rejected"
+		skip "kernel lacks the -o writable ABI (<4.9): -o writable rejected"
 		echo "---- mount error ----"; cat "$WORK/mnt.err"
-		echo; echo "SKIP: writable passthrough needs kernel >= 6.3"
+		echo; echo "SKIP: writable passthrough needs kernel >= 4.9"
 		exit 0
 	fi
 	echo "mount failed:"; cat "$WORK/mnt.err"; exit 1

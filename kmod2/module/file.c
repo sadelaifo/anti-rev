@@ -337,7 +337,7 @@ static ssize_t vcachefs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		if (pd->direct)
 			/* writable-mount plaintext: read straight from the lower
 			 * file so this fd sees its own (and others') writes. */
-			ret = vfs_iter_read(pd->lower, to, &pos, 0);
+			ret = vcf_vfs_iter_read(pd->lower, to, &pos);
 		else
 #endif
 			ret = vcachefs_passthrough_read(pd->lower, pd->limit,
@@ -358,7 +358,7 @@ static ssize_t vcachefs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (!pd || !pd->direct)
 		return -EROFS;			/* not a writable-plaintext fd */
 	pos = iocb->ki_pos;
-	ret = vfs_iter_write(pd->lower, from, &pos, 0);
+	ret = vcf_vfs_iter_write(pd->lower, from, &pos);
 	iocb->ki_pos = pos;
 	return ret;
 }
@@ -460,10 +460,10 @@ static int vcachefs_mmap(struct file *file, struct vm_area_struct *vma)
 
 			if (!realfile->f_op->mmap)
 				return -ENODEV;
-			vma_set_file(vma, realfile);
-			ret = call_mmap(vma->vm_file, vma);
+			vcf_vma_set_file(vma, realfile);
+			ret = vcf_call_mmap(vma->vm_file, vma);
 			if (ret)
-				vma_set_file(vma, file);
+				vcf_vma_set_file(vma, file);
 			return ret;
 		}
 #endif

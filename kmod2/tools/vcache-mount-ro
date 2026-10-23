@@ -7,7 +7,7 @@
 #   --passdata        serve ANY non-ANTREV01 file as plaintext passthrough — for
 #                     complete mixed-content read-only trees (vcache-pack.py
 #                     with mirror_plaintext).  Supersedes [passthrough-exts].
-#   --writable        gated plaintext write passthrough (6.8+ only): an
+#   --writable        gated plaintext write passthrough (kernel >= 4.9): an
 #                     authorized process may create/write/delete PLAINTEXT files
 #                     in-place; encrypted files stay immutable (read-only).  No
 #                     overlay needed.  Drops the mount's SB_RDONLY.  See CLAUDE.md

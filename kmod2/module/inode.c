@@ -329,7 +329,8 @@ const struct inode_operations vcachefs_file_iops = {
 #ifdef VCACHEFS_WRITE
 /*
  * ------------------------------------------------------------------------
- * Writable passthrough inode ops (mount option `writable`, mnt_idmap ABI).
+ * Writable passthrough inode ops (mount option `writable`; kernel >= 4.9, with
+ * the leading idmap/userns arg absorbed by the compat.h shims across bands).
  *
  * All of these forward the mutation verbatim to the LOWER (.enc/) tree, which
  * is the single source of truth — there is NO encrypt-on-write.  Two invariants
@@ -381,12 +382,12 @@ static int vcachefs_may_write(struct inode *dir)
 	return 0;
 }
 
-static int vcachefs_create(struct mnt_idmap *idmap, struct inode *dir,
+static int vcachefs_create(VCF_IOP_IDMAP_PARAM struct inode *dir,
 			    struct dentry *dentry, umode_t mode, bool excl)
 {
 	struct dentry *ldir = VCACHEFS_I(dir)->lower_path.dentry;
 	struct inode *ldir_inode = d_inode(ldir);
-	struct mnt_idmap *lidmap = vcachefs_lower_idmap(dir);
+	vcf_idmap_t lidmap __maybe_unused = vcachefs_lower_idmap(dir);
 	struct dentry *lchild;
 	struct inode *inode;
 	int err;
@@ -401,7 +402,7 @@ static int vcachefs_create(struct mnt_idmap *idmap, struct inode *dir,
 		inode_unlock(ldir_inode);
 		return PTR_ERR(lchild);
 	}
-	err = vfs_create(lidmap, ldir_inode, lchild, mode, excl);
+	err = vcf_vfs_create(lidmap, ldir_inode, lchild, mode, excl);
 	inode_unlock(ldir_inode);
 	if (err) {
 		dput(lchild);
@@ -421,7 +422,7 @@ static int vcachefs_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct dentry *ldir = VCACHEFS_I(dir)->lower_path.dentry;
 	struct inode *ldir_inode = d_inode(ldir);
-	struct mnt_idmap *lidmap = vcachefs_lower_idmap(dir);
+	vcf_idmap_t lidmap __maybe_unused = vcachefs_lower_idmap(dir);
 	struct inode *victim = d_inode(dentry);
 	struct dentry *lchild;
 	int err;
@@ -438,7 +439,7 @@ static int vcachefs_unlink(struct inode *dir, struct dentry *dentry)
 		inode_unlock(ldir_inode);
 		return PTR_ERR(lchild);
 	}
-	err = vfs_unlink(lidmap, ldir_inode, lchild, NULL);
+	err = vcf_vfs_unlink(lidmap, ldir_inode, lchild, NULL);
 	dput(lchild);
 	inode_unlock(ldir_inode);
 	if (!err && victim) {
@@ -450,12 +451,12 @@ static int vcachefs_unlink(struct inode *dir, struct dentry *dentry)
 	return err;
 }
 
-static int vcachefs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+static int vcachefs_mkdir(VCF_IOP_IDMAP_PARAM struct inode *dir,
 			   struct dentry *dentry, umode_t mode)
 {
 	struct dentry *ldir = VCACHEFS_I(dir)->lower_path.dentry;
 	struct inode *ldir_inode = d_inode(ldir);
-	struct mnt_idmap *lidmap = vcachefs_lower_idmap(dir);
+	vcf_idmap_t lidmap __maybe_unused = vcachefs_lower_idmap(dir);
 	struct dentry *lchild;
 	struct inode *inode;
 	int err;
@@ -470,7 +471,7 @@ static int vcachefs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		inode_unlock(ldir_inode);
 		return PTR_ERR(lchild);
 	}
-	err = vfs_mkdir(lidmap, ldir_inode, lchild, mode);
+	err = vcf_vfs_mkdir(lidmap, ldir_inode, lchild, mode);
 	if (err) {
 		inode_unlock(ldir_inode);
 		dput(lchild);
@@ -501,7 +502,7 @@ static int vcachefs_rmdir(struct inode *dir, struct dentry *dentry)
 {
 	struct dentry *ldir = VCACHEFS_I(dir)->lower_path.dentry;
 	struct inode *ldir_inode = d_inode(ldir);
-	struct mnt_idmap *lidmap = vcachefs_lower_idmap(dir);
+	vcf_idmap_t lidmap __maybe_unused = vcachefs_lower_idmap(dir);
 	struct inode *victim = d_inode(dentry);
 	struct dentry *lchild;
 	int err;
@@ -516,7 +517,7 @@ static int vcachefs_rmdir(struct inode *dir, struct dentry *dentry)
 		inode_unlock(ldir_inode);
 		return PTR_ERR(lchild);
 	}
-	err = vfs_rmdir(lidmap, ldir_inode, lchild);
+	err = vcf_vfs_rmdir(lidmap, ldir_inode, lchild);
 	dput(lchild);
 	inode_unlock(ldir_inode);
 	if (!err) {
@@ -527,12 +528,12 @@ static int vcachefs_rmdir(struct inode *dir, struct dentry *dentry)
 	return err;
 }
 
-static int vcachefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+static int vcachefs_symlink(VCF_IOP_IDMAP_PARAM struct inode *dir,
 			     struct dentry *dentry, const char *symname)
 {
 	struct dentry *ldir = VCACHEFS_I(dir)->lower_path.dentry;
 	struct inode *ldir_inode = d_inode(ldir);
-	struct mnt_idmap *lidmap = vcachefs_lower_idmap(dir);
+	vcf_idmap_t lidmap __maybe_unused = vcachefs_lower_idmap(dir);
 	struct dentry *lchild;
 	struct inode *inode;
 	int err;
@@ -547,7 +548,7 @@ static int vcachefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		inode_unlock(ldir_inode);
 		return PTR_ERR(lchild);
 	}
-	err = vfs_symlink(lidmap, ldir_inode, lchild, symname);
+	err = vcf_vfs_symlink(lidmap, ldir_inode, lchild, symname);
 	inode_unlock(ldir_inode);
 	if (err) {
 		dput(lchild);
@@ -561,18 +562,17 @@ static int vcachefs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	return 0;
 }
 
-static int vcachefs_rename(struct mnt_idmap *idmap,
+static int vcachefs_rename(VCF_IOP_IDMAP_PARAM
 			    struct inode *old_dir, struct dentry *old_dentry,
 			    struct inode *new_dir, struct dentry *new_dentry,
 			    unsigned int flags)
 {
 	struct dentry *lold_dir = VCACHEFS_I(old_dir)->lower_path.dentry;
 	struct dentry *lnew_dir = VCACHEFS_I(new_dir)->lower_path.dentry;
-	struct mnt_idmap *lidmap = vcachefs_lower_idmap(old_dir);
+	vcf_idmap_t lidmap __maybe_unused = vcachefs_lower_idmap(old_dir);
 	struct inode *old_victim = d_inode(old_dentry);
 	struct inode *new_victim = d_inode(new_dentry);
 	struct dentry *lold = NULL, *lnew = NULL, *trap;
-	struct renamedata rd;
 	int err;
 
 	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
@@ -618,15 +618,10 @@ static int vcachefs_rename(struct mnt_idmap *idmap,
 		goto unlock;
 	}
 
-	memset(&rd, 0, sizeof(rd));
-	rd.old_mnt_idmap = lidmap;
-	rd.old_dir	 = d_inode(lold_dir);
-	rd.old_dentry	 = lold;
-	rd.new_mnt_idmap = lidmap;
-	rd.new_dir	 = d_inode(lnew_dir);
-	rd.new_dentry	 = lnew;
-	rd.flags	 = flags;
-	err = vfs_rename(&rd);		/* VFS d_move()s our upper dentries on success */
+	/* VFS d_move()s our upper dentries on success.  vcf_vfs_rename packs the
+	 * renamedata (>= 5.12) or calls the positional 6-arg form (< 5.12). */
+	err = vcf_vfs_rename(lidmap, d_inode(lold_dir), lold,
+			     d_inode(lnew_dir), lnew, flags);
 unlock:
 	dput(lold);
 	dput(lnew);
@@ -634,14 +629,14 @@ unlock:
 	return err;
 }
 
-static int vcachefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int vcachefs_setattr(VCF_IOP_IDMAP_PARAM struct dentry *dentry,
 			     struct iattr *ia)
 {
 	struct inode *inode = d_inode(dentry);
 	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
 	struct dentry *lower = ii->lower_path.dentry;
 	struct inode *lower_inode = d_inode(lower);
-	struct mnt_idmap *lidmap = vcachefs_lower_idmap(inode);
+	vcf_idmap_t lidmap __maybe_unused = vcachefs_lower_idmap(inode);
 	struct iattr lia;
 	int err;
 
@@ -652,7 +647,7 @@ static int vcachefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (ii->encrypted)
 		return -EPERM;		/* can't resize/chmod ciphertext */
 
-	err = setattr_prepare(idmap, dentry, ia);
+	err = vcf_setattr_prepare(idmap, dentry, ia);
 	if (err)
 		return err;
 
@@ -661,7 +656,7 @@ static int vcachefs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	lia.ia_valid &= ~ATTR_FILE;
 
 	inode_lock(lower_inode);
-	err = notify_change(lidmap, lower, &lia, NULL);
+	err = vcf_notify_change(lidmap, lower, &lia, NULL);
 	inode_unlock(lower_inode);
 	if (!err)
 		vcachefs_copy_attr(inode, lower_inode);

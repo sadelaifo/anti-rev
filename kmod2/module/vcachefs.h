@@ -12,12 +12,8 @@
 #include <linux/fs.h>
 #include <linux/path.h>
 #include <linux/mutex.h>
-#include <linux/mount.h>	/* mnt_idmap() for the lower-idmap helper below */
-
-#include "compat.h"	/* d_inode() shim for the accessor used below */
-
-#define VCACHEFS_NAME		"vcachefs"
-#define VCACHEFS_MAGIC		0x9E2B1147	/* non-descriptive sb magic */
+#include <linux/mount.h>	/* mnt_idmap()/mnt_user_ns() for the lower-idmap helper */
+#include <linux/version.h>	/* LINUX_VERSION_CODE for the VCACHEFS_WRITE gate */
 
 /*
  * Writable passthrough ("-o writable"): an OPT-IN mode in which an *authorized*
@@ -28,12 +24,23 @@
  * removed/renamed/truncated, so the shipped ciphertext payload is immutable.
  * Only the app's own plaintext scratch (lock/pid/log files) is mutable.
  *
- * Implemented only for the mnt_idmap inode-op ABI (>= 6.3; the 6.8 field
- * target).  On older kernels the option is rejected at mount and the fs is RO.
+ * Compiled for kernels >= 4.9, where the two VFS APIs the write ops rely on both
+ * exist: setattr_prepare() and the flags-carrying ->rename inode op.  The
+ * leading idmap/userns parameter of the create/mkdir/symlink/rename/setattr ops
+ * (and of the lower-fs vfs_* helpers they call) is absorbed by the shims in
+ * compat.h across three ABI bands: mnt_idmap (>= 6.3), user_namespace
+ * (5.12-6.2), none (< 5.12).  On kernels < 4.9 the option is rejected at mount
+ * and the fs stays RO.  (compat.h gates those shims on the same >= 4.9 version
+ * check, not on VCACHEFS_WRITE, since .c files include it before this header.)
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
 #define VCACHEFS_WRITE 1
 #endif
+
+#include "compat.h"	/* d_inode() + writable-mode shims (keyed on VCACHEFS_WRITE) */
+
+#define VCACHEFS_NAME		"vcachefs"
+#define VCACHEFS_MAGIC		0x9E2B1147	/* non-descriptive sb magic */
 
 /* On-disk container format (antirev-fs-pack.py / protect.py --embed-key):
  *   [magic:8][iv:12][tag:16][ciphertext...][key:32][magic:8]
@@ -127,11 +134,14 @@ static inline struct inode *vcachefs_lower_inode(struct inode *inode)
 }
 
 #ifdef VCACHEFS_WRITE
-/* The idmap of the LOWER mount — what vfs_create/unlink/rename/notify_change on
- * the lower inodes expect (NOT the vcachefs mount's idmap passed to our ops). */
-static inline struct mnt_idmap *vcachefs_lower_idmap(struct inode *inode)
+/* The idmap/userns of the LOWER mount — what vfs_create/unlink/rename/
+ * notify_change on the lower inodes expect (NOT the vcachefs mount's idmap
+ * passed to our ops).  Type and accessor vary by kernel band; see vcf_idmap_t /
+ * vcf_mnt_idmap() in compat.h (mnt_idmap >= 6.3, mnt_user_ns 5.12-6.2, a
+ * placeholder 0 on < 5.12 where the lower-fs helpers take no such argument). */
+static inline vcf_idmap_t vcachefs_lower_idmap(struct inode *inode)
 {
-	return mnt_idmap(VCACHEFS_I(inode)->lower_path.mnt);
+	return vcf_mnt_idmap(VCACHEFS_I(inode)->lower_path.mnt);
 }
 #endif
 

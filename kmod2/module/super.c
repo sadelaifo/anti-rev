@@ -148,7 +148,7 @@ static int vcachefs_parse_opts(struct vcachefs_sb_info *sbi, char *opts)
 			sbi->pass_nonelf = true;
 		} else if (!strcmp(p, "writable")) {
 			/* Gated plaintext write passthrough (see vcachefs.h).
-			 * Only available on the mnt_idmap ABI (>= 6.3); reject on
+			 * Compiled for kernels >= 4.9 (VCACHEFS_WRITE); reject on
 			 * older kernels so the fs can never silently stay RO while
 			 * claiming to be writable. */
 #ifdef VCACHEFS_WRITE

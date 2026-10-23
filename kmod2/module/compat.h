@@ -203,4 +203,140 @@ static inline void vcf_d_invalidate(struct dentry *dentry)
 }
 #endif
 
+/*
+ * ------------------------------------------------------------------------
+ * Writable-passthrough ("-o writable") cross-kernel shims.
+ *
+ * Only compiled when VCACHEFS_WRITE is set (kernels >= 4.9; vcachefs.h defines
+ * it BEFORE including this header).  The write inode ops
+ * (create/mkdir/symlink/rename/setattr) gained a leading idmap/userns parameter,
+ * and the lower-fs VFS helpers they call gained the matching leading argument,
+ * over three bands:
+ *   >= 6.3      struct mnt_idmap *      (mnt_idmap(mnt))
+ *   5.12 - 6.2  struct user_namespace * (mnt_user_ns(mnt))
+ *   < 5.12      (no such argument)
+ * These shims absorb the difference so one op body serves all three ABIs.
+ *
+ * Gated on LINUX_VERSION_CODE (NOT VCACHEFS_WRITE) because every .c includes
+ * this header before vcachefs.h, i.e. before VCACHEFS_WRITE is defined.  The
+ * guard value is identical to vcachefs.h's VCACHEFS_WRITE gate (>= 4.9), so the
+ * shims exist exactly when the writable ops that use them are compiled; below
+ * 4.9 they are absent (and vfs_rename's positional form here would not even
+ * match the pre-3.15 prototype).
+ * ------------------------------------------------------------------------
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+typedef struct mnt_idmap *vcf_idmap_t;
+#define VCF_IOP_IDMAP_PARAM	struct mnt_idmap *idmap,
+#define vcf_mnt_idmap(mnt)	mnt_idmap(mnt)
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+typedef struct user_namespace *vcf_idmap_t;
+#define VCF_IOP_IDMAP_PARAM	struct user_namespace *idmap,
+#define vcf_mnt_idmap(mnt)	mnt_user_ns(mnt)
+#else
+typedef int vcf_idmap_t;		/* placeholder; the helpers below ignore it */
+#define VCF_IOP_IDMAP_PARAM		/* no leading inode-op parameter */
+#define vcf_mnt_idmap(mnt)	0
+#endif
+
+/*
+ * Lower-fs mutation helpers.  On >= 5.12 they take the idmap/userns leading
+ * argument; below that they don't.  The `idm` argument is still accepted (and
+ * discarded) on < 5.12 so every call site passes it uniformly.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+#define vcf_vfs_create(idm, dir, de, mode, excl) vfs_create((idm), (dir), (de), (mode), (excl))
+#define vcf_vfs_mkdir(idm, dir, de, mode)	 vfs_mkdir((idm), (dir), (de), (mode))
+#define vcf_vfs_rmdir(idm, dir, de)		 vfs_rmdir((idm), (dir), (de))
+#define vcf_vfs_unlink(idm, dir, de, deleg)	 vfs_unlink((idm), (dir), (de), (deleg))
+#define vcf_vfs_symlink(idm, dir, de, name)	 vfs_symlink((idm), (dir), (de), (name))
+#define vcf_notify_change(idm, de, attr, deleg)	 notify_change((idm), (de), (attr), (deleg))
+#define vcf_setattr_prepare(idm, de, attr)	 setattr_prepare((idm), (de), (attr))
+#else
+#define vcf_vfs_create(idm, dir, de, mode, excl) vfs_create((dir), (de), (mode), (excl))
+#define vcf_vfs_mkdir(idm, dir, de, mode)	 vfs_mkdir((dir), (de), (mode))
+#define vcf_vfs_rmdir(idm, dir, de)		 vfs_rmdir((dir), (de))
+#define vcf_vfs_unlink(idm, dir, de, deleg)	 vfs_unlink((dir), (de), (deleg))
+#define vcf_vfs_symlink(idm, dir, de, name)	 vfs_symlink((dir), (de), (name))
+#define vcf_notify_change(idm, de, attr, deleg)	 notify_change((de), (attr), (deleg))
+#define vcf_setattr_prepare(idm, de, attr)	 setattr_prepare((de), (attr))
+#endif
+
+/*
+ * vfs_rename(): a single struct renamedata * from 5.12 (whose idmap/userns field
+ * was renamed in 6.3); the classic positional 6-arg form (with a delegated-inode
+ * slot and flags) below that.  vcachefs never uses delegated-inode breaking, so
+ * pass NULL.
+ */
+static inline int vcf_vfs_rename(vcf_idmap_t idm,
+				  struct inode *old_dir, struct dentry *old_de,
+				  struct inode *new_dir, struct dentry *new_de,
+				  unsigned int flags)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	struct renamedata rd;
+
+	memset(&rd, 0, sizeof(rd));
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	rd.old_mnt_idmap  = idm;
+	rd.new_mnt_idmap  = idm;
+#else
+	rd.old_mnt_userns = idm;
+	rd.new_mnt_userns = idm;
+#endif
+	rd.old_dir	  = old_dir;
+	rd.old_dentry	  = old_de;
+	rd.new_dir	  = new_dir;
+	rd.new_dentry	  = new_de;
+	rd.flags	  = flags;
+	return vfs_rename(&rd);
+#else
+	(void)idm;
+	return vfs_rename(old_dir, old_de, new_dir, new_de, NULL, flags);
+#endif
+}
+
+/*
+ * vfs_iter_read()/vfs_iter_write() gained a trailing rwf_t flags argument in
+ * 4.13; before that the call took no flags.  We always pass 0 (no special I/O
+ * flags).  Override with AREV_OLD_VFS_ITER if a <4.13 distro kernel backported
+ * the flags argument (or AREV_NEW_VFS_ITER for the reverse).
+ */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0) || defined(AREV_NEW_VFS_ITER)) \
+	&& !defined(AREV_OLD_VFS_ITER)
+#define vcf_vfs_iter_read(f, it, pos)	vfs_iter_read((f), (it), (pos), 0)
+#define vcf_vfs_iter_write(f, it, pos)	vfs_iter_write((f), (it), (pos), 0)
+#else
+#define vcf_vfs_iter_read(f, it, pos)	vfs_iter_read((f), (it), (pos))
+#define vcf_vfs_iter_write(f, it, pos)	vfs_iter_write((f), (it), (pos))
+#endif
+
+/* vma_set_file() (balanced vm_file swap) arrived in 5.13; open-code it below. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0)
+#define vcf_vma_set_file(vma, file)	vma_set_file((vma), (file))
+#else
+static inline void vcf_vma_set_file(struct vm_area_struct *vma,
+				     struct file *file)
+{
+	get_file(file);
+	if (vma->vm_file)
+		fput(vma->vm_file);
+	vma->vm_file = file;
+}
+#endif
+
+/*
+ * call_mmap() helper for f_op->mmap arrived in the 4.x series; call it directly
+ * on kernels old enough to predate the wrapper (it is a plain forwarder there).
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 18, 0)
+#define vcf_call_mmap(file, vma)	call_mmap((file), (vma))
+#else
+#define vcf_call_mmap(file, vma)	((file)->f_op->mmap((file), (vma)))
+#endif
+
+#endif /* LINUX_VERSION_CODE >= 4.9 (writable-passthrough shims) */
+
 #endif /* _VCACHEFS_COMPAT_H */
