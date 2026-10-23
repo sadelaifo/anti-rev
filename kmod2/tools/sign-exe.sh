@@ -1,6 +1,6 @@
 #!/bin/bash
 # sign-exe.sh — vendor-sign a PLAINTEXT executable (e.g. the technician's
-# my_gdb) with the per-exe signature footer the vcachefs gate verifies, WITHOUT
+# vcache-coredbg) with the per-exe signature footer the vcachefs gate verifies, WITHOUT
 # encrypting it.  The signed binary still runs normally — the footer is trailing
 # bytes after the ELF's last segment, which the loader ignores — while the gate
 # reads the footer and authorizes the running process to read decrypted content
