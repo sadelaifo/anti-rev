@@ -22,6 +22,11 @@
 #include <linux/uio.h>
 #include <linux/uaccess.h>	/* copy_to_user for the <3.16 aio_read path */
 #include <linux/compat.h>	/* compat_ptr() for the 32-on-64 chattr ioctls */
+#include <linux/falloc.h>	/* fallocate mode flags */
+#include <linux/version.h>	/* LINUX_VERSION_CODE (before the filelock guard) */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+#include <linux/filelock.h>	/* posix_lock_file/locks_lock_file_wait moved here */
+#endif
 
 #include "compat.h"
 #include "vcachefs.h"
@@ -823,9 +828,71 @@ const struct address_space_operations vcachefs_aops = {
 #endif
 };
 
+/*
+ * flock(2) advisory locking.
+ *
+ * On a writable-mount plaintext passthrough (pd->direct) a per-open LOWER file
+ * exists; retarget the lock onto it (the overlayfs idiom — save/restore
+ * fl->fl_file) so the flock lands on the LOWER inode, coherent with anything
+ * that flocks the lower path directly, and is cleaned up when ->release fputs
+ * pd->lower.  The lower fs may rely on the VFS default (no ->flock, e.g. tmpfs/
+ * ext4), so call locks_lock_file_wait() on the lower rather than its ->flock.
+ * For every other file (encrypted / decrypt path) fall back to the VFS default:
+ * local flock on OUR shared inode, which is coherent among all mount users.
+ *
+ * POSIX record locks (fcntl ->lock) are deliberately NOT overridden: they stay
+ * local to the shared vcachefs inode (coherent among mount users — the actual
+ * deployment, where nothing touches the lower tree directly).  Forwarding them
+ * correctly would mean reproducing the VFS F_SETLKW blocking loop on the lower;
+ * not worth the fragility for a coherence domain nobody uses.
+ */
+static int vcachefs_flock(struct file *file, int cmd, struct file_lock *fl)
+{
+	struct vcachefs_passthrough *pd = file->private_data;
+
+#ifdef VCACHEFS_WRITE
+	if (pd && pd->direct) {
+		struct file *lower = pd->lower;
+		int ret;
+
+		fl->fl_file = lower;			/* lock the lower inode */
+		if (lower->f_op && lower->f_op->flock)
+			ret = lower->f_op->flock(lower, cmd, fl);
+		else
+			ret = locks_lock_file_wait(lower, fl);
+		fl->fl_file = file;			/* restore for the caller */
+		return ret;
+	}
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
+	return locks_lock_file_wait(file, fl);
+#else
+	return flock_lock_file_wait(file, fl);
+#endif
+}
+
+/*
+ * fallocate(2).  Only a writable plaintext passthrough has a real lower file
+ * with extents to grow/punch; forward to it.  Encrypted content is read-only
+ * (no encrypt-on-write) and the decrypt path has no backing extent, so
+ * fallocate is unsupported there.  (A read-only mount never reaches here — the
+ * fd must be open for write, which the RO mount refuses first.)
+ */
+static long vcachefs_fallocate(struct file *file, int mode,
+				loff_t offset, loff_t len)
+{
+	struct vcachefs_passthrough *pd = file->private_data;
+
+	if (pd && pd->direct && pd->lower->f_op && pd->lower->f_op->fallocate)
+		return pd->lower->f_op->fallocate(pd->lower, mode, offset, len);
+	return -EOPNOTSUPP;
+}
+
 const struct file_operations vcachefs_file_fops = {
 	.open		= vcachefs_file_open,
 	.release	= vcachefs_file_release,
+	.flock		= vcachefs_flock,
+	.fallocate	= vcachefs_fallocate,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
 	.read_iter	= vcachefs_read_iter,
 #else

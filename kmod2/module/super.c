@@ -162,6 +162,43 @@ static int vcachefs_parse_opts(struct vcachefs_sb_info *sbi, char *opts)
 	return 0;
 }
 
+/*
+ * Dentry revalidation.  vcachefs caches one inode per lower dentry (iget5) with
+ * no d_revalidate, so a cached path never noticed the lower moving under it.
+ * This completes the stacking-fs contract: if the lower dentry was unhashed
+ * out of band (renamed/unlinked) or its inode went away, invalidate OUR dentry
+ * so the next lookup re-resolves to the fresh lower (and a fresh iget5 inode);
+ * otherwise forward to the lower fs's own d_revalidate (e.g. a network-fs
+ * lower).  Content changes on a LOCAL lower (a replaced binary of the same
+ * name) are still self-healed by revalidate-on-open in file.c — this hook
+ * covers the name/identity change that open-time size/mtime checks cannot see.
+ */
+static int vcachefs_d_revalidate(struct dentry *dentry, unsigned int flags)
+{
+	struct inode *inode;
+	struct dentry *lower;
+	int ret = 1;
+
+	if (flags & LOOKUP_RCU)
+		return -ECHILD;			/* we deref; demand ref-walk */
+
+	inode = d_inode(dentry);
+	if (!inode)
+		return 1;			/* negative: let the VFS re-lookup */
+
+	lower = VCACHEFS_I(inode)->lower_path.dentry;
+	if (!lower || !d_inode(lower) || d_unhashed(lower))
+		return 0;			/* lower gone/moved -> invalidate */
+
+	if (lower->d_op && lower->d_op->d_revalidate)
+		ret = lower->d_op->d_revalidate(lower, flags);
+	return ret;
+}
+
+static const struct dentry_operations vcachefs_dops = {
+	.d_revalidate = vcachefs_d_revalidate,
+};
+
 /* ---- superblock setup ---- */
 
 static int vcachefs_fill_super(struct super_block *sb, void *data, int silent)
@@ -198,6 +235,7 @@ static int vcachefs_fill_super(struct super_block *sb, void *data, int silent)
 
 	sb->s_magic = VCACHEFS_MAGIC;
 	sb->s_op = &vcachefs_sops;
+	sb->s_d_op = &vcachefs_dops;	/* applied to the root + all children */
 #ifdef VCACHEFS_XATTR
 	/* Forward security.* / user.* / ... to the lower inode so file caps
 	 * and SELinux/LSM labels survive being read through the mount. */

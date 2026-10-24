@@ -102,6 +102,18 @@ int main(int argc, char **argv){
 	} else if (!strcmp(op,"rm")) {
 		if (removexattr(p, argv[3]) < 0) return fail();
 		printf("OK\n"); return 0;
+	} else if (!strcmp(op,"probe")) {            /* size query: getxattr(...,NULL,0) */
+		ssize_t n = getxattr(p, argv[3], NULL, 0);
+		if (n < 0) return fail();
+		printf("OK %zd\n", n); return 0;
+	} else if (!strcmp(op,"getsmall")) {         /* 1-byte buffer -> ERANGE if longer */
+		char b[1]; ssize_t n = getxattr(p, argv[3], b, 1);
+		if (n < 0) return fail();
+		printf("OK %zd\n", n); return 0;
+	} else if (!strcmp(op,"listsmall")) {        /* 1-byte list buffer -> ERANGE */
+		char b[1]; ssize_t n = listxattr(p, b, 1);
+		if (n < 0) return fail();
+		printf("OK %zd\n", n); return 0;
 	}
 	fprintf(stderr,"bad op %s\n", op); return 2;
 }
@@ -194,6 +206,47 @@ elif grep -qi "invalid argument" "$WORK/mntw.err"; then
 else
 	bad "writable mount failed: $(cat "$WORK/mntw.err")"
 fi
+
+echo "== 7. error paths: ENODATA / size-probe / ERANGE =="
+# getxattr of a missing attr -> ENODATA (61); size-probe (NULL,0) returns the
+# needed length; a too-small buffer -> ERANGE (34).  (Mount is writable here.)
+out=$("$WORK/xattrop" get "$MP/tool" user.doesnotexist 2>/dev/null)
+[[ "$out" == ERR\ 61\ * ]] && ok "missing xattr -> ENODATA ($out)" || bad "expected ENODATA, got: $out"
+out=$("$WORK/xattrop" probe "$MP/tool" user.flavor 2>/dev/null)
+[[ "$out" == "OK 5" ]] && ok "size-probe returns the value length ($out)" || bad "size-probe wrong: $out (want 'OK 5')"
+out=$("$WORK/xattrop" getsmall "$MP/tool" user.flavor 2>/dev/null)
+[[ "$out" == ERR\ 34\ * ]] && ok "too-small get buffer -> ERANGE ($out)" || bad "expected ERANGE, got: $out"
+out=$("$WORK/xattrop" listsmall "$MP/tool" 2>/dev/null)
+[[ "$out" == ERR\ 34\ * ]] && ok "too-small list buffer -> ERANGE ($out)" || bad "expected ERANGE on list, got: $out"
+
+echo "== 8. trusted.* namespace forwards too (root only) =="
+if "$WORK/xattrop" set "$MP/tool" trusted.vcf topsecret >/dev/null 2>"$WORK/tr.err"; then
+	out=$("$WORK/xattrop" get "$MP/tool" trusted.vcf 2>/dev/null)
+	[[ "$out" == "OK topsecret" ]] && ok "trusted.* set+get through the mount ($out)" || bad "trusted.* get wrong: $out"
+	low=$("$WORK/xattrop" get "$ENC/tool" trusted.vcf 2>/dev/null)
+	[[ "$low" == "OK topsecret" ]] && ok "trusted.* landed on the lower ($low)" || bad "trusted.* not on lower: $low"
+else
+	skip "lower fs rejects trusted.*: $(cat "$WORK/tr.err")"
+fi
+
+echo "== 9. gate orthogonality: xattr reads are NOT gated =="
+# Flip the content gate ON: reading DECRYPTED content is gated by identity, but
+# xattr is metadata and must stay readable (file caps/SELinux labels are read by
+# the kernel in contexts the content gate must not block).
+echo 1 > /sys/module/vcachefs/parameters/gate_enforce 2>/dev/null || true
+out=$("$WORK/xattrop" get "$MP/tool" user.flavor 2>/dev/null)
+[[ "$out" == "OK mango" ]] && ok "getxattr still works under gate_enforce=1 (metadata ungated)" || bad "xattr wrongly gated: $out"
+out=$("$WORK/xattrop" get "$MP/libtest.so" user.enc 2>/dev/null)
+[[ "$out" == "OK secret" ]] && ok "xattr on an encrypted file readable under the gate ($out)" || bad "enc xattr gated: $out"
+echo 0 > /sys/module/vcachefs/parameters/gate_enforce 2>/dev/null || true
+
+echo "== 10. symlink: traversal + xattr-through-link =="
+ln -sfn tool "$ENC/toollink"
+rl=$(readlink "$MP/toollink" 2>/dev/null)
+[[ "$rl" == "tool" ]] && ok "readlink through the mount resolves ($rl)" || bad "readlink wrong: $rl"
+# getxattr follows the link to the target (tool), so it reads tool's user.flavor
+out=$("$WORK/xattrop" get "$MP/toollink" user.flavor 2>/dev/null)
+[[ "$out" == "OK mango" ]] && ok "getxattr through a symlink reaches the target's xattr ($out)" || bad "symlink xattr traversal wrong: $out"
 
 echo
 echo "==== xattr: $PASS passed, $FAIL failed, $SKIP skipped ===="

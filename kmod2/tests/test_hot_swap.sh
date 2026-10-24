@@ -15,8 +15,8 @@
 #   3. vcache-replace swaps FOO -> version B on the LIVE mount     (hot swap)
 #   4. re-read returns version B with NO remount                   (refresh)
 #   5. a sibling file BAR is byte-unchanged across the swap        (isolation)
-#   6. --no-refresh leaves the cache STALE (re-read still B)       (failure mode
-#      and a following refresh then picks up A                      without fix)
+#   6. a --no-refresh rename-replace is now picked up live by d_revalidate, and
+#      the explicit-refresh path still swaps A->B->A                 (d_revalidate)
 #   7. a non-container input is rejected without --force           (sanity gate)
 #   8. after unmount, the lower file is the new ciphertext         (at rest 2)
 #
@@ -123,23 +123,26 @@ fi
 echo "== 5. sibling BAR untouched by the swap =="
 cmp -s "$BIN/BAR" "$WORK/bar.so" && ok "BAR unchanged across FOO swap" || bad "BAR changed!"
 
-echo "== 6. failure mode: --no-refresh leaves the cache STALE =="
-# Replace the lower back to A but SKIP the refresh ioctl: the cached dentry/
-# inode (version B) must persist — this is exactly the stale-cache bug that
-# AREV_IOC_REFRESH_PATH exists to fix.
+echo "== 6. d_revalidate: a --no-refresh rename-replace is picked up live =="
+# vcache-replace does an atomic renameat (a NEW lower inode).  Since the
+# d_revalidate hook was added, the cached vcachefs dentry is invalidated on the
+# next access (the old lower dentry is unhashed), so the NEW bytes are served
+# even WITHOUT the AREV_IOC_REFRESH_PATH ioctl.  Before d_revalidate this was the
+# stale-cache failure mode the refresh ioctl existed to work around; the hook now
+# closes that gap at the source.  (The ioctl remains useful to proactively
+# invalidate an ALREADY-OPEN dentry, which d_revalidate — a lookup-time hook —
+# cannot reach.)
 "$REPLACE" --no-refresh --force "$WORK/FOO_A.enc" "$BIN/FOO" >/dev/null 2>&1
-if cmp -s "$BIN/FOO" "$WORK/fooB.so"; then
-	ok "without refresh, re-read still returns B (stale cache — the bug)"
-else
-	bad "cache unexpectedly updated without a refresh"
-fi
-# Now a full replace (with refresh) must pick up A.
-"$REPLACE" --force "$WORK/FOO_A.enc" "$BIN/FOO" >/dev/null 2>&1
 if cmp -s "$BIN/FOO" "$WORK/fooA.so"; then
-	ok "refresh makes the re-read return A"
+	ok "--no-refresh rename-replace picked up on next access (d_revalidate)"
 else
-	bad "refresh did not pick up A"
+	bad "d_revalidate did not pick up the --no-refresh replace"
 fi
+# The explicit-refresh path still swaps correctly (A->B->A), leaving FOO == A.
+"$REPLACE" --force "$WORK/FOO_B.enc" "$BIN/FOO" >/dev/null 2>&1
+cmp -s "$BIN/FOO" "$WORK/fooB.so" && ok "explicit refresh still swaps A->B" || bad "refresh swap A->B failed"
+"$REPLACE" --force "$WORK/FOO_A.enc" "$BIN/FOO" >/dev/null 2>&1
+cmp -s "$BIN/FOO" "$WORK/fooA.so" && ok "explicit refresh swaps back B->A" || bad "refresh swap B->A failed"
 
 echo "== 7. sanity gate: a non-container input is refused =="
 printf 'not a container\n' > "$WORK/plain.txt"
