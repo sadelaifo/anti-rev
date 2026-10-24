@@ -543,10 +543,25 @@ static loff_t vcachefs_llseek(struct file *file, loff_t offset, int whence)
 
 	if (pd) {
 #ifdef VCACHEFS_WRITE
-		/* writable-mount plaintext: seek against the LIVE lower size so
-		 * SEEK_END follows the file as the app grows it. */
+		/*
+		 * Writable-mount plaintext.  Reads/writes are driven by THIS
+		 * file's position: vcachefs_read_iter/write_iter forward to the
+		 * lower with an EXPLICIT offset taken from iocb->ki_pos (==
+		 * file->f_pos), and never consult pd->lower->f_pos.  So the seek
+		 * must move file->f_pos — seeking pd->lower instead left
+		 * file->f_pos stale, so the next read landed a whole buffer away
+		 * from where lseek() claimed to be.  Sequential readers (cat,
+		 * sha256sum) never seek and were fine; bash, which parses a
+		 * script by read()-ing a buffer then lseek()ing back to the byte
+		 * it consumed, skipped a buffer's worth and silently dropped the
+		 * variable assignments in it.  Use generic_file_llseek_size on
+		 * OUR file with the LIVE lower size so SEEK_END still follows a
+		 * growing file.
+		 */
 		if (pd->direct)
-			return vfs_llseek(pd->lower, offset, whence);
+			return generic_file_llseek_size(
+				file, offset, whence, MAX_LFS_FILESIZE,
+				i_size_read(file_inode(pd->lower)));
 #endif
 		/* cipher-RO: seek against the exposed (trailer-stripped) length
 		 * so SEEK_END lands at the limit, not the real ciphertext end. */

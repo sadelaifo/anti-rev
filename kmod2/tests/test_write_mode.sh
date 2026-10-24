@@ -280,6 +280,44 @@ else
 	skip "chattr/lsattr not installed"
 fi
 
+echo "== 10. lseek+read coherence on a writable plaintext read (regression) =="
+# Regression for the writable-mount llseek bug: vcachefs_llseek used to seek the
+# LOWER file while reads are driven by THIS file's position (iocb->ki_pos), so a
+# seek left file->f_pos stale and the next read landed a whole buffer away.
+# Sequential readers (cat/sha256sum) never seek and looked fine; bash, which
+# parses a script by read()ing a buffer then lseek()ing back to the byte it
+# consumed, skipped a buffer's worth and silently dropped variable assignments
+# ("start_3rd=0" never ran -> `[ $start_3rd != 0 ]` -> "unary operator expected").
+#
+# (a) deterministic: a marker 5000 bytes in; dd skips to it via lseek then reads.
+{ head -c5000 /dev/zero | tr '\0' 'A'; printf 'START3RD'; \
+  head -c5000 /dev/zero | tr '\0' 'B'; } > "$ENC/seektest"
+got=$(dd if="$MP/seektest" bs=1 skip=5000 count=8 2>/dev/null)
+if [[ "$got" == "START3RD" ]]; then
+	ok "lseek+read returns the sought bytes (got '$got')"
+else
+	bad "lseek+read incoherent: got '$got' (expected START3RD; buggy .ko reads from offset 0 -> AAAAAAAA)"
+fi
+
+# (b) end-to-end: the field symptom — a large script whose early assignment must
+# survive bash's buffered-read + reposition.  External commands between the
+# assignment and the test force the fd reposition that exposed the bug.
+{
+	echo '#!/bin/sh'
+	echo 'start_3rd=0'
+	for i in $(seq 1 3000); do echo "# filler $i — push past bash's read buffer"; done
+	echo 'true; /bin/true'
+	echo 'if [ $start_3rd != 0 ]; then echo NONZERO; else echo ZERO; fi'
+	echo 'echo DONE'
+} > "$ENC/bigscript.sh"
+chmod +x "$ENC/bigscript.sh"
+out=$(sh "$MP/bigscript.sh" 2>&1)
+if [[ "$out" == *ZERO* && "$out" == *DONE* && "$out" != *unary* ]]; then
+	ok "bash runs a large script through the writable mount (assignment survived)"
+else
+	bad "large-script read corrupted through the mount: $(printf '%s' "$out" | tr '\n' '|')"
+fi
+
 echo
 echo "==== write-mode: $PASS passed, $FAIL failed, $SKIP skipped ===="
 [[ $FAIL -eq 0 ]]
