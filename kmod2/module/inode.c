@@ -17,6 +17,7 @@
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0)
 #include <linux/fileattr.h>	/* struct fileattr + vfs_fileattr_{get,set} (chattr) */
 #endif
+#include <linux/xattr.h>	/* struct xattr_handler + vfs_{get,set,list,remove}xattr */
 
 #include "compat.h"
 #include "vcachefs.h"
@@ -394,14 +395,93 @@ static int vcachefs_fileattr_set(VCF_IOP_IDMAP_PARAM struct dentry *dentry,
 #define VCACHEFS_FILEATTR_OPS
 #endif
 
+#ifdef VCACHEFS_XATTR
+/*
+ * ------------------------------------------------------------------------
+ * Extended-attribute passthrough (the overlayfs idiom).
+ *
+ * vcachefs stores no xattrs of its own, so WITHOUT this a shipped binary's
+ * security.capability / security.selinux would read back empty through the
+ * mount — setcap'd binaries lose their caps on exec, and an SELinux-enforcing
+ * host can deny the unlabeled inode.  We forward get/list/set/remove to the
+ * LOWER inode (reachable even on an in-place mount via the pinned ->lower_path).
+ *
+ * A single catch-all handler (prefix == "") matches every namespace, so one
+ * table serves security.*, user.*, trusted.*, system.*.  The generic VFS keys
+ * get/set off sb->s_xattr (installed in super.c); listxattr is the inode op
+ * below.  get carries no idmap in any kernel era; set's leading idmap/userns
+ * arg is absorbed by VCF_IOP_IDMAP_PARAM (compat.h), same bands as the write
+ * ops.  Writes still only reach the lower on a writable mount — a read-only
+ * vcachefs mount rejects set/removexattr at the VFS layer before the handler.
+ * ------------------------------------------------------------------------
+ */
+static int vcachefs_xattr_get(const struct xattr_handler *handler,
+			       struct dentry *dentry, struct inode *inode,
+			       const char *name, void *buffer, size_t size)
+{
+	struct dentry *lower = VCACHEFS_I(inode)->lower_path.dentry;
+
+	/* prefix == "" means `name` is the full, unstripped xattr name. */
+	return vcf_vfs_getxattr(vcachefs_lower_idmap(inode), lower,
+				name, buffer, size);
+}
+
+static int vcachefs_xattr_set(const struct xattr_handler *handler,
+			       VCF_IOP_IDMAP_PARAM struct dentry *dentry,
+			       struct inode *inode, const char *name,
+			       const void *buffer, size_t size, int flags)
+{
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
+	struct dentry *lower = ii->lower_path.dentry;
+	vcf_idmap_t lidmap = vcachefs_lower_idmap(inode);
+	int err;
+
+	/* The VFS holds a write ref on OUR mount; take one on the lower mount
+	 * too (that is where the attr actually lands), mirroring fileattr_set. */
+	err = mnt_want_write(ii->lower_path.mnt);
+	if (err)
+		return err;
+	if (buffer)			/* value present -> set */
+		err = vcf_vfs_setxattr(lidmap, lower, name, buffer, size, flags);
+	else				/* NULL value -> remove (the VFS convention) */
+		err = vcf_vfs_removexattr(lidmap, lower, name);
+	mnt_drop_write(ii->lower_path.mnt);
+	return err;
+}
+
+static const struct xattr_handler vcachefs_xattr_all_handler = {
+	.prefix	= "",			/* catch-all: every namespace */
+	.get	= vcachefs_xattr_get,
+	.set	= vcachefs_xattr_set,
+};
+
+const struct xattr_handler * const vcachefs_xattr_handlers[] = {
+	&vcachefs_xattr_all_handler,
+	NULL,
+};
+
+ssize_t vcachefs_listxattr(struct dentry *dentry, char *list, size_t size)
+{
+	struct dentry *lower = VCACHEFS_I(d_inode(dentry))->lower_path.dentry;
+
+	return vfs_listxattr(lower, list, size);
+}
+
+#define VCACHEFS_XATTR_OPS	.listxattr = vcachefs_listxattr,
+#else
+#define VCACHEFS_XATTR_OPS
+#endif /* VCACHEFS_XATTR */
+
 const struct inode_operations vcachefs_dir_iops = {
 	.lookup		= vcachefs_lookup,
 	.getattr	= vcachefs_getattr,
+	VCACHEFS_XATTR_OPS
 	VCACHEFS_FILEATTR_OPS
 };
 
 const struct inode_operations vcachefs_file_iops = {
 	.getattr	= vcachefs_getattr,
+	VCACHEFS_XATTR_OPS
 	VCACHEFS_FILEATTR_OPS
 };
 
@@ -768,12 +848,14 @@ const struct inode_operations vcachefs_dir_iops_rw = {
 	.symlink	= vcachefs_symlink,
 	.rename		= vcachefs_rename,
 	.setattr	= vcachefs_setattr,
+	VCACHEFS_XATTR_OPS
 	VCACHEFS_FILEATTR_OPS
 };
 
 const struct inode_operations vcachefs_file_iops_rw = {
 	.getattr	= vcachefs_getattr,
 	.setattr	= vcachefs_setattr,
+	VCACHEFS_XATTR_OPS
 	VCACHEFS_FILEATTR_OPS
 };
 #endif /* VCACHEFS_WRITE */
@@ -799,6 +881,7 @@ static const char *vcachefs_get_link(struct dentry *dentry, struct inode *inode,
 const struct inode_operations vcachefs_symlink_iops = {
 	.get_link	= vcachefs_get_link,
 	.getattr	= vcachefs_getattr,
+	VCACHEFS_XATTR_OPS
 };
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(4, 2, 0)
 /*

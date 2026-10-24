@@ -45,6 +45,23 @@
 #define VCACHEFS_WRITE 1
 #endif
 
+/*
+ * VCACHEFS_XATTR — forward extended attributes to the lower inode (the
+ * overlayfs idiom), so security.capability (file capabilities) and
+ * security.selinux / LSM labels on a shipped binary survive being read through
+ * the mount.  Without it the vcachefs inode reports NO xattrs, so a setcap'd
+ * binary silently loses its caps on exec and an SELinux-enforcing host (e.g.
+ * RHEL7) may deny the unlabeled inode outright.  Gated >= 4.9 to match the
+ * modern xattr_handler ABI (get/set carry the inode arg since 4.7; the set
+ * handler's idmap/userns arg is absorbed by VCF_IOP_IDMAP_PARAM across the same
+ * mnt_idmap/user_namespace/none bands as the write ops).  On < 4.9 (RHEL7 3.10)
+ * the old handler ABI + inode-op getxattr/setxattr pointers would be needed;
+ * left as a documented gap (that target is itself not yet build-verified).
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
+#define VCACHEFS_XATTR 1
+#endif
+
 #include "compat.h"	/* d_inode() + writable-mode shims (keyed on VCACHEFS_WRITE) */
 
 #define VCACHEFS_NAME		"vcachefs"
@@ -153,12 +170,14 @@ static inline struct inode *vcachefs_lower_inode(struct inode *inode)
 	return d_inode(VCACHEFS_I(inode)->lower_path.dentry);
 }
 
-#ifdef VCACHEFS_WRITE
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
 /* The idmap/userns of the LOWER mount — what vfs_create/unlink/rename/
- * notify_change on the lower inodes expect (NOT the vcachefs mount's idmap
- * passed to our ops).  Type and accessor vary by kernel band; see vcf_idmap_t /
- * vcf_mnt_idmap() in compat.h (mnt_idmap >= 6.3, mnt_user_ns 5.12-6.2, a
- * placeholder 0 on < 5.12 where the lower-fs helpers take no such argument). */
+ * notify_change (and the xattr forwarders) on the lower inodes expect (NOT the
+ * vcachefs mount's idmap passed to our ops).  Type and accessor vary by kernel
+ * band; see vcf_idmap_t / vcf_mnt_idmap() in compat.h (mnt_idmap >= 6.3,
+ * mnt_user_ns 5.12-6.2, a placeholder 0 on < 5.12 where the lower-fs helpers
+ * take no such argument).  Gated >= 4.9 (not on VCACHEFS_WRITE) because the
+ * xattr passthrough — available on read-only mounts too — also needs it. */
 static inline vcf_idmap_t vcachefs_lower_idmap(struct inode *inode)
 {
 	return vcf_mnt_idmap(VCACHEFS_I(inode)->lower_path.mnt);
@@ -173,6 +192,13 @@ extern const struct super_operations vcachefs_sops;
 extern const struct inode_operations vcachefs_dir_iops;
 extern const struct inode_operations vcachefs_file_iops;
 extern const struct inode_operations vcachefs_symlink_iops;
+#ifdef VCACHEFS_XATTR
+/* security.* / user.* / etc. xattr passthrough to the lower inode (see super.c
+ * sb->s_xattr and the iops' .listxattr).  Declared here so super.c can install
+ * the handler table on the superblock. */
+extern const struct xattr_handler * const vcachefs_xattr_handlers[];
+ssize_t vcachefs_listxattr(struct dentry *dentry, char *list, size_t size);
+#endif
 #ifdef VCACHEFS_WRITE
 /* Writable-mount variants: add the create/unlink/rename/setattr seam. */
 extern const struct inode_operations vcachefs_dir_iops_rw;

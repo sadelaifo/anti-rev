@@ -198,6 +198,11 @@ static int vcachefs_fill_super(struct super_block *sb, void *data, int silent)
 
 	sb->s_magic = VCACHEFS_MAGIC;
 	sb->s_op = &vcachefs_sops;
+#ifdef VCACHEFS_XATTR
+	/* Forward security.* / user.* / ... to the lower inode so file caps
+	 * and SELinux/LSM labels survive being read through the mount. */
+	sb->s_xattr = vcachefs_xattr_handlers;
+#endif
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_blocksize = PAGE_SIZE;
 	sb->s_blocksize_bits = PAGE_SHIFT;

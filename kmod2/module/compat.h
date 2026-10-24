@@ -291,6 +291,14 @@ typedef int vcf_idmap_t;		/* placeholder; the helpers below ignore it */
 #define vcf_vfs_symlink(idm, dir, de, name)	 vfs_symlink((idm), (dir), (de), (name))
 #define vcf_notify_change(idm, de, attr, deleg)	 notify_change((idm), (de), (attr), (deleg))
 #define vcf_setattr_prepare(idm, de, attr)	 setattr_prepare((idm), (de), (attr))
+/* Lower-fs xattr forwarders (the idmap/userns leading arg appeared with the
+ * idmapped-mount xattr API).  get takes no idmap in any era, so it is called
+ * directly at the site; set/remove do. */
+#define vcf_vfs_getxattr(idm, de, name, val, sz) \
+	vfs_getxattr((idm), (de), (name), (val), (sz))
+#define vcf_vfs_setxattr(idm, de, name, val, sz, fl) \
+	vfs_setxattr((idm), (de), (name), (val), (sz), (fl))
+#define vcf_vfs_removexattr(idm, de, name)	 vfs_removexattr((idm), (de), (name))
 #else
 #define vcf_vfs_create(idm, dir, de, mode, excl) vfs_create((dir), (de), (mode), (excl))
 #define vcf_vfs_mkdir(idm, dir, de, mode)	 vfs_mkdir((dir), (de), (mode))
@@ -299,6 +307,11 @@ typedef int vcf_idmap_t;		/* placeholder; the helpers below ignore it */
 #define vcf_vfs_symlink(idm, dir, de, name)	 vfs_symlink((dir), (de), (name))
 #define vcf_notify_change(idm, de, attr, deleg)	 notify_change((de), (attr), (deleg))
 #define vcf_setattr_prepare(idm, de, attr)	 setattr_prepare((de), (attr))
+#define vcf_vfs_getxattr(idm, de, name, val, sz) \
+	vfs_getxattr((de), (name), (val), (sz))
+#define vcf_vfs_setxattr(idm, de, name, val, sz, fl) \
+	vfs_setxattr((de), (name), (val), (sz), (fl))
+#define vcf_vfs_removexattr(idm, de, name)	 vfs_removexattr((de), (name))
 #endif
 
 /*
