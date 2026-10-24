@@ -67,7 +67,7 @@ gcc -shared -fPIC -o "$WORK/libtest.so" "$WORK/libtest.c"
 cp "$WORK/libtest.so" "$WORK/libtest.plain.so"   # reference plaintext
 
 # Encrypt into the lower tree; protect.py creates the keyfile.
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --fs --key "$WORK/key.hex" \
 	--libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
 # Mixed content: a plaintext .so (strict-mode reject) and a whitelisted .json.
 echo "not encrypted" > "$ENC/plain.so"

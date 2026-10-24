@@ -82,7 +82,7 @@ gcc -o "$WORK/listed"   "$WORK/listed.c"
 gcc -o "$WORK/unlisted" "$WORK/unlisted.c"
 printf 'TOPSECRET42' > "$WORK/secret.dat"
 
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --fs --key "$WORK/key.hex" \
 	--libs "$WORK/listed" "$WORK/unlisted" "$WORK/secret.dat" \
 	--output-dir "$ENC" >/dev/null
 chmod +x "$ENC/listed" "$ENC/unlisted"          # mount mirrors the lower mode

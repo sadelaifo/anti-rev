@@ -26,6 +26,24 @@
 #      read-only live (writes -> -EPERM); chattr -i restores it; lsattr reads the
 #      flag through the mount.  Best-effort (SKIPs if the lower fs lacks flag
 #      support, e.g. tmpfs on an older kernel)                             (chattr)
+#  10. lseek+read coherence on a writable plaintext read               (lseek)
+#  11. chmod of an ENCRYPTED file must NOT corrupt its size/decrypt range (regression)
+#  12. chmod actually CHANGES the mode (plaintext + encrypted) and the new mode is
+#      visible through the mount AND on the lower inode; on an encrypted file the
+#      mode changes while size/decrypt stay intact                        (chmod)
+#  13. chown through the mount forwards uid/gid to the lower inode (plaintext +
+#      encrypted); the encrypted file's size/decrypt stay intact          (chown)
+#  14. touch/utimes through the mount forwards the time to the lower inode and does
+#      NOT corrupt an encrypted file's size/decrypt (the utimes arm of the
+#      copy_attr regression in §11)                                       (utimes)
+#  15. chattr +i on an ENCRYPTED file — the field "lock a shipped binary" case:
+#      writes/unlink are denied -EPERM while decrypt-read STILL works; -i restores.
+#      Best-effort (same flag-support SKIP as §9)                         (chattr-enc)
+#  16. chattr +a (append-only) on a plaintext scratch file: append succeeds, a
+#      truncating/overwriting open is denied -EPERM; -a restores.  Best-effort (append)
+#  17. privilege separation: metadata writes are UNGATED (an unlisted identity may
+#      chmod an encrypted file) while the content-READ gate still denies that same
+#      identity the decrypted bytes                                       (priv-sep)
 #
 # Requires root + a kernel >= 4.9 (the write-op inode ABI the module shims span
 # mnt_idmap >= 6.3, user_namespace 5.12-6.2, and none < 5.12 down to 4.9).  On an
@@ -69,7 +87,7 @@ int vcachefs_answer(void) { return 42; }
 EOF
 gcc -shared -fPIC -o "$WORK/libtest.so" "$WORK/libtest.c"
 python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
-	--libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
+	--fs --libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
 
 # A SECOND, clearly bigger encrypted lib, used as a replacement container to
 # prove live refresh-on-write-close (its decrypted size differs from libtest.so).
@@ -79,7 +97,7 @@ int vcachefs_answer(void) { return 99; }
 EOF
 gcc -shared -fPIC -o "$WORK/libbig.so" "$WORK/libbig.c"
 python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
-	--libs "$WORK/libbig.so" --output-dir "$ENC" >/dev/null
+	--fs --libs "$WORK/libbig.so" --output-dir "$ENC" >/dev/null
 BIG_PLAIN_SZ=$(stat -c%s "$WORK/libbig.so")
 
 # fsop: a precise single-identity filesystem op tool.  Prints "OK[ <data>]" on
@@ -355,6 +373,149 @@ lmag=$(head -c8 "$ENC/libtest.so" | xxd -p 2>/dev/null)
 [[ "$lmag" == "a74c2e91d63b085f" ]] && ok "post-chmod: lower stays ciphertext (chmod is metadata-only)" \
 	|| bad "post-chmod lower magic: $lmag"
 echo 1 > "$GPARAM" 2>/dev/null || true
+
+echo "== 12. chmod actually changes the mode (plaintext + encrypted) =="
+# copy_attr mirrors the lower i_mode onto the vcachefs inode after setattr, so a
+# chmod through the mount is visible both through the mount (->getattr) and on the
+# lower inode — AND for an encrypted file the mode changes while the plaintext
+# size / decrypt range survive (the positive counterpart to §11's regression).
+run create "$MP/mode.txt" "x" >/dev/null
+chmod 600 "$MP/mode.txt"
+mp_mode=$(stat -c%a "$MP/mode.txt"); lo_mode=$(stat -c%a "$ENC/mode.txt")
+[[ "$mp_mode" == 600 && "$lo_mode" == 600 ]] \
+	&& ok "plaintext chmod 600 visible through mount ($mp_mode) and on lower ($lo_mode)" \
+	|| bad "plaintext chmod not applied: mount=$mp_mode lower=$lo_mode"
+# encrypted file: mode changes, size/decrypt untouched
+echo 0 > "$GPARAM" 2>/dev/null || true     # read freely; testing classification, not the gate
+cp "$ENC/libtest.so" "$ENC/libperm.so"
+P_perm=$(stat -c%s "$WORK/libtest.so")
+sha_perm=$(sha256sum "$MP/libperm.so" | cut -d' ' -f1)
+chmod 500 "$MP/libperm.so"
+enc_mp_mode=$(stat -c%a "$MP/libperm.so"); enc_lo_mode=$(stat -c%a "$ENC/libperm.so")
+[[ "$enc_mp_mode" == 500 && "$enc_lo_mode" == 500 ]] \
+	&& ok "encrypted chmod 500 applied (mount=$enc_mp_mode lower=$enc_lo_mode)" \
+	|| bad "encrypted chmod not applied: mount=$enc_mp_mode lower=$enc_lo_mode"
+[[ "$(stat -c%s "$MP/libperm.so")" == "$P_perm" ]] \
+	&& ok "encrypted chmod left the PLAINTEXT size intact ($P_perm)" \
+	|| bad "encrypted chmod corrupted the size: $(stat -c%s "$MP/libperm.so") (want $P_perm)"
+[[ "$(sha256sum "$MP/libperm.so" | cut -d' ' -f1)" == "$sha_perm" ]] \
+	&& ok "encrypted chmod left the decrypted bytes intact" \
+	|| bad "encrypted chmod corrupted the decrypt range"
+echo 1 > "$GPARAM" 2>/dev/null || true
+
+echo "== 13. chown through the mount forwards uid/gid to the lower inode =="
+# setattr forwards ATTR_UID/ATTR_GID via notify_change on the lower; copy_attr then
+# mirrors uid/gid onto the vcachefs inode.  uid/gid 1:1 (bin/daemon) always exist.
+run create "$MP/own.txt" "x" >/dev/null
+if chown 1:1 "$MP/own.txt" 2>"$WORK/chown.err"; then
+	mp_own=$(stat -c%u:%g "$MP/own.txt"); lo_own=$(stat -c%u:%g "$ENC/own.txt")
+	[[ "$mp_own" == 1:1 && "$lo_own" == 1:1 ]] \
+		&& ok "plaintext chown 1:1 visible through mount ($mp_own) and on lower ($lo_own)" \
+		|| bad "plaintext chown not applied: mount=$mp_own lower=$lo_own"
+	# encrypted file: uid/gid change, size/decrypt untouched
+	echo 0 > "$GPARAM" 2>/dev/null || true
+	cp "$ENC/libtest.so" "$ENC/libown.so"
+	P_own=$(stat -c%s "$WORK/libtest.so")
+	sha_own=$(sha256sum "$MP/libown.so" | cut -d' ' -f1)
+	chown 1:1 "$MP/libown.so"
+	enc_own=$(stat -c%u:%g "$ENC/libown.so")
+	[[ "$enc_own" == 1:1 ]] \
+		&& ok "encrypted chown 1:1 applied on the lower ($enc_own)" \
+		|| bad "encrypted chown not applied on lower: $enc_own"
+	[[ "$(stat -c%s "$MP/libown.so")" == "$P_own" \
+	   && "$(sha256sum "$MP/libown.so" | cut -d' ' -f1)" == "$sha_own" ]] \
+		&& ok "encrypted chown left size + decrypted bytes intact" \
+		|| bad "encrypted chown corrupted size/decrypt"
+	echo 1 > "$GPARAM" 2>/dev/null || true
+else
+	skip "chown not permitted on the lower fs: $(cat "$WORK/chown.err")"
+fi
+
+echo "== 14. touch/utimes through the mount forwards mtime + keeps encrypted intact =="
+# The utimes arm of the §11 copy_attr regression: a time-only setattr on an
+# encrypted file must forward the mtime to the lower yet leave plain_len/decrypt
+# alone.  (A `touch -r`/log-rotation sweep is a real field trigger.)
+echo 0 > "$GPARAM" 2>/dev/null || true
+cp "$ENC/libtest.so" "$ENC/libtouch.so"
+P_tch=$(stat -c%s "$WORK/libtest.so")
+sha_tch=$(sha256sum "$MP/libtouch.so" | cut -d' ' -f1)
+touch -d '2020-01-02 03:04:05' "$MP/libtouch.so"
+lo_mtime=$(stat -c%y "$ENC/libtouch.so")
+[[ "$lo_mtime" == 2020-01-02* ]] \
+	&& ok "touch forwarded the mtime to the lower inode ($lo_mtime)" \
+	|| bad "touch did not forward mtime to lower: $lo_mtime"
+[[ "$(stat -c%s "$MP/libtouch.so")" == "$P_tch" \
+   && "$(sha256sum "$MP/libtouch.so" | cut -d' ' -f1)" == "$sha_tch" ]] \
+	&& ok "touch left the encrypted file's size + decrypt intact" \
+	|| bad "touch corrupted the encrypted file's size/decrypt"
+echo 1 > "$GPARAM" 2>/dev/null || true
+
+echo "== 15. chattr +i on an ENCRYPTED file locks it while decrypt still works =="
+# The field "lock a shipped binary read-only, live" case.  +i on the lower inode
+# makes every write/unlink -EPERM, but the immutable flag does NOT block reads, so
+# the authorized decrypt path keeps serving plaintext.  Best-effort (SKIP if the
+# lower fs can't store the flag, like §9).
+if command -v chattr >/dev/null && command -v lsattr >/dev/null; then
+	echo 0 > "$GPARAM" 2>/dev/null || true
+	cp "$ENC/libtest.so" "$ENC/libimm.so"
+	run readelf "$MP/libimm.so" >/dev/null        # classify as encrypted first
+	if chattr +i "$MP/libimm.so" 2>"$WORK/chattr_enc.err"; then
+		out=$(run write "$MP/libimm.so" "x")
+		[[ "$out" == ERR* ]] && ok "write to a +i encrypted file is denied ($out)" || bad "write succeeded despite +i: $out"
+		out=$(run unlink "$MP/libimm.so")
+		[[ "$out" == ERR* && -e "$ENC/libimm.so" ]] && ok "unlink of a +i encrypted file is denied ($out)" || bad "unlink succeeded despite +i: $out"
+		out=$(run readelf "$MP/libimm.so")
+		[[ "$out" == "OK 7f454c46" ]] && ok "a +i encrypted file STILL decrypts (read not blocked by immutability)" || bad "decrypt broke under +i: $out"
+		lsattr "$MP/libimm.so" 2>/dev/null | grep -q 'i' && ok "lsattr shows the immutable flag on the encrypted file" || bad "lsattr missing the i flag"
+		chattr -i "$MP/libimm.so" 2>/dev/null
+		out=$(run unlink "$MP/libimm.so")
+		[[ "$out" == "OK" && ! -e "$ENC/libimm.so" ]] && ok "chattr -i restores mutability (unlink succeeds)" || bad "still locked after -i: $out"
+	else
+		skip "lower fs ($(stat -f -c %T "$ENC" 2>/dev/null)) has no chattr-flag support: $(cat "$WORK/chattr_enc.err")"
+	fi
+	echo 1 > "$GPARAM" 2>/dev/null || true
+else
+	skip "chattr/lsattr not installed"
+fi
+
+echo "== 16. chattr +a (append-only) on a plaintext scratch file =="
+# +a lets O_APPEND writes through but denies a truncating/overwriting open — the
+# forward to the lower inode carries the append-only semantics.  Best-effort.
+if command -v chattr >/dev/null; then
+	run create "$MP/applog" "line1
+" >/dev/null
+	if chattr +a "$MP/applog" 2>"$WORK/chattr_a.err"; then
+		out=$(run append "$MP/applog" "line2
+")
+		[[ "$out" == "OK" ]] && ok "append to a +a file succeeds" || bad "append denied despite +a: $out"
+		out=$(run create "$MP/applog" "clobber")    # O_WRONLY|O_CREAT|O_TRUNC -> denied
+		[[ "$out" == ERR* ]] && ok "a truncating open of a +a file is denied ($out)" || bad "truncating open succeeded despite +a: $out"
+		out=$(run write "$MP/applog" "mid")         # O_WRONLY (no append) -> denied
+		[[ "$out" == ERR* ]] && ok "a non-append write open of a +a file is denied ($out)" || bad "non-append write succeeded despite +a: $out"
+		chattr -a "$MP/applog" 2>/dev/null
+		out=$(run write "$MP/applog" "ok")
+		[[ "$out" == "OK" ]] && ok "chattr -a restores normal writes" || bad "still append-only after -a: $out"
+	else
+		skip "lower fs ($(stat -f -c %T "$ENC" 2>/dev/null)) has no chattr-flag support: $(cat "$WORK/chattr_a.err")"
+	fi
+else
+	skip "chattr not installed"
+fi
+
+echo "== 17. privilege separation: metadata write UNGATED, content read GATED =="
+# The core claim: the SAME unlisted identity (here the root shell running chmod —
+# /usr/bin/chmod is NOT in the allow-list) may freely change an encrypted file's
+# metadata, yet is still denied the decrypted bytes by the READ gate.  Metadata
+# writes forward raw to the lower and leak neither plaintext nor key; only reading
+# decrypted content is gated.
+chmod 644 "$MP/libtest.so"      # unlisted identity, gate_enforce=1 -> metadata write must succeed
+[[ "$(stat -c%a "$ENC/libtest.so")" == 644 ]] \
+	&& ok "an unlisted identity CAN chmod an encrypted file (metadata writes ungated)" \
+	|| bad "chmod by unlisted identity did not take effect: $(stat -c%a "$ENC/libtest.so")"
+out=$(evil readelf "$MP/libtest.so")
+[[ "$out" != "OK 7f454c46" ]] \
+	&& ok "that same unlisted identity is STILL denied the decrypted bytes ($out)" \
+	|| bad "read gate broken: unlisted identity decrypted after chmod ($out)"
 
 echo
 echo "==== write-mode: $PASS passed, $FAIL failed, $SKIP skipped ===="

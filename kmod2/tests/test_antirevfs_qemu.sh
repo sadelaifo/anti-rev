@@ -118,9 +118,9 @@ EOF
 "$ACC" -o "$WORK/armapp" "$WORK/armapp.c"
 
 # encrypt both the ARM .so and the ARM exe (encryption is arch-agnostic)
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --fs --key "$WORK/key.hex" \
 	--libs "$WORK/libtest_arm.so" --output-dir "$ENC" >/dev/null
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --fs --key "$WORK/key.hex" \
 	--libs "$WORK/armapp" --output-dir "$ENC" >/dev/null
 chmod +x "$ENC/armapp"      # mount mirrors lower mode; exec needs +x
 

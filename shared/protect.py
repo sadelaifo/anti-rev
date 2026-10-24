@@ -46,6 +46,10 @@ except ImportError:
     sys.exit("Missing dependency: pip install cryptography")
 
 MAGIC    = b"ANTREV01"
+# Neutral (non-descriptive) container magic used by the kmod2/fusefs designs; it
+# MUST byte-match the module's ANTREV_MAGIC (kmod2/module/vcachefs.h) and
+# vcache-pack.py's FS_MAGIC.  Selected on `encrypt-lib` via `--fs`.
+FS_MAGIC = bytes.fromhex("a74c2e91d63b085f")
 KEY_SIZE = 32   # AES-256
 IV_SIZE  = 12   # GCM nonce
 
@@ -319,7 +323,9 @@ def cmd_encrypt_lib(args):
             sys.exit(f"[error] library not found: {lib}")
 
         data     = lib.read_bytes()
-        enc_data = make_container(data, key, embed_key=args.embed_key)
+        magic    = FS_MAGIC if getattr(args, "fs", False) else MAGIC
+        enc_data = make_container(data, key, embed_key=args.embed_key,
+                                  magic=magic)
 
         dest = (out_dir / lib.name) if out_dir else lib
         dest.write_bytes(enc_data)
@@ -361,6 +367,10 @@ def main():
     el.add_argument("--embed-key",  action="store_true",
                     help="Append the AES key as a file trailer (antirevfs form; "
                          "module reads the key per-file, no mount-time key)")
+    el.add_argument("--fs",         action="store_true",
+                    help="Use the neutral kmod2/fusefs container magic "
+                         "(a74c2e91d63b085f) instead of the daemon/shim ANTREV01, "
+                         "so the vcachefs module/daemon recognizes the file")
 
     args = p.parse_args()
 

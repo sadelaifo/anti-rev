@@ -62,7 +62,7 @@ int antirevfs_answer(void){ return 42; }
 EOF
 gcc -shared -fPIC -o "$WORK/libtest.so" "$WORK/libtest.c"
 cp "$WORK/libtest.so" "$WORK/libtest.plain.so"
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --fs --key "$WORK/key.hex" \
 	--libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
 
 echo "== load module + key =="

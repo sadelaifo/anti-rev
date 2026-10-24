@@ -71,7 +71,7 @@ int main(void){ printf("RAN_$name\n"); return 0; }
 EOF
 	gcc -o "$WORK/$name" "$WORK/$name.c"
 done
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --fs --key "$WORK/key.hex" \
 	--libs "$WORK/alpha" "$WORK/beta" "$WORK/gamma" "$WORK/rogue" \
 	--output-dir "$ENC" >/dev/null
 chmod +x "$ENC"/alpha "$ENC"/beta "$ENC"/gamma "$ENC"/rogue   # mount mirrors lower mode

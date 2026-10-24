@@ -172,7 +172,7 @@ mk_file() {
 	head -c "$bytes" /dev/urandom > "$src"
 	SHAS[$idx]="$(sha256sum "$src" | awk '{print $1}')"
 	NAMES[$idx]="enc_$idx.bin"
-	python3 "$PROTECT" encrypt-lib --key "$KEY" \
+	python3 "$PROTECT" encrypt-lib --fs --key "$KEY" \
 		--libs "$src" --output-dir "$ENC" >/dev/null 2>&1 \
 		|| abort "packing enc_$idx failed"
 	mv "$ENC/$(basename "$src")" "$ENC/${NAMES[$idx]}"

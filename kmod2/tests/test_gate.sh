@@ -56,7 +56,7 @@ EOF
 gcc -shared -fPIC -o "$WORK/libtest.so" "$WORK/libtest.c"
 cp "$WORK/libtest.so" "$WORK/libtest.plain.so"   # reference plaintext
 
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --fs --key "$WORK/key.hex" \
 	--libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
 
 # An authorized loader (dlopen+dlsym+call) and a byte-identical unlisted twin.
@@ -152,7 +152,7 @@ cat > "$WORK/Foo.c" <<'EOF'
 int main(void) { printf("FOO_RAN_OK\n"); return 0; }
 EOF
 gcc -o "$WORK/Foo" "$WORK/Foo.c"
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" --libs "$WORK/Foo" --output-dir "$ENC" >/dev/null
+python3 "$PROTECT" encrypt-lib --fs --key "$WORK/key.hex" --libs "$WORK/Foo" --output-dir "$ENC" >/dev/null
 chmod +x "$ENC/Foo"                        # mount mirrors the lower mode; exe needs +x
 echo "$MP/Foo" >> "$AUTHZ"                  # authorize the exe by its mounted path
 OUT="$("$MP/Foo" 2>&1)"; RC=$?

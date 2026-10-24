@@ -53,7 +53,7 @@ cat > "$WORK/libtest.c" <<'EOF'
 int antirevfs_answer(void){ return 42; }
 EOF
 "$CC" -shared -fPIC -o "$WORK/libtest.so" "$WORK/libtest.c"
-python3 "$PROTECT" encrypt-lib --key "$WORK/key.hex" \
+python3 "$PROTECT" encrypt-lib --fs --key "$WORK/key.hex" \
 	--libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
 cat > "$WORK/loader.c" <<'EOF'
 #include <dlfcn.h>
@@ -72,8 +72,12 @@ bash "$TOOLS/authz-sign.sh" "$WORK/keys/authz_priv.pem" "$WORK/keys/authz_cert.p
 
 echo "== load module: gate_enforce=1 gate_require_sig=1 =="
 # key-in-.ko: build the module with the SAME key we packed with, then load
+# Bake the pack key into the THROWAWAY module (it already carries the embedded
+# vendor pubkey from authz-embed-pubkey.sh above); $MOD points there.  Rebuilding
+# $KMOD/module instead would leave the loaded .ko with the placeholder key -> the
+# authorized decrypt fails with EBADMSG ("Bad message").
 source "$KMOD/tests/keyhelper.sh"
-arev_build_with_key "$WORK/key.hex" "$KMOD/module"
+arev_build_with_key "$WORK/key.hex" "$WORK/module"
 insmod "$MOD" gate_enforce=1 gate_require_sig=1 \
 	authz_path="$AUTHZ" authz_sig_path="$SIG" || { echo "insmod failed"; dmesg|tail -5; exit 1; }
 dmesg | tail -3 | grep -qi 'authz vendor key loaded' && ok "module loaded the embedded vendor key" \
