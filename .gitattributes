@@ -29,4 +29,4 @@ kmod2/tools/prebuilt/vcache-mount-* binary
 Makefile   text eol=lf
 Kbuild     text eol=lf
 dkms.conf  text eol=lf
-kmod2/tools/prebuilt/vcache-coredbg-* binary
+kmod2/tools/prebuilt/vdb-* binary

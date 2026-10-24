@@ -1,5 +1,5 @@
 #!/bin/sh
-# build-gdb-static.sh — build a fully-static, multiarch "vcache-coredbg" for debugging
+# build-gdb-static.sh — build a fully-static, multiarch "vdb" for debugging
 # coredumps of protected (encrypted-binary) processes at a client site.
 #
 # WHY: a client's stock gdb is denied by the vcachefs gate when it tries to read
@@ -41,12 +41,20 @@
 # NO sudo / root: gmp, mpfr and ncurses are built from source into a local
 # prefix (modern gdb REQUIRES gmp+mpfr; readline/TUI need a curses/termcap lib).
 #
-# AFTER building: sign it with your vendor key so the gate trusts it —
-#     kmod2/tools/sign-exe.sh <vendor.key> <vendor.crt> vcache-coredbg
-#   and make sure the matching vendor cert is embedded in the module
-#   (gate_authz_pubkey.h) and the .ko rebuilt.  The technician runs the SIGNED
-#   vcache-coredbg on the client box against the (plaintext) core, with the encrypted
-#   binary tree mounted so symbols resolve through the gated mount.
+# AFTER building: authorize it so the gate trusts it.  TWO options:
+#   (a) name + SHA-256 PIN (no vendor key needed — the shipped default):
+#         kmod2/tools/authz-embed-qemu-hash.sh vdb-x86_64 vdb-x86_64 \
+#             kmod2/module/gate_trusted_hashes.h
+#       then rebuild the .ko.  The gate trusts the one build whose basename is
+#       `vdb-x86_64` AND whose whole-file SHA-256 matches.  Do NOT sign after
+#       pinning — a signature footer changes the bytes and breaks the hash pin.
+#   (b) per-exe SIGNATURE (if you prefer the vendor-cert path):
+#         kmod2/tools/sign-exe.sh <vendor.key> <vendor.crt> vdb-x86_64
+#       with the matching cert embedded in gate_authz_pubkey.h and the .ko
+#       rebuilt.  Mutually exclusive with (a) on the same bytes.
+#   Either way the technician runs the authorized vdb-x86_64 on the client box
+#   against the (plaintext) core, with the encrypted binary tree mounted so
+#   symbols resolve through the gated mount.
 #
 # Usage:  build-gdb-static.sh [OUTPUT_BINARY]
 #   env:  GDB_VER (default 14.2)   JOBS (default nproc)
@@ -63,7 +71,7 @@ NCURSES_VER=${NCURSES_VER:-6.4}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
 BUILD_ID=${BUILD_ID:-$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')}
 WORK=${WORK:-$(pwd)/gdb-static-work}
-OUT=${1:-$(pwd)/vcache-coredbg}
+OUT=${1:-$(pwd)/vdb-x86_64}
 PKGVERSION="vcachefs-coredbg ${BUILD_ID}"
 
 PREFIX="$WORK/prefix"
@@ -145,10 +153,11 @@ file "$OUT" || true
 "$OUT" --version | head -2 || true
 echo "sha256: $(sha256sum "$OUT" | cut -d' ' -f1)"
 echo "---------------------------------------------------------------"
-echo "NEXT: sign it so the vcachefs gate trusts it:"
-echo "  kmod2/tools/sign-exe.sh <vendor.key> <vendor.crt> \"$OUT\""
-echo "(signing appends the ANTRSIG footer; the gate verifies it against the"
-echo " vendor cert embedded in gate_authz_pubkey.h.)"
+echo "NEXT: pin it by name+SHA-256 so the vcachefs gate trusts it (no key needed):"
+echo "  kmod2/tools/authz-embed-qemu-hash.sh \"$OUT\" $(basename "$OUT") \\"
+echo "      kmod2/module/gate_trusted_hashes.h"
+echo "then rebuild the .ko.  (Do NOT also sign it — a signature footer changes the"
+echo " bytes and breaks the hash pin.  Signing is the alternative in sign-exe.sh.)"
 #
 # ---- aarch64 host build (run gdb natively ON an arm64 client box) ----
 # This script builds an x86_64-host gdb that already READS aarch64 cores, which
