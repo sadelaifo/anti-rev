@@ -154,12 +154,97 @@ struct vcachefs_passthrough {
 	bool		direct;		/* true: forward ALL ops to lower (writable plaintext) */
 };
 
+/*
+ * Drop an inode's cached whole-file decrypt + clean page-cache pages and re-sniff
+ * the lower (encrypted vs plaintext, new size / container_len / signature, and —
+ * via classify resetting authz_sig — the per-exe signature verdict).  Shared by
+ * the writable mount's refresh-on-write-close and revalidate-on-open.
+ *
+ * Safe against concurrent readers: ii->plain is touched ONLY under plain_lock
+ * (vcachefs_fill_page holds it across the copy — there is no lockless reader), so
+ * swapping it to NULL here and freeing the old buffer after the lock cannot race
+ * a fault.  Cached pages are dropped with invalidate_mapping_pages, which evicts
+ * only clean, UNMAPPED pages — the intended case is a quiescent file (e.g. a
+ * subsystem the operator stopped before swapping its binary); a page still mapped
+ * by a live reader is left alone, exactly as overwriting an in-use file behaves on
+ * any filesystem.
+ */
+static void vcachefs_drop_and_reclassify(struct inode *inode)
+{
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
+	loff_t plain_len = 0;
+	void *old;
+
+	mutex_lock(&ii->plain_lock);
+	old = ii->plain;
+	ii->plain = NULL;			/* force re-decrypt on next fault */
+	if (vcachefs_reclassify(inode, &plain_len) == 0) {
+		ii->plain_len = plain_len;
+		i_size_write(inode, plain_len);
+	} else {
+		ii->open_ok = false;		/* fail-closed if the re-sniff failed */
+	}
+	mutex_unlock(&ii->plain_lock);
+
+	if (old)
+		vfree(old);
+	invalidate_mapping_pages(inode->i_mapping, 0, -1);
+}
+
+/*
+ * Revalidate the cached classification against the LIVE lower inode at open time.
+ * If the lower file changed IN PLACE after this vcachefs inode was first
+ * classified — a deploy/sign that landed after (or raced) the mount, OR a
+ * metadata op such as `chmod -R` whose ctime bump used to leave the inode's
+ * cached container_len correct but is a cheap, reliable "something touched this"
+ * signal — the cached verdict (encrypted / has_sig / container_len and the
+ * lazily-cached authz_sig) may be stale, and the gate could wrongly deny a
+ * properly-signed binary until a remount.  Comparing the lower's size + mtime +
+ * ctime (stamped by classify) catches it and reclassifies here, so the next
+ * open/exec sees a fresh verdict with NO remount, vcache-replace, or
+ * write-through-the-mount.
+ *
+ * Steady-state cost on the unchanged fast path is five scalar compares, no I/O
+ * and no lock (the app loading hundreds of libs pays essentially nothing).  Only
+ * an IN-PLACE change (same lower inode) is observable through the pinned
+ * lower_path; an atomic rename-over installs a NEW lower inode handled by
+ * refresh-on-write-close or vcache-replace's REFRESH_PATH ioctl.
+ */
+static void vcachefs_revalidate(struct inode *inode)
+{
+	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
+	struct inode *lower = d_inode(ii->lower_path.dentry);
+	s64 msec, csec;
+	long mnsec, cnsec;
+	loff_t lsize;
+
+	if (!lower)
+		return;
+	lsize = i_size_read(lower);
+	vcf_inode_mtime(lower, &msec, &mnsec);
+	vcf_inode_ctime(lower, &csec, &cnsec);
+	if (lsize == ii->cls_size &&
+	    msec == ii->cls_mtime_sec && mnsec == ii->cls_mtime_nsec &&
+	    csec == ii->cls_ctime_sec && cnsec == ii->cls_ctime_nsec)
+		return;				/* unchanged: cheap no-op */
+
+	/* Changed in place — reclassify (drops stale decrypt, resets authz_sig,
+	 * re-stamps cls_* so this fires once per real change, not every open). */
+	vcachefs_drop_and_reclassify(inode);
+}
+
 static int vcachefs_file_open(struct inode *inode, struct file *file)
 {
 	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
 #ifdef VCACHEFS_WRITE
 	struct vcachefs_sb_info *sbi = VCACHEFS_SB(inode->i_sb);
 #endif
+
+	/* Pick up an out-of-band IN-PLACE change to the lower file (a deploy that
+	 * landed after — or raced — the mount, or a metadata sweep like chmod -R)
+	 * BEFORE the gate below, so a freshly-signed binary authorizes on this open
+	 * with no remount. */
+	vcachefs_revalidate(inode);
 
 	if (!ii->open_ok)
 		return -EIO;	/* strict mode: unencrypted, non-whitelisted */
@@ -571,49 +656,6 @@ static loff_t vcachefs_llseek(struct file *file, loff_t offset, int whence)
 	return generic_file_llseek(file, offset, whence);
 }
 
-#ifdef VCACHEFS_WRITE
-/*
- * Refresh an inode after it was written through a writable mount, so a file
- * replaced via a plain write (cp/scp/drag of a new container, in place OR via a
- * fresh file) is picked up LIVE — no remount, no vcache-replace.  Re-sniffs the
- * current lower content (encrypted vs plaintext, new size / container_len /
- * signature) and drops the cached whole-file decrypt plus any cached pages, so
- * the next read/exec re-decrypts the new bytes.
- *
- * Safe against concurrent readers: ii->plain is touched ONLY under plain_lock
- * (vcachefs_fill_page holds it across the copy — there is no lockless reader),
- * so swapping it to NULL here and freeing the old buffer after the lock cannot
- * race a fault.  Cached pages are dropped with invalidate_mapping_pages, which
- * only evicts clean, UNMAPPED pages — the intended case is a quiescent file
- * (e.g. a subsystem the operator stopped before swapping its binary); a page
- * still mapped by a live reader is left alone, exactly as overwriting an in-use
- * file behaves on any filesystem.
- */
-static void vcachefs_refresh_after_write(struct inode *inode)
-{
-	struct vcachefs_inode_info *ii = VCACHEFS_I(inode);
-	loff_t plain_len = 0;
-	void *old;
-	int err;
-
-	mutex_lock(&ii->plain_lock);
-	old = ii->plain;
-	ii->plain = NULL;			/* force re-decrypt on next fault */
-	err = vcachefs_reclassify(inode, &plain_len);
-	if (!err) {
-		ii->plain_len = plain_len;
-		i_size_write(inode, plain_len);
-	} else {
-		ii->open_ok = false;		/* fail-closed if the re-sniff failed */
-	}
-	mutex_unlock(&ii->plain_lock);
-
-	if (old)
-		vfree(old);
-	invalidate_mapping_pages(inode->i_mapping, 0, -1);
-}
-#endif /* VCACHEFS_WRITE */
-
 static int vcachefs_file_release(struct inode *inode, struct file *file)
 {
 	struct vcachefs_passthrough *pd = file->private_data;
@@ -632,7 +674,7 @@ static int vcachefs_file_release(struct inode *inode, struct file *file)
 	}
 #ifdef VCACHEFS_WRITE
 	if (refresh)
-		vcachefs_refresh_after_write(inode);
+		vcachefs_drop_and_reclassify(inode);
 #endif
 	return 0;
 }

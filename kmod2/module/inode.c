@@ -51,6 +51,13 @@ static int vcachefs_classify(struct inode *inode, struct dentry *lower_dentry,
 	struct file *lower_file;
 	int magic;
 
+	/* Stamp the lower identity we are about to classify against, so
+	 * vcachefs_file_open can detect a later in-place change (incl. a chmod's
+	 * ctime bump) and reclassify — revalidate-on-open. */
+	ii->cls_size = i_size_read(lower_inode);
+	vcf_inode_mtime(lower_inode, &ii->cls_mtime_sec, &ii->cls_mtime_nsec);
+	vcf_inode_ctime(lower_inode, &ii->cls_ctime_sec, &ii->cls_ctime_nsec);
+
 	lower_file = dentry_open(&ii->lower_path, O_RDONLY, current_cred());
 	if (IS_ERR(lower_file))
 		return PTR_ERR(lower_file);
@@ -134,22 +141,21 @@ static int vcachefs_classify(struct inode *inode, struct dentry *lower_dentry,
 	return 0;
 }
 
-#ifdef VCACHEFS_WRITE
 /*
  * Re-run classification against the CURRENT lower content.  Used by the writable
- * mount's refresh-on-write-close (vcachefs_refresh_after_write in file.c) so a
- * file replaced through the mount — e.g. `cp newver.enc bin/FOO` — is re-sniffed
- * (encrypted vs plaintext, new size / container_len / signature) and picked up
- * live without a remount or vcache-replace.  The caller holds ii->plain_lock and
- * has already dropped the stale decrypt buffer, so re-setting ii->encrypted etc.
- * here cannot race a reader.
+ * mount's refresh-on-write-close (file.c) when a file is replaced through the
+ * mount — e.g. `cp newver.enc bin/FOO` — AND by revalidate-on-open (all mounts)
+ * when the lower changed in place under the cached inode.  Re-sniffs encrypted vs
+ * plaintext, new size / container_len / signature, and re-stamps cls_* (so a
+ * given change triggers one reclassify, not every open).  The caller holds
+ * ii->plain_lock and has already dropped the stale decrypt buffer, so re-setting
+ * ii->encrypted etc. here cannot race a reader.
  */
 int vcachefs_reclassify(struct inode *inode, loff_t *plain_len)
 {
 	return vcachefs_classify(inode, VCACHEFS_I(inode)->lower_path.dentry,
 				 plain_len);
 }
-#endif
 
 struct inode *vcachefs_iget(struct super_block *sb, struct dentry *lower_dentry)
 {
@@ -416,7 +422,7 @@ const struct inode_operations vcachefs_file_iops = {
  * file.c), and these ops only move RAW bytes (no decrypt, no key).  A file
  * replaced through the mount is picked up live: on close of the write fd the
  * inode is re-classified and its stale decrypt cache dropped (file.c's
- * vcachefs_refresh_after_write via vcachefs_reclassify).
+ * refresh-on-write-close, and revalidate-on-open, via vcachefs_reclassify).
  *
  * The lower directory dentry is pinned by the parent vcachefs inode's
  * ->lower_path, so these ops reach the (possibly overmounted/in-place-shadowed)
@@ -440,7 +446,23 @@ static void vcachefs_copy_attr(struct inode *inode, struct inode *lower)
 	inode->i_mtime = lower->i_mtime;
 	inode->i_ctime = lower->i_ctime;
 #endif
-	if (S_ISREG(lower->i_mode)) {
+	if (S_ISREG(lower->i_mode) && !VCACHEFS_I(inode)->encrypted) {
+		/*
+		 * NON-encrypted (plaintext passthrough): the lower raw size IS the
+		 * logical size, so mirror it.
+		 *
+		 * ENCRYPTED files are deliberately skipped: the lower size is the
+		 * ciphertext container (plus any appended signature) and is NEITHER
+		 * the plaintext size NOR container_len.  A metadata-only setattr
+		 * (chmod/chown/utimes — e.g. a `chmod -R` sweeping the mount) must
+		 * NOT overwrite plain_len/container_len with the raw size: doing so
+		 * made container_len == lower size, so the gate's signature probe
+		 * (`container_len >= lower_size` ⇒ "no signature") denied every
+		 * encrypted exe until remount, and broke the decrypt range.  A real
+		 * content/size change to an encrypted file is instead picked up by
+		 * reclassify (refresh-on-write-close, or revalidate-on-open), which
+		 * recomputes both from the actual bytes.
+		 */
 		loff_t sz = i_size_read(lower);
 
 		i_size_write(inode, sz);

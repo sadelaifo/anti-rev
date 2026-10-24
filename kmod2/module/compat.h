@@ -204,6 +204,43 @@ static inline void vcf_d_invalidate(struct dentry *dentry)
 #endif
 
 /*
+ * Lower-inode mtime/ctime read, normalised to (sec, nsec) scalars across the
+ * accessor split: the inode_get_*time() wrappers landed in 6.6 (commit
+ * 077c212f0344); before that the stamp lives in i_mtime/i_ctime directly
+ * (struct timespec64 from 5.6, struct timespec earlier — both expose tv_sec /
+ * tv_nsec, so the field read is uniform and we never name timespec64, which is
+ * absent on 3.10).  Used by revalidate-on-open to detect an out-of-band change
+ * to the lower file.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+static inline void vcf_inode_mtime(struct inode *i, s64 *sec, long *nsec)
+{
+	struct timespec64 t = inode_get_mtime(i);
+
+	*sec = t.tv_sec;
+	*nsec = t.tv_nsec;
+}
+static inline void vcf_inode_ctime(struct inode *i, s64 *sec, long *nsec)
+{
+	struct timespec64 t = inode_get_ctime(i);
+
+	*sec = t.tv_sec;
+	*nsec = t.tv_nsec;
+}
+#else
+static inline void vcf_inode_mtime(struct inode *i, s64 *sec, long *nsec)
+{
+	*sec = i->i_mtime.tv_sec;
+	*nsec = i->i_mtime.tv_nsec;
+}
+static inline void vcf_inode_ctime(struct inode *i, s64 *sec, long *nsec)
+{
+	*sec = i->i_ctime.tv_sec;
+	*nsec = i->i_ctime.tv_nsec;
+}
+#endif
+
+/*
  * ------------------------------------------------------------------------
  * Writable-passthrough ("-o writable") cross-kernel shims.
  *

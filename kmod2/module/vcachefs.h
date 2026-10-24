@@ -123,6 +123,18 @@ struct vcachefs_inode_info {
 	loff_t		container_len;	/* bytes before the sig section */
 	bool		has_sig;	/* an ANTRSIG1 section is present */
 	int		authz_sig;	/* 0 unknown / 1 ok / -1 bad (gate cache) */
+	/* Lower-inode identity stamped at classify time.  vcachefs_file_open
+	 * compares these against the live lower inode and reclassifies if they
+	 * differ, so a binary (re)written IN PLACE in the lower tree after this
+	 * inode was first classified — a deploy that landed after/raced the mount
+	 * — is picked up on the next open with no remount or vcache-replace.  (An
+	 * atomic rename-over installs a NEW lower inode the pinned lower_path
+	 * can't observe; write through the mount or use vcache-replace for that.) */
+	loff_t		cls_size;	/* i_size_read(lower) at classify */
+	s64		cls_mtime_sec;
+	long		cls_mtime_nsec;
+	s64		cls_ctime_sec;	/* ctime too: catches metadata-only swaps */
+	long		cls_ctime_nsec;
 	struct inode	vfs_inode;
 };
 
@@ -165,9 +177,10 @@ extern const struct inode_operations vcachefs_symlink_iops;
 /* Writable-mount variants: add the create/unlink/rename/setattr seam. */
 extern const struct inode_operations vcachefs_dir_iops_rw;
 extern const struct inode_operations vcachefs_file_iops_rw;
-/* Re-sniff the lower after a write, for refresh-on-write-close (file.c). */
-int vcachefs_reclassify(struct inode *inode, loff_t *plain_len);
 #endif
+/* Re-sniff the lower content.  Used by refresh-on-write-close (writable mounts)
+ * AND revalidate-on-open (all mounts), so it is NOT gated on VCACHEFS_WRITE. */
+int vcachefs_reclassify(struct inode *inode, loff_t *plain_len);
 struct inode *vcachefs_iget(struct super_block *sb, struct dentry *lower_dentry);
 
 /* True iff @inode is a vcachefs REGULAR-file inode (either the read-only or the

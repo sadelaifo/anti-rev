@@ -318,6 +318,44 @@ else
 	bad "large-script read corrupted through the mount: $(printf '%s' "$out" | tr '\n' '|')"
 fi
 
+echo "== 11. chmod through the mount must NOT corrupt an encrypted file (regression) =="
+# Root cause of the field bug "start script mounts, then `chmod -R /root/proj`,
+# then every encrypted exe -> permission denied until a manual down+up":
+# the writable setattr's vcachefs_copy_attr() overwrote plain_len AND
+# container_len with the RAW lower size on ANY metadata change (chmod/chown/
+# utimes).  That made container_len == lower_size, so the gate's signature probe
+# (`container_len >= lower_size` ⇒ "no signature") denied every encrypted exe
+# (caching authz_sig = -1) until remount, and also broke the decrypt range.
+# Hermetic proxy for it (no signing infra needed): a chmod through the mount must
+# leave the reported PLAINTEXT size and the decrypted bytes intact.
+echo 0 > "$GPARAM" 2>/dev/null || true    # read freely; testing classification, not the gate
+P_orig=$(stat -c%s "$WORK/libtest.so")
+sz_before=$(stat -c%s "$MP/libtest.so")
+[[ "$sz_before" == "$P_orig" ]] && ok "pre-chmod: mount reports the plaintext size ($sz_before)" \
+	|| bad "pre-chmod size $sz_before != plaintext $P_orig"
+sha_before=$(sha256sum "$MP/libtest.so" | cut -d' ' -f1)
+
+chmod 755 "$MP/libtest.so"                # the exact field trigger, through the writable mount
+
+# stat() goes through ->getattr (NOT ->open), so revalidate-on-open can't mask a
+# copy_attr clobber here — this is the pure regression assertion.
+sz_after=$(stat -c%s "$MP/libtest.so")
+if [[ "$sz_after" == "$P_orig" ]]; then
+	ok "post-chmod: still reports the PLAINTEXT size ($sz_after) — container_len not clobbered"
+else
+	bad "post-chmod size CORRUPTED: $sz_after (want plaintext $P_orig; buggy .ko reports the raw container size)"
+fi
+# end-to-end: the bytes still decrypt correctly through the mount
+sha_after=$(sha256sum "$MP/libtest.so" | cut -d' ' -f1)
+[[ "$sha_after" == "$sha_before" ]] && ok "post-chmod: decrypted bytes unchanged (decrypt range intact)" \
+	|| bad "post-chmod decrypt CORRUPTED: $sha_before -> $sha_after"
+out=$(run readelf "$MP/libtest.so")
+[[ "$out" == "OK 7f454c46" ]] && ok "post-chmod: still a valid decrypted ELF" || bad "post-chmod readelf: $out"
+lmag=$(head -c8 "$ENC/libtest.so" | xxd -p 2>/dev/null)
+[[ "$lmag" == "a74c2e91d63b085f" ]] && ok "post-chmod: lower stays ciphertext (chmod is metadata-only)" \
+	|| bad "post-chmod lower magic: $lmag"
+echo 1 > "$GPARAM" 2>/dev/null || true
+
 echo
 echo "==== write-mode: $PASS passed, $FAIL failed, $SKIP skipped ===="
 [[ $FAIL -eq 0 ]]
