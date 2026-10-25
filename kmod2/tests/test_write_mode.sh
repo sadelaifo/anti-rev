@@ -76,6 +76,9 @@ mkdir -p "$ENC" "$MP"
 cleanup() {
 	mountpoint -q "$MP" && umount "$MP" 2>/dev/null
 	rmmod vcachefs 2>/dev/null
+	# Defensive: the chattr sections (§9/§15/§18) set +i/+a on lower files; clear
+	# any that a failure left behind so `rm -rf` isn't blocked by an immutable file.
+	command -v chattr >/dev/null && chattr -R -i -a "$ENC" 2>/dev/null
 	rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -516,6 +519,67 @@ out=$(evil readelf "$MP/libtest.so")
 [[ "$out" != "OK 7f454c46" ]] \
 	&& ok "that same unlisted identity is STILL denied the decrypted bytes ($out)" \
 	|| bad "read gate broken: unlisted identity decrypted after chmod ($out)"
+
+echo "== 18. NON-ROOT is denied privileged attr ops (the mount forwards the caps) =="
+# §12-§17 all ran as root, so they prove the setattr passthrough WORKS; they say
+# nothing about who may USE it.  This verifies the writable mount does NOT let an
+# UNPRIVILEGED caller bypass the kernel's capability model on the lower inode:
+#   chown (to another uid)   -> needs CAP_CHOWN
+#   chattr +/-i, +/-a        -> needs CAP_LINUX_IMMUTABLE
+# while an ownership-only chmod of a file the user OWNS still succeeds (no false
+# deny — metadata writes are ungated by vcachefs; only the kernel caps apply).
+# Field relevance: a NON-ROOT deploy/update script running `chattr -R -i -a` or
+# `chown` on root-owned bin/lib gets EPERM — a kernel permission matter, not a
+# vcachefs bug.  Assertions are STATE-based (owner/mode/lsattr unchanged), so they
+# don't depend on the locale of the errno text.  SKIP if no privilege-drop tool.
+NB_UID=65534; NB_GID=65534            # nobody:nogroup (universal)
+if command -v setpriv >/dev/null && \
+   setpriv --reuid=$NB_UID --regid=$NB_GID --clear-groups true 2>/dev/null; then
+	asuser() { setpriv --reuid=$NB_UID --regid=$NB_GID --clear-groups "$@"; }
+elif command -v runuser >/dev/null && runuser -u nobody -- true 2>/dev/null; then
+	asuser() { runuser -u nobody -- "$@"; }
+elif command -v sudo >/dev/null && sudo -n -u nobody true 2>/dev/null; then
+	asuser() { sudo -n -u nobody "$@"; }
+else
+	asuser() { return 127; }
+fi
+
+if asuser true 2>/dev/null; then
+	chmod a+rx "$WORK" "$MP" 2>/dev/null    # let the unprivileged user traverse to $MP
+	# A file the unprivileged user OWNS, created+chowned through the mount by root.
+	run create "$MP/np.txt" "x" >/dev/null
+	chown "$NB_UID:$NB_GID" "$MP/np.txt"; chmod 666 "$MP/np.txt"
+
+	# (a) chown by non-root -> denied (CAP_CHOWN); owner must stay nobody.
+	asuser chown 0:0 "$MP/np.txt" 2>/dev/null
+	if [[ "$(stat -c%u "$ENC/np.txt")" == "$NB_UID" ]]; then
+		ok "non-root chown -> denied, owner unchanged (needs CAP_CHOWN)"
+	else
+		bad "non-root chown CHANGED the owner to $(stat -c%u "$ENC/np.txt") — cap bypassed!"
+	fi
+
+	# (b) ownership-only chmod of its OWN file -> must succeed (no false deny).
+	asuser chmod 600 "$MP/np.txt" 2>/dev/null
+	[[ "$(stat -c%a "$ENC/np.txt")" == 600 ]] \
+		&& ok "non-root CAN chmod a file it owns (metadata write not falsely denied)" \
+		|| bad "non-root chmod of own file failed: mode $(stat -c%a "$ENC/np.txt")"
+
+	# (c) chattr -i by non-root -> denied (CAP_LINUX_IMMUTABLE); flag must persist.
+	if command -v chattr >/dev/null && command -v lsattr >/dev/null \
+	   && chattr +i "$MP/np.txt" 2>"$WORK/np.err"; then
+		asuser chattr -i "$MP/np.txt" 2>/dev/null
+		if lsattr "$MP/np.txt" 2>/dev/null | grep -q 'i'; then
+			ok "non-root chattr -i -> denied, immutable flag persists (needs CAP_LINUX_IMMUTABLE)"
+		else
+			bad "non-root chattr -i CLEARED the immutable flag — cap bypassed!"
+		fi
+		chattr -i "$MP/np.txt" 2>/dev/null      # root cleanup (so rm -rf works)
+	else
+		skip "lower fs can't store the immutable flag — non-root chattr check skipped"
+	fi
+else
+	skip "no usable privilege-drop tool (setpriv/runuser/sudo -u nobody) — non-root matrix skipped"
+fi
 
 echo
 echo "==== write-mode: $PASS passed, $FAIL failed, $SKIP skipped ===="
