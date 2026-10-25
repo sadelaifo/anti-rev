@@ -339,13 +339,25 @@ static int vcachefs_file_open(struct inode *inode, struct file *file)
 		} else if (!vcachefs_task_authorized()) {
 			/*
 			 * Unauthorized data read.  Default: deny (-EACCES).  With
-			 * gate_passthrough_cipher: serve the lower .enc/ ciphertext
-			 * WITH THE KEY TRAILER STRIPPED — stash an O_RDONLY lower
-			 * file plus an exposure limit in ->private_data; the
-			 * read/splice ops below route to it capped at the limit
-			 * (mmap is refused), bypassing this inode's (possibly
-			 * plaintext) page cache entirely.  The withheld trailer is
-			 * what keeps the embedded key out of the reader's hands.
+			 * gate_passthrough_cipher: serve the WHOLE lower .enc/ file
+			 * (the keyless container AND its appended signature footer),
+			 * minus only a legacy embedded-key TRAILER — stash an O_RDONLY
+			 * lower file plus an exposure limit in ->private_data; the
+			 * read/splice ops below route to it capped at the limit (mmap
+			 * is refused), bypassing this inode's (possibly plaintext) page
+			 * cache entirely.
+			 *
+			 * We serve the FULL file (not just container_len) so a backup
+			 * taken THROUGH the mount — tar/cp by an unauthorized reader —
+			 * is a BYTE-FAITHFUL copy that still verifies and runs after
+			 * restore.  Safe under key-in-.ko (ANTREV_TRAILER_LEN == 0):
+			 * the file carries no key, and the signature footer is
+			 * non-secret (the vendor cert is already compiled into this
+			 * .ko), so a copier gains nothing it couldn't copy from the
+			 * lower tree directly.  The TRAILER subtraction remains for the
+			 * legacy embedded-key form, where the last TRAILER bytes are
+			 * the AES key and MUST stay withheld (that form does not also
+			 * carry a signature footer).
 			 */
 			struct vcachefs_passthrough *pd;
 			struct file *lower;
@@ -363,7 +375,7 @@ static int vcachefs_file_open(struct inode *inode, struct file *file)
 				kfree(pd);
 				return PTR_ERR(lower);
 			}
-			lsz = ii->container_len;	/* excludes any appended sig */
+			lsz = i_size_read(file_inode(lower));	/* FULL lower size (incl. sig footer) */
 			pd->lower = lower;
 			pd->limit = lsz > ANTREV_TRAILER_LEN ?
 				    lsz - ANTREV_TRAILER_LEN : 0;

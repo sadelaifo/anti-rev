@@ -1,17 +1,21 @@
 #!/bin/bash
-# gate_passthrough_cipher test for antirevfs (embedded-key format): when an
+# gate_passthrough_cipher test for vcachefs (key-in-.ko format): when an
 # unauthorized process reads an encrypted file, instead of -EACCES it is served
-# the lower .enc/ ciphertext WITH THE KEY TRAILER STRIPPED — a valid-looking but
-# keyless, undecryptable ANTREV01 container.  Security is unchanged (no plaintext
-# AND no key escapes); the difference is posture — the read "succeeds" with
-# useless bytes rather than a permission error that advertises the gate.  Proves:
+# the WHOLE lower .enc/ file — the keyless container PLUS any appended signature
+# footer — a valid-looking but undecryptable container (the AES key lives in the
+# .ko, never in the file; a legacy embedded-key TRAILER, if any, stays withheld).
+# Security is unchanged (no plaintext AND no key escapes); the difference is
+# posture — the read "succeeds" with useless bytes rather than a permission error.
+# Serving the WHOLE file (footer included) makes a backup taken THROUGH the mount
+# byte-faithful, so a restored binary still verifies and runs.  Proves:
 #   1. an authorized program still reads DECRYPTED content through the mount
-#   2. cp (unlisted) SUCCEEDS but yields the container minus the 40-byte key
-#      trailer (key + trailing magic), and the embedded key is NOT in the output
-#   3. cat (unlisted) yields ciphertext (ANTREV01 magic, not the plaintext ELF)
+#   2. cp (unlisted) SUCCEEDS but yields the whole keyless container; the embedded
+#      key is NOT in the output
+#   3. cat (unlisted) yields ciphertext (container magic, not the plaintext ELF)
 #   4. an unauthorized objdump sees "not an ELF" — no symbols leak
 #   5. flipping gate_passthrough_cipher=0 restores the -EACCES deny
 #   6. the lower .enc file is (still) ciphertext
+#   7. a SIGNED container copies through the mount WITH its footer intact (tar-safe)
 #
 # Requires root (insmod/mount).  Run:  sudo bash test_gate_passthrough.sh
 set -uo pipefail
@@ -59,6 +63,19 @@ cp "$WORK/libtest.so" "$WORK/libtest.plain.so"   # reference plaintext
 python3 "$PROTECT" encrypt-lib --fs --key "$WORK/key.hex" \
 	--libs "$WORK/libtest.so" --output-dir "$ENC" >/dev/null
 
+# A SIGNED container: the encrypted lib + a synthetic per-exe signature footer
+# ([sig][sig_len:4 LE][SIG_MAGIC:8]).  The sig need not verify here — vcachefs
+# detects it by the trailing SIG_MAGIC, so container_len < lower_size and the OLD
+# passthrough would have truncated the footer off a copy.  §7 proves the new
+# behavior serves the WHOLE file so the footer survives a backup through the mount.
+cp "$ENC/libtest.so" "$ENC/libsigned.so"
+python3 - "$ENC/libsigned.so" <<'PY'
+import sys, struct
+p = sys.argv[1]; d = open(p, "rb").read()
+sig = b"\xA5" * 128
+open(p, "wb").write(d + sig + struct.pack("<I", len(sig)) + bytes.fromhex("3d6af0128c55b427"))
+PY
+
 # An authorized loader (dlopen+dlsym+call).
 cat > "$WORK/loader.c" <<'EOF'
 #include <dlfcn.h>
@@ -96,16 +113,18 @@ echo "    loader: $OUT (rc=$RC)"
 [[ $RC -eq 0 ]] && ok "authorized loader dlopen'd + called (answer=42)" \
 	|| bad "authorized loader failed (rc=$RC)"
 
-echo "== 2. cp (unlisted) succeeds but yields TRAILER-STRIPPED ciphertext (no key) =="
+echo "== 2. cp (unlisted) succeeds but yields the whole keyless ciphertext (no key) =="
 ENCSZ="$(stat -c%s "$ENC/libtest.so")"
 if cp "$MP/libtest.so" "$WORK/out_cp" 2>"$WORK/cp.err"; then
 	OUTSZ="$(stat -c%s "$WORK/out_cp")"
 	if cmp -s "$WORK/out_cp" "$WORK/libtest.plain.so"; then
 		bad "cp yielded PLAINTEXT (passthrough leaked decrypted content!)"
-	elif [[ "$OUTSZ" -eq "$ENCSZ" ]]; then
-		ok "cp output is the whole keyless .enc container ($OUTSZ = $ENCSZ; key is in the .ko)"
+	elif cmp -s "$WORK/out_cp" "$ENC/libtest.so"; then
+		# `cp FOO FOO_new` through the mount must be BYTE-IDENTICAL to the lower:
+		# no header dropped (served from offset 0), no trailer dropped.
+		ok "cp output is BYTE-IDENTICAL to the lower container ($OUTSZ bytes; nothing dropped — tar/backup-safe)"
 	else
-		bad "cp output size $OUTSZ != enc ($ENCSZ)"
+		bad "cp output differs from the lower container (OUTSZ=$OUTSZ ENCSZ=$ENCSZ; header/trailer dropped?)"
 	fi
 	# the embedded AES key (key.hex) must NOT appear anywhere in the stripped copy
 	if python3 -c "import sys; d=open('$WORK/out_cp','rb').read(); k=bytes.fromhex(open('$WORK/key.hex').read().strip()); sys.exit(0 if k in d else 1)"; then
@@ -148,6 +167,45 @@ echo 1 > "$PASS_PARAM"
 echo "== 6. lower .enc file is ciphertext =="
 cmp -s "$ENC/libtest.so" "$WORK/libtest.plain.so" && bad "lower file is plaintext!" \
 	|| ok "lower .enc file is ciphertext"
+
+echo "== 7. a SIGNED container copies through the mount WITH its footer (tar-safe) =="
+# Unlisted cp -> passthrough path.  The NEW behavior serves the WHOLE lower file
+# (container + footer), so the copy is byte-identical to the lower and its
+# signature footer survives — a backup taken through the mount still verifies.
+# (The OLD behavior truncated at container_len, dropping the footer -> unsigned.)
+SGN_SZ="$(stat -c%s "$ENC/libsigned.so")"
+if cp "$MP/libsigned.so" "$WORK/out_signed" 2>"$WORK/cps.err"; then
+	if cmp -s "$WORK/out_signed" "$ENC/libsigned.so"; then
+		ok "passthrough copy of a signed container is byte-identical to the lower (footer preserved)"
+	else
+		bad "passthrough copy differs from lower (footer stripped? out=$(stat -c%s "$WORK/out_signed") lower=$SGN_SZ)"
+	fi
+	[[ "$(tail -c8 "$WORK/out_signed" | xxd -p)" == "3d6af0128c55b427" ]] \
+		&& ok "signature footer present in the copy -> survives tar/backup through the mount" \
+		|| bad "footer magic missing from the passthrough copy"
+	# still no plaintext / no key leak on the signed path
+	cmp -s "$WORK/out_signed" "$WORK/libtest.plain.so" && bad "signed passthrough copy is PLAINTEXT!" \
+		|| ok "signed passthrough copy is still ciphertext (no plaintext leak)"
+else
+	bad "cp of signed container denied (expected passthrough success): $(cat "$WORK/cps.err")"
+fi
+# The OTHER direction: an AUTHORIZED read of the SIGNED container must decrypt to
+# EXACTLY the original plaintext — the signature footer is NOT part of the
+# plaintext (all crypto/size math uses container_len, which excludes it).  Flip
+# the gate off so a plain read is authorized, then cmp against the pre-encryption
+# file.  (libsigned's container == libtest's container, so the plaintext matches.)
+GENF=/sys/module/vcachefs/parameters/gate_enforce
+if [[ -w "$GENF" ]]; then
+	echo 0 > "$GENF"
+	if cmp -s "$MP/libsigned.so" "$WORK/libtest.plain.so"; then
+		ok "authorized read of the signed container == original plaintext (footer excluded, byte-identical)"
+	else
+		bad "authorized read of signed container != original plaintext (footer bled into the plaintext?)"
+	fi
+	echo 1 > "$GENF"
+else
+	echo "    (gate_enforce param absent — release build; authorized-plaintext check skipped)"
+fi
 
 echo
 echo "== RESULT: $PASS passed, $FAIL failed =="
