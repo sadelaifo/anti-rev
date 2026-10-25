@@ -322,17 +322,19 @@ static int vcachefs_getattr(AREV_GETATTR_PROTO)
 
 	/*
 	 * Under gate_passthrough_cipher an unauthorized caller is served the
-	 * lower .enc/ ciphertext with the key TRAILER stripped — i.e. the first
-	 * (lower_size - TRAILER) bytes.  Report THAT length to such callers so
-	 * size-honoring copiers (cp via copy_file_range/sendfile) read the whole
-	 * keyless container and stop before the (already withheld) trailer.
-	 * getattr runs in the caller's context, so this varies per reader while
-	 * the shared inode keeps reporting plaintext size to authorized ones.
+	 * WHOLE lower .enc/ file (keyless container + its appended signature
+	 * footer), minus only a legacy embedded-key TRAILER.  Report that full
+	 * length — i.e. (lower_size - TRAILER) — so a size-honoring copier (tar,
+	 * cp via copy_file_range/sendfile) reads the complete file and a backup
+	 * taken THROUGH the mount is byte-faithful and still verifies on restore.
+	 * Safe under key-in-.ko (TRAILER == 0): no key is in the file and the
+	 * footer is non-secret.  getattr runs in the caller's context, so this
+	 * varies per reader while authorized ones still see the plaintext size.
 	 */
 	if (VCACHEFS_I(inode)->encrypted &&
 	    vcachefs_gate_passthrough_cipher() &&
 	    !vcachefs_task_authorized()) {
-		loff_t csz = VCACHEFS_I(inode)->container_len -
+		loff_t csz = i_size_read(vcachefs_lower_inode(inode)) -
 			     ANTREV_TRAILER_LEN;
 
 		if (csz < 0)
