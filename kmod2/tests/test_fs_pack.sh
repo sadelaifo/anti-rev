@@ -59,6 +59,11 @@ EOF
 
 echo "== run the packer =="
 python3 "$PACK" "$WORK/config.yaml" || { echo "packer failed"; exit 1; }
+# Snapshot THIS run's manifest: the manifest path is cfg_path.parent/
+# vcache-fs-manifest.json, and the §7 mode2 run (config2.yaml, same $WORK dir)
+# overwrites it before §8 reads it.  §8 inspects the encrypt_ext run, so it must
+# read this snapshot, not the clobbered live file.
+cp "$WORK/vcache-fs-manifest.json" "$WORK/manifest-main.json"
 
 echo "== 1. ELFs encrypted into mirror with ANTREV01 magic =="
 for f in lib/libtest.so.1.0 bin/app; do
@@ -163,7 +168,9 @@ for f in lib/libstatic.a lib/mod.pyc bin/weird.elf; do
 	fi
 done
 # and they must be listed under encrypted (not plaintext) in the manifest
-if python3 - "$WORK/vcache-fs-manifest.json" <<'PY'
+# (manifest-main.json: the encrypt_ext run's manifest, snapshotted before the
+# §7 mode2 run overwrote the live vcache-fs-manifest.json in this same dir)
+if python3 - "$WORK/manifest-main.json" <<'PY'
 import json,sys
 m=json.load(open(sys.argv[1]))
 enc=set(m["encrypted"]); pt=set(m.get("plaintext",[]))

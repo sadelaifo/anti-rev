@@ -116,8 +116,12 @@ if [[ -f "$W/leak.bin" ]]; then
     LSZ=$(stat -c%s "$W/leak.bin"); HDR=$(head -c8 "$W/leak.bin" | xxd -p)
     [[ "$HDR" == "$MAGIC_HEX" ]] && ok "cipher output carries the container magic" \
         || bad "cipher output magic wrong ($HDR)"
-    [[ "$LSZ" -eq $((ENCSZ-40)) ]] && ok "cipher output is trailer-stripped (enc-40 = $LSZ)" \
-        || bad "cipher output size $LSZ != enc-40 $((ENCSZ-40)) (key may be exposed!)"
+    # key-in-.ko scheme: ANTREV_TRAILER_LEN is 0 (no appended key trailer), so an
+    # unauthorized reader is served the WHOLE keyless container — safe because the
+    # key lives in the module, not the file.  (Matches test_gate_passthrough's
+    # `OUTSZ == ENCSZ` contract; the old enc-40 was the embedded-key trailer era.)
+    [[ "$LSZ" -eq "$ENCSZ" ]] && ok "cipher output is the whole keyless container ($LSZ = enc; key is in the .ko)" \
+        || bad "cipher output size $LSZ != enc $ENCSZ"
     # the last 8 bytes must NOT be the trailing magic (trailer stripped)
     TAIL=$(tail -c8 "$W/leak.bin" | xxd -p)
     [[ "$TAIL" != "$MAGIC_HEX" ]] && ok "no trailing key-magic (trailer removed)" \
