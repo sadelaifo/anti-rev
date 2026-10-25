@@ -62,10 +62,13 @@ echo "  sig bytes : $siglen"
 echo "  total     : $(wc -c < "$OUT")"
 command -v sha256sum >/dev/null && echo "  sha256    : $(sha256sum "$OUT" | cut -d' ' -f1)"
 
-# self-check: the detached sig verifies against the exe + cert (not a trust
-# check of the cert chain — just that key/cert/content are consistent)
+# self-check: the detached sig verifies against the exe + cert.  Use the cert as
+# the trust anchor (-CAfile + -partial_chain so a self-signed vendor cert works);
+# NOT -no_signer_cert_verify (unknown to OpenSSL 3.0.x — parsed as a cipher) and
+# NOT -noverify/-certfile alone (cms embeds the signer cert, so those "verify" any
+# self-consistent sig).  This matches the kernel gate: signer must chain to CERT.
 if openssl cms -verify -binary -noattr -inform DER -in "$tmp/sig.der" \
-	-content "$EXE" -certfile "$CERT" -no_signer_cert_verify -out /dev/null 2>/dev/null; then
+	-content "$EXE" -CAfile "$CERT" -partial_chain -out /dev/null 2>/dev/null; then
 	echo "  verify    : OK"
 else
 	echo "  verify    : WARNING — self-check failed; check the key/cert pair" >&2
