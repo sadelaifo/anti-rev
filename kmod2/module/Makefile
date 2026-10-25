@@ -107,9 +107,16 @@ ifeq ($(AREV_DEV),)
 	@# the module loader — the .ko still loads, but `nm`/`strings`/kallsyms no
 	@# longer reveal what any routine does (decrypt/gate/authz/...).  --strip-unneeded
 	@# then drops debug info and any now-unreferenced names.
+	@# Only GLOBAL symbols ($$2 uppercase) are renamed: file-local statics (e.g.
+	@# obfstr_k.h's inlined `_vcf_obf_e.N`, duplicated across TUs) are dropped by
+	@# --strip-unneeded anyway, and feeding their duplicate names to objcopy makes
+	@# --redefine-syms abort ("Multiple redefinition of symbol") renaming NOTHING.
+	@# Dedup OLD names (seen[]) as belt-and-suspenders against the same abort.
 	@$(NM) --defined-only $(PWD)/vcachefs.ko | \
-	  awk '$$3 ~ /vcachefs_|vcf_/ { printf "%s z%08x\n", $$3, NR }' > $(PWD)/.symmap
-	@test -s $(PWD)/.symmap && $(OBJCOPY) --redefine-syms=$(PWD)/.symmap $(PWD)/vcachefs.ko || true
+	  awk '$$2 ~ /^[A-Z]$$/ && $$3 ~ /vcachefs_|vcf_/ { if (!seen[$$3]++) printf "%s z%08x\n", $$3, NR }' > $(PWD)/.symmap
+	@# No `|| true`: a failing objcopy must fail the build, not silently ship an
+	@# unscrubbed .ko (the bug this guard replaces).  Empty map (no globals) is a no-op.
+	@if test -s $(PWD)/.symmap; then $(OBJCOPY) --redefine-syms=$(PWD)/.symmap $(PWD)/vcachefs.ko; fi
 	@rm -f $(PWD)/.symmap
 	$(STRIP) --strip-unneeded $(PWD)/vcachefs.ko
 endif
