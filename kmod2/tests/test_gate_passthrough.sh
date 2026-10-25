@@ -189,6 +189,23 @@ if cp "$MP/libsigned.so" "$WORK/out_signed" 2>"$WORK/cps.err"; then
 else
 	bad "cp of signed container denied (expected passthrough success): $(cat "$WORK/cps.err")"
 fi
+# The OTHER direction: an AUTHORIZED read of the SIGNED container must decrypt to
+# EXACTLY the original plaintext — the signature footer is NOT part of the
+# plaintext (all crypto/size math uses container_len, which excludes it).  Flip
+# the gate off so a plain read is authorized, then cmp against the pre-encryption
+# file.  (libsigned's container == libtest's container, so the plaintext matches.)
+GENF=/sys/module/vcachefs/parameters/gate_enforce
+if [[ -w "$GENF" ]]; then
+	echo 0 > "$GENF"
+	if cmp -s "$MP/libsigned.so" "$WORK/libtest.plain.so"; then
+		ok "authorized read of the signed container == original plaintext (footer excluded, byte-identical)"
+	else
+		bad "authorized read of signed container != original plaintext (footer bled into the plaintext?)"
+	fi
+	echo 1 > "$GENF"
+else
+	echo "    (gate_enforce param absent — release build; authorized-plaintext check skipped)"
+fi
 
 echo
 echo "== RESULT: $PASS passed, $FAIL failed =="
