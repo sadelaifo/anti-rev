@@ -19,10 +19,16 @@ OBFGEN  := ../../shared/obfstr_gen.py
 OBFDIR  := obf
 PY      ?= python3
 
-all: vcache-mount vcache-mount-inplace vcache-replace
+all: vcache-mount vcache-mount-inplace vcache-replace vcache-readout
 
 # Minimal single-tree ro/rw helper (explicit args) — not obfuscated.
 vcache-mount: vcache-mount.c
+	$(CC) $(CFLAGS) $(SECFLAGS) $(LDFLAGS) -o $@ $<
+
+# Diagnostic: capture exactly the bytes the gate serves THIS process for a file
+# through the mount (plain read(2) loop, no mmap), dump a byte-faithful copy,
+# and decode leading/trailing magic.  Not shipped — no string obfuscation.
+vcache-readout: vcache-readout.c
 	$(CC) $(CFLAGS) $(SECFLAGS) $(LDFLAGS) -o $@ $<
 
 # Live per-file upgrade helper for in-place mounts.  Drives /dev/vcachefs
@@ -69,6 +75,6 @@ vcache-mount-inplace: $(OBFDIR)/vcache-mount-inplace.c
 	$(CC) $(CFLAGS) $(SECFLAGS) -I$(STUB) $(LDFLAGS) -o $@ $<
 
 clean:
-	rm -f vcache-mount vcache-mount-inplace vcache-replace
+	rm -f vcache-mount vcache-mount-inplace vcache-replace vcache-readout
 	rm -rf $(OBFDIR)
 .PHONY: all clean
