@@ -13,6 +13,9 @@
 
 #include <linux/version.h>
 #include <linux/fs.h>
+#include <linux/file.h>	/* fput()/get_file() — used by the writable-mode vma_set_file
+				 * shim below; 6.8/4.12 pull it in transitively but BiSheng
+				 * 5.10's header chain does not, so include it explicitly. */
 #include <linux/mm.h>
 #include <linux/dcache.h>
 
