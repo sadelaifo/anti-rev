@@ -115,24 +115,106 @@ static char        CTL_MM[64];
 
 /* ------------------------------------------------------------- tiny helpers */
 
-static void xlog(const char *fmt, ...)
+/*
+ * Logging / status (opsec).  Normal output is a plain timestamped, leveled log —
+ * it looks like any generic application logger:
+ *
+ *     [YYYY-MM-DD HH:MM:SS:nnnnnnnnn] [LEVEL]  message
+ *       (exactly two spaces after the [LEVEL] field; LEVEL in INFO|WARN|ERROR|DEBUG)
+ *
+ * The camouflage is in WHAT is logged, not whether:
+ *   - DEBUG lines carry the descriptive detail (fs, mount, the gate, "ciphertext
+ *     not ready", ...) that would reveal the tool's purpose, so they are emitted
+ *     ONLY when AREV_DEBUG is set (a technician bringing a box up), and their text
+ *     literals are OBFSTR'd so they never sit in `strings` even then.
+ *   - INFO/WARN/ERROR lines are always emitted but carry only an opaque status
+ *     code ("rc=<n>"), never a descriptive phrase — so the operator and scripts
+ *     learn the outcome (grep "rc=", or read $?), while anyone merely watching the
+ *     binary run sees a generic logger emitting numbers.
+ *
+ * Status code map (out-of-band key; the meanings live ONLY in this comment, never
+ * in the binary's output).  rc is also the process exit code:
+ *   0  ok (action done; for 'up', the target was mounted)   -> INFO
+ *   1  hard failure (run again with AREV_DEBUG=1 for why)    -> ERROR
+ *   2  usage error                                           -> ERROR
+ *   10 not ready: install tree empty/absent -> nothing up    -> WARN
+ *   11 target not present (sim container not running)        -> WARN
+ *   12 already mounted (tear down first)                     -> WARN
+ */
+enum {
+	VCX_OK = 0, VCX_FAIL = 1, VCX_USAGE = 2,
+	VCX_NOTREADY = 10, VCX_NOTPRESENT = 11, VCX_ALREADY = 12,
+};
+enum { L_DEBUG, L_INFO, L_WARN, L_ERROR };
+static int DBG;                 /* AREV_DEBUG: 1 => also emit DEBUG lines */
+static int G_STATUS = VCX_OK;   /* first non-OK outcome of this run */
+
+static void note_status(int code)
+{ if (G_STATUS == VCX_OK && code != VCX_OK) G_STATUS = code; }
+
+/* Generic (non-revealing) level names — left plaintext on purpose: they make the
+ * binary look like it carries an ordinary logging library. */
+static const char *lvl_name(int l)
 {
-	va_list ap; va_start(ap, fmt);
-	fprintf(stderr, "[vc:%s%s] ", MODE_SIM ? OBFSTR("sim") : OBFSTR("real"),
-		IN_CONTAINER ? OBFSTR(":ctr") : "");
-	vfprintf(stderr, fmt, ap);
-	fputc('\n', stderr);
-	va_end(ap);
+	switch (l) {
+	case L_INFO:  return "INFO";
+	case L_WARN:  return "WARN";
+	case L_ERROR: return "ERROR";
+	default:      return "DEBUG";
+	}
 }
 
-static void die(const char *fmt, ...)
+/* Core logger.  DEBUG lines are suppressed unless AREV_DEBUG; INFO/WARN/ERROR
+ * always print.  Timestamp format + scaffolding are generic (no purpose leak). */
+static void vlog(int level, const char *fmt, va_list ap)
 {
-	va_list ap; va_start(ap, fmt);
-	fprintf(stderr, "[vc:%s] ERROR: ", MODE_SIM ? OBFSTR("sim") : OBFSTR("real"));
+	struct timespec tsp;
+	struct tm tm;
+	char tb[24];
+
+	if (level == L_DEBUG && !DBG)
+		return;
+	clock_gettime(CLOCK_REALTIME, &tsp);
+	localtime_r(&tsp.tv_sec, &tm);
+	strftime(tb, sizeof tb, "%Y-%m-%d %H:%M:%S", &tm);
+	fprintf(stderr, "[%s:%09ld] [%s]  ", tb, (long)tsp.tv_nsec, lvl_name(level));
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
-	va_end(ap);
-	exit(1);
+}
+
+static void logf_at(int level, const char *fmt, ...)
+{ va_list ap; va_start(ap, fmt); vlog(level, fmt, ap); va_end(ap); }
+
+/* Descriptive line -> DEBUG level (hidden unless AREV_DEBUG).  Every existing
+ * xlog("...") call site routes here, so revealing text never shows in normal
+ * operation; keep those literals wrapped in OBFSTR() so they stay out of strings. */
+static void xlog(const char *fmt, ...)
+{ va_list ap; va_start(ap, fmt); vlog(L_DEBUG, fmt, ap); va_end(ap); }
+
+/* Opaque status line: INFO for success, WARN for a soft skip, ERROR otherwise.
+ * Content is only the numeric code, so it reveals nothing. */
+static void emit_status(int code)
+{
+	int lvl = (code == VCX_OK) ? L_INFO
+		: (code >= VCX_NOTREADY) ? L_WARN : L_ERROR;
+	logf_at(lvl, "rc=%d", code);
+}
+
+/* Hard failure: describe it at DEBUG (shown only under AREV_DEBUG), always emit
+ * the opaque ERROR status line, and exit with VCX_FAIL so scripts branch on $?. */
+static void die(const char *fmt, ...)
+{
+	va_list ap; va_start(ap, fmt); vlog(L_DEBUG, fmt, ap); va_end(ap);
+	emit_status(VCX_FAIL);
+	exit(VCX_FAIL);
+}
+
+/* Exit now with a SPECIFIC code (a distinct outcome a script cares about); any
+ * descriptive reason was already xlog'd (DEBUG-only) by the caller. */
+static void exit_status(int code)
+{
+	emit_status(code);
+	exit(code);
 }
 
 static const char *env_def(const char *k, const char *d)
@@ -186,7 +268,7 @@ static void rebase_list(char **a, const char *base)
 		const char *tail = bar ? bar : "";     /* "|rel" kept verbatim */
 		char *out = malloc(blen + 1 + rootlen + strlen(tail) + 1);
 		if (!out)
-			die("out of memory rebasing mount list");
+			die(OBFSTR("oom"));
 		sprintf(out, "%.*s/%.*s%s", (int)blen, base,
 			(int)rootlen, a[i], tail);
 		free(a[i]);
@@ -462,7 +544,10 @@ static int do_up(void)
 	for (int i = 0; i < n; i++) {
 		const char *root = MOUNTS[i];
 		if (!is_dir(root)) die(OBFSTR("not a directory: %s"), root);
-		if (is_mountpoint(root)) die(OBFSTR("already mounted: %s (run 'down' first)"), root);
+		if (is_mountpoint(root)) {
+			xlog(OBFSTR("already mounted: %s (run 'down' first)"), root);
+			exit_status(VCX_ALREADY);
+		}
 		int stage = 0;
 		if      (!strcmp(STAGE_MODE, "always")) stage = 1;
 		else if (!strcmp(STAGE_MODE, "never"))  stage = 0;
@@ -550,17 +635,24 @@ static int do_down(void)
 
 static int do_status(void)
 {
+	/* The per-target lines name mount points (revealing), so they print only
+	 * under AREV_DEBUG.  The machine-readable answer is the exit/token code:
+	 * any target not mounted marks the run VCX_NOTREADY. */
 	for (int i = 0; MOUNTS[i]; i++) {
-		if (is_mountpoint(MOUNTS[i])) {
-			fprintf(stdout, "  %-22s mounted\n", MOUNTS[i]);
+		int mnt = is_mountpoint(MOUNTS[i]);
+		if (!mnt)
+			note_status(VCX_NOTREADY);
+		if (!DBG)
+			continue;
+		if (mnt) {
+			xlog(OBFSTR("  %-22s mounted"), MOUNTS[i]);
 			char **subs; int m = collect_submounts(MOUNTS[i], &subs);
-			for (int j = m - 1; j >= 0; j--) { fprintf(stdout, "      %s\n", subs[j]); free(subs[j]); }
+			for (int j = m - 1; j >= 0; j--) { xlog(OBFSTR("      %s"), subs[j]); free(subs[j]); }
 			free(subs);
 		} else {
-			fprintf(stdout, "  %-22s not-mounted\n", MOUNTS[i]);
+			xlog(OBFSTR("  %-22s not-mounted"), MOUNTS[i]);
 		}
 	}
-	fflush(stdout);
 	return 0;
 }
 
@@ -651,9 +743,9 @@ static int run_in_target(int (*fn)(void))
 	if (c == 0) {
 		int pfd = open(nsp, O_RDONLY);          /* pid ns (best-effort) */
 		int mfd = open(nsm, O_RDONLY);          /* mount ns (required) */
-		if (mfd < 0) { fprintf(stderr, "open %s: %s\n", nsm, strerror(errno)); _exit(3); }
+		if (mfd < 0) { xlog(OBFSTR("open %s: %s"), nsm, strerror(errno)); _exit(3); }
 		if (pfd >= 0) setns(pfd, CLONE_NEWPID); /* affects our next fork()'s child */
-		if (setns(mfd, CLONE_NEWNS) != 0) { fprintf(stderr, "setns mnt: %s\n", strerror(errno)); _exit(4); }
+		if (setns(mfd, CLONE_NEWNS) != 0) { xlog(OBFSTR("setns mnt: %s"), strerror(errno)); _exit(4); }
 		if (pfd >= 0) close(pfd);
 		close(mfd);
 		pid_t g = fork();                        /* grandchild: in container pid+mnt ns */
@@ -688,15 +780,18 @@ static void up_one(int container)
 	if (!target_present()) {
 		xlog(OBFSTR("[%s] not running -> skipped (start it, or use 'watch')"),
 		     container ? OBFSTR("ctr") : OBFSTR("host"));
+		note_status(VCX_NOTPRESENT);
 		return;
 	}
 	if (run_in_target(target_ready) != 1) {
 		xlog(OBFSTR("[%s] ciphertext NOT ready -> not mounting"),
 		     container ? OBFSTR("ctr") : OBFSTR("host"));
+		note_status(VCX_NOTREADY);
 		return;
 	}
 	xlog(OBFSTR("[%s] mounting"), container ? OBFSTR("ctr") : OBFSTR("host"));
-	run_in_target(target_up_body);
+	if (run_in_target(target_up_body) != 0)   /* propagate a forked child's die() */
+		note_status(VCX_FAIL);
 }
 
 static void down_one(int container)
@@ -721,7 +816,7 @@ static void down_pre(int container)
 static void status_one(int container)
 {
 	set_target(container);
-	if (!target_present()) { xlog(OBFSTR("[%s] not running"), container ? OBFSTR("ctr") : OBFSTR("host")); return; }
+	if (!target_present()) { xlog(OBFSTR("[%s] not running"), container ? OBFSTR("ctr") : OBFSTR("host")); note_status(VCX_NOTPRESENT); return; }
 	xlog(OBFSTR("[%s] status:"), container ? OBFSTR("ctr") : OBFSTR("host"));
 	run_in_target(do_status);
 }
@@ -828,13 +923,19 @@ static void load_config(void)
 
 static void usage(void)
 {
-	fprintf(stderr, "usage: vcache-mount-inplace [--mode real|sim] {up|down|status|watch}\n");
-	exit(2);
+	/* Shown only on explicit -h/--help (a deliberate request).  OBFSTR'd so the
+	 * revealing words don't sit in `strings` of the shipped binary. */
+	fputs(OBFSTR("usage: [--mode real|sim] {up|down|status|watch}\n"), stderr);
+	exit(VCX_USAGE);
 }
 
 int main(int argc, char **argv)
 {
 	become_root(argc, argv);
+
+	/* Resolve AREV_DEBUG ONCE, up front, so later xlog()/die() never re-enter
+	 * OBFSTR() while a caller's OBFSTR format string is still live. */
+	{ const char *v = getenv(OBFSTR("AREV_DEBUG")); DBG = (v && *v && strcmp(v, "0")) ? 1 : 0; }
 
 	const char *mode = env_def(OBFSTR("AREV_MODE"), CFG_MODE);
 	ACTION = NULL;
@@ -845,7 +946,7 @@ int main(int argc, char **argv)
 			 !strcmp(argv[i], "status") || !strcmp(argv[i], "watch"))
 			ACTION = argv[i];
 		else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) usage();
-		else { fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(); }
+		else { if (DBG) fprintf(stderr, "unknown arg: %s\n", argv[i]); exit_status(VCX_USAGE); }
 	}
 	if (!ACTION) ACTION = OBFSTR("up");
 
@@ -862,10 +963,12 @@ int main(int argc, char **argv)
 	}
 
 	if      (!strcmp(ACTION, "up"))     run_up_sequence();
-	else if (!strcmp(ACTION, "watch"))  do_watch();
+	else if (!strcmp(ACTION, "watch"))  do_watch();   /* daemon: never returns */
 	else if (!strcmp(ACTION, "down"))   { for_each_target(down_one);
 					      xlog(OBFSTR("down complete (module left loaded; 'rmmod vcachefs' to unload)")); }
 	else if (!strcmp(ACTION, "status")) for_each_target(status_one);
-	else usage();
-	return 0;
+	else exit_status(VCX_USAGE);
+
+	emit_status(G_STATUS);   /* terse token + matching exit code for scripts */
+	return G_STATUS;
 }
