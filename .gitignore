@@ -23,8 +23,12 @@ __pycache__/
 # Local Claude Code settings (per-machine)
 .claude/settings.local.json
 
-# Generated presentation
+# Office docs / generated presentations — never commit binary office files to the
+# source repo (keep them locally; share them elsewhere).
 *.pptx
+*.ppt
+*.xlsx
+*.xls
 
 # Debug symbol files
 *.debug
